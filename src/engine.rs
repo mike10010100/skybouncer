@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use skybase::ingest::{CommitOperation, JetstreamCommit};
 use skybase::repo::PdsRepoClient;
 use tokio::sync::mpsc;
@@ -294,7 +295,7 @@ impl EngineStats {
 }
 
 /// Point-in-time immutable snapshot of [`EngineStats`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EngineStatsSnapshot {
     /// Total incoming Jetstream commits processed.
     pub commits_received: u64,
@@ -491,6 +492,7 @@ impl ProcessCommitResult {
 pub struct SkybouncerEngine {
     config: SkybouncerConfig,
     protected_dids: Arc<RwLock<HashSet<String>>>,
+    rubric: Arc<RwLock<RuleRubric>>,
     follow_graph: Arc<FollowGraph>,
     gate: Arc<NonFollowedGate>,
     heuristic_classifier: HeuristicClassifier,
@@ -521,11 +523,13 @@ impl SkybouncerEngine {
         let cache = Arc::clone(modlist_manager.cache());
         let heuristic_classifier = HeuristicClassifier::default();
         let protected_dids = Arc::new(RwLock::new(config.protected_dids.clone()));
+        let rubric = Arc::new(RwLock::new(config.rubric.clone()));
         let stats = Arc::new(EngineStats::default());
 
         Self {
             config,
             protected_dids,
+            rubric,
             follow_graph,
             gate,
             heuristic_classifier,
@@ -704,8 +708,9 @@ impl SkybouncerEngine {
                 confidence,
                 reason,
             } => {
-                let threshold = self.config.rubric.sensitivity.threshold();
-                if !self.config.rubric.meets_threshold(&category, confidence) {
+                let rubric = self.rubric();
+                let threshold = rubric.sensitivity.threshold();
+                if !rubric.meets_threshold(&category, confidence) {
                     self.stats
                         .bounces_skipped_rubric
                         .fetch_add(1, Ordering::Relaxed);
@@ -878,10 +883,16 @@ impl SkybouncerEngine {
         &self.config
     }
 
-    /// Returns a reference to the active rule rubric.
+    /// Returns a copy of the active rule rubric.
     #[must_use]
-    pub fn rubric(&self) -> &RuleRubric {
-        &self.config.rubric
+    pub fn rubric(&self) -> RuleRubric {
+        self.rubric.read().clone()
+    }
+
+    /// Updates the active moderation rubric in real time across the engine and modlist manager.
+    pub fn set_rubric(&self, rubric: RuleRubric) {
+        *self.rubric.write() = rubric.clone();
+        self.modlist_manager.set_rubric(rubric);
     }
 
     /// Returns a reference to the heuristic classifier.
@@ -1216,11 +1227,13 @@ impl SkybouncerEngineBuilder {
         };
 
         let protected_dids = Arc::new(RwLock::new(self.config.protected_dids.clone()));
+        let rubric = Arc::new(RwLock::new(self.config.rubric.clone()));
         let stats = Arc::new(EngineStats::default());
 
         Ok(SkybouncerEngine {
             config: self.config,
             protected_dids,
+            rubric,
             follow_graph,
             gate,
             heuristic_classifier,

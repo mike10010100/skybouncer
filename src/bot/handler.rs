@@ -139,6 +139,7 @@ impl BotCommandHandler {
         }
 
         let parsed = RuleRubric::parse(prompt)?;
+        self.engine.set_rubric(parsed.clone());
         Ok(format!(
             "✅ Moderation rubric updated successfully!\n\n\
              Prompt: \"{}\"\n\
@@ -158,6 +159,10 @@ impl BotCommandHandler {
                 );
             }
         };
+
+        let mut rubric = self.engine.rubric();
+        rubric.sensitivity = sens;
+        self.engine.set_rubric(rubric);
 
         Ok(format!(
             "✅ Sensitivity threshold updated to **{}** (confidence: {:.2}).",

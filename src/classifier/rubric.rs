@@ -7,8 +7,7 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Sensitivity level determining confidence thresholds for automated list actions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Sensitivity {
     /// High precision, low false-positive rate. Flags when confidence >= 0.90.
     Low,
@@ -17,6 +16,25 @@ pub enum Sensitivity {
     Medium,
     /// High recall, aggressive filtering. Flags when confidence >= 0.60.
     High,
+}
+
+impl Serialize for Sensitivity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Sensitivity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse::<Self>().map_err(serde::de::Error::custom)
+    }
 }
 
 impl Sensitivity {

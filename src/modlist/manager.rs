@@ -5,6 +5,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use serde::Deserialize;
 use skybase::repo::PdsRepoClient;
 use tracing::{debug, info, instrument};
@@ -79,7 +80,7 @@ impl Default for StripedAsyncLocks {
 #[derive(Clone)]
 pub struct ModListManager {
     cache: Arc<DeduplicationCache>,
-    rubric: Option<RuleRubric>,
+    rubric: Arc<RwLock<Option<RuleRubric>>>,
     list_name: String,
     list_description: Option<String>,
     list_provision_locks: Arc<StripedAsyncLocks>,
@@ -92,7 +93,7 @@ impl ModListManager {
     pub fn new(cache: DeduplicationCache, rubric: Option<RuleRubric>) -> Self {
         Self {
             cache: Arc::new(cache),
-            rubric,
+            rubric: Arc::new(RwLock::new(rubric)),
             list_name: DEFAULT_MOD_LIST_NAME.to_string(),
             list_description: Some(DEFAULT_MOD_LIST_DESCRIPTION.to_string()),
             list_provision_locks: Arc::new(StripedAsyncLocks::new()),
@@ -105,7 +106,7 @@ impl ModListManager {
     pub fn from_shared_cache(cache: Arc<DeduplicationCache>) -> Self {
         Self {
             cache,
-            rubric: None,
+            rubric: Arc::new(RwLock::new(None)),
             list_name: DEFAULT_MOD_LIST_NAME.to_string(),
             list_description: Some(DEFAULT_MOD_LIST_DESCRIPTION.to_string()),
             list_provision_locks: Arc::new(StripedAsyncLocks::new()),
@@ -115,9 +116,14 @@ impl ModListManager {
 
     /// Attaches an optional [`RuleRubric`] for sensitivity threshold validation.
     #[must_use]
-    pub fn with_rubric(mut self, rubric: RuleRubric) -> Self {
-        self.rubric = Some(rubric);
+    pub fn with_rubric(self, rubric: RuleRubric) -> Self {
+        *self.rubric.write() = Some(rubric);
         self
+    }
+
+    /// Updates the active moderation rubric in real time.
+    pub fn set_rubric(&self, rubric: RuleRubric) {
+        *self.rubric.write() = Some(rubric);
     }
 
     /// Configures a custom name for newly provisioned moderation lists.
@@ -158,10 +164,10 @@ impl ModListManager {
         &self.cache
     }
 
-    /// Returns a reference to the active [`RuleRubric`], if configured.
+    /// Returns a copy of the active [`RuleRubric`], if configured.
     #[must_use]
-    pub fn rubric(&self) -> Option<&RuleRubric> {
-        self.rubric.as_ref()
+    pub fn rubric(&self) -> Option<RuleRubric> {
+        self.rubric.read().clone()
     }
 
     /// Ensures that an ATProto moderation list (`app.bsky.graph.list` with
@@ -314,7 +320,7 @@ impl ModListManager {
         post_uri: &str,
     ) -> Result<Option<String>, SkybouncerError> {
         // 1. Check rubric threshold if rubric is configured
-        if let Some(ref rubric) = self.rubric {
+        if let Some(ref rubric) = *self.rubric.read() {
             if !rubric.meets_threshold(category, confidence) {
                 debug!(
                     confidence = %confidence,

@@ -206,6 +206,35 @@ async fn main() -> Result<(), SkybouncerError> {
         info!("ℹ️ ATProto DM bot disabled (CHAT_ACCESS_TOKEN / BOT_DID not configured)");
     }
 
+    // Optional Sovereign Web Dashboard
+    let web_enabled = std::env::var("WEB_ENABLED")
+        .or_else(|_| std::env::var("SKYBOUNCER_WEB_ENABLED"))
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    let port_configured = std::env::var("PORT").is_ok() || std::env::var("SKYBOUNCER_PORT").is_ok();
+
+    if web_enabled || port_configured {
+        let web_config = skybouncer::web::WebServerConfig::from_env();
+        let web_port = web_config.port;
+        let engine_web = std::sync::Arc::new(engine.clone());
+        let cancel_web = cancel.clone();
+
+        join_set.spawn(async move {
+            if let Err(e) =
+                skybouncer::web::run_web_server(web_config, engine_web, cancel_web).await
+            {
+                error!(error = %e, "Sovereign web dashboard server encountered error");
+            }
+            Ok(Default::default())
+        });
+        info!(
+            port = web_port,
+            "🌐 Sovereign Web Dashboard server activated"
+        );
+    } else {
+        info!("ℹ️ Sovereign Web Dashboard disabled (WEB_ENABLED / PORT not configured)");
+    }
+
     info!("🚀 Skybouncer is running! Press Ctrl+C to stop.");
 
     // 7. Await shutdown signal

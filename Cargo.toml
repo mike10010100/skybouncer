@@ -25,7 +25,13 @@ path = "src/main.rs"
 [dependencies]
 # Sibling workspace dependencies
 skybase = { path = "../skybase", version = "0.1" }
-skyauth = { path = "../skyauth", version = "0.3" }
+skyauth = { path = "../skyauth", version = "0.3", features = ["axum"] }
+
+# HTTP Web Framework & Networking
+axum = { version = "0.7", default-features = false, features = ["json", "query", "tokio", "macros", "http1"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tower-http = { version = "0.6", default-features = false, features = ["cors", "trace"] }
+http = "1.1"
 
 # Concurrency & Async Runtime
 tokio = { version = "1.40", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }

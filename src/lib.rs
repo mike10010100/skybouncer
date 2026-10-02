@@ -27,6 +27,7 @@ pub mod matcher;
 pub mod modlist;
 pub mod stream;
 pub mod types;
+pub mod web;
 
 pub use bot::{
     run_bot_poller, BotCommandHandler, ChatClient, ConvoMember, ConvoView, GetMessagesResponse,
@@ -34,6 +35,11 @@ pub use bot::{
     UpdateReadRequest, DEFAULT_BOT_POLL_INTERVAL, DEFAULT_CHAT_ENDPOINT,
 };
 pub use stream::{run_jetstream_streamer, StreamConfig, DEFAULT_JETSTREAM_ENDPOINT};
+pub use web::{
+    create_web_router, run_web_server, ApiState, BouncesQuery, LoginQuery, OAuthState,
+    PardonRequest, PardonResponse, RulesResponse, SimulateRequest, SimulateResponse,
+    StatusResponse, UpdateRulesRequest, WebServerConfig, DEFAULT_WEB_HOST, DEFAULT_WEB_PORT,
+};
 
 pub use classifier::{
     Classifier, HeuristicClassifier, HeuristicRule, JevClassifier, JevConfig, MockClassifier,
