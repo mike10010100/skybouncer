@@ -226,11 +226,11 @@ Adhering to [`AGENTS.md`](AGENTS.md) and [`rust-best-practices`](/Users/mike1001
 
 | Milestone | Deliverables | Status |
 | :--- | :--- | :--- |
-| **M1: Core Domain & Classifier Engine** | `skybouncer` crate structure, typed `SkybouncerError`, `Classifier` trait, `JevClassifier` client, `MockClassifier` for hermetic testing, `RuleRubric` parser. | Pending |
-| **M2: Jetstream Ingestion & Target Matching** | Integration with `skybase::ingest`, reply/mention/quote detector, deduplication cache in embedded SQLite (`skybase::index`). | Pending |
-| **M3: Mod List Provisioning & PDS Mutations** | Integration with `skybase::repo`, `app.bsky.graph.list` creation, `app.bsky.graph.listitem` upsert and pardon mutations with DPoP signing. | Pending |
-| **M4: ATProto DM Bot Interface** | ATProto Chat client (`chat.bsky.convo.*`), conversational command parser (`rules`, `recent`, `pardon`, `sensitivity`), automated DM alert dispatcher. | Pending |
-| **M5: Web Dashboard & Verification Suite** | Minimal Web UI with `skyauth` OAuth login, dry-run simulator, 100% test coverage, clippy/fmt/deny compliance. | Pending |
+| **M1: Core Domain & Classifier Engine** | `skybouncer` crate structure, typed `SkybouncerError`, `Classifier` trait, `JevClassifier` client, `MockClassifier` for hermetic testing, `RuleRubric` parser. | ✅ **Completed** |
+| **M2: Jetstream Ingestion & Target Matching** | Integration with `skybase::ingest`, reply/mention/quote detector, deduplication cache in embedded SQLite (`skybase::index`). | ✅ **Completed** |
+| **M3: Mod List Provisioning & PDS Mutations** | Integration with `skybase::repo`, `app.bsky.graph.list` creation, `app.bsky.graph.listitem` upsert and pardon mutations with DPoP signing. | ✅ **Completed** |
+| **M4: ATProto DM Bot Interface** | ATProto Chat client (`chat.bsky.convo.*`), conversational command parser (`rules`, `recent`, `pardon`, `sensitivity`), automated DM alert dispatcher. | ✅ **Completed** |
+| **M5: Web Dashboard & Verification Suite** | Minimal Web UI with `skyauth` OAuth login, dry-run simulator, 100% test coverage, clippy/fmt/deny compliance. | ⏳ **Next Up** |
 
 ---
 
