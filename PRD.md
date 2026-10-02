@@ -40,6 +40,9 @@ The concept for `skybouncer` directly realizes the architectural pattern discuss
 > *"actually that would be a fun little project to set up, the user SSO’s in and sets some rules, and then you use Jev or a Jevlike to populate a list that they can subscribe to. theoretically stateless too, unless you want the rules to be private"*
 > 
 > *"literally the only annoying thing would be making a website. instead, make this an account you DM with"*
+> 
+> *"For cost control the rule has to be “all posts directed at them, but by a user they don’t follow” of course"*
+
 
 ### 1.3 What is "Jev" and Why Now?
 In mid-September 2026, TypeSafe AI introduced **Jev**, a specialized "System 1" AI model designed specifically for low-latency, structured classification rather than open-ended text generation:
@@ -141,13 +144,20 @@ Unlike centralized Web2 moderation bots that require a database of user accounts
 ## 4. Key Functional Features
 
 ### 4.1 Ingestion & Target Matching
-* **Jetstream Edge Filtering**: Connects to global Jetstream WebSocket firehoses using `skybase::ingest`, filtering for `app.bsky.feed.post` commit events.
+* **Jetstream Edge Filtering**: Connects to global Jetstream WebSocket firehoses using `skybase::ingest`, filtering for `app.bsky.feed.post` and `app.bsky.graph.follow` commit events.
 * **Target Detection**: Rapidly inspects incoming posts to determine if they interact with a protected user:
   * **Direct Replies**: `record.reply.parent.uri` matching protected user's DID.
   * **Thread Infiltration**: `record.reply.root.uri` owned by protected user.
   * **Mentions**: Text facets containing `app.bsky.richtext.facet#mention` with protected user's DID.
   * **Quotes**: Embeds of type `app.bsky.embed.record` pointing to protected user's posts.
-* **Self-Interaction Exclusion**: Automatically skips posts authored by the protected user, users already on the user's follow list, or authorized bypass list.
+* **The Non-Followed Direct Interaction Gate (Cost Control Invariant)**:
+  * **Core Invariant**: For strict cost control and false-positive prevention, an interaction is **ONLY** dispatched to the classifier if it is directed at the protected user **by an author the protected user DOES NOT follow**.
+  * **Instant Short-Circuit ($0 Cost, $<1\mu s$ Latency)**: If `author_did == protected_user_did` OR `protected_user.follows(author_did)`, the post is immediately bypassed with zero external API calls.
+  * **Follow-Graph Dynamic Synchronization**:
+    * On initialization, `skybouncer` loads the protected user's active `app.bsky.graph.follow` records into a lock-free in-memory set (`HashSet<Did>` or bitset).
+    * `skybase::ingest` continuously listens to commit events (`create` and `delete`) on the user's `app.bsky.graph.follow` collection, dynamically keeping the follow-graph bypass set up to date in real time without requiring restarts.
+  * **Social Context Preservation**: Ensures friends, mutuals, and accounts the user actively chose to follow are never accidentally moderated or blocked due to playful, sarcastic, or edgy banter.
+
 
 ### 4.2 Pluggable Classification Engine
 * **Trait-Based Classifier Interface**:
@@ -204,9 +214,11 @@ Adhering to [`AGENTS.md`](AGENTS.md) and [`rust-best-practices`](/Users/mike1001
 * Background tasks managed via `tokio::task::JoinSet` with `tokio_util::sync::CancellationToken`.
 
 ### 5.2 Anti-Denial-of-Wallet & Cost Safeguards
-* **Per-User Rate Limits**: Hard ceiling on LLM/classifier evaluations per user per hour (e.g., max 100 evaluations/hour) to prevent malicious actors from triggering expensive model calls by spam-mentioning a protected user.
-* **Heuristic Short-Circuit**: Zero-cost heuristic pre-filters (e.g. bio heuristics, known account blocklists) run before external API invocations.
-* **Result Caching**: Evaluated authors are cached in SQLite with a configurable TTL (e.g. 24 hours), avoiding redundant re-evaluations.
+* **Tier 1: Non-Followed Pre-Filter ($0 Cost, $<1\mu s$)**: All interactions authored by accounts the user follows (or the user themselves) are dropped immediately before any network or model calls.
+* **Tier 2: Deduplication & Evaluation Caching ($0 Cost, $<100\mu s$)**: Previously evaluated authors are cached in the embedded SQLite store (`skybase::index`) with a configurable TTL (e.g. 24 hours), avoiding redundant re-evaluations.
+* **Tier 3: Heuristic Short-Circuit ($0 Cost, $<500\mu s$)**: Zero-cost heuristic pre-filters (e.g. obvious spam keyword patterns, known malicious domains, bot link structures) can trigger immediate list additions without external API calls.
+* **Tier 4: Per-User Evaluation Rate Limits**: Hard ceiling on LLM/classifier evaluations per user per hour (e.g., max 100 external model evaluations/hour) to prevent malicious actors from triggering expensive model calls by spam-mentioning a protected user.
+
 
 ---
 
