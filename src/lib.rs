@@ -24,7 +24,10 @@ pub mod engine;
 pub mod error;
 pub mod matcher;
 pub mod modlist;
+pub mod stream;
 pub mod types;
+
+pub use stream::{run_jetstream_streamer, StreamConfig, DEFAULT_JETSTREAM_ENDPOINT};
 
 pub use classifier::{
     Classifier, HeuristicClassifier, HeuristicRule, JevClassifier, JevConfig, MockClassifier,

@@ -17,6 +17,11 @@ readme = "README.md"
 name = "skybouncer"
 path = "src/lib.rs"
 
+[[bin]]
+name = "skybouncer"
+path = "src/main.rs"
+
+
 [dependencies]
 # Sibling workspace dependencies
 skybase = { path = "../skybase", version = "0.1" }
@@ -45,6 +50,12 @@ url = { version = "2.5", features = ["serde"] }
 # Error Handling & Observability
 thiserror = "1.0"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+
+# WebSocket Stream Ingestion for Live Daemon
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = { version = "0.3", features = ["sink"] }
+
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["full", "test-util"] }
