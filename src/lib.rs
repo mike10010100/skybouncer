@@ -19,6 +19,7 @@
     rust_2018_idioms
 )]
 
+pub mod bot;
 pub mod classifier;
 pub mod engine;
 pub mod error;
@@ -27,6 +28,11 @@ pub mod modlist;
 pub mod stream;
 pub mod types;
 
+pub use bot::{
+    run_bot_poller, BotCommandHandler, ChatClient, ConvoMember, ConvoView, GetMessagesResponse,
+    ListConvosResponse, MessageSender, MessageView, SendMessagePayload, SendMessageRequest,
+    UpdateReadRequest, DEFAULT_BOT_POLL_INTERVAL, DEFAULT_CHAT_ENDPOINT,
+};
 pub use stream::{run_jetstream_streamer, StreamConfig, DEFAULT_JETSTREAM_ENDPOINT};
 
 pub use classifier::{

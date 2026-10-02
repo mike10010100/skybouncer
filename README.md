@@ -19,7 +19,15 @@
 3. **Native ATProto Mod Lists**: Violators are added as `app.bsky.graph.listitem` records to an ATProto Moderation List (`app.bsky.graph.list` with `purpose: "app.bsky.graph.defs#modlist"`). Subscribing natively mutes or blocks them across the entire network.
 4. **Stateless & Sovereign**: Rules and lists can live directly in the user's sovereign repository on their PDS, requiring zero external database custody.
 5. **Dual Interaction Topologies**:
-   - **DM Bot Interface (`chat.bsky.convo.*`)**: Website-free interaction. DM `@skybouncer.bsky.social` to configure rules and view bouncer activity.
+   - **DM Bot Interface (`chat.bsky.convo.*`)**: Website-free interaction. DM the bot account to configure rules, test text, and view bouncer activity:
+     - `rules`: View current moderation rubric and sensitivity.
+     - `set rules <prompt>`: Update your moderation rubric in real time.
+     - `sensitivity <low|medium|high>`: Adjust classification threshold.
+     - `recent`: List recently bounced violators.
+     - `pardon <did>`: Pardon and remove an account from your moderation list.
+     - `status`: View live engine telemetry and bounce counts.
+     - `test <text>`: Dry-run evaluation on sample text.
+     - `help`: View all available commands.
    - **Sovereign Web Dashboard (`skyauth`)**: Web UI with ATProto OAuth 2.0 PKCE + DPoP login and real-time rule playground.
 
 ---

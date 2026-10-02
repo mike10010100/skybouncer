@@ -28,7 +28,8 @@ skybase = { path = "../skybase", version = "0.1" }
 skyauth = { path = "../skyauth", version = "0.3" }
 
 # Concurrency & Async Runtime
-tokio = { version = "1.40", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+tokio = { version = "1.40", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+
 tokio-util = "0.7"
 async-trait = "0.1"
 parking_lot = "0.12"

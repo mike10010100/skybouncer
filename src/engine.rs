@@ -167,29 +167,35 @@ impl SkybouncerConfig {
     /// Returns [`SkybouncerError::Config`] if rubric parsing fails.
     pub fn from_env() -> Result<Self, SkybouncerError> {
         let mut protected_dids = HashSet::new();
-        if let Ok(dids_str) = std::env::var("PROTECTED_DIDS") {
-            for did in dids_str.split(',') {
-                let trimmed = did.trim();
-                if !trimmed.is_empty() {
-                    protected_dids.insert(trimmed.to_string());
-                }
+        let dids_str = std::env::var("PROTECTED_DIDS")
+            .or_else(|_| std::env::var("SKYBOUNCER_PROTECTED_DIDS"))
+            .unwrap_or_default();
+        for did in dids_str.split(',') {
+            let trimmed = did.trim();
+            if !trimmed.is_empty() {
+                protected_dids.insert(trimmed.to_string());
             }
         }
 
-        let rubric_prompt = std::env::var("MODERATION_RUBRIC").unwrap_or_else(|_| {
-            "Block crypto airdrop spam, scam bots, phishing, targeted harassment, and bad-faith sea-lioning."
-                .to_string()
-        });
+        let rubric_prompt = std::env::var("MODERATION_RUBRIC")
+            .or_else(|_| std::env::var("SKYBOUNCER_RULES"))
+            .unwrap_or_else(|_| {
+                "Block crypto airdrop spam, scam bots, phishing, targeted harassment, and bad-faith sea-lioning."
+                    .to_string()
+            });
         let rubric = RuleRubric::parse(&rubric_prompt)?;
 
-        let pds_endpoint = std::env::var("PDS_ENDPOINT").ok().and_then(|s| {
-            let t = s.trim().to_string();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
-        });
+        let pds_endpoint = std::env::var("PDS_ENDPOINT")
+            .or_else(|_| std::env::var("SKYBOUNCER_PDS_URL"))
+            .ok()
+            .and_then(|s| {
+                let t = s.trim().to_string();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
+            });
 
         let pds_access_token = std::env::var("PDS_ACCESS_TOKEN").ok().and_then(|s| {
             let t = s.trim().to_string();
@@ -200,7 +206,10 @@ impl SkybouncerConfig {
             }
         });
 
-        let cache_path = std::env::var("SKYBOUNCER_DB_PATH").ok().map(PathBuf::from);
+        let cache_path = std::env::var("SKYBOUNCER_DB_PATH")
+            .or_else(|_| std::env::var("SKYBOUNCER_DATABASE_PATH"))
+            .ok()
+            .map(PathBuf::from);
 
         let jev_config = JevConfig::from_env().ok();
 
@@ -831,6 +840,14 @@ impl SkybouncerEngine {
         self.cache.get_bounced_user(subject_did)
     }
 
+    /// Lists recently bounced violators ordered by most recent bounce timestamp descending.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn list_recent_bounces(&self, limit: usize) -> Result<Vec<BouncedUser>, SkybouncerError> {
+        self.cache.list_recent_bounces(limit)
+    }
+
     /// Pardons an account by deleting its listitems from the PDS and purging the cache.
     ///
     /// # Errors
@@ -865,6 +882,18 @@ impl SkybouncerEngine {
     #[must_use]
     pub fn rubric(&self) -> &RuleRubric {
         &self.config.rubric
+    }
+
+    /// Returns a reference to the heuristic classifier.
+    #[must_use]
+    pub fn heuristic_classifier(&self) -> &HeuristicClassifier {
+        &self.heuristic_classifier
+    }
+
+    /// Returns a reference to the primary classifier.
+    #[must_use]
+    pub fn primary_classifier(&self) -> &Arc<dyn Classifier> {
+        &self.classifier
     }
 
     /// Returns a reference to the follow graph.

@@ -167,6 +167,45 @@ async fn main() -> Result<(), SkybouncerError> {
         Ok(Default::default())
     });
 
+    // Optional ATProto DM Bot worker
+    let chat_endpoint = std::env::var("CHAT_ENDPOINT")
+        .unwrap_or_else(|_| skybouncer::DEFAULT_CHAT_ENDPOINT.to_string());
+    let chat_token = std::env::var("CHAT_ACCESS_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("PDS_ACCESS_TOKEN").ok());
+    let bot_did = std::env::var("BOT_DID")
+        .ok()
+        .or_else(|| config.protected_dids.iter().next().cloned());
+
+    if let (Some(token), Some(did)) = (chat_token, bot_did) {
+        match skybouncer::ChatClient::new(chat_endpoint, token) {
+            Ok(chat_client) => {
+                let handler =
+                    skybouncer::BotCommandHandler::new(std::sync::Arc::new(engine.clone()), did);
+                let cancel_bot = cancel.clone();
+                join_set.spawn(async move {
+                    if let Err(e) = skybouncer::run_bot_poller(
+                        chat_client,
+                        handler,
+                        skybouncer::DEFAULT_BOT_POLL_INTERVAL,
+                        cancel_bot,
+                    )
+                    .await
+                    {
+                        error!(error = %e, "ATProto DM bot worker encountered error");
+                    }
+                    Ok(Default::default())
+                });
+                info!("🤖 ATProto DM bot poller activated");
+            }
+            Err(e) => {
+                warn!(error = %e, "Could not initialize ATProto DM chat client");
+            }
+        }
+    } else {
+        info!("ℹ️ ATProto DM bot disabled (CHAT_ACCESS_TOKEN / BOT_DID not configured)");
+    }
+
     info!("🚀 Skybouncer is running! Press Ctrl+C to stop.");
 
     // 7. Await shutdown signal

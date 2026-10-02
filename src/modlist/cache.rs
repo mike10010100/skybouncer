@@ -414,6 +414,44 @@ impl DeduplicationCache {
         self.get_all_bounced_rkeys(subject_did)
     }
 
+    /// Lists recently bounced users ordered by most recent bounce timestamp descending.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    pub fn list_recent_bounces(&self, limit: usize) -> Result<Vec<BouncedUser>, SkybouncerError> {
+        let limit_i64 = i64::try_from(limit).unwrap_or(50);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
+                    category, confidence, reason, post_uri, bounced_at
+             FROM bounced_users
+             ORDER BY bounced_at DESC
+             LIMIT ?1;",
+        )?;
+
+        let rows = stmt.query_map(params![limit_i64], |row| {
+            let bounced_at_i64: i64 = row.get(8)?;
+            let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
+            Ok(BouncedUser {
+                subject_did: row.get(0)?,
+                listitem_uri: row.get(1)?,
+                listitem_rkey: row.get(2)?,
+                listitem_cid: row.get(3)?,
+                category: row.get(4)?,
+                confidence: row.get(5)?,
+                reason: row.get(6)?,
+                post_uri: row.get(7)?,
+                bounced_at,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
     /// Removes a bounced user from the cache, returning the primary listitem `rkey`.
     ///
     /// Cleans up both `bounced_users` and all associated entries in `bounced_user_rkeys`.
