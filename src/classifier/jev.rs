@@ -463,19 +463,18 @@ impl JevClassifier {
                     );
                     criteria.insert(
                         "harassment".to_string(),
-                        "Targeted harassment, threats, abusive behavior, hostility, slurs"
-                            .to_string(),
+                        "Targeted harassment, personal attacks, insults, threats, abusive hostility".to_string(),
                     );
                     criteria.insert(
                         "spam".to_string(),
                         format!(
-                            "Content violating moderation house rules: {}",
+                            "Unsolicited promotional spam, scam bots, or content violating: {}",
                             self.rubric.prompt
                         ),
                     );
                     criteria.insert(
                         "permitted".to_string(),
-                        "Benign, normal social post or interaction conforming to house rules"
+                        "Benign, normal social post or civil conversation conforming to house rules"
                             .to_string(),
                     );
                     let mut questions = std::collections::BTreeMap::new();
@@ -567,7 +566,15 @@ impl JevClassifier {
                             answer
                                 .probabilities
                                 .as_ref()
-                                .and_then(|p| p.get(&answer.choice).copied())
+                                .and_then(|p| {
+                                    p.get("permitted").map(|perm| (1.0 - perm).clamp(0.0, 1.0))
+                                })
+                                .or_else(|| {
+                                    answer
+                                        .probabilities
+                                        .as_ref()
+                                        .and_then(|p| p.get(&answer.choice).copied())
+                                })
                                 .or(answer.confidence)
                                 .unwrap_or(0.95)
                         } else {
