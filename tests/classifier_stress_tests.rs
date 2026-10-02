@@ -27,6 +27,7 @@ fn make_test_interaction(text: &str) -> Interaction {
         parent_uri: None,
         root_uri: None,
         created_at_us: 1_700_000_000_000_000,
+        enriched_context: None,
     }
 }
 

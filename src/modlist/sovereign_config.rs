@@ -1,0 +1,188 @@
+//! Sovereign ATProto PDS configuration storage for zero-custody, stateless operation.
+//!
+//! Enables users to store and resolve their moderation rules and sensitivity thresholds directly
+//! in their own sovereign ATProto repository (`social.skybouncer.config` or list metadata),
+//! eliminating the need for centralized configuration databases.
+
+use serde::{Deserialize, Serialize};
+use skybase::repo::PdsRepoClient;
+
+use crate::classifier::{RuleRubric, Sensitivity};
+use crate::error::SkybouncerError;
+
+/// The canonical ATProto NSID collection for sovereign skybouncer configuration.
+pub const SOVEREIGN_CONFIG_COLLECTION: &str = "social.skybouncer.config";
+
+/// The default record key (rkey) used for sovereign configuration records.
+pub const SOVEREIGN_CONFIG_RKEY: &str = "self";
+
+/// An ATProto repository record holding sovereign moderation configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SovereignConfigRecord {
+    /// ATProto type identifier.
+    #[serde(rename = "$type")]
+    pub record_type: String,
+    /// Natural-language moderation rubric prompt.
+    pub rules: String,
+    /// Sensitivity string (`"low"`, `"medium"`, `"high"`).
+    pub sensitivity: String,
+    /// Timestamp of last modification in ISO 8601 format.
+    pub updated_at: String,
+}
+
+impl SovereignConfigRecord {
+    /// Creates a new [`SovereignConfigRecord`] from a [`RuleRubric`].
+    #[must_use]
+    pub fn from_rubric(rubric: &RuleRubric) -> Self {
+        Self {
+            record_type: SOVEREIGN_CONFIG_COLLECTION.to_string(),
+            rules: rubric.prompt.clone(),
+            sensitivity: rubric.sensitivity.as_str().to_string(),
+            updated_at: chrono_timestamp(),
+        }
+    }
+
+    /// Converts this record into a domain [`RuleRubric`].
+    #[must_use]
+    pub fn to_rubric(&self) -> RuleRubric {
+        let sensitivity = match self.sensitivity.to_lowercase().as_str() {
+            "low" => Sensitivity::Low,
+            "high" => Sensitivity::High,
+            _ => Sensitivity::Medium,
+        };
+        RuleRubric::new(&self.rules, sensitivity)
+    }
+}
+
+/// Generates a simple UTC ISO 8601 timestamp string without external dependencies.
+fn chrono_timestamp() -> String {
+    // Standard Unix epoch elapsed seconds
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ListMetadata {
+    rules: String,
+    sensitivity: String,
+}
+
+/// Encodes rubric parameters into moderation list description metadata.
+///
+/// Format: `[skybouncer:{"rules":"...","sensitivity":"..."}]`
+#[must_use]
+pub fn format_list_description_with_rubric(base_description: &str, rubric: &RuleRubric) -> String {
+    let clean_base = base_description
+        .split("[skybouncer:")
+        .next()
+        .unwrap_or("")
+        .trim_end();
+
+    let meta = ListMetadata {
+        rules: rubric.prompt.clone(),
+        sensitivity: rubric.sensitivity.as_str().to_string(),
+    };
+
+    let json_str = serde_json::to_string(&meta).unwrap_or_default();
+    let tag = format!("[skybouncer:{json_str}]");
+
+    if clean_base.is_empty() {
+        tag
+    } else {
+        format!("{clean_base}\n\n{tag}")
+    }
+}
+
+/// Extracts a [`RuleRubric`] from an encoded moderation list description, if present.
+#[must_use]
+pub fn extract_rubric_from_list_description(description: &str) -> Option<RuleRubric> {
+    let marker = "[skybouncer:";
+    let start_idx = description.find(marker)? + marker.len();
+    let end_idx = description[start_idx..].find(']')? + start_idx;
+    let json_str = &description[start_idx..end_idx];
+
+    let meta: ListMetadata = serde_json::from_str(json_str).ok()?;
+    let sensitivity = match meta.sensitivity.to_lowercase().as_str() {
+        "low" => Sensitivity::Low,
+        "high" => Sensitivity::High,
+        _ => Sensitivity::Medium,
+    };
+
+    Some(RuleRubric::new(&meta.rules, sensitivity))
+}
+
+/// Client helper fetching sovereign configuration from a user's PDS repository.
+///
+/// Attempts to read `social.skybouncer.config/self` via XRPC `com.atproto.repo.getRecord`.
+///
+/// # Errors
+/// Returns [`SkybouncerError::Repo`] on permanent network or parse errors.
+pub async fn fetch_sovereign_config(
+    pds_client: &PdsRepoClient,
+    repo_did: &str,
+) -> Result<Option<RuleRubric>, SkybouncerError> {
+    let res = pds_client
+        .get_record(repo_did, SOVEREIGN_CONFIG_COLLECTION, SOVEREIGN_CONFIG_RKEY)
+        .await;
+
+    match res {
+        Ok(record_view) => {
+            let record: SovereignConfigRecord =
+                serde_json::from_value(record_view.value).map_err(|e| {
+                    SkybouncerError::Repo(format!(
+                        "Failed to deserialize sovereign config record: {e}"
+                    ))
+                })?;
+            Ok(Some(record.to_rubric()))
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            // If record doesn't exist (CouldNotFindRecord or 404), return None cleanly
+            if msg.contains("CouldNotFindRecord")
+                || msg.contains("404")
+                || msg.contains("RecordNotFound")
+            {
+                Ok(None)
+            } else {
+                Err(SkybouncerError::Repo(format!(
+                    "Failed to fetch sovereign config from PDS: {e}"
+                )))
+            }
+        }
+    }
+}
+
+/// Publishes or updates sovereign configuration to `social.skybouncer.config/self` on the user's PDS.
+///
+/// Uses `com.atproto.repo.putRecord` for idempotent upserting.
+///
+/// # Errors
+/// Returns [`SkybouncerError::Repo`] on PDS mutation failure.
+pub async fn publish_sovereign_config(
+    pds_client: &PdsRepoClient,
+    _repo_did: &str,
+    rubric: &RuleRubric,
+) -> Result<String, SkybouncerError> {
+    let record = SovereignConfigRecord::from_rubric(rubric);
+    let value = serde_json::to_value(&record).map_err(|e| {
+        SkybouncerError::Repo(format!("Failed to serialize sovereign config record: {e}"))
+    })?;
+
+    let put_res = pds_client
+        .put_record(
+            SOVEREIGN_CONFIG_COLLECTION,
+            SOVEREIGN_CONFIG_RKEY,
+            &value,
+            false,
+        )
+        .await
+        .map_err(|e| {
+            SkybouncerError::Repo(format!("Failed to put sovereign config record: {e}"))
+        })?;
+
+    Ok(put_res.uri)
+}

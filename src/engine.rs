@@ -31,7 +31,9 @@ use crate::classifier::{
     Classifier, HeuristicClassifier, JevClassifier, JevConfig, RuleRubric, Verdict,
     ViolationCategory,
 };
+use crate::enricher::{ContextEnricher, NoopContextEnricher};
 use crate::error::SkybouncerError;
+use crate::limiter::{EvaluationRateLimiter, RateLimiterConfig};
 use crate::matcher::{
     BypassReason, FollowGraph, FollowSyncEvent, GateDecision, Interaction, NonFollowedGate,
     TargetMatcher,
@@ -73,6 +75,10 @@ pub struct SkybouncerConfig {
     pub list_name: String,
     /// Optional description for provisioned moderation lists.
     pub list_description: Option<String>,
+    /// Configuration parameters for the Tier-4 per-user evaluation rate limiter.
+    pub rate_limiter_config: RateLimiterConfig,
+    /// Whether to operate in stateless mode (resolving rules directly from sovereign PDS).
+    pub stateless_mode: bool,
 }
 
 impl Default for SkybouncerConfig {
@@ -88,6 +94,8 @@ impl Default for SkybouncerConfig {
             jev_config: None,
             list_name: DEFAULT_MOD_LIST_NAME.to_string(),
             list_description: None,
+            rate_limiter_config: RateLimiterConfig::default(),
+            stateless_mode: false,
         }
     }
 }
@@ -162,6 +170,13 @@ impl SkybouncerConfig {
         self
     }
 
+    /// Sets the rate limiter configuration.
+    #[must_use]
+    pub fn with_rate_limiter_config(mut self, config: RateLimiterConfig) -> Self {
+        self.rate_limiter_config = config;
+        self
+    }
+
     /// Loads configuration from environment variables with fallback defaults.
     ///
     /// # Errors
@@ -214,6 +229,11 @@ impl SkybouncerConfig {
 
         let jev_config = JevConfig::from_env().ok();
 
+        let rate_limiter_config = RateLimiterConfig::from_env();
+        let stateless_mode = std::env::var("SKYBOUNCER_STATELESS_MODE")
+            .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
+            .unwrap_or(false);
+
         Ok(Self {
             protected_dids,
             rubric,
@@ -225,6 +245,8 @@ impl SkybouncerConfig {
             jev_config,
             list_name: DEFAULT_MOD_LIST_NAME.to_string(),
             list_description: None,
+            rate_limiter_config,
+            stateless_mode,
         })
     }
 }
@@ -254,6 +276,10 @@ pub struct EngineStats {
     pub heuristic_violations: AtomicU64,
     /// Candidate interactions dispatched to the primary classifier (e.g. Jev model).
     pub model_evaluations: AtomicU64,
+    /// Evaluations dropped due to Tier-4 per-user evaluation rate limits.
+    pub rate_limited_evaluations: AtomicU64,
+    /// Candidates enriched with author profile and parent post context.
+    pub context_enrichments: AtomicU64,
     /// Total violations confirmed across heuristic and model classifiers.
     pub violations_detected: AtomicU64,
     /// Successful listitem mutations created on the sovereign PDS.
@@ -284,6 +310,8 @@ impl EngineStats {
             eval_cache_hits: self.eval_cache_hits.load(Ordering::Relaxed),
             heuristic_violations: self.heuristic_violations.load(Ordering::Relaxed),
             model_evaluations: self.model_evaluations.load(Ordering::Relaxed),
+            rate_limited_evaluations: self.rate_limited_evaluations.load(Ordering::Relaxed),
+            context_enrichments: self.context_enrichments.load(Ordering::Relaxed),
             violations_detected: self.violations_detected.load(Ordering::Relaxed),
             bounces_executed: self.bounces_executed.load(Ordering::Relaxed),
             bounced: self.bounced.load(Ordering::Relaxed),
@@ -319,6 +347,10 @@ pub struct EngineStatsSnapshot {
     pub heuristic_violations: u64,
     /// Candidate interactions dispatched to the primary classifier (e.g. Jev model).
     pub model_evaluations: u64,
+    /// Evaluations dropped due to Tier-4 per-user evaluation rate limits.
+    pub rate_limited_evaluations: u64,
+    /// Candidates enriched with author profile and parent post context.
+    pub context_enrichments: u64,
     /// Total violations confirmed across heuristic and model classifiers.
     pub violations_detected: u64,
     /// Successful listitem mutations created on the sovereign PDS.
@@ -387,6 +419,15 @@ pub enum InteractionOutcome {
         /// Required sensitivity threshold.
         threshold: f64,
     },
+    /// Dropped because per-user evaluation rate limit was exceeded (Tier-4 Anti-Denial-of-Wallet).
+    RateLimited {
+        /// DID of the interaction author.
+        author_did: String,
+        /// DID of the protected target account.
+        target_did: String,
+        /// Reason describing the rate limit ceiling.
+        reason: String,
+    },
 }
 
 impl InteractionOutcome {
@@ -398,7 +439,8 @@ impl InteractionOutcome {
             | Self::AlreadyBounced { author_did }
             | Self::Permitted { author_did, .. }
             | Self::Bounced { author_did, .. }
-            | Self::BelowThreshold { author_did, .. } => author_did.as_str(),
+            | Self::BelowThreshold { author_did, .. }
+            | Self::RateLimited { author_did, .. } => author_did.as_str(),
         }
     }
 
@@ -409,7 +451,8 @@ impl InteractionOutcome {
             Self::Bypassed { target_did, .. }
             | Self::Permitted { target_did, .. }
             | Self::Bounced { target_did, .. }
-            | Self::BelowThreshold { target_did, .. } => Some(target_did.as_str()),
+            | Self::BelowThreshold { target_did, .. }
+            | Self::RateLimited { target_did, .. } => Some(target_did.as_str()),
             Self::AlreadyBounced { .. } => None,
         }
     }
@@ -500,6 +543,8 @@ pub struct SkybouncerEngine {
     modlist_manager: Arc<ModListManager>,
     cache: Arc<DeduplicationCache>,
     pds_client: Arc<PdsRepoClient>,
+    rate_limiter: Arc<EvaluationRateLimiter>,
+    enricher: Arc<dyn ContextEnricher>,
     stats: Arc<EngineStats>,
 }
 
@@ -524,6 +569,10 @@ impl SkybouncerEngine {
         let heuristic_classifier = HeuristicClassifier::default();
         let protected_dids = Arc::new(RwLock::new(config.protected_dids.clone()));
         let rubric = Arc::new(RwLock::new(config.rubric.clone()));
+        let rate_limiter = Arc::new(EvaluationRateLimiter::new(
+            config.rate_limiter_config.clone(),
+        ));
+        let enricher: Arc<dyn ContextEnricher> = Arc::new(NoopContextEnricher);
         let stats = Arc::new(EngineStats::default());
 
         Self {
@@ -537,6 +586,8 @@ impl SkybouncerEngine {
             modlist_manager,
             cache,
             pds_client,
+            rate_limiter,
+            enricher,
             stats,
         }
     }
@@ -667,6 +718,34 @@ impl SkybouncerEngine {
                 debug!("Heuristic regex pre-filter detected violation at zero cost");
                 heuristic_verdict
             } else {
+                // Tier 4: Per-User Evaluation Rate Limiter (Anti-Denial-of-Wallet, PRD §5.2)
+                if !self.rate_limiter.check_and_record(&target_did) {
+                    self.stats
+                        .rate_limited_evaluations
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        target = %target_did,
+                        author = %author_did,
+                        "Evaluation rate limit reached for target user; skipping external model call"
+                    );
+                    return Ok(InteractionOutcome::RateLimited {
+                        author_did,
+                        target_did,
+                        reason: "Tier-4 Anti-Denial-of-Wallet rate limit exceeded".to_string(),
+                    });
+                }
+
+                // Context Enricher: Fetch author profile & parent post context (PRD §3 & §4.2)
+                let enriched = self.enricher.enrich(&interaction).await;
+                let interaction = if !enriched.is_empty() {
+                    self.stats
+                        .context_enrichments
+                        .fetch_add(1, Ordering::Relaxed);
+                    interaction.with_enriched_context(enriched)
+                } else {
+                    interaction
+                };
+
                 // Tier 7: Primary Model Evaluation
                 self.stats.model_evaluations.fetch_add(1, Ordering::Relaxed);
                 let model_verdict =
@@ -937,6 +1016,53 @@ impl SkybouncerEngine {
         &self.stats
     }
 
+    /// Returns a reference to the evaluation rate limiter.
+    #[must_use]
+    pub fn rate_limiter(&self) -> &Arc<EvaluationRateLimiter> {
+        &self.rate_limiter
+    }
+
+    /// Returns a reference to the context enricher.
+    #[must_use]
+    pub fn enricher(&self) -> &Arc<dyn ContextEnricher> {
+        &self.enricher
+    }
+
+    /// Synchronizes sovereign moderation rules from the protected user's PDS repository.
+    ///
+    /// Reads `social.skybouncer.config` or list metadata description on the user's PDS.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if PDS communication fails.
+    pub async fn sync_sovereign_config(
+        &self,
+        protected_did: &str,
+    ) -> Result<Option<RuleRubric>, SkybouncerError> {
+        let pds_rubric =
+            crate::modlist::fetch_sovereign_config(&self.pds_client, protected_did).await?;
+        if let Some(ref rubric) = pds_rubric {
+            self.set_rubric(rubric.clone());
+            info!(
+                did = %protected_did,
+                rubric = %rubric.prompt,
+                "Synchronized sovereign rules from PDS repo"
+            );
+        }
+        Ok(pds_rubric)
+    }
+
+    /// Publishes current active rules to the user's sovereign ATProto repository.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if PDS mutation fails.
+    pub async fn publish_sovereign_config(
+        &self,
+        protected_did: &str,
+    ) -> Result<String, SkybouncerError> {
+        let rubric = self.rubric();
+        crate::modlist::publish_sovereign_config(&self.pds_client, protected_did, &rubric).await
+    }
+
     /// Runs the pipeline event processing loop reading from `rx` until cancelled.
     ///
     /// # Errors
@@ -1072,6 +1198,8 @@ pub struct SkybouncerEngineBuilder {
     modlist_manager: Option<Arc<ModListManager>>,
     cache: Option<Arc<DeduplicationCache>>,
     pds_client: Option<Arc<PdsRepoClient>>,
+    rate_limiter: Option<Arc<EvaluationRateLimiter>>,
+    enricher: Option<Arc<dyn ContextEnricher>>,
 }
 
 impl SkybouncerEngineBuilder {
@@ -1087,6 +1215,8 @@ impl SkybouncerEngineBuilder {
             modlist_manager: None,
             cache: None,
             pds_client: None,
+            rate_limiter: None,
+            enricher: None,
         }
     }
 
@@ -1136,6 +1266,20 @@ impl SkybouncerEngineBuilder {
     #[must_use]
     pub fn with_pds_client(mut self, client: Arc<PdsRepoClient>) -> Self {
         self.pds_client = Some(client);
+        self
+    }
+
+    /// Configures an explicit evaluation rate limiter.
+    #[must_use]
+    pub fn with_rate_limiter(mut self, limiter: Arc<EvaluationRateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Configures an explicit context enricher.
+    #[must_use]
+    pub fn with_enricher(mut self, enricher: Arc<dyn ContextEnricher>) -> Self {
+        self.enricher = Some(enricher);
         self
     }
 
@@ -1226,6 +1370,15 @@ impl SkybouncerEngineBuilder {
             }
         };
 
+        let rate_limiter = self.rate_limiter.unwrap_or_else(|| {
+            Arc::new(EvaluationRateLimiter::new(
+                self.config.rate_limiter_config.clone(),
+            ))
+        });
+        let enricher = self
+            .enricher
+            .unwrap_or_else(|| Arc::new(NoopContextEnricher));
+
         let protected_dids = Arc::new(RwLock::new(self.config.protected_dids.clone()));
         let rubric = Arc::new(RwLock::new(self.config.rubric.clone()));
         let stats = Arc::new(EngineStats::default());
@@ -1241,6 +1394,8 @@ impl SkybouncerEngineBuilder {
             modlist_manager,
             cache,
             pds_client,
+            rate_limiter,
+            enricher,
             stats,
         })
     }

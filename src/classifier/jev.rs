@@ -422,12 +422,21 @@ impl JevClassifier {
                         {{\"violates\": boolean, \"category\": string or null, \"confidence\": float (0.0 to 1.0), \"reason\": string}}",
                         self.rubric.prompt
                     );
+                    let enrichment_str = interaction
+                        .enriched_context
+                        .as_ref()
+                        .map(|ctx| ctx.format_for_classifier())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("\n{s}"))
+                        .unwrap_or_default();
+
                     let user_prompt = format!(
-                        "Interaction: {}\nAuthor: {}\nTarget: {}\nPost text: \"{}\"",
+                        "Interaction: {}\nAuthor: {}\nTarget: {}\nPost text: \"{}\"{}",
                         interaction.interaction_type.as_str(),
                         interaction.author_did,
                         interaction.target_did,
-                        interaction.text
+                        interaction.text,
+                        enrichment_str
                     );
                     let payload = OllamaChatRequest {
                         model: self.config.model.clone(),
@@ -477,14 +486,23 @@ impl JevClassifier {
                             criteria,
                         },
                     );
+                    let enrichment_str = interaction
+                        .enriched_context
+                        .as_ref()
+                        .map(|ctx| ctx.format_for_classifier())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("\n{s}"))
+                        .unwrap_or_default();
+
                     let payload = SystemOneRequest {
                         model: Some(self.config.model.clone()),
                         state: format!(
-                            "Interaction: {}\nAuthor: {}\nTarget: {}\nText: \"{}\"",
+                            "Interaction: {}\nAuthor: {}\nTarget: {}\nText: \"{}\"{}",
                             interaction.interaction_type.as_str(),
                             interaction.author_did,
                             interaction.target_did,
-                            interaction.text
+                            interaction.text,
+                            enrichment_str
                         ),
                         questions,
                     };

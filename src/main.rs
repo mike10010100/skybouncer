@@ -102,8 +102,18 @@ async fn main() -> Result<(), SkybouncerError> {
         warn!("No JEV_API_BASE_URL configured; primary classifier fallback disabled");
     }
 
-    // 4. Build the unified Skybouncer engine
-    let engine = match SkybouncerEngine::builder(config.clone()).build() {
+    // 4. Build the unified Skybouncer engine with context enricher
+    let appview_endpoint = std::env::var("APPVIEW_ENDPOINT")
+        .or_else(|_| std::env::var("SKYBOUNCER_APPVIEW_ENDPOINT"))
+        .unwrap_or_else(|_| skybouncer::enricher::DEFAULT_APPVIEW_ENDPOINT.to_string());
+    let enricher = std::sync::Arc::new(
+        skybouncer::enricher::AppViewContextEnricher::with_endpoint(appview_endpoint),
+    );
+
+    let engine = match SkybouncerEngine::builder(config.clone())
+        .with_enricher(enricher)
+        .build()
+    {
         Ok(eng) => eng,
         Err(e) => {
             error!(error = %e, "Failed to initialize Skybouncer engine");

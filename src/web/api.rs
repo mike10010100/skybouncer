@@ -26,6 +26,15 @@ pub struct ApiState {
     pub engine: Arc<SkybouncerEngine>,
 }
 
+/// Response payload for service health check endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthResponse {
+    /// Operational status (e.g. `"healthy"`).
+    pub status: String,
+    /// Crate version.
+    pub version: String,
+}
+
 /// Response payload containing current moderation rubric configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RulesResponse {
@@ -138,6 +147,17 @@ pub async fn get_status(State(state): State<ApiState>) -> Json<StatusResponse> {
         },
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
+}
+
+/// Handler for `GET /healthz` and `GET /api/health`: service liveness and readiness probe.
+pub async fn health_check() -> (StatusCode, Json<HealthResponse>) {
+    (
+        StatusCode::OK,
+        Json(HealthResponse {
+            status: "healthy".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+    )
 }
 
 /// Handler for `GET /api/rules`: returns active moderation rubric.
@@ -272,6 +292,7 @@ pub async fn simulate_interaction(
         parent_uri: None,
         root_uri: None,
         created_at_us: 0,
+        enriched_context: None,
     };
 
     let rubric = state.engine.rubric();

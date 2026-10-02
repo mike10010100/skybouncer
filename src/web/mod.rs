@@ -21,8 +21,8 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 pub use api::{
-    ApiState, BouncesQuery, PardonRequest, PardonResponse, RulesResponse, SimulateRequest,
-    SimulateResponse, StatusResponse, UpdateRulesRequest,
+    health_check, ApiState, BouncesQuery, HealthResponse, PardonRequest, PardonResponse,
+    RulesResponse, SimulateRequest, SimulateResponse, StatusResponse, UpdateRulesRequest,
 };
 pub use oauth::{LoginQuery, OAuthState};
 pub use ui::serve_dashboard;
@@ -166,6 +166,7 @@ pub fn create_web_router(
     };
 
     let api_router = Router::new()
+        .route("/health", get(api::health_check))
         .route("/status", get(api::get_status))
         .route("/rules", get(api::get_rules).post(api::update_rules))
         .route("/bounces", get(api::get_bounces))
@@ -181,6 +182,7 @@ pub fn create_web_router(
 
     Router::new()
         .route("/", get(ui::serve_dashboard))
+        .route("/healthz", get(api::health_check))
         .nest("/api", api_router)
         .nest("/oauth", oauth_router)
         .layer(CorsLayer::permissive())

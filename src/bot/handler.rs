@@ -264,6 +264,7 @@ impl BotCommandHandler {
             parent_uri: None,
             root_uri: None,
             created_at_us: 0,
+            enriched_context: None,
         };
 
         // Evaluate using heuristic first, then model

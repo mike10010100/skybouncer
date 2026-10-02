@@ -22,7 +22,9 @@
 pub mod bot;
 pub mod classifier;
 pub mod engine;
+pub mod enricher;
 pub mod error;
+pub mod limiter;
 pub mod matcher;
 pub mod modlist;
 pub mod stream;
@@ -33,6 +35,14 @@ pub use bot::{
     run_bot_poller, BotCommandHandler, ChatClient, ConvoMember, ConvoView, GetMessagesResponse,
     ListConvosResponse, MessageSender, MessageView, SendMessagePayload, SendMessageRequest,
     UpdateReadRequest, DEFAULT_BOT_POLL_INTERVAL, DEFAULT_CHAT_ENDPOINT,
+};
+pub use enricher::{
+    AppViewContextEnricher, AuthorContext, ContextEnricher, EnrichedContext, MockContextEnricher,
+    NoopContextEnricher, ParentPostContext, DEFAULT_APPVIEW_ENDPOINT, DEFAULT_ENRICHER_TIMEOUT_MS,
+};
+pub use limiter::{
+    EvaluationRateLimiter, RateLimiterConfig, DEFAULT_MAX_EVALUATIONS_PER_WINDOW,
+    DEFAULT_RATE_LIMIT_WINDOW,
 };
 pub use stream::{run_jetstream_streamer, StreamConfig, DEFAULT_JETSTREAM_ENDPOINT};
 pub use web::{
@@ -56,8 +66,10 @@ pub use matcher::{
     FollowSyncEvent, GateDecision, Interaction, InteractionType, NonFollowedGate, TargetMatcher,
 };
 pub use modlist::{
-    BouncedUser, DeduplicationCache, ModListConfig, ModListManager, DEFAULT_MOD_LIST_DESCRIPTION,
-    DEFAULT_MOD_LIST_NAME,
+    extract_rubric_from_list_description, fetch_sovereign_config,
+    format_list_description_with_rubric, publish_sovereign_config, BouncedUser, DeduplicationCache,
+    ModListConfig, ModListManager, SovereignConfigRecord, DEFAULT_MOD_LIST_DESCRIPTION,
+    DEFAULT_MOD_LIST_NAME, SOVEREIGN_CONFIG_COLLECTION, SOVEREIGN_CONFIG_RKEY,
 };
 pub use types::{
     format_system_time_iso8601, now_iso8601, ByteSlice, Embed, Facet, FacetFeature, FollowRecord,

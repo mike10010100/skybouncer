@@ -42,6 +42,7 @@ use skybouncer::classifier::{
     Classifier, JevClassifier, JevConfig, MockClassifier, RuleRubric, Sensitivity, Verdict,
 };
 use skybouncer::engine::{InteractionOutcome, SkybouncerConfig, SkybouncerEngine};
+use skybouncer::limiter::RateLimiterConfig;
 use skybouncer::matcher::{BypassReason, FollowGraph, NonFollowedGate};
 use skybouncer::modlist::manager::NUM_LOCK_SHARDS;
 use skybouncer::modlist::{DeduplicationCache, ModListManager};
@@ -212,8 +213,9 @@ async fn make_fast_engine(
     let mut protected_dids = HashSet::new();
     protected_dids.insert(protected_did.to_string());
 
-    let config =
-        SkybouncerConfig::new(protected_dids, rubric).with_channel_capacity(channel_capacity);
+    let config = SkybouncerConfig::new(protected_dids, rubric)
+        .with_channel_capacity(channel_capacity)
+        .with_rate_limiter_config(RateLimiterConfig::unlimited());
 
     let engine = Arc::new(SkybouncerEngine::new(
         config,

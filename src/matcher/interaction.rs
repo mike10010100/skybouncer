@@ -57,13 +57,61 @@ pub struct Interaction {
     pub root_uri: Option<String>,
     /// Event timestamp in monotonic microseconds since Unix epoch.
     pub created_at_us: u64,
+    /// Optional enriched author profile and parent post context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enriched_context: Option<crate::enricher::EnrichedContext>,
 }
 
 impl Interaction {
+    /// Creates a new candidate [`Interaction`].
+    #[must_use]
+    pub fn new(
+        author_did: impl Into<String>,
+        target_did: impl Into<String>,
+        interaction_type: InteractionType,
+        post_uri: impl Into<String>,
+        post_cid: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            post_uri: post_uri.into(),
+            post_cid: Some(post_cid.into()),
+            author_did: author_did.into(),
+            target_did: target_did.into(),
+            text: text.into(),
+            interaction_type,
+            parent_uri: None,
+            root_uri: None,
+            created_at_us: 1_700_000_000_000_000,
+            enriched_context: None,
+        }
+    }
+
+    /// Sets the parent post AT-URI.
+    #[must_use]
+    pub fn with_parent_uri(mut self, uri: impl Into<String>) -> Self {
+        self.parent_uri = Some(uri.into());
+        self
+    }
+
+    /// Sets the root post AT-URI.
+    #[must_use]
+    pub fn with_root_uri(mut self, uri: impl Into<String>) -> Self {
+        self.root_uri = Some(uri.into());
+        self
+    }
+
     /// Returns `true` if the interaction is an author interacting with themselves.
     #[must_use]
     pub fn is_self_interaction(&self) -> bool {
         self.author_did == self.target_did
+    }
+
+    /// Attaches enriched context to this interaction.
+    #[must_use]
+    pub fn with_enriched_context(mut self, ctx: crate::enricher::EnrichedContext) -> Self {
+        self.enriched_context = Some(ctx);
+        self
     }
 
     /// Helper for creating synthetic interactions in tests.
@@ -81,6 +129,7 @@ impl Interaction {
             )),
             root_uri: Some(format!("at://{target_did}/app.bsky.feed.post/3rootrkey123")),
             created_at_us: 1_700_000_000_000_000,
+            enriched_context: None,
         }
     }
 }

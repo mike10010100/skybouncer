@@ -122,6 +122,48 @@ async fn test_serve_dashboard_html() {
     assert!(body_str.contains("Recently Bounced"));
 }
 
+#[tokio::test]
+async fn test_health_endpoints() {
+    let (_engine, _cache, _pds, app) = setup_test_web_environment("did:plc:protected123").await;
+
+    // 1. Test /healthz
+    let res1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res1.status(), StatusCode::OK);
+    let bytes1 = axum::body::to_bytes(res1.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let health1: skybouncer::web::HealthResponse = serde_json::from_slice(&bytes1).unwrap();
+    assert_eq!(health1.status, "healthy");
+    assert_eq!(health1.version, env!("CARGO_PKG_VERSION"));
+
+    // 2. Test /api/health
+    let res2 = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res2.status(), StatusCode::OK);
+    let bytes2 = axum::body::to_bytes(res2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let health2: skybouncer::web::HealthResponse = serde_json::from_slice(&bytes2).unwrap();
+    assert_eq!(health2.status, "healthy");
+    assert_eq!(health2.version, env!("CARGO_PKG_VERSION"));
+}
+
 // =============================================================================
 // Telemetry & Status API Tests
 // =============================================================================

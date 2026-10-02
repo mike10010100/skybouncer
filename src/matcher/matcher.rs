@@ -103,6 +103,7 @@ impl TargetMatcher {
                         parent_uri: Some(reply.parent.uri.clone()),
                         root_uri: Some(reply.root.uri.clone()),
                         created_at_us: commit.time_us,
+                        enriched_context: None,
                     });
                 }
             }
@@ -121,6 +122,7 @@ impl TargetMatcher {
                         parent_uri: Some(reply.parent.uri.clone()),
                         root_uri: Some(reply.root.uri.clone()),
                         created_at_us: commit.time_us,
+                        enriched_context: None,
                     });
                 }
             }
@@ -143,6 +145,7 @@ impl TargetMatcher {
                                 parent_uri: post.reply.as_ref().map(|r| r.parent.uri.clone()),
                                 root_uri: post.reply.as_ref().map(|r| r.root.uri.clone()),
                                 created_at_us: commit.time_us,
+                                enriched_context: None,
                             });
                         }
                     }
@@ -166,6 +169,7 @@ impl TargetMatcher {
                             parent_uri: post.reply.as_ref().map(|r| r.parent.uri.clone()),
                             root_uri: post.reply.as_ref().map(|r| r.root.uri.clone()),
                             created_at_us: commit.time_us,
+                            enriched_context: None,
                         });
                     }
                 }

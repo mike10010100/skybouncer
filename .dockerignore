@@ -1,0 +1,10 @@
+**/target
+**/.git
+**/.github
+**/.agents
+**/.env
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.log
+**/.DS_Store
