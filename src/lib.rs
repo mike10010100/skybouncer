@@ -19,6 +19,33 @@
     rust_2018_idioms
 )]
 
+pub mod classifier;
+pub mod engine;
 pub mod error;
+pub mod matcher;
+pub mod modlist;
+pub mod types;
 
+pub use classifier::{
+    Classifier, HeuristicClassifier, HeuristicRule, JevClassifier, JevConfig, MockClassifier,
+    RuleRubric, Sensitivity, Verdict, ViolationCategory,
+};
+pub use engine::{
+    EngineStats, EngineStatsSnapshot, InteractionOutcome, ProcessCommitResult, ProcessOutcome,
+    SkybouncerConfig, SkybouncerEngine, SkybouncerEngineBuilder, DEFAULT_ENGINE_CHANNEL_CAPACITY,
+    DEFAULT_EVALUATION_CACHE_TTL, DEFAULT_MAINTENANCE_INTERVAL, DEFAULT_SHUTDOWN_TIMEOUT,
+};
 pub use error::SkybouncerError;
+pub use matcher::{
+    extract_did_for_collection, extract_did_from_at_uri, BypassReason, FollowGraph,
+    FollowSyncEvent, GateDecision, Interaction, InteractionType, NonFollowedGate, TargetMatcher,
+};
+pub use modlist::{
+    BouncedUser, DeduplicationCache, ModListConfig, ModListManager, DEFAULT_MOD_LIST_DESCRIPTION,
+    DEFAULT_MOD_LIST_NAME,
+};
+pub use types::{
+    format_system_time_iso8601, now_iso8601, ByteSlice, Embed, Facet, FacetFeature, FollowRecord,
+    ListItemRecord, ListRecordsResponse, ModListRecord, PostRecord, RecordEmbed,
+    RecordWithMediaEmbed, ReplyRef, RepoRecordItem, StrongRef,
+};

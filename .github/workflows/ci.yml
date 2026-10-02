@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-test:
+    name: Format, Clippy, Test & Security Deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: skybouncer
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Check Formatting
+        working-directory: skybouncer
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy Lints
+        working-directory: skybouncer
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run Unit and Integration Tests
+        working-directory: skybouncer
+        run: cargo test --all-targets
+
+      - name: Security and License Policy Check
+        working-directory: skybouncer
+        run: cargo deny check

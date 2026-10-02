@@ -41,3 +41,9 @@ pub enum SkybouncerError {
     #[error("Network HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 }
+
+impl From<rusqlite::Error> for SkybouncerError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Database(err.to_string())
+    }
+}
