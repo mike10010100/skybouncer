@@ -3,7 +3,13 @@
 *.log
 .DS_Store
 
-cargo-mutants output
+# Local environment & SQLite databases
+.env
+*.db
+*.db-shm
+*.db-wal
+
+# cargo-mutants output
 mutants.out/
 mutants.out.old/
 mutants.out.*/

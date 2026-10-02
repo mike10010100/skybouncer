@@ -2,46 +2,66 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main", "master" ]
   pull_request:
-    branches: ["main"]
+    branches: [ "main", "master" ]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check-and-test:
-    name: Format, Clippy, Test & Security Deny
+  quality-gate:
+    name: Rust Quality Gate
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+    steps:
+      - name: Checkout skybouncer
+        uses: actions/checkout@v4
+        with:
+          path: skybouncer
+
+      - name: Checkout sibling dependency (skybase)
+        uses: actions/checkout@v4
+        with:
+          repository: mike10010100/skybase
+          path: skybase
+
+      - name: Checkout sibling dependency (skyauth)
+        uses: actions/checkout@v4
+        with:
+          repository: mike10010100/skyauth
+          path: skyauth
+
+      - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy, rustfmt
 
-      - name: Rust Cache
+      - name: Enable Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: skybouncer
+          workspaces: |
+            skybouncer -> skybouncer/target
+            skybase -> skybase/target
+            skyauth -> skyauth/target
 
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@cargo-deny
+      - name: Install Cargo Deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
 
-      - name: Check Formatting
+      - name: 1. Enforce Code Formatting
         working-directory: skybouncer
         run: cargo fmt --all -- --check
 
-      - name: Run Clippy Lints
+      - name: 2. Enforce Strict Clippy Lints
         working-directory: skybouncer
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Run Unit and Integration Tests
+      - name: 3. Run All Test Suites
         working-directory: skybouncer
         run: cargo test --all-targets
 
-      - name: Security and License Policy Check
+      - name: 4. Dependency Governance & Advisory Scan (cargo-deny)
         working-directory: skybouncer
         run: cargo deny check

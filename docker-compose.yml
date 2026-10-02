@@ -1,0 +1,47 @@
+# ==============================================================================
+# Docker Compose Configuration for Skybouncer
+# Sovereign Auto-Moderation & Bouncer Service for AT Protocol & Bluesky
+# ==============================================================================
+
+services:
+  skybouncer:
+    build:
+      context: ..
+      dockerfile: skybouncer/Dockerfile
+    image: skybouncer:${IMAGE_TAG:-latest}
+    container_name: skybouncer
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      - "${PORT_BIND:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3000
+      - WEB_ENABLED=true
+      - SKYBOUNCER_DATABASE_PATH=/data/skybouncer.db
+      - RUST_LOG=${RUST_LOG:-info,skybouncer=info,skybase=info}
+    stop_grace_period: 30s
+    volumes:
+      # Persistent storage for SQLite deduplication and evaluation TTL cache
+      - skybouncer_data:/data:rw
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: ${MEM_LIMIT:-2048M}
+        reservations:
+          memory: 256M
+
+volumes:
+  skybouncer_data:
+    name: skybouncer_data

@@ -64,7 +64,40 @@ Incoming Jetstream (app.bsky.feed.post)
 
 ---
 
-## 🛠️ Repository Standards
+## 🐳 Deployment & Containerization
+
+### Running with Docker Compose
+
+1. Copy `.env.example` to `.env` and configure your protected DIDs, PDS credentials, and Jev API keys:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Build and start the service with persistent SQLite storage:
+   ```bash
+   docker compose up --build -d
+   ```
+
+3. View live logs and telemetry:
+   ```bash
+   docker compose logs -f skybouncer
+   ```
+
+4. Access the embedded sovereign dashboard in your browser:
+   ```
+   http://localhost:3000
+   ```
+
+### Building Standalone Docker Image
+
+From the workspace root (`atproto-experiments/`):
+```bash
+docker build -f skybouncer/Dockerfile -t skybouncer:latest .
+```
+
+---
+
+## 🛠️ Repository Standards & Quality Gates
 
 `skybouncer` enforces strict production-grade Rust safety standards:
 * `#![forbid(unsafe_code)]`
@@ -72,5 +105,20 @@ Incoming Jetstream (app.bsky.feed.post)
 * Strongly typed errors via `SkybouncerError`
 * Clock-warp safe monotonic time handling
 * 100% documentation coverage
+
+Before every commit and in CI (`.github/workflows/ci.yml`), all 4 gates must pass:
+```bash
+# 1. Format check
+cargo fmt --all -- --check
+
+# 2. Strict clippy
+cargo clippy --all-targets -- -D warnings
+
+# 3. Unit and integration tests
+cargo test --all-targets
+
+# 4. Dependency governance & security scan
+cargo deny check
+```
 
 For full architectural requirements, see [`PRD.md`](PRD.md) and [`AGENTS.md`](AGENTS.md).
