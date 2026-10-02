@@ -1,0 +1,46 @@
+[package]
+name = "skybouncer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Michael Paulauski <mike10010100@gmail.com>"]
+description = "Sovereign, Rule-Driven Auto-Moderation & Bouncer Service for AT Protocol and Bluesky"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mike10010100/skybouncer"
+homepage = "https://github.com/mike10010100/skybouncer"
+documentation = "https://docs.rs/skybouncer"
+keywords = ["atproto", "bluesky", "moderation", "bouncer", "jev"]
+categories = ["web-programming", "asynchronous"]
+readme = "README.md"
+
+[lib]
+name = "skybouncer"
+path = "src/lib.rs"
+
+[dependencies]
+# Sibling workspace dependencies
+skybase = { path = "../skybase", version = "0.1" }
+skyauth = { path = "../skyauth", version = "0.3" }
+
+# Concurrency & Async Runtime
+tokio = { version = "1.40", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+parking_lot = "0.12"
+
+# Serialization & JSON
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Networking & HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = { version = "2.5", features = ["serde"] }
+
+# Error Handling & Observability
+thiserror = "1.0"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["full", "test-util"] }
+wiremock = "0.6"
+tempfile = "3"
