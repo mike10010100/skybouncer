@@ -12,8 +12,8 @@ use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use skybouncer::classifier::{
-    Classifier, HeuristicClassifier, JevClassifier, JevConfig, MockClassifier, RuleRubric,
-    Sensitivity, Verdict, ViolationCategory,
+    Classifier, HeuristicClassifier, JevClassifier, JevConfig, JevEndpointKind, MockClassifier,
+    RuleRubric, Sensitivity, Verdict, ViolationCategory,
 };
 use skybouncer::error::SkybouncerError;
 use skybouncer::matcher::{extract_did_from_at_uri, Interaction, InteractionType};
@@ -318,6 +318,133 @@ fn test_jev_config_defaults_and_env() {
     std::env::remove_var("JEV_MODEL");
     std::env::remove_var("JEV_TIMEOUT_MS");
     std::env::remove_var("JEV_MAX_RETRIES");
+}
+
+#[tokio::test]
+async fn test_jev_classifier_endpoint_kind_detection() {
+    let rubric = RuleRubric::default();
+
+    // Standard Jev
+    let c_std = JevClassifier::new(
+        JevConfig {
+            base_url: "https://example.com/api".to_string(),
+            ..Default::default()
+        },
+        rubric.clone(),
+    )
+    .unwrap();
+    assert_eq!(c_std.endpoint_kind(), JevEndpointKind::StandardJev);
+    assert_eq!(c_std.classify_url(), "https://example.com/api/v1/classify");
+
+    // Ollama port 11434
+    let c_ollama = JevClassifier::new(
+        JevConfig {
+            base_url: "http://nmo.purdlauski.net:11434".to_string(),
+            ..Default::default()
+        },
+        rubric.clone(),
+    )
+    .unwrap();
+    assert_eq!(c_ollama.endpoint_kind(), JevEndpointKind::Ollama);
+    assert_eq!(
+        c_ollama.classify_url(),
+        "http://nmo.purdlauski.net:11434/api/chat"
+    );
+
+    // System-One port 8000
+    let c_sysone = JevClassifier::new(
+        JevConfig {
+            base_url: "http://nmo.purdlauski.net:8000".to_string(),
+            ..Default::default()
+        },
+        rubric,
+    )
+    .unwrap();
+    assert_eq!(c_sysone.endpoint_kind(), JevEndpointKind::SystemOne);
+    assert_eq!(
+        c_sysone.classify_url(),
+        "http://nmo.purdlauski.net:8000/v1/systemone"
+    );
+}
+
+#[tokio::test]
+async fn test_jev_classifier_ollama_dialect_success() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "tev1:latest",
+            "message": {
+                "role": "assistant",
+                "content": "{\"violates\": true, \"category\": \"crypto_spam\", \"confidence\": 0.95, \"reason\": \"Airdrop scam link detected\"}"
+            },
+            "done": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = JevConfig {
+        base_url: format!("{}/api/chat", server.uri()),
+        api_key: None,
+        model: "tev1:latest".to_string(),
+        timeout: Duration::from_millis(1000),
+        max_retries: 1,
+    };
+    let rubric = RuleRubric::new("Block crypto scams", Sensitivity::Medium);
+    let classifier = JevClassifier::new(config, rubric).unwrap();
+    assert_eq!(classifier.endpoint_kind(), JevEndpointKind::Ollama);
+
+    let interaction = sample_interaction("Claim free airdrop now");
+    let verdict = classifier.classify(&interaction).await.unwrap();
+
+    assert!(verdict.is_violation());
+    assert_eq!(verdict.category(), Some(&ViolationCategory::CryptoSpam));
+    assert_eq!(verdict.confidence(), Some(0.95));
+}
+
+#[tokio::test]
+async fn test_jev_classifier_systemone_dialect_success() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "tev1",
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "crypto_spam",
+                    "probabilities": {
+                        "crypto_spam": 0.985,
+                        "permitted": 0.015
+                    },
+                    "confidence": 0.94
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = JevConfig {
+        base_url: format!("{}/v1/systemone", server.uri()),
+        api_key: None,
+        model: "tev1".to_string(),
+        timeout: Duration::from_millis(1000),
+        max_retries: 1,
+    };
+    let rubric = RuleRubric::new("Block crypto scams", Sensitivity::Medium);
+    let classifier = JevClassifier::new(config, rubric).unwrap();
+    assert_eq!(classifier.endpoint_kind(), JevEndpointKind::SystemOne);
+
+    let interaction = sample_interaction("Claim free airdrop now");
+    let verdict = classifier.classify(&interaction).await.unwrap();
+
+    assert!(verdict.is_violation());
+    assert_eq!(verdict.category(), Some(&ViolationCategory::CryptoSpam));
+    assert!((verdict.confidence().unwrap() - 0.985).abs() < 1e-4);
 }
 
 // =============================================================================

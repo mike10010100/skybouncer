@@ -13,7 +13,7 @@ pub mod mock;
 pub mod rubric;
 
 pub use heuristic::{HeuristicClassifier, HeuristicRule};
-pub use jev::{JevClassifier, JevConfig};
+pub use jev::{JevClassifier, JevConfig, JevEndpointKind};
 pub use mock::MockClassifier;
 pub use rubric::{RuleRubric, Sensitivity};
 
