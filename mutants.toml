@@ -1,0 +1,11 @@
+# mutants.toml
+# Configuration for cargo-mutants mutation testing.
+
+# Avoid mutating test files, only mutate source implementation
+exclude_re = [
+    "tests/.*",
+    "src/lib.rs", # Crate root lints & exports don't need mutation
+]
+
+# Set the test runner to nextest for much faster mutation runs
+test_tool = "nextest"

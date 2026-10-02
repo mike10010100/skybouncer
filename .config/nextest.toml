@@ -1,0 +1,10 @@
+# .config/nextest.toml
+# Nextest configuration for resilient test execution.
+
+[profile.default]
+# Automatically retry failing tests up to 2 times.
+# This prevents CI pipelines from failing due to minor scheduling jitter in async/Tokio tests.
+retries = 2
+
+# Fail the test run immediately if any test fails (fail-fast behavior)
+fail-fast = true
