@@ -19,7 +19,7 @@ pub const DEFAULT_APPVIEW_ENDPOINT: &str = "https://public.api.bsky.app";
 pub const DEFAULT_CDN_ENDPOINT: &str = "https://cdn.bsky.app";
 
 /// Default timeout in milliseconds for AppView profile and post enrichment queries.
-pub const DEFAULT_ENRICHER_TIMEOUT_MS: u64 = 600;
+pub const DEFAULT_ENRICHER_TIMEOUT_MS: u64 = 1500;
 
 /// Profile metadata describing the author of an interaction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]

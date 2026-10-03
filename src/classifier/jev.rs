@@ -21,7 +21,7 @@ pub const DEFAULT_JEV_BASE_URL: &str = "https://nmo.purdlauski.net";
 pub const DEFAULT_JEV_MODEL: &str = "jev-system1-mod-v1";
 
 /// Default timeout in milliseconds for Jev API requests.
-pub const DEFAULT_JEV_TIMEOUT_MS: u64 = 3000;
+pub const DEFAULT_JEV_TIMEOUT_MS: u64 = 15000;
 
 /// Default maximum retry count on transient errors.
 pub const DEFAULT_JEV_MAX_RETRIES: usize = 1;

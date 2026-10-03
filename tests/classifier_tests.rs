@@ -301,7 +301,7 @@ fn test_jev_config_defaults_and_env() {
     let default_config = JevConfig::default();
     assert_eq!(default_config.base_url, "https://nmo.purdlauski.net");
     assert_eq!(default_config.model, "jev-system1-mod-v1");
-    assert_eq!(default_config.timeout, Duration::from_millis(3000));
+    assert_eq!(default_config.timeout, Duration::from_millis(15000));
     assert_eq!(default_config.max_retries, 1);
     assert!(default_config.api_key.is_none());
 
