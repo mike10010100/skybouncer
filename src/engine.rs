@@ -29,7 +29,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::classifier::{
     CertaintyConfig, Classifier, HeuristicClassifier, JevClassifier, JevConfig, RuleRubric,
-    TieredClassifier, Verdict, ViolationCategory,
+    Sensitivity, TieredClassifier, Verdict, ViolationCategory,
 };
 use crate::enricher::{ContextEnricher, NoopContextEnricher};
 use crate::error::SkybouncerError;
@@ -445,6 +445,8 @@ pub struct EngineStats {
     pub bounces_skipped_rubric: AtomicU64,
     /// Total operational or network errors encountered during pipeline execution.
     pub errors_encountered: AtomicU64,
+    /// Total sovereign configuration hot-reload events synchronized from the firehose.
+    pub sovereign_configs_synced: AtomicU64,
 }
 
 impl EngineStats {
@@ -474,6 +476,7 @@ impl EngineStats {
             permitted: self.permitted.load(Ordering::Relaxed),
             bounces_skipped_rubric: self.bounces_skipped_rubric.load(Ordering::Relaxed),
             errors_encountered: self.errors_encountered.load(Ordering::Relaxed),
+            sovereign_configs_synced: self.sovereign_configs_synced.load(Ordering::Relaxed),
         }
     }
 }
@@ -525,6 +528,9 @@ pub struct EngineStatsSnapshot {
     pub bounces_skipped_rubric: u64,
     /// Total operational or network errors encountered during pipeline execution.
     pub errors_encountered: u64,
+    /// Total sovereign configuration hot-reload events synchronized from the firehose.
+    #[serde(default)]
+    pub sovereign_configs_synced: u64,
 }
 
 /// Outcome of evaluating an interaction candidate through the moderation pipeline.
@@ -706,6 +712,36 @@ impl InteractionOutcome {
     }
 }
 
+/// Event emitted when sovereign configuration is synchronized from a firehose commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SovereignConfigSyncEvent {
+    /// Moderation rules and sensitivity were updated from `social.skybouncer.config`.
+    Updated {
+        /// Protected DID whose configuration was updated.
+        did: String,
+        /// New rubric prompt.
+        prompt: String,
+        /// New operating sensitivity.
+        sensitivity: Sensitivity,
+    },
+    /// Moderation rules and sensitivity were extracted and updated from `app.bsky.graph.list` description metadata.
+    ListMetadataUpdated {
+        /// Protected DID whose list metadata was updated.
+        did: String,
+        /// New rubric prompt.
+        prompt: String,
+        /// New operating sensitivity.
+        sensitivity: Sensitivity,
+    },
+    /// Sovereign configuration record was deleted.
+    Deleted {
+        /// Protected DID whose configuration was deleted.
+        did: String,
+    },
+    /// Commit did not contain valid or relevant sovereign configuration.
+    Ignored,
+}
+
 /// Backward compatibility alias for [`InteractionOutcome`].
 pub type ProcessOutcome = InteractionOutcome;
 
@@ -714,6 +750,8 @@ pub type ProcessOutcome = InteractionOutcome;
 pub enum ProcessCommitResult {
     /// Commit updated the follow graph for a protected user.
     FollowSynced(FollowSyncEvent),
+    /// Commit updated or deleted sovereign configuration for a protected user.
+    SovereignConfigSynced(SovereignConfigSyncEvent),
     /// Post commit did not target any configured protected user.
     NoMatch,
     /// One or more interaction candidates were extracted and evaluated.
@@ -745,6 +783,21 @@ impl ProcessCommitResult {
     #[must_use]
     pub fn is_follow_synced(&self) -> bool {
         matches!(self, Self::FollowSynced(_))
+    }
+
+    /// Returns `true` if this commit was a sovereign configuration synchronization event.
+    #[must_use]
+    pub fn is_sovereign_config_synced(&self) -> bool {
+        matches!(self, Self::SovereignConfigSynced(_))
+    }
+
+    /// Returns a reference to the [`SovereignConfigSyncEvent`] if this was a config sync commit.
+    #[must_use]
+    pub fn sovereign_config_sync_event(&self) -> Option<&SovereignConfigSyncEvent> {
+        match self {
+            Self::SovereignConfigSynced(event) => Some(event),
+            _ => None,
+        }
     }
 
     /// Returns `true` if the commit was ignored.
@@ -866,6 +919,24 @@ impl SkybouncerEngine {
             return Ok(ProcessCommitResult::FollowSynced(sync_event));
         }
 
+        // Tier 0.5: Sovereign Config Collection Intercept (PRD §2.2)
+        if commit.collection.as_str() == crate::modlist::SOVEREIGN_CONFIG_COLLECTION {
+            let p_dids = self.protected_dids.read().clone();
+            if p_dids.contains(&commit.did) {
+                return Ok(self.handle_sovereign_config_commit(commit));
+            }
+            return Ok(ProcessCommitResult::Ignored);
+        }
+
+        // Tier 0.6: List Metadata Intercept (PRD §2.2)
+        if commit.collection.as_str() == "app.bsky.graph.list" {
+            let p_dids = self.protected_dids.read().clone();
+            if p_dids.contains(&commit.did) {
+                return Ok(self.handle_list_commit(commit));
+            }
+            return Ok(ProcessCommitResult::Ignored);
+        }
+
         // Tier 1: Post Collection & Operation Filter
         if commit.collection.as_str() != "app.bsky.feed.post"
             || commit.operation != CommitOperation::Create
@@ -930,6 +1001,24 @@ impl SkybouncerEngine {
                 debug!(event = ?sync_event, "Synchronized follow graph from firehose commit");
             }
             return Ok(ProcessCommitResult::FollowSynced(sync_event));
+        }
+
+        // Tier 0.5: Sovereign Config Collection Intercept (PRD §2.2)
+        if commit.collection.as_str() == crate::modlist::SOVEREIGN_CONFIG_COLLECTION {
+            let p_dids = self.protected_dids.read().clone();
+            if p_dids.contains(&commit.did) {
+                return Ok(self.handle_sovereign_config_commit(commit));
+            }
+            return Ok(ProcessCommitResult::Ignored);
+        }
+
+        // Tier 0.6: List Metadata Intercept (PRD §2.2)
+        if commit.collection.as_str() == "app.bsky.graph.list" {
+            let p_dids = self.protected_dids.read().clone();
+            if p_dids.contains(&commit.did) {
+                return Ok(self.handle_list_commit(commit));
+            }
+            return Ok(ProcessCommitResult::Ignored);
         }
 
         // Tier 1: Post Collection & Operation Filter
@@ -1641,6 +1730,100 @@ impl SkybouncerEngine {
     ) -> Result<String, SkybouncerError> {
         let rubric = self.rubric();
         crate::modlist::publish_sovereign_config(&self.pds_client, protected_did, &rubric).await
+    }
+
+    /// Handles a commit event on `social.skybouncer.config` for a protected user.
+    fn handle_sovereign_config_commit(&self, commit: &JetstreamCommit) -> ProcessCommitResult {
+        match commit.operation {
+            CommitOperation::Create | CommitOperation::Update => {
+                if let Some(ref record_val) = commit.record {
+                    match serde_json::from_value::<crate::modlist::SovereignConfigRecord>(
+                        record_val.clone(),
+                    ) {
+                        Ok(config_record) => {
+                            let rubric = config_record.to_rubric();
+                            self.set_rubric(rubric.clone());
+                            self.stats
+                                .sovereign_configs_synced
+                                .fetch_add(1, Ordering::Relaxed);
+                            info!(
+                                did = %commit.did,
+                                prompt = %rubric.prompt,
+                                sensitivity = %rubric.sensitivity,
+                                "Hot-reloaded sovereign moderation rules from Jetstream firehose"
+                            );
+                            ProcessCommitResult::SovereignConfigSynced(
+                                SovereignConfigSyncEvent::Updated {
+                                    did: commit.did.clone(),
+                                    prompt: rubric.prompt,
+                                    sensitivity: rubric.sensitivity,
+                                },
+                            )
+                        }
+                        Err(e) => {
+                            warn!(
+                                did = %commit.did,
+                                error = %e,
+                                "Failed to parse sovereign config record from firehose commit"
+                            );
+                            ProcessCommitResult::Ignored
+                        }
+                    }
+                } else {
+                    ProcessCommitResult::Ignored
+                }
+            }
+            CommitOperation::Delete => {
+                if commit.rkey == crate::modlist::SOVEREIGN_CONFIG_RKEY {
+                    self.stats
+                        .sovereign_configs_synced
+                        .fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        did = %commit.did,
+                        "Sovereign configuration record deleted from PDS via firehose"
+                    );
+                    ProcessCommitResult::SovereignConfigSynced(SovereignConfigSyncEvent::Deleted {
+                        did: commit.did.clone(),
+                    })
+                } else {
+                    ProcessCommitResult::Ignored
+                }
+            }
+        }
+    }
+
+    /// Handles a commit event on `app.bsky.graph.list` for a protected user.
+    fn handle_list_commit(&self, commit: &JetstreamCommit) -> ProcessCommitResult {
+        if commit.operation != CommitOperation::Create
+            && commit.operation != CommitOperation::Update
+        {
+            return ProcessCommitResult::Ignored;
+        }
+
+        if let Some(ref record_val) = commit.record {
+            if let Some(desc) = record_val.get("description").and_then(|d| d.as_str()) {
+                if let Some(rubric) = crate::modlist::extract_rubric_from_list_description(desc) {
+                    self.set_rubric(rubric.clone());
+                    self.stats
+                        .sovereign_configs_synced
+                        .fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        did = %commit.did,
+                        prompt = %rubric.prompt,
+                        sensitivity = %rubric.sensitivity,
+                        "Hot-reloaded sovereign moderation rules from list description metadata"
+                    );
+                    return ProcessCommitResult::SovereignConfigSynced(
+                        SovereignConfigSyncEvent::ListMetadataUpdated {
+                            did: commit.did.clone(),
+                            prompt: rubric.prompt,
+                            sensitivity: rubric.sensitivity,
+                        },
+                    );
+                }
+            }
+        }
+        ProcessCommitResult::Ignored
     }
 
     /// Runs the pipeline event processing loop reading from `rx` until cancelled.

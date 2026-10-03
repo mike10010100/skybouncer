@@ -148,3 +148,281 @@ async fn test_sovereign_config_pds_not_found_returns_none() {
     let fetched = fetch_sovereign_config(&pds_client, repo_did).await.unwrap();
     assert!(fetched.is_none());
 }
+
+// =============================================================================
+// Autonomous Sovereign Firehose Synchronization Tests (PRD §2.2)
+// =============================================================================
+
+use skybase::ingest::{CommitOperation, JetstreamCommit};
+use skybouncer::classifier::{MockClassifier, Verdict};
+use skybouncer::engine::{
+    ProcessCommitResult, SkybouncerConfig, SkybouncerEngine, SovereignConfigSyncEvent,
+};
+use skybouncer::matcher::{FollowGraph, NonFollowedGate};
+use skybouncer::modlist::{DeduplicationCache, ModListManager};
+use skybouncer::stream::StreamConfig;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+async fn setup_sovereign_test_engine(protected_did: &str) -> (Arc<SkybouncerEngine>, MockServer) {
+    let mock_server = MockServer::start().await;
+    let pds_client = Arc::new(
+        PdsRepoClient::from_credentials(mock_server.uri(), protected_did, "mock_token").unwrap(),
+    );
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let initial_rubric = RuleRubric::new("Initial rules prompt", Sensitivity::Medium);
+    let modlist_manager = Arc::new(
+        ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(initial_rubric.clone()),
+    );
+    let classifier = Arc::new(MockClassifier::new(Verdict::permitted("benign test")));
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert(protected_did.to_string());
+    let config = SkybouncerConfig::new(protected_dids, initial_rubric);
+
+    let engine = Arc::new(SkybouncerEngine::new(
+        config,
+        follow_graph,
+        gate,
+        classifier,
+        modlist_manager,
+        pds_client,
+    ));
+
+    (engine, mock_server)
+}
+
+#[test]
+fn test_stream_config_default_includes_sovereign_collections() {
+    let config = StreamConfig::default();
+    assert!(
+        config
+            .collections
+            .contains(&"app.bsky.feed.post".to_string()),
+        "Must contain app.bsky.feed.post"
+    );
+    assert!(
+        config
+            .collections
+            .contains(&"app.bsky.graph.follow".to_string()),
+        "Must contain app.bsky.graph.follow"
+    );
+    assert!(
+        config
+            .collections
+            .contains(&SOVEREIGN_CONFIG_COLLECTION.to_string()),
+        "Must contain social.skybouncer.config"
+    );
+    assert!(
+        config
+            .collections
+            .contains(&"app.bsky.graph.list".to_string()),
+        "Must contain app.bsky.graph.list"
+    );
+}
+
+#[tokio::test]
+async fn test_firehose_sovereign_config_create_and_update_hot_reloads_rubric() {
+    let protected_did = "did:plc:protected_sovereign_alice";
+    let (engine, _server) = setup_sovereign_test_engine(protected_did).await;
+
+    // Verify initial rubric state
+    assert_eq!(engine.rubric().prompt, "Initial rules prompt");
+    assert_eq!(engine.rubric().sensitivity, Sensitivity::Medium);
+
+    // 1. Simulate incoming CommitOperation::Create on social.skybouncer.config
+    let updated_rubric = RuleRubric::new(
+        "Strictly block crypto spam, drainers, and phishing attacks.",
+        Sensitivity::High,
+    );
+    let record_payload = json!(SovereignConfigRecord::from_rubric(&updated_rubric));
+
+    let commit = JetstreamCommit {
+        did: protected_did.to_string(),
+        time_us: 1_720_000_000_000_000,
+        collection: SOVEREIGN_CONFIG_COLLECTION.to_string(),
+        rkey: SOVEREIGN_CONFIG_RKEY.to_string(),
+        operation: CommitOperation::Create,
+        cid: Some("bafyreisovereigncommitcid".to_string()),
+        record: Some(record_payload),
+    };
+
+    let result = engine.process_commit(&commit).await.unwrap();
+    assert!(result.is_sovereign_config_synced());
+
+    match result {
+        ProcessCommitResult::SovereignConfigSynced(SovereignConfigSyncEvent::Updated {
+            did,
+            prompt,
+            sensitivity,
+        }) => {
+            assert_eq!(did, protected_did);
+            assert_eq!(prompt, updated_rubric.prompt);
+            assert_eq!(sensitivity, Sensitivity::High);
+        }
+        other => panic!("Expected SovereignConfigSynced(Updated), got {other:?}"),
+    }
+
+    // Verify engine state was dynamically hot-reloaded
+    assert_eq!(engine.rubric().prompt, updated_rubric.prompt);
+    assert_eq!(engine.rubric().sensitivity, Sensitivity::High);
+    assert_eq!(engine.stats().snapshot().sovereign_configs_synced, 1);
+
+    // 2. Simulate CommitOperation::Update
+    let second_rubric =
+        RuleRubric::new("Permissive mode: block only direct slurs", Sensitivity::Low);
+    let second_payload = json!(SovereignConfigRecord::from_rubric(&second_rubric));
+
+    let update_commit = JetstreamCommit {
+        did: protected_did.to_string(),
+        time_us: 1_720_000_001_000_000,
+        collection: SOVEREIGN_CONFIG_COLLECTION.to_string(),
+        rkey: SOVEREIGN_CONFIG_RKEY.to_string(),
+        operation: CommitOperation::Update,
+        cid: Some("bafyreisovereigncommitcid2".to_string()),
+        record: Some(second_payload),
+    };
+
+    let result2 = engine.process_commit(&update_commit).await.unwrap();
+    assert!(result2.is_sovereign_config_synced());
+    assert_eq!(engine.rubric().prompt, second_rubric.prompt);
+    assert_eq!(engine.rubric().sensitivity, Sensitivity::Low);
+    assert_eq!(engine.stats().snapshot().sovereign_configs_synced, 2);
+}
+
+#[tokio::test]
+async fn test_firehose_sovereign_config_delete() {
+    let protected_did = "did:plc:protected_sovereign_bob";
+    let (engine, _server) = setup_sovereign_test_engine(protected_did).await;
+
+    let delete_commit = JetstreamCommit {
+        did: protected_did.to_string(),
+        time_us: 1_720_000_000_000_000,
+        collection: SOVEREIGN_CONFIG_COLLECTION.to_string(),
+        rkey: SOVEREIGN_CONFIG_RKEY.to_string(),
+        operation: CommitOperation::Delete,
+        cid: None,
+        record: None,
+    };
+
+    let result = engine.process_commit(&delete_commit).await.unwrap();
+    assert!(result.is_sovereign_config_synced());
+
+    match result {
+        ProcessCommitResult::SovereignConfigSynced(SovereignConfigSyncEvent::Deleted { did }) => {
+            assert_eq!(did, protected_did);
+        }
+        other => panic!("Expected SovereignConfigSynced(Deleted), got {other:?}"),
+    }
+    assert_eq!(engine.stats().snapshot().sovereign_configs_synced, 1);
+}
+
+#[tokio::test]
+async fn test_firehose_sovereign_config_unprotected_did_ignored() {
+    let protected_did = "did:plc:protected_alice";
+    let stranger_did = "did:plc:stranger_eve";
+    let (engine, _server) = setup_sovereign_test_engine(protected_did).await;
+
+    let stranger_rubric = RuleRubric::new(
+        "Malicious attacker trying to tamper rules",
+        Sensitivity::Low,
+    );
+    let commit = JetstreamCommit {
+        did: stranger_did.to_string(),
+        time_us: 1_720_000_000_000_000,
+        collection: SOVEREIGN_CONFIG_COLLECTION.to_string(),
+        rkey: SOVEREIGN_CONFIG_RKEY.to_string(),
+        operation: CommitOperation::Create,
+        cid: Some("bafyreicit".to_string()),
+        record: Some(json!(SovereignConfigRecord::from_rubric(&stranger_rubric))),
+    };
+
+    let result = engine.process_commit(&commit).await.unwrap();
+    assert!(result.is_ignored());
+
+    // Protected user's rubric must remain 100% intact
+    assert_eq!(engine.rubric().prompt, "Initial rules prompt");
+    assert_eq!(engine.rubric().sensitivity, Sensitivity::Medium);
+    assert_eq!(engine.stats().snapshot().sovereign_configs_synced, 0);
+}
+
+#[tokio::test]
+async fn test_firehose_list_metadata_commit_hot_reloads_rubric() {
+    let protected_did = "did:plc:protected_alice";
+    let (engine, _server) = setup_sovereign_test_engine(protected_did).await;
+
+    let list_rubric = RuleRubric::new(
+        "Extracted from list description: block spam & trolls",
+        Sensitivity::High,
+    );
+    let encoded_desc = format_list_description_with_rubric("My personal blocklist", &list_rubric);
+
+    let list_commit = JetstreamCommit {
+        did: protected_did.to_string(),
+        time_us: 1_720_000_000_000_000,
+        collection: "app.bsky.graph.list".to_string(),
+        rkey: "3mwu123list".to_string(),
+        operation: CommitOperation::Update,
+        cid: Some("bafyreilistcid".to_string()),
+        record: Some(json!({
+            "$type": "app.bsky.graph.list",
+            "name": "Skybouncer Auto-Filter",
+            "purpose": "app.bsky.graph.defs#modlist",
+            "description": encoded_desc,
+            "createdAt": "2026-10-01T20:00:00.000Z"
+        })),
+    };
+
+    let result = engine.process_commit(&list_commit).await.unwrap();
+    assert!(result.is_sovereign_config_synced());
+
+    match result {
+        ProcessCommitResult::SovereignConfigSynced(
+            SovereignConfigSyncEvent::ListMetadataUpdated {
+                did,
+                prompt,
+                sensitivity,
+            },
+        ) => {
+            assert_eq!(did, protected_did);
+            assert_eq!(prompt, list_rubric.prompt);
+            assert_eq!(sensitivity, Sensitivity::High);
+        }
+        other => panic!("Expected SovereignConfigSynced(ListMetadataUpdated), got {other:?}"),
+    }
+
+    assert_eq!(engine.rubric().prompt, list_rubric.prompt);
+    assert_eq!(engine.rubric().sensitivity, Sensitivity::High);
+    assert_eq!(engine.stats().snapshot().sovereign_configs_synced, 1);
+}
+
+#[tokio::test]
+async fn test_process_commit_queued_sovereign_config_sync() {
+    let protected_did = "did:plc:protected_alice";
+    let (engine, _server) = setup_sovereign_test_engine(protected_did).await;
+    let (eval_tx, mut eval_rx) = tokio::sync::mpsc::channel(16);
+
+    let updated_rubric = RuleRubric::new("Queued pipeline dynamic rubric update", Sensitivity::Low);
+    let commit = JetstreamCommit {
+        did: protected_did.to_string(),
+        time_us: 1_720_000_000_000_000,
+        collection: SOVEREIGN_CONFIG_COLLECTION.to_string(),
+        rkey: SOVEREIGN_CONFIG_RKEY.to_string(),
+        operation: CommitOperation::Create,
+        cid: Some("bafyreiqueued".to_string()),
+        record: Some(json!(SovereignConfigRecord::from_rubric(&updated_rubric))),
+    };
+
+    let result = engine
+        .process_commit_queued(&commit, &eval_tx)
+        .await
+        .unwrap();
+    assert!(result.is_sovereign_config_synced());
+    assert_eq!(engine.rubric().prompt, updated_rubric.prompt);
+    assert_eq!(engine.rubric().sensitivity, Sensitivity::Low);
+
+    // Ensure evaluation queue was NOT polluted with non-post candidates
+    assert!(eval_rx.try_recv().is_err());
+}

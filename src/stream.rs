@@ -1,7 +1,7 @@
 //! Jetstream WebSocket streaming client for live firehose ingestion.
 //!
-//! Connects to public ATProto Jetstream firehose endpoints, subscribes to `app.bsky.feed.post`
-//! and `app.bsky.graph.follow` collections, handles automatic reconnection with exponential backoff,
+//! Connects to public ATProto Jetstream firehose endpoints, subscribes to post, follow,
+//! and sovereign configuration collections, handles automatic reconnection with exponential backoff,
 //! and dispatches parsed [`JetstreamCommit`] frames to the [`crate::engine::SkybouncerEngine`].
 
 use std::time::Duration;
@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::error::SkybouncerError;
+use crate::modlist::SOVEREIGN_CONFIG_COLLECTION;
 
 /// Default public Jetstream endpoint.
 pub const DEFAULT_JETSTREAM_ENDPOINT: &str = "wss://jetstream2.us-east.bsky.network/subscribe";
@@ -43,6 +44,8 @@ impl Default for StreamConfig {
             collections: vec![
                 "app.bsky.feed.post".to_string(),
                 "app.bsky.graph.follow".to_string(),
+                SOVEREIGN_CONFIG_COLLECTION.to_string(),
+                "app.bsky.graph.list".to_string(),
             ],
             cursor: None,
         }

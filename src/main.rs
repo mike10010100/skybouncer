@@ -360,6 +360,10 @@ async fn main() -> Result<(), SkybouncerError> {
     );
     info!("   Follows Synced:               {}", stats.follows_synced);
     info!(
+        "   Sovereign Configs Synced:     {}",
+        stats.sovereign_configs_synced
+    );
+    info!(
         "   Interactions Matched:         {}",
         stats.interactions_matched
     );

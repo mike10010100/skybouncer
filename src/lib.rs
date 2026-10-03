@@ -59,8 +59,9 @@ pub use classifier::{
 pub use engine::{
     BounceNotification, EngineStats, EngineStatsSnapshot, InteractionOutcome, ProcessCommitResult,
     ProcessOutcome, SkybouncerConfig, SkybouncerEngine, SkybouncerEngineBuilder,
-    DEFAULT_ENGINE_CHANNEL_CAPACITY, DEFAULT_EVALUATION_CACHE_TTL, DEFAULT_EVALUATION_CONCURRENCY,
-    DEFAULT_EVALUATION_QUEUE_CAPACITY, DEFAULT_MAINTENANCE_INTERVAL, DEFAULT_SHUTDOWN_TIMEOUT,
+    SovereignConfigSyncEvent, DEFAULT_ENGINE_CHANNEL_CAPACITY, DEFAULT_EVALUATION_CACHE_TTL,
+    DEFAULT_EVALUATION_CONCURRENCY, DEFAULT_EVALUATION_QUEUE_CAPACITY,
+    DEFAULT_MAINTENANCE_INTERVAL, DEFAULT_SHUTDOWN_TIMEOUT,
 };
 pub use error::SkybouncerError;
 pub use matcher::{
