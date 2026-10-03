@@ -4,8 +4,11 @@
 //! using TypeSafe AI's Jev "System 1" model or compatible HTTP endpoints.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
+
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
 use crate::classifier::{Classifier, RuleRubric, Verdict, ViolationCategory};
 use crate::error::SkybouncerError;
@@ -251,7 +254,7 @@ pub struct SystemOneResponse {
 #[derive(Debug, Clone)]
 pub struct JevClassifier {
     config: JevConfig,
-    rubric: RuleRubric,
+    rubric: Arc<RwLock<RuleRubric>>,
     http_client: reqwest::Client,
     classify_url: String,
     endpoint_kind: JevEndpointKind,
@@ -333,7 +336,7 @@ impl JevClassifier {
 
         Ok(Self {
             config,
-            rubric,
+            rubric: Arc::new(RwLock::new(rubric)),
             http_client,
             classify_url,
             endpoint_kind,
@@ -355,10 +358,15 @@ impl JevClassifier {
         &self.config
     }
 
-    /// Returns a reference to the active [`RuleRubric`].
+    /// Returns a copy of the active [`RuleRubric`].
     #[must_use]
-    pub fn rubric(&self) -> &RuleRubric {
-        &self.rubric
+    pub fn rubric(&self) -> RuleRubric {
+        self.rubric.read().clone()
+    }
+
+    /// Dynamically updates the active moderation rubric in thread-safe memory.
+    pub fn set_rubric(&self, rubric: RuleRubric) {
+        *self.rubric.write() = rubric;
     }
 
     /// Returns the resolved classification URL string.
@@ -399,28 +407,32 @@ impl JevClassifier {
                 request_builder = request_builder.header("Authorization", format!("Bearer {key}"));
             }
 
+            let (rubric_prompt, sensitivity_str) = {
+                let r = self.rubric.read();
+                (r.prompt.clone(), r.sensitivity.as_str().to_string())
+            };
+
             let send_result = match self.endpoint_kind {
                 JevEndpointKind::StandardJev => {
                     let payload = JevClassifyRequest {
                         model: self.config.model.clone(),
                         text: interaction.text.clone(),
-                        rubric: self.rubric.prompt.clone(),
+                        rubric: rubric_prompt.clone(),
                         context: JevRequestContext {
                             author_did: interaction.author_did.clone(),
                             target_did: interaction.target_did.clone(),
                             interaction_type: interaction.interaction_type.as_str().to_string(),
                         },
-                        sensitivity: self.rubric.sensitivity.as_str().to_string(),
+                        sensitivity: sensitivity_str,
                     };
                     request_builder.json(&payload).send().await
                 }
                 JevEndpointKind::Ollama => {
                     let system_prompt = format!(
                         "You are an automated content moderation classifier. \
-                        Evaluate candidate posts against this rubric: \"{}\". \
+                        Evaluate candidate posts against this rubric: \"{rubric_prompt}\". \
                         Output ONLY a single valid JSON object matching: \
-                        {{\"violates\": boolean, \"category\": string or null, \"confidence\": float (0.0 to 1.0), \"reason\": string}}",
-                        self.rubric.prompt
+                        {{\"violates\": boolean, \"category\": string or null, \"confidence\": float (0.0 to 1.0), \"reason\": string}}"
                     );
                     let enrichment_str = interaction
                         .enriched_context
@@ -459,22 +471,29 @@ impl JevClassifier {
                     let mut criteria = std::collections::BTreeMap::new();
                     criteria.insert(
                         "crypto_spam".to_string(),
-                        "Cryptocurrency scam, airdrop lure, fake giveaway, wallet drainer, phishing token".to_string(),
+                        "Cryptocurrency scam, airdrop lure, fake giveaway, wallet drainer, phishing token, or investment spam".to_string(),
                     );
                     criteria.insert(
                         "harassment".to_string(),
-                        "Targeted harassment, personal attacks, insults, threats, abusive hostility".to_string(),
+                        "Targeted harassment, personal attacks, insults, slurs, threats, abusive hostility".to_string(),
+                    );
+                    criteria.insert(
+                        "phishing".to_string(),
+                        "Credential harvesting, phishing links, fake account suspension warnings, fake security alerts, or malicious links".to_string(),
+                    );
+                    criteria.insert(
+                        "sealioning_or_bad_faith".to_string(),
+                        "Bad-faith sea-lioning, disingenuous badgering, relentless interrogation, feigned ignorance, or debate-bro trolling".to_string(),
                     );
                     criteria.insert(
                         "spam".to_string(),
                         format!(
-                            "Unsolicited promotional spam, scam bots, or content violating: {}",
-                            self.rubric.prompt
+                            "Unsolicited promotional spam, scam bots, commercial solicitations, or content violating: {rubric_prompt}"
                         ),
                     );
                     criteria.insert(
                         "permitted".to_string(),
-                        "Benign, normal social post or civil conversation conforming to house rules"
+                        "Benign social discussion, genuine questions, technical debate, respectful disagreement, humor, or normal social chatter conforming to house rules"
                             .to_string(),
                     );
                     let mut questions = std::collections::BTreeMap::new();
@@ -628,14 +647,18 @@ impl JevClassifier {
 
     /// Evaluates raw Jev response against configured rubric sensitivity.
     fn build_verdict(&self, resp: JevClassifyResponse) -> Verdict {
-        if resp.violates && self.rubric.is_actionable(resp.confidence) {
+        let is_actionable = self.rubric.read().is_actionable(resp.confidence);
+        if resp.violates && is_actionable {
             let category = match resp.category.as_deref() {
                 Some("spam") => ViolationCategory::Spam,
                 Some("crypto_spam") | Some("crypto-spam") | Some("crypto") => {
                     ViolationCategory::CryptoSpam
                 }
                 Some("harassment") => ViolationCategory::Harassment,
-                Some("sea_lioning") | Some("sealioning") => ViolationCategory::SeaLioning,
+                Some("sea_lioning")
+                | Some("sealioning")
+                | Some("sealioning_or_bad_faith")
+                | Some("bad_faith") => ViolationCategory::SeaLioning,
                 Some("phishing") => ViolationCategory::Phishing,
                 Some("hate_speech") | Some("hatespeech") => ViolationCategory::HateSpeech,
                 Some(other) => ViolationCategory::Custom(other.to_string()),
@@ -653,5 +676,9 @@ impl JevClassifier {
 impl Classifier for JevClassifier {
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
         self.evaluate(interaction).await
+    }
+
+    fn set_rubric(&self, rubric: RuleRubric) {
+        self.set_rubric(rubric);
     }
 }

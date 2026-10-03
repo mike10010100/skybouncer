@@ -195,6 +195,9 @@ pub trait Classifier: Send + Sync {
     ///
     /// Returns [`SkybouncerError`] if external API evaluation fails or times out.
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError>;
+
+    /// Dynamically updates the active moderation rubric across the classifier.
+    fn set_rubric(&self, _rubric: RuleRubric) {}
 }
 
 #[async_trait]
@@ -202,11 +205,19 @@ impl<T: Classifier + ?Sized> Classifier for std::sync::Arc<T> {
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
         (**self).classify(interaction).await
     }
+
+    fn set_rubric(&self, rubric: RuleRubric) {
+        (**self).set_rubric(rubric);
+    }
 }
 
 #[async_trait]
 impl<T: Classifier + ?Sized> Classifier for Box<T> {
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
         (**self).classify(interaction).await
+    }
+
+    fn set_rubric(&self, rubric: RuleRubric) {
+        (**self).set_rubric(rubric);
     }
 }

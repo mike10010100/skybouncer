@@ -1023,10 +1023,11 @@ impl SkybouncerEngine {
         self.rubric.read().clone()
     }
 
-    /// Updates the active moderation rubric in real time across the engine and modlist manager.
+    /// Updates the active moderation rubric in real time across the engine, modlist manager, and classifier.
     pub fn set_rubric(&self, rubric: RuleRubric) {
         *self.rubric.write() = rubric.clone();
-        self.modlist_manager.set_rubric(rubric);
+        self.modlist_manager.set_rubric(rubric.clone());
+        self.classifier.set_rubric(rubric);
     }
 
     /// Returns a reference to the heuristic classifier.

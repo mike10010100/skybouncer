@@ -248,9 +248,13 @@ async fn main() -> Result<(), SkybouncerError> {
         .unwrap_or_else(|_| skybouncer::DEFAULT_CHAT_ENDPOINT.to_string());
     let chat_token = std::env::var("CHAT_ACCESS_TOKEN")
         .ok()
-        .or_else(|| std::env::var("PDS_ACCESS_TOKEN").ok());
+        .or_else(|| std::env::var("PDS_ACCESS_TOKEN").ok())
+        .filter(|t| !t.trim().is_empty() && !t.contains("xxxx"));
     let bot_did = std::env::var("BOT_DID")
         .ok()
+        .filter(|d| {
+            !d.trim().is_empty() && !d.contains("example") && !d.contains("skybouncerbotdid")
+        })
         .or_else(|| config.protected_dids.iter().next().cloned());
 
     if let (Some(token), Some(did)) = (chat_token, bot_did) {
