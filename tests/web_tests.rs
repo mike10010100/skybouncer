@@ -121,6 +121,8 @@ async fn test_serve_dashboard_html() {
     assert!(body_str.contains("color-scheme"));
     assert!(body_str.contains("Simulator"));
     assert!(body_str.contains("Recently Bounced"));
+    assert!(body_str.contains("Evaluation Queue"));
+    assert!(body_str.contains("Queue Overflows"));
 }
 
 #[tokio::test]

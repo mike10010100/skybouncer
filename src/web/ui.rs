@@ -353,9 +353,12 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       </div>
     </div>
     <div class="header-actions">
-      <div class="status-badge">
+      <div class="status-badge" id="firehose-badge">
         <div class="pulse-dot"></div>
         <span>Firehose Active</span>
+      </div>
+      <div class="status-badge" id="queue-badge" style="background: rgba(99, 102, 241, 0.12); color: var(--accent); border: 1px solid rgba(99, 102, 241, 0.25);">
+        <span id="queue-badge-text">Queue: Idle (1 worker)</span>
       </div>
       <button class="btn btn-secondary" onclick="showLoginModal()">Bluesky SSO</button>
     </div>
@@ -388,6 +391,16 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         <div class="kpi-label">Model Evaluations</div>
         <div class="kpi-val" id="kpi-evals">0</div>
         <div class="kpi-sub">Jev System-1 Classifier</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Evaluation Queue</div>
+        <div class="kpi-val" id="kpi-queue-backlog" style="color: var(--accent);">0</div>
+        <div class="kpi-sub" id="kpi-queue-sub">0 Enqueued &bull; 1 Worker</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Queue Overflows</div>
+        <div class="kpi-val" id="kpi-queue-overflows">0</div>
+        <div class="kpi-sub" id="kpi-queue-overflows-sub">Capacity: 256 (0 Shed)</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Bounces Executed</div>
@@ -509,8 +522,40 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         document.getElementById("kpi-dedup").innerText = data.stats.dedup_cache_hits.toLocaleString();
         document.getElementById("kpi-evals").innerText = data.stats.model_evaluations.toLocaleString();
         document.getElementById("kpi-bounces").innerText = data.stats.bounces_executed.toLocaleString();
+
+        const enqueued = data.stats.eval_queue_enqueued || 0;
+        const processed = data.stats.eval_queue_processed || 0;
+        const overflows = data.stats.eval_queue_overflows || 0;
+        const backlog = Math.max(0, enqueued - processed);
+
+        const backlogEl = document.getElementById("kpi-queue-backlog");
+        if (backlogEl) backlogEl.innerText = backlog.toLocaleString();
+
+        const queueSubEl = document.getElementById("kpi-queue-sub");
+        if (queueSubEl) queueSubEl.innerText = `${enqueued.toLocaleString()} Enqueued • ${processed.toLocaleString()} Done`;
+
+        const overflowsEl = document.getElementById("kpi-queue-overflows");
+        if (overflowsEl) {
+          overflowsEl.innerText = overflows.toLocaleString();
+          overflowsEl.style.color = overflows > 0 ? "var(--danger)" : "var(--text-main)";
+        }
+
+        const overflowsSubEl = document.getElementById("kpi-queue-overflows-sub");
+        if (overflowsSubEl) {
+          overflowsSubEl.innerText = overflows > 0
+            ? `${overflows.toLocaleString()} Shed (Cap: 256)`
+            : "Capacity: 256 (0 Shed)";
+        }
+
+        const queueBadgeText = document.getElementById("queue-badge-text");
+        if (queueBadgeText) {
+          queueBadgeText.innerText = backlog > 0
+            ? `Queue: ${backlog} pending`
+            : "Queue: Idle (1 worker)";
+        }
+
         if (data.dry_run) {
-          const badge = document.querySelector(".status-badge");
+          const badge = document.getElementById("firehose-badge");
           if (badge) {
             badge.style.borderColor = "var(--warning)";
             badge.style.color = "var(--warning)";
