@@ -7,10 +7,10 @@ Welcome, Agent! This document is designed specifically for AI coding assistants 
 ## 🎯 Repository Standards & Reference Blueprint
 
 This project is built following the **Production-Grade Rust Best Practices & Architecture Standards** defined in the user's reference repository:
-- **Reference Repo**: [`rust-best-practices`](/Users/mike10010100/git/rust-best-practices) (or `https://github.com/mike10010100/rust-best-practices`)
-- **Architecture Guide**: [`BEST_PRACTICES.md`](/Users/mike10010100/git/rust-best-practices/BEST_PRACTICES.md)
-- **Tooling Blueprint**: [`TOOLING.md`](/Users/mike10010100/git/rust-best-practices/TOOLING.md)
-- **Agent Blueprint**: [`agents.md`](/Users/mike10010100/git/rust-best-practices/agents.md)
+- **Reference Repo**: [`rust-best-practices`](https://github.com/mike10010100/rust-best-practices)
+- **Architecture Guide**: [`BEST_PRACTICES.md`](https://github.com/mike10010100/rust-best-practices/blob/main/BEST_PRACTICES.md)
+- **Tooling Blueprint**: [`TOOLING.md`](https://github.com/mike10010100/rust-best-practices/blob/main/TOOLING.md)
+- **Agent Blueprint**: [`agents.md`](https://github.com/mike10010100/rust-best-practices/blob/main/agents.md)
 
 When working in this repository:
 - Treat every safety gate and architectural pattern from `rust-best-practices` as a strict non-negotiable requirement.

@@ -23,9 +23,9 @@ services:
       - HOST=0.0.0.0
       - PORT=3000
       - WEB_ENABLED=true
-      - HOSTNAME=${HOSTNAME:-skybouncer.mike10010100.com}
-      - PUBLIC_URL=${PUBLIC_URL:-https://skybouncer.mike10010100.com}
-      - SERVICE_DID=${SERVICE_DID:-did:web:skybouncer.mike10010100.com}
+      - HOSTNAME=${HOSTNAME:-skybouncer.example.com}
+      - PUBLIC_URL=${PUBLIC_URL:-https://skybouncer.example.com}
+      - SERVICE_DID=${SERVICE_DID:-did:web:skybouncer.example.com}
       - SKYBOUNCER_DATABASE_PATH=/data/skybouncer.db
       - RUST_LOG=${RUST_LOG:-info,skybouncer=info,skybase=info}
     stop_grace_period: 30s
@@ -49,7 +49,7 @@ services:
 
   # ----------------------------------------------------------------------------
   # Cloudflare Tunnel for Secure Public HTTPS Access & OAuth Callbacks
-  # Forwards traffic from your public domain (e.g. skybouncer.mike10010100.com)
+  # Forwards traffic from your public domain (e.g. skybouncer.example.com)
   # directly into the isolated container network without exposing router ports.
   # ----------------------------------------------------------------------------
   cloudflared:

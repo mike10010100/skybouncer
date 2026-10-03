@@ -178,7 +178,7 @@ Unlike centralized Web2 moderation bots that require a database of user accounts
 #### Mode 1: Public ATProto Chat / DM Bot (`chat.bsky.convo.*`)
 * **Conversational Onboarding (For Any Bluesky User)**:
   * Any user on Bluesky can message `@skybouncer.bot`.
-  * If the sender is **not yet enrolled**, the bot replies with an introduction and a 1-click authorization link (`https://skybouncer.mike10010100.com/auth`) to activate protection on their account.
+  * If the sender is **not yet enrolled**, the bot replies with an introduction and a 1-click authorization link (`https://skybouncer.example.com/auth`) to activate protection on their account.
 * **Management Commands (For Enrolled Users)**:
   * `rules`: Display the user's active moderation rubric.
   * `set rules <text>`: Update the user's rule rubric and sync to their sovereign PDS.
@@ -189,7 +189,7 @@ Unlike centralized Web2 moderation bots that require a database of user accounts
   * `sensitivity <low|medium|high>`: Adjust the user's confidence threshold.
 
 #### Mode 2: Sovereign Web Portal & OAuth 2.1 Gateway (`skyauth`)
-* Public web service hosted at `https://skybouncer.mike10010100.com`.
+* Public web service hosted at `https://skybouncer.example.com`.
 * **ATProto OAuth 2.1 Login**: Users sign in with their Bluesky handle via `skyauth` (PKCE + DPoP), granting permission to manage their moderation list.
 * **Live Sandbox & Simulator**: Test hypothetical posts or paste thread URLs to preview classifier decisions against their custom rubric.
 * **Audit Dashboard**: Chronological timeline of evaluations, model confidence, and 1-click unban buttons.
@@ -199,7 +199,7 @@ Unlike centralized Web2 moderation bots that require a database of user accounts
   * Runs in its own dedicated, user-defined Docker bridge network (`skybouncer_net`).
   * Sibling Docker Compose stacks (such as `for-your-consideration`) run in separate, isolated bridge networks. Containers in one stack cannot see, resolve, or communicate with containers in another stack.
 * **Cloudflare Tunnel Edge Ingress**:
-  * Companion `cloudflared` container mounts `~/.cloudflared` read-only and tunnels traffic from `https://skybouncer.mike10010100.com` directly into `http://skybouncer:3000` over `skybouncer_net`.
+  * Companion `cloudflared` container mounts `~/.cloudflared` read-only and tunnels traffic from `https://skybouncer.example.com` directly into `http://skybouncer:3000` over `skybouncer_net`.
   * **Zero Inbound Router Ports**: No open ports on the firewall or host router; all traffic enters encrypted via Cloudflare's edge with automatic TLS termination and DDoS mitigation.
 * **Port Conflict Prevention**:
   * Default host port mapping `PORT_BIND=3031` (bound to `127.0.0.1:3031:3000`), completely eliminating port collisions with `for-your-consideration` on `3030`.
@@ -212,7 +212,7 @@ Unlike centralized Web2 moderation bots that require a database of user accounts
 ## 5. Non-Functional & Safety Requirements
 
 ### 5.1 Rust Safety & Quality Gates
-Adhering to [`AGENTS.md`](AGENTS.md) and [`rust-best-practices`](/Users/mike10010100/git/rust-best-practices):
+Adhering to [`AGENTS.md`](AGENTS.md) and [`rust-best-practices`](https://github.com/mike10010100/rust-best-practices):
 * `#![forbid(unsafe_code)]` in all crates and binaries.
 * `#![deny(clippy::all, clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::todo, missing_docs, rust_2018_idioms)]`.
 * Zero unwrap/panic in production paths; all errors mapped to strongly-typed `SkybouncerError`.

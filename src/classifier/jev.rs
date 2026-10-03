@@ -15,7 +15,7 @@ use crate::error::SkybouncerError;
 use crate::matcher::Interaction;
 
 /// Default endpoint URL for Jev classification API.
-pub const DEFAULT_JEV_BASE_URL: &str = "https://nmo.purdlauski.net";
+pub const DEFAULT_JEV_BASE_URL: &str = "https://api.jev.ai";
 
 /// Default model identifier for Jev classification.
 pub const DEFAULT_JEV_MODEL: &str = "jev-system1-mod-v1";
@@ -29,7 +29,7 @@ pub const DEFAULT_JEV_MAX_RETRIES: usize = 1;
 /// Configuration parameters for [`JevClassifier`].
 #[derive(Debug, Clone)]
 pub struct JevConfig {
-    /// Base URL of the Jev classification API (e.g. `<https://nmo.purdlauski.net>`).
+    /// Base URL of the Jev classification API (e.g. `<https://api.jev.ai>`).
     pub base_url: String,
     /// API authentication key (bearer token), if required.
     pub api_key: Option<String>,
@@ -57,7 +57,7 @@ impl JevConfig {
     /// Constructs a [`JevConfig`] loaded from environment variables with fallback defaults.
     ///
     /// # Environment Variables
-    /// - `JEV_API_BASE_URL`: Base URL (defaults to `<https://nmo.purdlauski.net>`)
+    /// - `JEV_API_BASE_URL`: Base URL (defaults to `<https://api.jev.ai>`)
     /// - `JEV_API_KEY`: API key for authentication (optional in development, recommended in production)
     /// - `JEV_MODEL`: Model name (defaults to `"jev-system1-mod-v1"`)
     /// - `JEV_TIMEOUT_MS`: Request timeout in milliseconds (defaults to `3000`)

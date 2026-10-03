@@ -64,12 +64,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("║   🛡️  SKYBOUNCER TIERED MULTIMODAL BENCHMARK (Real Viral Posts & Live Jev)   ║");
     println!("╚══════════════════════════════════════════════════════════════════════════════╝\n");
 
-    let primary_endpoint = std::env::var("JEV_API_BASE_URL")
-        .unwrap_or_else(|_| "http://nmo.purdlauski.net:8000".to_string());
+    let primary_endpoint =
+        std::env::var("JEV_API_BASE_URL").unwrap_or_else(|_| "http://localhost:8000".to_string());
     let primary_model = std::env::var("JEV_MODEL").unwrap_or_else(|_| "tev1".to_string());
 
     let fallback_endpoint = std::env::var("FALLBACK_API_BASE_URL")
-        .unwrap_or_else(|_| "http://nmo.purdlauski.net:8000".to_string());
+        .unwrap_or_else(|_| "http://localhost:8000".to_string());
     let fallback_model = std::env::var("FALLBACK_MODEL").unwrap_or_else(|_| "nimble".to_string());
 
     println!("📡 Connecting to Tiered Live Evaluators:");

@@ -299,7 +299,7 @@ async fn test_jev_classifier_timeout() {
 #[test]
 fn test_jev_config_defaults_and_env() {
     let default_config = JevConfig::default();
-    assert_eq!(default_config.base_url, "https://nmo.purdlauski.net");
+    assert_eq!(default_config.base_url, "https://api.jev.ai");
     assert_eq!(default_config.model, "jev-system1-mod-v1");
     assert_eq!(default_config.timeout, Duration::from_millis(15000));
     assert_eq!(default_config.max_retries, 1);
@@ -345,22 +345,19 @@ async fn test_jev_classifier_endpoint_kind_detection() {
     // Ollama port 11434
     let c_ollama = JevClassifier::new(
         JevConfig {
-            base_url: "http://nmo.purdlauski.net:11434".to_string(),
+            base_url: "http://localhost:11434".to_string(),
             ..Default::default()
         },
         rubric.clone(),
     )
     .unwrap();
     assert_eq!(c_ollama.endpoint_kind(), JevEndpointKind::Ollama);
-    assert_eq!(
-        c_ollama.classify_url(),
-        "http://nmo.purdlauski.net:11434/api/chat"
-    );
+    assert_eq!(c_ollama.classify_url(), "http://localhost:11434/api/chat");
 
     // System-One port 8000
     let c_sysone = JevClassifier::new(
         JevConfig {
-            base_url: "http://nmo.purdlauski.net:8000".to_string(),
+            base_url: "http://localhost:8000".to_string(),
             ..Default::default()
         },
         rubric,
@@ -369,7 +366,7 @@ async fn test_jev_classifier_endpoint_kind_detection() {
     assert_eq!(c_sysone.endpoint_kind(), JevEndpointKind::SystemOne);
     assert_eq!(
         c_sysone.classify_url(),
-        "http://nmo.purdlauski.net:8000/v1/systemone"
+        "http://localhost:8000/v1/systemone"
     );
 }
 

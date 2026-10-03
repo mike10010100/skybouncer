@@ -991,46 +991,46 @@ fn test_adversarial_url_normalization_variants() {
     // Case 1: Plain host without trailing slash
     let c1 = JevClassifier::new(
         JevConfig {
-            base_url: "https://nmo.purdlauski.net".to_string(),
+            base_url: "https://api.jev.ai".to_string(),
             ..Default::default()
         },
         rubric.clone(),
     )
     .unwrap();
-    assert_eq!(c1.classify_url(), "https://nmo.purdlauski.net/v1/classify");
+    assert_eq!(c1.classify_url(), "https://api.jev.ai/v1/classify");
 
     // Case 2: Host with trailing slash
     let c2 = JevClassifier::new(
         JevConfig {
-            base_url: "https://nmo.purdlauski.net/".to_string(),
+            base_url: "https://api.jev.ai/".to_string(),
             ..Default::default()
         },
         rubric.clone(),
     )
     .unwrap();
-    assert_eq!(c2.classify_url(), "https://nmo.purdlauski.net/v1/classify");
+    assert_eq!(c2.classify_url(), "https://api.jev.ai/v1/classify");
 
     // Case 3: Already has /v1
     let c3 = JevClassifier::new(
         JevConfig {
-            base_url: "https://nmo.purdlauski.net/v1".to_string(),
+            base_url: "https://api.jev.ai/v1".to_string(),
             ..Default::default()
         },
         rubric.clone(),
     )
     .unwrap();
-    assert_eq!(c3.classify_url(), "https://nmo.purdlauski.net/v1/classify");
+    assert_eq!(c3.classify_url(), "https://api.jev.ai/v1/classify");
 
     // Case 4: Already has /v1/classify
     let c4 = JevClassifier::new(
         JevConfig {
-            base_url: "https://nmo.purdlauski.net/v1/classify/".to_string(),
+            base_url: "https://api.jev.ai/v1/classify/".to_string(),
             ..Default::default()
         },
         rubric.clone(),
     )
     .unwrap();
-    assert_eq!(c4.classify_url(), "https://nmo.purdlauski.net/v1/classify");
+    assert_eq!(c4.classify_url(), "https://api.jev.ai/v1/classify");
 
     // Case 5: Custom prefix
     let c5 = JevClassifier::new(

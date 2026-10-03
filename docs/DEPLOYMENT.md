@@ -187,7 +187,7 @@ sudo systemctl reload nginx
 | `PDS_PASSWORD` | — | App password generated in Bluesky Settings -> App Passwords. |
 | `MODERATION_RULES` | — | Natural-language moderation instructions evaluated by the classifier. |
 | `SENSITIVITY` | `medium` | Confidence threshold: `low` ($\ge 0.90$), `medium` ($\ge 0.75$), `high` ($\ge 0.60$). |
-| `JEV_API_BASE_URL` | `https://nmo.purdlauski.net` | Primary Decision Gateway / Jev classification endpoint. |
+| `JEV_API_BASE_URL` | `https://api.jev.ai` | Primary Decision Gateway / Jev classification endpoint. |
 | `JEV_MODEL` | `nimble` | Primary classifier model name. |
 | `FALLBACK_JEV_API_BASE_URL` | — | Optional secondary multimodal fallback endpoint (e.g. Ollama chat). |
 | `FALLBACK_JEV_MODEL` | — | Multimodal fallback model (e.g. `gemma4:12b`, `llava`). |
