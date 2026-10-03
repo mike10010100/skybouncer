@@ -1,0 +1,42 @@
+[Unit]
+Description=Skybouncer Sovereign Auto-Moderation & Bouncer Service for ATProto
+Documentation=https://github.com/mike10010100/skybouncer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=skybouncer
+Group=skybouncer
+WorkingDirectory=/var/lib/skybouncer
+ExecStart=/usr/local/bin/skybouncer
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+
+# Environment configuration
+EnvironmentFile=-/etc/skybouncer/skybouncer.env
+Environment=SKYBOUNCER_DATABASE_PATH=/var/lib/skybouncer/skybouncer.db
+Environment=HOST=127.0.0.1
+Environment=PORT=3000
+
+# File descriptor ceiling for high-concurrency Jetstream WebSocket streaming
+LimitNOFILE=65536
+
+# Security & Sandbox Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+ReadWritePaths=/var/lib/skybouncer
+
+[Install]
+WantedBy=multi-user.target

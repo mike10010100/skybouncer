@@ -64,35 +64,36 @@ Incoming Jetstream (app.bsky.feed.post)
 
 ---
 
-## 🐳 Deployment & Containerization
+## 🐳 Deployment & Operations
 
-### Running with Docker Compose
+For complete production deployment instructions, system hardening, and operational runbooks, see the [**Production Deployment & Operations Guide**](docs/DEPLOYMENT.md).
 
-1. Copy `.env.example` to `.env` and configure your protected DIDs, PDS credentials, and Jev API keys:
+### Quickstart with Docker Compose
+
+1. Copy `.env.example` to `.env` and configure your credentials:
    ```bash
    cp .env.example .env
    ```
 
-2. Build and start the service with persistent SQLite storage:
+2. Launch Skybouncer with persistent SQLite storage:
    ```bash
    docker compose up --build -d
    ```
+   *(To run with a self-contained local Ollama vision model, use: `docker compose --profile local-ai up -d`)*
 
 3. View live logs and telemetry:
    ```bash
    docker compose logs -f skybouncer
    ```
 
-4. Access the embedded sovereign dashboard in your browser:
-   ```
-   http://localhost:3000
-   ```
+4. Access the embedded sovereign dashboard: `<http://localhost:3000>`
 
-### Building Standalone Docker Image
+### Bare Metal / VPS Deployment with Systemd
 
-From the workspace root (`atproto-experiments/`):
+For Linux servers, an automated idempotent installer with strict process sandboxing is provided:
 ```bash
-docker build -f skybouncer/Dockerfile -t skybouncer:latest .
+cargo build --release --bin skybouncer
+sudo ./deploy/systemd/install.sh
 ```
 
 ---

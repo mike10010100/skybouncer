@@ -41,7 +41,39 @@ services:
           memory: ${MEM_LIMIT:-2048M}
         reservations:
           memory: 256M
+    networks:
+      - skybouncer_net
+
+  # ----------------------------------------------------------------------------
+  # Optional Local AI Engine: Ollama with Multimodal Vision (Gemma 4:12B, LLaVA)
+  # Activated via: docker compose --profile local-ai up -d
+  # ----------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: skybouncer-ollama
+    profiles:
+      - local-ai
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT_BIND:-11434}:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - skybouncer_net
+    deploy:
+      resources:
+        limits:
+          memory: ${OLLAMA_MEM_LIMIT:-16384M}
+        reservations:
+          memory: 4096M
 
 volumes:
   skybouncer_data:
     name: skybouncer_data
+  ollama_models:
+    name: skybouncer_ollama_models
+
+networks:
+  skybouncer_net:
+    name: skybouncer_net
+    driver: bridge
