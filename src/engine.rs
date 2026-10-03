@@ -39,6 +39,7 @@ use crate::matcher::{
     TargetMatcher,
 };
 use crate::modlist::{BouncedUser, DeduplicationCache, ModListManager, DEFAULT_MOD_LIST_NAME};
+use crate::tenant::{Tenant, TenantRegistry};
 
 /// Default capacity for the engine's internal commit event processing channel.
 pub const DEFAULT_ENGINE_CHANNEL_CAPACITY: usize = 1024;
@@ -825,6 +826,7 @@ pub struct SkybouncerEngine {
     classifier: Arc<dyn Classifier>,
     modlist_manager: Arc<ModListManager>,
     cache: Arc<DeduplicationCache>,
+    tenant_registry: Arc<TenantRegistry>,
     pds_client: Arc<PdsRepoClient>,
     rate_limiter: Arc<EvaluationRateLimiter>,
     enricher: Arc<dyn ContextEnricher>,
@@ -851,6 +853,11 @@ impl SkybouncerEngine {
         pds_client: Arc<PdsRepoClient>,
     ) -> Self {
         let cache = Arc::clone(modlist_manager.cache());
+        let tenant_registry = Arc::new(
+            TenantRegistry::from_connection(cache.connection())
+                .or_else(|_| TenantRegistry::open_in_memory())
+                .unwrap_or_else(|_| TenantRegistry::fallback()),
+        );
         let heuristic_classifier = if config.enable_heuristic_prefilter {
             HeuristicClassifier::default()
         } else {
@@ -861,7 +868,13 @@ impl SkybouncerEngine {
         } else {
             modlist_manager
         };
-        let protected_dids = Arc::new(RwLock::new(config.protected_dids.clone()));
+        let mut protected = config.protected_dids.clone();
+        if let Ok(active) = tenant_registry.list_active() {
+            for t in active {
+                protected.insert(t.did);
+            }
+        }
+        let protected_dids = Arc::new(RwLock::new(protected));
         let rubric = Arc::new(RwLock::new(config.rubric.clone()));
         let rate_limiter = Arc::new(EvaluationRateLimiter::new(
             config.rate_limiter_config.clone(),
@@ -881,6 +894,7 @@ impl SkybouncerEngine {
             classifier,
             modlist_manager,
             cache,
+            tenant_registry,
             pds_client,
             rate_limiter,
             enricher,
@@ -1094,11 +1108,11 @@ impl SkybouncerEngine {
         }
 
         // Tier 3.5: Moderation Pause Check
-        if self.is_paused() {
+        if self.is_tenant_paused(&target_did) {
             debug!(
                 author = %author_did,
                 target = %target_did,
-                "Engine is paused; bypassing interaction evaluation"
+                "Engine or tenant is paused; bypassing interaction evaluation"
             );
             return Ok(InteractionOutcome::Paused {
                 author_did,
@@ -1238,11 +1252,11 @@ impl SkybouncerEngine {
         }
 
         // Tier 3.5: Moderation Pause Check
-        if self.is_paused() {
+        if self.is_tenant_paused(&target_did) {
             debug!(
                 author = %author_did,
                 target = %target_did,
-                "Engine is paused; bypassing interaction evaluation"
+                "Engine or tenant is paused; bypassing interaction evaluation"
             );
             return Ok(InteractionOutcome::Paused {
                 author_did,
@@ -1318,7 +1332,20 @@ impl SkybouncerEngine {
         interaction: Interaction,
     ) -> Result<InteractionOutcome, SkybouncerError> {
         let author_did = interaction.author_did.clone();
+        let target_did = interaction.target_did.clone();
         let post_uri = interaction.post_uri.clone();
+
+        if self.is_tenant_paused(&target_did) {
+            debug!(
+                author = %author_did,
+                target = %target_did,
+                "Engine or tenant is paused; bypassing queued evaluation"
+            );
+            return Ok(InteractionOutcome::Paused {
+                author_did,
+                target_did,
+            });
+        }
 
         // Double check dedup cache before making expensive model call,
         // in case a prior candidate from the same author already resulted in a bounce while this was queued!
@@ -1400,7 +1427,7 @@ impl SkybouncerEngine {
                 confidence,
                 reason,
             } => {
-                let rubric = self.rubric();
+                let rubric = self.rubric_for(&target_did);
                 let threshold = rubric.sensitivity.threshold();
                 if !rubric.meets_threshold(&category, confidence) {
                     self.stats
@@ -1422,10 +1449,11 @@ impl SkybouncerEngine {
                 }
 
                 // Actionable violation: bounce on sovereign PDS
+                let pds_client = self.pds_client_for(&target_did);
                 let bounce_result = self
                     .modlist_manager
                     .bounce_user(
-                        &self.pds_client,
+                        &pds_client,
                         &target_did,
                         &author_did,
                         &category,
@@ -1566,8 +1594,9 @@ impl SkybouncerEngine {
         protected_did: &str,
         subject_did: &str,
     ) -> Result<bool, SkybouncerError> {
+        let pds_client = self.pds_client_for(protected_did);
         self.modlist_manager
-            .pardon_user(&self.pds_client, protected_did, subject_did)
+            .pardon_user(&pds_client, protected_did, subject_did)
             .await
     }
 
@@ -1576,8 +1605,9 @@ impl SkybouncerEngine {
     /// # Errors
     /// Returns [`SkybouncerError`] if list provisioning fails.
     pub async fn ensure_mod_list(&self, protected_did: &str) -> Result<String, SkybouncerError> {
+        let pds_client = self.pds_client_for(protected_did);
         self.modlist_manager
-            .ensure_mod_list(&self.pds_client, protected_did)
+            .ensure_mod_list(&pds_client, protected_did)
             .await
     }
 
@@ -1697,6 +1727,61 @@ impl SkybouncerEngine {
         &self.enricher
     }
 
+    /// Returns a reference to the multi-tenant registry.
+    #[must_use]
+    pub fn tenant_registry(&self) -> &Arc<TenantRegistry> {
+        &self.tenant_registry
+    }
+
+    /// Enrolls or updates an active tenant in the registry and active watch set.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if tenant registration fails.
+    pub fn enroll_tenant(&self, tenant: Tenant) -> Result<(), SkybouncerError> {
+        let did = tenant.did.clone();
+        self.tenant_registry.register_or_update(&tenant)?;
+        self.add_protected_did(did);
+        Ok(())
+    }
+
+    /// Checks whether a DID is an enrolled tenant in the registry.
+    #[must_use]
+    pub fn is_enrolled(&self, did: &str) -> bool {
+        self.tenant_registry.is_enrolled(did).unwrap_or(false)
+    }
+
+    /// Checks whether a tenant is paused (or the entire engine is paused).
+    #[must_use]
+    pub fn is_tenant_paused(&self, did: &str) -> bool {
+        if self.is_paused() {
+            return true;
+        }
+        match self.tenant_registry.get(did) {
+            Ok(Some(tenant)) => !tenant.is_active,
+            _ => false,
+        }
+    }
+
+    /// Retrieves the moderation rubric for a specific protected user, falling back to engine default rubric.
+    #[must_use]
+    pub fn rubric_for(&self, did: &str) -> RuleRubric {
+        if let Ok(Some(tenant)) = self.tenant_registry.get(did) {
+            if let Some(rubric) = tenant.rubric {
+                return rubric;
+            }
+        }
+        self.rubric()
+    }
+
+    /// Retrieves the [`PdsRepoClient`] for a specific protected user, falling back to default engine client.
+    #[must_use]
+    pub fn pds_client_for(&self, did: &str) -> Arc<PdsRepoClient> {
+        if let Ok(Some(client)) = self.tenant_registry.get_pds_client(did, None) {
+            return client;
+        }
+        Arc::clone(&self.pds_client)
+    }
+
     /// Synchronizes sovereign moderation rules from the protected user's PDS repository.
     ///
     /// Reads `social.skybouncer.config` or list metadata description on the user's PDS.
@@ -1707,9 +1792,12 @@ impl SkybouncerEngine {
         &self,
         protected_did: &str,
     ) -> Result<Option<RuleRubric>, SkybouncerError> {
-        let pds_rubric =
-            crate::modlist::fetch_sovereign_config(&self.pds_client, protected_did).await?;
+        let pds_client = self.pds_client_for(protected_did);
+        let pds_rubric = crate::modlist::fetch_sovereign_config(&pds_client, protected_did).await?;
         if let Some(ref rubric) = pds_rubric {
+            if self.is_enrolled(protected_did) {
+                let _ = self.tenant_registry.update_rubric(protected_did, rubric);
+            }
             self.set_rubric(rubric.clone());
             info!(
                 did = %protected_did,
@@ -1728,8 +1816,9 @@ impl SkybouncerEngine {
         &self,
         protected_did: &str,
     ) -> Result<String, SkybouncerError> {
-        let rubric = self.rubric();
-        crate::modlist::publish_sovereign_config(&self.pds_client, protected_did, &rubric).await
+        let rubric = self.rubric_for(protected_did);
+        let pds_client = self.pds_client_for(protected_did);
+        crate::modlist::publish_sovereign_config(&pds_client, protected_did, &rubric).await
     }
 
     /// Handles a commit event on `social.skybouncer.config` for a protected user.
@@ -1742,6 +1831,9 @@ impl SkybouncerEngine {
                     ) {
                         Ok(config_record) => {
                             let rubric = config_record.to_rubric();
+                            if self.is_enrolled(&commit.did) {
+                                let _ = self.tenant_registry.update_rubric(&commit.did, &rubric);
+                            }
                             self.set_rubric(rubric.clone());
                             self.stats
                                 .sovereign_configs_synced
@@ -1803,6 +1895,9 @@ impl SkybouncerEngine {
         if let Some(ref record_val) = commit.record {
             if let Some(desc) = record_val.get("description").and_then(|d| d.as_str()) {
                 if let Some(rubric) = crate::modlist::extract_rubric_from_list_description(desc) {
+                    if self.is_enrolled(&commit.did) {
+                        let _ = self.tenant_registry.update_rubric(&commit.did, &rubric);
+                    }
                     self.set_rubric(rubric.clone());
                     self.stats
                         .sovereign_configs_synced
@@ -2032,6 +2127,7 @@ pub struct SkybouncerEngineBuilder {
     modlist_manager: Option<Arc<ModListManager>>,
     cache: Option<Arc<DeduplicationCache>>,
     pds_client: Option<Arc<PdsRepoClient>>,
+    tenant_registry: Option<Arc<TenantRegistry>>,
     rate_limiter: Option<Arc<EvaluationRateLimiter>>,
     enricher: Option<Arc<dyn ContextEnricher>>,
 }
@@ -2050,9 +2146,17 @@ impl SkybouncerEngineBuilder {
             modlist_manager: None,
             cache: None,
             pds_client: None,
+            tenant_registry: None,
             rate_limiter: None,
             enricher: None,
         }
+    }
+
+    /// Configures an explicit shared tenant registry.
+    #[must_use]
+    pub fn with_tenant_registry(mut self, registry: Arc<TenantRegistry>) -> Self {
+        self.tenant_registry = Some(registry);
+        self
     }
 
     /// Configures an explicit shared follow graph.
@@ -2276,31 +2380,52 @@ impl SkybouncerEngineBuilder {
                             |e| SkybouncerError::Config(format!("Failed to build PDS client: {e}")),
                         )?,
                     )
-                } else {
-                    let endpoint = self.config.pds_endpoint.as_ref().ok_or_else(|| {
-                        SkybouncerError::Config(
-                            "PDS endpoint is required to build SkybouncerEngine".to_string(),
-                        )
-                    })?;
-                    let token = self.config.pds_access_token.as_ref().ok_or_else(|| {
-                        SkybouncerError::Config(
-                            "PDS access token is required to build SkybouncerEngine".to_string(),
-                        )
-                    })?;
-                    let primary_did =
-                        self.config.protected_dids.iter().next().ok_or_else(|| {
-                            SkybouncerError::Config(
-                                "At least one protected DID is required to initialize PDS client"
-                                    .to_string(),
-                            )
-                        })?;
+                } else if self.config.pds_endpoint.is_some()
+                    && self.config.pds_access_token.is_some()
+                {
+                    let endpoint = self
+                        .config
+                        .pds_endpoint
+                        .as_deref()
+                        .unwrap_or("https://bsky.social");
+                    let token = self.config.pds_access_token.as_deref().unwrap_or("");
+                    let primary_did = self
+                        .config
+                        .protected_dids
+                        .iter()
+                        .next()
+                        .map(String::as_str)
+                        .unwrap_or("did:plc:skybouncer_admin");
                     Arc::new(
                         PdsRepoClient::from_credentials(endpoint, primary_did, token).map_err(
                             |e| SkybouncerError::Config(format!("Failed to build PDS client: {e}")),
                         )?,
                     )
+                } else {
+                    Arc::new(
+                        PdsRepoClient::from_credentials(
+                            "https://bsky.social",
+                            "did:plc:skybouncer_multi_tenant",
+                            "multi_tenant_placeholder_token",
+                        )
+                        .map_err(|e| {
+                            SkybouncerError::Config(format!(
+                                "Failed to build fallback PDS client: {e}"
+                            ))
+                        })?,
+                    )
                 }
             }
+        };
+
+        // 7. Initialize TenantRegistry
+        let tenant_registry = match self.tenant_registry {
+            Some(tr) => tr,
+            None => Arc::new(
+                TenantRegistry::from_connection(cache.connection())
+                    .or_else(|_| TenantRegistry::open_in_memory())
+                    .unwrap_or_else(|_| TenantRegistry::fallback()),
+            ),
         };
 
         let rate_limiter = self.rate_limiter.unwrap_or_else(|| {
@@ -2312,7 +2437,13 @@ impl SkybouncerEngineBuilder {
             .enricher
             .unwrap_or_else(|| Arc::new(NoopContextEnricher));
 
-        let protected_dids = Arc::new(RwLock::new(self.config.protected_dids.clone()));
+        let mut protected = self.config.protected_dids.clone();
+        if let Ok(active) = tenant_registry.list_active() {
+            for t in active {
+                protected.insert(t.did);
+            }
+        }
+        let protected_dids = Arc::new(RwLock::new(protected));
         let rubric = Arc::new(RwLock::new(self.config.rubric.clone()));
         let stats = Arc::new(EngineStats::default());
         let paused = Arc::new(AtomicBool::new(false));
@@ -2328,6 +2459,7 @@ impl SkybouncerEngineBuilder {
             classifier,
             modlist_manager,
             cache,
+            tenant_registry,
             pds_client,
             rate_limiter,
             enricher,

@@ -55,6 +55,8 @@ services:
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: skybouncer-cloudflared
+    profiles:
+      - tunnel
     restart: unless-stopped
     command: tunnel --config /etc/cloudflared/config.yml run
     volumes:

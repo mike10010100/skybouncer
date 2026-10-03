@@ -108,6 +108,12 @@ impl DeduplicationCache {
         })
     }
 
+    /// Returns a shared reference to the underlying SQLite connection mutex.
+    #[must_use]
+    pub fn connection(&self) -> Arc<Mutex<Connection>> {
+        Arc::clone(&self.conn)
+    }
+
     fn apply_pragmas(conn: &Connection, busy_timeout_ms: u32) -> Result<(), SkybouncerError> {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| {

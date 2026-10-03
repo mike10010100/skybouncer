@@ -22,16 +22,34 @@ use crate::matcher::Interaction;
 pub struct BotCommandHandler {
     engine: Arc<SkybouncerEngine>,
     bot_did: String,
+    public_url: String,
 }
 
 impl BotCommandHandler {
     /// Creates a new [`BotCommandHandler`] bound to an engine instance and bot DID.
     #[must_use]
     pub fn new(engine: Arc<SkybouncerEngine>, bot_did: impl Into<String>) -> Self {
+        let public_url = std::env::var("PUBLIC_URL")
+            .or_else(|_| std::env::var("SKYBOUNCER_PUBLIC_URL"))
+            .unwrap_or_else(|_| "https://skybouncer.mike10010100.com".to_string());
         Self {
             engine,
             bot_did: bot_did.into(),
+            public_url,
         }
+    }
+
+    /// Sets the public base URL for onboarding authorization links.
+    #[must_use]
+    pub fn with_public_url(mut self, url: impl Into<String>) -> Self {
+        self.public_url = url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Returns the resolved 1-click authorization URL for account onboarding.
+    #[must_use]
+    pub fn auth_url(&self) -> String {
+        format!("{}/auth", self.public_url.trim_end_matches('/'))
     }
 
     /// Returns the bot's own DID.
@@ -58,16 +76,30 @@ impl BotCommandHandler {
             return Ok(self.cmd_help());
         }
 
+        let is_onboard_cmd = trimmed.eq_ignore_ascii_case("start")
+            || trimmed.eq_ignore_ascii_case("onboard")
+            || trimmed.eq_ignore_ascii_case("activate")
+            || trimmed.eq_ignore_ascii_case("auth")
+            || trimmed.eq_ignore_ascii_case("login")
+            || trimmed.eq_ignore_ascii_case("join")
+            || trimmed.eq_ignore_ascii_case("hi")
+            || trimmed.eq_ignore_ascii_case("hello")
+            || trimmed.eq_ignore_ascii_case("hey");
+
+        if is_onboard_cmd {
+            return Ok(self.cmd_onboarding(sender_did));
+        }
+
         if trimmed.eq_ignore_ascii_case("pause") {
-            return Ok(self.cmd_pause());
+            return Ok(self.cmd_pause(sender_did));
         }
 
         if trimmed.eq_ignore_ascii_case("resume") {
-            return Ok(self.cmd_resume());
+            return Ok(self.cmd_resume(sender_did));
         }
 
         if trimmed.eq_ignore_ascii_case("rules") {
-            return Ok(self.cmd_rules());
+            return Ok(self.cmd_rules(sender_did));
         }
 
         if trimmed.eq_ignore_ascii_case("set rules") {
@@ -99,7 +131,7 @@ impl BotCommandHandler {
         }
 
         if trimmed.eq_ignore_ascii_case("status") {
-            return Ok(self.cmd_status());
+            return Ok(self.cmd_status(sender_did));
         }
 
         if trimmed.eq_ignore_ascii_case("test") {
@@ -110,43 +142,58 @@ impl BotCommandHandler {
             return self.cmd_test(sender_did, sample.trim()).await;
         }
 
-        Ok(format!(
-            "Unknown command: `{trimmed}`\n\nType `help` to see available commands."
-        ))
+        let unknown_msg =
+            format!("Unknown command: `{trimmed}`\n\nType `help` to see available commands.");
+        if !self.engine.is_enrolled(sender_did) && !self.engine.is_protected(sender_did) {
+            Ok(format!("{unknown_msg}\n\n(Tip: Your account is not yet protected. Visit {} to activate 1-click protection.)", self.auth_url()))
+        } else {
+            Ok(unknown_msg)
+        }
     }
 
     fn cmd_help(&self) -> String {
-        "🛡️ Skybouncer Bot Commands:\n\n\
-         • `rules` — View your active moderation prompt & sensitivity\n\
-         • `set rules <prompt>` — Update your moderation prompt\n\
-         • `sensitivity <low|medium|high>` — Adjust detection sensitivity\n\
-         • `pause` — Temporarily suspend automated moderation\n\
-         • `resume` — Reactivate automated moderation\n\
-         • `recent` — List the 5 most recently bounced accounts\n\
-         • `pardon <did|@handle>` — Remove an account from your moderation list\n\
-         • `status` — View engine telemetry & total bounces\n\
-         • `test <text>` — Dry-run evaluation on sample text\n\
-         • `help` — Show this help message"
-            .to_string()
+        format!(
+            "🛡️ Skybouncer Bot Commands:\n\n\
+             • `rules` — View your active moderation prompt & sensitivity\n\
+             • `set rules <prompt>` — Update your moderation prompt\n\
+             • `sensitivity <low|medium|high>` — Adjust detection sensitivity\n\
+             • `pause` — Temporarily suspend automated moderation\n\
+             • `resume` — Reactivate automated moderation\n\
+             • `recent` — List the 5 most recently bounced accounts\n\
+             • `pardon <did|@handle>` — Remove an account from your moderation list\n\
+             • `status` — View engine telemetry & total bounces\n\
+             • `test <text>` — Dry-run evaluation on sample text\n\
+             • `start` / `auth` — 1-click link to activate Skybouncer ({})\n\
+             • `help` — Show this help message",
+            self.auth_url()
+        )
     }
 
-    fn cmd_pause(&self) -> String {
-        let _ = self.engine.pause();
+    fn cmd_pause(&self, sender_did: &str) -> String {
+        if self.engine.is_enrolled(sender_did) {
+            let _ = self.engine.tenant_registry().set_active(sender_did, false);
+        } else {
+            let _ = self.engine.pause();
+        }
         "⏸️ Skybouncer has been **paused**.\n\n\
          Automated moderation evaluations and PDS list mutations are temporarily suspended.\n\
          Send `resume` when you are ready to reactivate protection."
             .to_string()
     }
 
-    fn cmd_resume(&self) -> String {
-        let _ = self.engine.resume();
+    fn cmd_resume(&self, sender_did: &str) -> String {
+        if self.engine.is_enrolled(sender_did) {
+            let _ = self.engine.tenant_registry().set_active(sender_did, true);
+        } else {
+            let _ = self.engine.resume();
+        }
         "▶️ Skybouncer has been **resumed**.\n\n\
          Automated moderation evaluations and protection are now active."
             .to_string()
     }
 
-    fn cmd_rules(&self) -> String {
-        let rubric = self.engine.rubric();
+    fn cmd_rules(&self, sender_did: &str) -> String {
+        let rubric = self.engine.rubric_for(sender_did);
         format!(
             "📋 Current Moderation Rubric:\n\n\
              Prompt: \"{}\"\n\
@@ -164,7 +211,14 @@ impl BotCommandHandler {
         }
 
         let parsed = RuleRubric::parse(prompt)?;
-        self.engine.set_rubric(parsed.clone());
+        if self.engine.is_enrolled(sender_did) {
+            let _ = self
+                .engine
+                .tenant_registry()
+                .update_rubric(sender_did, &parsed);
+        } else {
+            self.engine.set_rubric(parsed.clone());
+        }
 
         // Asynchronously persist to sender's sovereign PDS repo
         let eng = self.engine.clone();
@@ -197,9 +251,16 @@ impl BotCommandHandler {
             }
         };
 
-        let mut rubric = self.engine.rubric();
+        let mut rubric = self.engine.rubric_for(sender_did);
         rubric.sensitivity = sens;
-        self.engine.set_rubric(rubric);
+        if self.engine.is_enrolled(sender_did) {
+            let _ = self
+                .engine
+                .tenant_registry()
+                .update_rubric(sender_did, &rubric);
+        } else {
+            self.engine.set_rubric(rubric);
+        }
 
         // Asynchronously persist to sender's sovereign PDS repo
         let eng = self.engine.clone();
@@ -288,9 +349,9 @@ impl BotCommandHandler {
         }
     }
 
-    fn cmd_status(&self) -> String {
+    fn cmd_status(&self, sender_did: &str) -> String {
         let stats = self.engine.stats().snapshot();
-        let state_label = if self.engine.is_paused() {
+        let state_label = if self.engine.is_tenant_paused(sender_did) {
             "⏸️ PAUSED"
         } else {
             "▶️ ACTIVE"
@@ -321,6 +382,21 @@ impl BotCommandHandler {
             stats.violations_detected,
             stats.bounces_executed,
             stats.permitted,
+        )
+    }
+
+    fn cmd_onboarding(&self, sender_did: &str) -> String {
+        let auth_url = self.auth_url();
+        format!(
+            "👋 Welcome to **Skybouncer** — your personal, sovereign automated bouncer for Bluesky!\n\n\
+             Skybouncer monitors your incoming replies and mentions in real-time, using AI and your custom natural-language rules to catch spam bots, crypto schemes, and bad-faith harassment, placing them on your personal moderation list.\n\n\
+             To activate 1-click protection for your account (`{sender_did}`), authorize Skybouncer here:\n\
+             🔗 {auth_url}\n\n\
+             Once authorized, your personal bouncer is live! You can message me anytime right here with:\n\
+             • `rules` — View or update your moderation prompt\n\
+             • `pause` / `resume` — Suspend or re-enable protection\n\
+             • `status` — View your protection status and stats\n\
+             • `help` — List all available commands"
         )
     }
 

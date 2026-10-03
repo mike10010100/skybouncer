@@ -28,8 +28,11 @@ pub mod limiter;
 pub mod matcher;
 pub mod modlist;
 pub mod stream;
+pub mod tenant;
 pub mod types;
 pub mod web;
+
+pub use tenant::{Tenant, TenantRegistry};
 
 pub use bot::{
     format_bounce_alert, run_bot_poller, run_bounce_alert_dispatcher, BotCommandHandler,

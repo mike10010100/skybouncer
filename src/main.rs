@@ -934,8 +934,10 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
     if let (Some(token), Some(did)) = (chat_token, bot_did) {
         match skybouncer::ChatClient::new(chat_endpoint, token) {
             Ok(chat_client) => {
+                let web_config = skybouncer::web::WebServerConfig::from_env();
                 let handler =
-                    skybouncer::BotCommandHandler::new(std::sync::Arc::new(engine.clone()), did);
+                    skybouncer::BotCommandHandler::new(std::sync::Arc::new(engine.clone()), did)
+                        .with_public_url(web_config.public_url);
                 let poller_client = chat_client.clone();
                 let cancel_bot = cancel.clone();
                 join_set.spawn(async move {

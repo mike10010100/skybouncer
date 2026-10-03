@@ -17,6 +17,9 @@ use skyauth::client::{AtprotoOAuthClient, OAuthClientMetadata};
 use skyauth::integrations::axum::{client_metadata_response, redirect_to_authorization};
 use skyauth::integrations::OAuthCallbackQuery;
 
+use crate::engine::SkybouncerEngine;
+use crate::tenant::Tenant;
+
 /// Shared state for OAuth route handlers.
 #[derive(Clone)]
 pub struct OAuthState {
@@ -24,6 +27,8 @@ pub struct OAuthState {
     pub oauth_client: Option<Arc<AtprotoOAuthClient>>,
     /// Client metadata document.
     pub metadata: OAuthClientMetadata,
+    /// Reference to moderation engine for multi-tenant enrollment.
+    pub engine: Option<Arc<SkybouncerEngine>>,
 }
 
 /// Query parameters for initiating OAuth login.
@@ -126,10 +131,27 @@ pub async fn oauth_callback(
 
     match client.handle_callback(&params).await {
         Ok(session) => {
-            info!(did = %session.sub, "OAuth authorization completed successfully");
+            let did = session.sub.clone();
+            info!(did = %did, "OAuth authorization completed successfully");
+
+            if let Some(ref engine) = state.engine {
+                let tenant = Tenant::new(did.clone()).with_session(session);
+                if let Err(e) = engine.enroll_tenant(tenant) {
+                    error!(error = %e, did = %did, "Failed to enroll tenant into registry");
+                } else {
+                    info!(did = %did, "Enrolled tenant into Skybouncer engine");
+                    let eng = Arc::clone(engine);
+                    let enroll_did = did.clone();
+                    tokio::spawn(async move {
+                        let _ = eng.ensure_mod_list(&enroll_did).await;
+                        let _ = eng.sync_sovereign_config(&enroll_did).await;
+                    });
+                }
+            }
+
             Ok(Redirect::to(&format!(
                 "/?auth=success&did={}",
-                urlencoding_simple(&session.sub)
+                urlencoding_simple(&did)
             )))
         }
         Err(e) => {
@@ -140,6 +162,22 @@ pub async fn oauth_callback(
             )))
         }
     }
+}
+
+/// Handler for `GET /auth` convenience onboarding route.
+///
+/// Redirects to `/oauth/login` with user handle if provided, or to the dashboard login page.
+pub async fn auth_redirect(Query(query): Query<LoginQuery>) -> Redirect {
+    if let Some(ref handle) = query.handle {
+        let trimmed = handle.trim();
+        if !trimmed.is_empty() {
+            return Redirect::to(&format!(
+                "/oauth/login?handle={}",
+                urlencoding_simple(trimmed)
+            ));
+        }
+    }
+    Redirect::to("/?auth=login")
 }
 
 /// Simple URL encoder for error and success redirect query parameters.

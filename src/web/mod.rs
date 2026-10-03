@@ -163,6 +163,7 @@ pub fn create_web_router(
     let oauth_state = OAuthState {
         oauth_client,
         metadata,
+        engine: Some(Arc::clone(&engine)),
     };
 
     let api_router = Router::new()
@@ -178,11 +179,16 @@ pub fn create_web_router(
         .route("/client-metadata.json", get(oauth::get_client_metadata))
         .route("/login", get(oauth::oauth_login))
         .route("/callback", get(oauth::oauth_callback))
-        .with_state(oauth_state);
+        .with_state(oauth_state.clone());
 
     Router::new()
         .route("/", get(ui::serve_dashboard))
+        .route("/auth", get(oauth::auth_redirect))
         .route("/healthz", get(api::health_check))
+        .route(
+            "/client-metadata.json",
+            get(oauth::get_client_metadata).with_state(oauth_state),
+        )
         .nest("/api", api_router)
         .nest("/oauth", oauth_router)
         .layer(CorsLayer::permissive())
