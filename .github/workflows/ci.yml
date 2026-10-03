@@ -1,4 +1,4 @@
-name: CI
+name: CI & Release
 
 on:
   push:
@@ -8,6 +8,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   quality-gate:
@@ -65,3 +73,118 @@ jobs:
       - name: 4. Dependency Governance & Advisory Scan (cargo-deny)
         working-directory: skybouncer
         run: cargo deny check
+
+  publish:
+    name: Auto-Publish to Crates.io & Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [quality-gate]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    permissions:
+      contents: write
+      checks: read
+    steps:
+      - name: Checkout skybouncer
+        uses: actions/checkout@v4
+        with:
+          path: skybouncer
+          persist-credentials: false
+
+      - name: Checkout sibling dependency (skybase)
+        uses: actions/checkout@v4
+        with:
+          repository: mike10010100/skybase
+          path: skybase
+
+      - name: Checkout sibling dependency (skyauth)
+        uses: actions/checkout@v4
+        with:
+          repository: mike10010100/skyauth
+          path: skyauth
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Extract Current Version & Name
+        id: pkg_info
+        working-directory: skybouncer
+        run: |
+          VERSION=$(grep -m1 '^[[:space:]]*version[[:space:]]*=' Cargo.toml | awk -F'"' '{print $2}')
+          NAME=$(grep -m1 '^[[:space:]]*name[[:space:]]*=' Cargo.toml | awk -F'"' '{print $2}')
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "name=${NAME}" >> $GITHUB_OUTPUT
+          echo "Detected package: ${NAME} v${VERSION}"
+
+      - name: Check if Version Already Published on Crates.io
+        id: check_published
+        run: |
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: ${{ steps.pkg_info.outputs.name }}-release-check" "https://crates.io/api/v1/crates/${{ steps.pkg_info.outputs.name }}/${{ steps.pkg_info.outputs.version }}" || echo "000")
+          if [ "$HTTP_STATUS" -eq 200 ]; then
+            echo "published=true" >> $GITHUB_OUTPUT
+            echo "Version ${{ steps.pkg_info.outputs.version }} is already published on crates.io."
+          else
+            echo "published=false" >> $GITHUB_OUTPUT
+            echo "Version ${{ steps.pkg_info.outputs.version }} is NOT published on crates.io yet."
+          fi
+
+      - name: Wait for Sibling Dependencies in Crates.io Index
+        if: steps.check_published.outputs.published == 'false'
+        run: |
+          echo "Checking if skybase dependency is available on crates.io..."
+          max_attempts=30
+          attempt=1
+          until [ $attempt -gt $max_attempts ]; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: skybouncer-dep-check" "https://crates.io/api/v1/crates/skybase/0.1.0" || echo "000")
+            if [ "$STATUS" -eq 200 ]; then
+              echo "skybase 0.1.0 is confirmed published on crates.io!"
+              break
+            fi
+            echo "Attempt $attempt/$max_attempts: skybase 0.1.0 not yet visible on crates.io (HTTP $STATUS). Waiting 15s..."
+            sleep 15
+            attempt=$((attempt + 1))
+          done
+          if [ $attempt -gt $max_attempts ]; then
+            echo "::error::Timed out waiting for dependency 'skybase' 0.1.0 on crates.io."
+            exit 1
+          fi
+
+      - name: Validate package before publish
+        if: steps.check_published.outputs.published == 'false'
+        working-directory: skybouncer
+        run: cargo publish --dry-run --allow-dirty
+
+      - name: Publish to Crates.io
+        if: steps.check_published.outputs.published == 'false'
+        working-directory: skybouncer
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN secret is not configured; cannot publish"
+            exit 1
+          fi
+          echo "Publishing ${{ steps.pkg_info.outputs.name }} v${{ steps.pkg_info.outputs.version }} to crates.io..."
+          cargo publish --allow-dirty --token "${CARGO_REGISTRY_TOKEN}"
+
+      - name: Create or Update GitHub Release Tag
+        if: steps.check_published.outputs.published == 'false'
+        working-directory: skybouncer
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: "v${{ steps.pkg_info.outputs.version }}"
+        run: |
+          if ! gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            echo "Creating GitHub Release ${TAG_NAME}..."
+            if [ -f CHANGELOG.md ]; then
+              gh release create "${TAG_NAME}" \
+                --target "${GITHUB_SHA}" \
+                --title "${TAG_NAME} - Production Release" \
+                --notes-file CHANGELOG.md
+            else
+              gh release create "${TAG_NAME}" \
+                --target "${GITHUB_SHA}" \
+                --title "${TAG_NAME} - Production Release" \
+                --generate-notes
+            fi
+          else
+            echo "GitHub Release ${TAG_NAME} already exists."
+          fi
