@@ -9,12 +9,12 @@
 
 | Dimension | Specification |
 | :--- | :--- |
-| **Product** | `skybouncer`: A sovereign, rule-driven automated moderation service and bouncer for Bluesky and the AT Protocol (ATProto). |
+| **Product** | `skybouncer`: A hosted, multi-tenant sovereign auto-moderation service and public bouncer for Bluesky and the AT Protocol (ATProto). |
 | **The Core Problem** | Social spam, bad-faith sea-lioning, crypto airdrop bots, and targeted harassment degrade conversations on Bluesky. Existing solutions require tedious manual muting/blocking, crude static keyword filters, or blanket third-party blocklists that lack personal nuance and context. |
-| **The Solution** | `skybouncer` allows users to define natural-language moderation rules (e.g., *"Block crypto scam bots, harassment, and aggressive sea-lioning"*). An interaction watcher monitors incoming mentions, replies, and quotes directed at protected users via the Jetstream firehose, evaluates interactions using low-latency System-1 classifiers (**Jev** / lightweight LLMs), and automatically appends offending accounts to an ATProto Moderation List (`app.bsky.graph.listitem`). The user subscribes to their own list, natively muting or blocking violators across the entire Bluesky network. |
-| **Dual UX Topologies** | **1. DM Bot Interface (`chat.bsky.convo.*`)**: Website-free interaction. Users direct-message `@skybouncer.bsky.social` to configure rules, view recent actions, or toggle aggressive vs. permissive modes.<br/>**2. Sovereign Web Dashboard (`skyauth`)**: Web UI powered by ATProto OAuth 2.0 with PKCE and DPoP cryptographic proofs, featuring a live rule playground and audit stream. |
-| **The Stateless Invariant** | Moderation rules and lists can be published directly to the user's sovereign repository on their PDS (e.g., as custom ATProto records or encoded list metadata). The service can operate in a **completely stateless, zero-custody mode**—holding zero user databases or persistent credentials. |
-| **Underlying Engine** | Built in 100% Safe Rust (`#![forbid(unsafe_code)]`), powered directly by sibling workspace crates [`skybase`] (Jetstream ingestion, SQLite caching, DPoP PDS write client) and [`skyauth`] (OAuth 2.0 PKCE + DPoP session lifecycle). |
+| **The Solution** | `skybouncer` allows any Bluesky user to define personalized, natural-language moderation rules (e.g., *"Block crypto scam bots, harassment, and aggressive sea-lioning"*). An interaction watcher monitors incoming mentions, replies, and quotes directed at enrolled users via the Jetstream firehose, evaluates interactions using low-latency System-1 classifiers (**Jev** / lightweight LLMs), and automatically appends offending accounts to each user's sovereign ATProto Moderation List (`app.bsky.graph.listitem`). The user subscribes to their own list, natively muting or blocking violators across the entire Bluesky network. |
+| **Dual UX Topologies** | **1. Public DM Bot Interface (`chat.bsky.convo.*`)**: Conversational onboarding and self-service management for anyone on Bluesky. Unenrolled users receive a friendly greeting and 1-click authorization link; enrolled users configure rules, view recent actions, or adjust sensitivity.<br/>**2. Sovereign Web Portal (`skyauth`)**: Web UI powered by ATProto OAuth 2.0 with PKCE and DPoP cryptographic proofs, featuring multi-tenant onboarding, live rule playground, and audit stream. |
+| **The Sovereign Multi-Tenant Model** | Moderation rules and lists are published directly to each user's sovereign repository on their PDS (e.g., as custom ATProto records or encoded list metadata). The service operates in a **sovereign, multi-tenant mode**—storing only encrypted OAuth DPoP sessions and caching interaction evaluations, with zero platform lock-in. |
+| **Underlying Engine & Release** | Published on crates.io (`skybouncer v0.1.0`), built in 100% Safe Rust (`#![forbid(unsafe_code)]`), powered directly by sibling crates [`skybase`] (Jetstream ingestion, SQLite caching, DPoP PDS write client) and [`skyauth`] (OAuth 2.0 PKCE + DPoP session lifecycle). |
 
 ---
 
@@ -90,53 +90,42 @@ Unlike centralized Web2 moderation bots that require a database of user accounts
 ## 3. Product Architecture & System Topologies
 
 ```
-                             USER INTERFACES
-      ┌─────────────────────────────────────────────────────────────┐
-      │  Topology A: ATProto DM Bot       Topology B: Web Dashboard │
-      │  (chat.bsky.convo via XRPC)       (skyauth OAuth 2.0 DPoP)  │
-      └──────────────────────────────┬──────────────────────────────┘
-                                     │ User Rules & Target List
-                                     ▼
-                         ┌───────────────────────┐
-                         │   Rule & User Store   │
-                         │ (Stateless or SQLite) │
-                         └───────────┬───────────┘
-                                     │ Active Watch Targets
-                                     ▼
-┌─────────────────────────┐      ┌───────────────────────────────┐
-│ Global Jetstream Stream │ ───► │   Interaction Watcher         │
-│ (skybase::ingest)       │      │   - Mentions (facets)         │
-└─────────────────────────┘      │   - Replies (reply.parent)    │
-                                 │   - Quotes (embed)            │
-                                 └───────────────┬───────────────┘
-                                                 │ Candidate Interaction
-                                                 ▼
-                                 ┌───────────────────────────────┐
-                                 │   Context Enricher & Cache    │
-                                 │   - Embedded SQLite check     │
-                                 │   - Author bio & recent post  │
-                                 └───────────────┬───────────────┘
-                                                 │ Enriched Payload
-                                                 ▼
-                                 ┌───────────────────────────────┐
-                                 │   Evaluation Engine           │
-                                 │   - Fast Heuristics / DenyList│
-                                 │   - Jev Classifier (System 1) │
-                                 │   - LLM Classifier (Fallback) │
-                                 └───────────────┬───────────────┘
-                                                 │ Verdict: VIOLATION
-                                                 ▼
-                                 ┌───────────────────────────────┐
-                                 │   Sovereign List Mutator      │
-                                 │   (skybase::repo::PdsClient)  │
-                                 │   Writes app.bsky.graph.listitem│
-                                 └───────────────┬───────────────┘
-                                                 │
-                                                 ▼
-                                 ┌───────────────────────────────┐
-                                 │   Audit & User Notification   │
-                                 │   (DM alert / Webhook / Log)  │
-                                 └───────────────────────────────┘
+                  ┌────────────────────────────────────────────────────────┐
+                  │                    PUBLIC INTERNET                     │
+                  │   - Any Bluesky User (@alice.bsky.social)              │
+                  │   - Bluesky PDS Authorization Servers                  │
+                  └──────────────────────────┬─────────────────────────────┘
+                                             │ HTTPS
+                                             ▼
+                                  ┌────────────────────┐
+                                  │  Cloudflare Edge   │
+                                  │(SSL / DDoS Shield) │
+                                  └──────────┬─────────┘
+                                             │ Encrypted Tunnel
+                                             ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                   DOCKER COMPOSE POD (skybouncer_net)                    │
+│                                                                          │
+│   ┌────────────────────┐   Isolated Network     ┌────────────────────┐   │
+│   │    cloudflared     │ ─────────────────────> │     skybouncer     │   │
+│   │ (Tunnels into host)│   http://skybouncer    │ (Port 3000, non-   │   │
+│   └────────────────────┘      (internal)        │  root, read-only)  │   │
+│                                                 └─────────┬──────────┘   │
+│                                                           │              │
+│       ┌───────────────────────────────────────────────────┼──────────┐   │
+│       │ Subsystems within skybouncer:                     │          │   │
+│       │  1. Multi-Tenant Registry (SQLite /data)          │          │   │
+│       │  2. skyauth OAuth Gateway (/auth/login, /callback)│          │   │
+│       │  3. Public @skybouncer.bot DM Onboarding & Comms  │          │   │
+│       │  4. Global Jetstream Firehose (watches all DIDs)  │          │   │
+│       │  5. Non-Followed Gate (per-tenant FollowGraph)    │          │   │
+│       │  6. Multi-Tenant PDS Mutator (Alice's DPoP keys)  │          │   │
+│       │                                                   ▼          │   │
+│       │                                            Persistent Disk   │   │
+│       └──────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────────────────┘
+  NOTE: Completely isolated from sibling compose stacks (e.g. for-your-consideration)
+        via independent Docker Compose bridge networking (`skybouncer_net`).
 ```
 
 ---
@@ -186,20 +175,37 @@ Unlike centralized Web2 moderation bots that require a database of user accounts
 
 ### 4.4 Interaction Modes
 
-#### Mode 1: ATProto Chat / DM Bot (`chat.bsky.convo.*`)
-* **Commands**:
-  * `rules`: Display current active moderation rules.
-  * `set rules <text>`: Update rule rubric.
-  * `status`: Show list subscriber status, total accounts bounced, and uptime.
-  * `recent`: List the last 5 accounts added with reason and post snippet.
-  * `pardon @handle`: Remove an account from the moderation list.
-  * `pause` / `resume`: Temporarily disable or enable automated actions.
-  * `sensitivity <low|medium|high>`: Adjust confidence threshold.
+#### Mode 1: Public ATProto Chat / DM Bot (`chat.bsky.convo.*`)
+* **Conversational Onboarding (For Any Bluesky User)**:
+  * Any user on Bluesky can message `@skybouncer.bot`.
+  * If the sender is **not yet enrolled**, the bot replies with an introduction and a 1-click authorization link (`https://skybouncer.mike10010100.com/auth`) to activate protection on their account.
+* **Management Commands (For Enrolled Users)**:
+  * `rules`: Display the user's active moderation rubric.
+  * `set rules <text>`: Update the user's rule rubric and sync to their sovereign PDS.
+  * `status`: Show user's protection state (Active/Paused), bounced account count, and modlist link.
+  * `recent`: List the last 5 accounts added with violation category and snippet.
+  * `pardon @handle` or `pardon <did>`: Remove an account from their personal moderation list on their PDS.
+  * `pause` / `resume`: Temporarily disable or enable automated actions for their account.
+  * `sensitivity <low|medium|high>`: Adjust the user's confidence threshold.
 
-#### Mode 2: Sovereign Web Dashboard (OAuth via `skyauth`)
-* Single-page web application served locally or hosted.
-* **Live Sandbox / Simulator**: Paste a post URL or handle to simulate how current rules would evaluate it.
-* **Audit Timeline**: View chronological feed of bounced accounts, post snippets, classifier reasoning, and one-click pardon buttons.
+#### Mode 2: Sovereign Web Portal & OAuth 2.1 Gateway (`skyauth`)
+* Public web service hosted at `https://skybouncer.mike10010100.com`.
+* **ATProto OAuth 2.1 Login**: Users sign in with their Bluesky handle via `skyauth` (PKCE + DPoP), granting permission to manage their moderation list.
+* **Live Sandbox & Simulator**: Test hypothetical posts or paste thread URLs to preview classifier decisions against their custom rubric.
+* **Audit Dashboard**: Chronological timeline of evaluations, model confidence, and 1-click unban buttons.
+
+### 4.5 Production Deployment & Docker Compose Network Isolation
+* **Zero-Leakage Container Network Isolation**:
+  * Runs in its own dedicated, user-defined Docker bridge network (`skybouncer_net`).
+  * Sibling Docker Compose stacks (such as `for-your-consideration`) run in separate, isolated bridge networks. Containers in one stack cannot see, resolve, or communicate with containers in another stack.
+* **Cloudflare Tunnel Edge Ingress**:
+  * Companion `cloudflared` container mounts `~/.cloudflared` read-only and tunnels traffic from `https://skybouncer.mike10010100.com` directly into `http://skybouncer:3000` over `skybouncer_net`.
+  * **Zero Inbound Router Ports**: No open ports on the firewall or host router; all traffic enters encrypted via Cloudflare's edge with automatic TLS termination and DDoS mitigation.
+* **Port Conflict Prevention**:
+  * Default host port mapping `PORT_BIND=3031` (bound to `127.0.0.1:3031:3000`), completely eliminating port collisions with `for-your-consideration` on `3030`.
+* **Hardened Execution Environment**:
+  * `#![forbid(unsafe_code)]` binary stripped and running as non-root user `appuser:appgroup` (UID 10001).
+  * `read_only: true`, `security_opt: [no-new-privileges:true]`, `cap_drop: [ALL]`.
 
 ---
 
@@ -226,18 +232,19 @@ Adhering to [`AGENTS.md`](AGENTS.md) and [`rust-best-practices`](/Users/mike1001
 
 | Milestone | Deliverables | Status |
 | :--- | :--- | :--- |
-| **M1: Core Domain & Classifier Engine** | `skybouncer` crate structure, typed `SkybouncerError`, `Classifier` trait, `JevClassifier` client, `MockClassifier` for hermetic testing, `RuleRubric` parser. | ✅ **Completed** |
-| **M2: Jetstream Ingestion & Target Matching** | Integration with `skybase::ingest`, reply/mention/quote detector, deduplication cache in embedded SQLite (`skybase::index`). | ✅ **Completed** |
-| **M3: Mod List Provisioning & PDS Mutations** | Integration with `skybase::repo`, `app.bsky.graph.list` creation, `app.bsky.graph.listitem` upsert and pardon mutations with DPoP signing. | ✅ **Completed** |
-| **M4: ATProto DM Bot Interface** | ATProto Chat client (`chat.bsky.convo.*`), conversational command parser (`rules`, `recent`, `pardon`, `sensitivity`), automated DM alert dispatcher. | ✅ **Completed** |
-| **M5: Web Dashboard & Verification Suite** | Minimal Web UI with `skyauth` OAuth login, dry-run simulator, 100% test coverage, clippy/fmt/deny compliance. | ✅ **Completed** |
+| **M1: Core Domain & Classifier Engine** | `skybouncer` crate structure, typed `SkybouncerError`, `Classifier` trait, `JevClassifier` client, `MockClassifier` for hermetic testing, `RuleRubric` parser. | ✅ **Completed & Published (`v0.1.0`)** |
+| **M2: Jetstream Ingestion & Target Matching** | Integration with `skybase::ingest`, reply/mention/quote detector, deduplication cache in embedded SQLite (`skybase::index`). | ✅ **Completed & Published (`v0.1.0`)** |
+| **M3: Mod List Provisioning & PDS Mutations** | Integration with `skybase::repo`, `app.bsky.graph.list` creation, `app.bsky.graph.listitem` upsert and pardon mutations with DPoP signing. | ✅ **Completed & Published (`v0.1.0`)** |
+| **M4: ATProto DM Bot Interface** | ATProto Chat client (`chat.bsky.convo.*`), conversational command parser (`rules`, `recent`, `pardon`, `sensitivity`), automated DM alert dispatcher. | ✅ **Completed & Published (`v0.1.0`)** |
+| **M5: Web Dashboard & Automated Release** | Minimal Web UI with `skyauth` OAuth login, dry-run simulator, 100% test coverage, GitHub Actions automated crates.io publish & release pipeline. | ✅ **Completed & Published (`v0.1.0`)** |
+| **M6: Multi-Tenant Hosted Service & Onboarding** | SQLite `TenantRegistry` managing dynamic multi-user DPoP sessions, public bot conversational onboarding flow for unenrolled users, and production Docker Compose with Cloudflare Tunnel isolation. | 🚀 **In Progress** |
 
 ---
 
 ## 7. Disambiguation & Namespace Verification
 
 * **Crate Name**: `skybouncer`
-* **Crates.io Status**: Verified available (0 registered crates as of Oct 2026).
+* **Crates.io Status**: ✅ **Published & Active** ([`skybouncer 0.1.0`](https://crates.io/api/v1/crates/skybouncer/0.1.0) and [`skybase 0.1.0`](https://crates.io/api/v1/crates/skybase/0.1.0) are live on crates.io).
 * **Bluesky Handle Status**: Verified completely free (`@skybouncer` and `@skybouncer.bsky.social` have 0 users).
 * **Prior Art Disambiguation**:
   * Distinct from `@skysentry.bsky.social` (an existing manual blocklist curator).
