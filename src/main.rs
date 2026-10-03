@@ -366,6 +366,18 @@ async fn main() -> Result<(), SkybouncerError> {
         stats.model_evaluations
     );
     info!(
+        "   Eval Queue Enqueued:          {}",
+        stats.eval_queue_enqueued
+    );
+    info!(
+        "   Eval Queue Processed:         {}",
+        stats.eval_queue_processed
+    );
+    info!(
+        "   Eval Queue Overflows:         {}",
+        stats.eval_queue_overflows
+    );
+    info!(
         "   Violations Detected:          {}",
         stats.violations_detected
     );

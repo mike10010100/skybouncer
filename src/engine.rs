@@ -43,6 +43,12 @@ use crate::modlist::{BouncedUser, DeduplicationCache, ModListManager, DEFAULT_MO
 /// Default capacity for the engine's internal commit event processing channel.
 pub const DEFAULT_ENGINE_CHANNEL_CAPACITY: usize = 1024;
 
+/// Default capacity for the decoupled candidate evaluation queue.
+pub const DEFAULT_EVALUATION_QUEUE_CAPACITY: usize = 256;
+
+/// Default maximum concurrent evaluations permitted against the primary model.
+pub const DEFAULT_EVALUATION_CONCURRENCY: usize = 1;
+
 /// Default evaluation verdict cache TTL (24 hours).
 pub const DEFAULT_EVALUATION_CACHE_TTL: Duration = Duration::from_secs(86400);
 
@@ -69,6 +75,10 @@ pub struct SkybouncerConfig {
     pub evaluation_ttl: Duration,
     /// Bounded capacity for the incoming commit event channel.
     pub channel_capacity: usize,
+    /// Bounded capacity for the decoupled candidate evaluation queue.
+    pub evaluation_queue_capacity: usize,
+    /// Maximum concurrent evaluations permitted against the primary model.
+    pub evaluation_concurrency: usize,
     /// Jev classification client configuration, if Jev is used as the primary model.
     pub jev_config: Option<JevConfig>,
     /// Title assigned to provisioned moderation lists.
@@ -102,6 +112,8 @@ impl Default for SkybouncerConfig {
             cache_path: None,
             evaluation_ttl: DEFAULT_EVALUATION_CACHE_TTL,
             channel_capacity: DEFAULT_ENGINE_CHANNEL_CAPACITY,
+            evaluation_queue_capacity: DEFAULT_EVALUATION_QUEUE_CAPACITY,
+            evaluation_concurrency: DEFAULT_EVALUATION_CONCURRENCY,
             jev_config: None,
             list_name: DEFAULT_MOD_LIST_NAME.to_string(),
             list_description: None,
@@ -159,6 +171,21 @@ impl SkybouncerConfig {
     #[must_use]
     pub fn with_channel_capacity(mut self, capacity: usize) -> Self {
         self.channel_capacity = capacity;
+        self.evaluation_queue_capacity = self.evaluation_queue_capacity.max(capacity);
+        self
+    }
+
+    /// Sets the bounded capacity for the decoupled candidate evaluation queue.
+    #[must_use]
+    pub fn with_evaluation_queue_capacity(mut self, capacity: usize) -> Self {
+        self.evaluation_queue_capacity = capacity;
+        self
+    }
+
+    /// Sets the maximum concurrent evaluations permitted against the primary model.
+    #[must_use]
+    pub fn with_evaluation_concurrency(mut self, concurrency: usize) -> Self {
+        self.evaluation_concurrency = concurrency.max(1);
         self
     }
 
@@ -272,6 +299,16 @@ impl SkybouncerConfig {
             .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
             .unwrap_or(false);
 
+        let evaluation_queue_capacity = std::env::var("SKYBOUNCER_EVAL_QUEUE_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_EVALUATION_QUEUE_CAPACITY);
+
+        let evaluation_concurrency = std::env::var("SKYBOUNCER_EVAL_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_EVALUATION_CONCURRENCY);
+
         Ok(Self {
             protected_dids,
             rubric,
@@ -280,6 +317,8 @@ impl SkybouncerConfig {
             cache_path,
             evaluation_ttl: DEFAULT_EVALUATION_CACHE_TTL,
             channel_capacity: DEFAULT_ENGINE_CHANNEL_CAPACITY,
+            evaluation_queue_capacity,
+            evaluation_concurrency,
             jev_config,
             list_name: DEFAULT_MOD_LIST_NAME.to_string(),
             list_description: None,
@@ -316,6 +355,12 @@ pub struct EngineStats {
     pub heuristic_violations: AtomicU64,
     /// Candidate interactions dispatched to the primary classifier (e.g. Jev model).
     pub model_evaluations: AtomicU64,
+    /// Candidate interactions enqueued to the background evaluation queue.
+    pub eval_queue_enqueued: AtomicU64,
+    /// Candidate interactions processed by the background evaluation worker.
+    pub eval_queue_processed: AtomicU64,
+    /// Candidate interactions dropped due to evaluation queue capacity saturation.
+    pub eval_queue_overflows: AtomicU64,
     /// Evaluations dropped due to Tier-4 per-user evaluation rate limits.
     pub rate_limited_evaluations: AtomicU64,
     /// Candidates enriched with author profile and parent post context.
@@ -350,6 +395,9 @@ impl EngineStats {
             eval_cache_hits: self.eval_cache_hits.load(Ordering::Relaxed),
             heuristic_violations: self.heuristic_violations.load(Ordering::Relaxed),
             model_evaluations: self.model_evaluations.load(Ordering::Relaxed),
+            eval_queue_enqueued: self.eval_queue_enqueued.load(Ordering::Relaxed),
+            eval_queue_processed: self.eval_queue_processed.load(Ordering::Relaxed),
+            eval_queue_overflows: self.eval_queue_overflows.load(Ordering::Relaxed),
             rate_limited_evaluations: self.rate_limited_evaluations.load(Ordering::Relaxed),
             context_enrichments: self.context_enrichments.load(Ordering::Relaxed),
             violations_detected: self.violations_detected.load(Ordering::Relaxed),
@@ -387,6 +435,12 @@ pub struct EngineStatsSnapshot {
     pub heuristic_violations: u64,
     /// Candidate interactions dispatched to the primary classifier (e.g. Jev model).
     pub model_evaluations: u64,
+    /// Candidate interactions enqueued to the background evaluation queue.
+    pub eval_queue_enqueued: u64,
+    /// Candidate interactions processed by the background evaluation worker.
+    pub eval_queue_processed: u64,
+    /// Candidate interactions dropped due to evaluation queue capacity saturation.
+    pub eval_queue_overflows: u64,
     /// Evaluations dropped due to Tier-4 per-user evaluation rate limits.
     pub rate_limited_evaluations: u64,
     /// Candidates enriched with author profile and parent post context.
@@ -468,6 +522,24 @@ pub enum InteractionOutcome {
         /// Reason describing the rate limit ceiling.
         reason: String,
     },
+    /// Interaction candidate was accepted into the decoupled evaluation queue.
+    QueuedForEvaluation {
+        /// DID of the interaction author.
+        author_did: String,
+        /// DID of the protected target account.
+        target_did: String,
+        /// Canonical AT-URI of the candidate post.
+        post_uri: String,
+    },
+    /// Interaction candidate was dropped because evaluation queue was saturated.
+    QueueOverflow {
+        /// DID of the interaction author.
+        author_did: String,
+        /// DID of the protected target account.
+        target_did: String,
+        /// Canonical AT-URI of the candidate post.
+        post_uri: String,
+    },
 }
 
 impl InteractionOutcome {
@@ -480,7 +552,9 @@ impl InteractionOutcome {
             | Self::Permitted { author_did, .. }
             | Self::Bounced { author_did, .. }
             | Self::BelowThreshold { author_did, .. }
-            | Self::RateLimited { author_did, .. } => author_did.as_str(),
+            | Self::RateLimited { author_did, .. }
+            | Self::QueuedForEvaluation { author_did, .. }
+            | Self::QueueOverflow { author_did, .. } => author_did.as_str(),
         }
     }
 
@@ -492,7 +566,9 @@ impl InteractionOutcome {
             | Self::Permitted { target_did, .. }
             | Self::Bounced { target_did, .. }
             | Self::BelowThreshold { target_did, .. }
-            | Self::RateLimited { target_did, .. } => Some(target_did.as_str()),
+            | Self::RateLimited { target_did, .. }
+            | Self::QueuedForEvaluation { target_did, .. }
+            | Self::QueueOverflow { target_did, .. } => Some(target_did.as_str()),
             Self::AlreadyBounced { .. } => None,
         }
     }
@@ -513,6 +589,18 @@ impl InteractionOutcome {
     #[must_use]
     pub fn is_bypassed(&self) -> bool {
         matches!(self, Self::Bypassed { .. })
+    }
+
+    /// Returns `true` if this outcome was enqueued for background evaluation.
+    #[must_use]
+    pub fn is_queued(&self) -> bool {
+        matches!(self, Self::QueuedForEvaluation { .. })
+    }
+
+    /// Returns `true` if this outcome was dropped due to evaluation queue saturation.
+    #[must_use]
+    pub fn is_queue_overflow(&self) -> bool {
+        matches!(self, Self::QueueOverflow { .. })
     }
 }
 
@@ -702,7 +790,208 @@ impl SkybouncerEngine {
         Ok(ProcessCommitResult::InteractionsProcessed(outcomes))
     }
 
-    /// Evaluates an extracted interaction through the non-followed gate, caches, classifiers, and modlist mutator.
+    /// Evaluates a single Jetstream commit, dispatching candidate interactions to a decoupled evaluation queue.
+    ///
+    /// Fast-path operations (follow graph sync, non-post filtering, self/followed gate checks,
+    /// dedup cache hits, and evaluation cache hits) are completed immediately (<1µs to <50µs).
+    /// Candidates requiring model evaluation are enqueued to `eval_tx` without blocking the caller.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if cache query or PDS mutation fails.
+    #[instrument(skip(self, commit, eval_tx), fields(collection = %commit.collection, did = %commit.did, rkey = %commit.rkey))]
+    pub async fn process_commit_queued(
+        &self,
+        commit: &JetstreamCommit,
+        eval_tx: &mpsc::Sender<Interaction>,
+    ) -> Result<ProcessCommitResult, SkybouncerError> {
+        self.stats.commits_received.fetch_add(1, Ordering::Relaxed);
+
+        // Tier 0: Follow Collection Intercept
+        if commit.collection.as_str() == "app.bsky.graph.follow" {
+            let p_dids = {
+                let guard = self.protected_dids.read();
+                guard.clone()
+            };
+
+            let sync_event = self.follow_graph.handle_commit(commit, &p_dids);
+            if sync_event != FollowSyncEvent::Ignored {
+                self.stats
+                    .follow_sync_events
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats.follows_synced.fetch_add(1, Ordering::Relaxed);
+                debug!(event = ?sync_event, "Synchronized follow graph from firehose commit");
+            }
+            return Ok(ProcessCommitResult::FollowSynced(sync_event));
+        }
+
+        // Tier 1: Post Collection & Operation Filter
+        if commit.collection.as_str() != "app.bsky.feed.post"
+            || commit.operation != CommitOperation::Create
+        {
+            return Ok(ProcessCommitResult::Ignored);
+        }
+
+        // Tier 2: Target Matcher Extraction
+        let p_dids = {
+            let guard = self.protected_dids.read();
+            guard.clone()
+        };
+
+        let interactions = TargetMatcher::match_all_interactions(commit, &p_dids);
+        if interactions.is_empty() {
+            return Ok(ProcessCommitResult::NoMatch);
+        }
+
+        let count = u64::try_from(interactions.len()).unwrap_or(0);
+        self.stats
+            .interactions_matched
+            .fetch_add(count, Ordering::Relaxed);
+
+        let mut outcomes = Vec::with_capacity(interactions.len());
+        for interaction in interactions {
+            let outcome = self
+                .process_interaction_queued(interaction, eval_tx)
+                .await?;
+            outcomes.push(outcome);
+        }
+
+        Ok(ProcessCommitResult::InteractionsProcessed(outcomes))
+    }
+
+    /// Evaluates an extracted interaction through the fast-path gates and caches,
+    /// enqueueing surviving candidates to the decoupled background evaluation queue.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if cache query or PDS mutation fails.
+    #[instrument(skip(self, interaction, eval_tx), fields(author = %interaction.author_did, target = %interaction.target_did, post_uri = %interaction.post_uri))]
+    pub async fn process_interaction_queued(
+        &self,
+        interaction: Interaction,
+        eval_tx: &mpsc::Sender<Interaction>,
+    ) -> Result<InteractionOutcome, SkybouncerError> {
+        let author_did = interaction.author_did.clone();
+        let target_did = interaction.target_did.clone();
+        let post_uri = interaction.post_uri.clone();
+
+        // Tier 3: Non-Followed Cost Control Gate (<1µs, $0 cost)
+        let decision = self.gate.evaluate(interaction.clone());
+        if let GateDecision::Bypassed { reason, .. } = decision {
+            match reason {
+                BypassReason::SelfInteraction => {
+                    self.stats
+                        .gate_bypassed_self
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                BypassReason::FollowedAuthor => {
+                    self.stats
+                        .gate_bypassed_followed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            debug!(reason = ?reason, "Bypassed interaction at gate with zero cost");
+            return Ok(InteractionOutcome::Bypassed {
+                reason,
+                author_did,
+                target_did,
+            });
+        }
+
+        // Tier 4: Deduplication Cache Check (<50µs, $0 cost)
+        self.stats
+            .candidates_evaluated
+            .fetch_add(1, Ordering::Relaxed);
+        if self.cache.is_bounced(&author_did)? {
+            self.stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
+            debug!("Author already bounced in deduplication cache; skipping evaluation");
+            return Ok(InteractionOutcome::AlreadyBounced { author_did });
+        }
+
+        // Tier 5: Evaluation TTL Cache Check (<50µs, $0 cost)
+        let cached_verdict = self.cache.get_evaluation(&post_uri)?;
+        if let Some(verdict) = cached_verdict {
+            self.stats.eval_cache_hits.fetch_add(1, Ordering::Relaxed);
+            debug!("Evaluation cache hit for post; reusing verdict");
+            return self.act_on_verdict(&interaction, verdict).await;
+        }
+
+        // Tier 6: Zero-Cost Regex Heuristic Pre-Filter (<500ns, $0 cost)
+        let heuristic_verdict = self.heuristic_classifier.evaluate(&interaction);
+        if heuristic_verdict.is_violation() {
+            self.stats
+                .heuristic_violations
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .violations_detected
+                .fetch_add(1, Ordering::Relaxed);
+            debug!("Heuristic regex pre-filter detected violation at zero cost");
+            let _ = self.cache.set_evaluation(
+                &post_uri,
+                &author_did,
+                &heuristic_verdict,
+                self.config.evaluation_ttl,
+            );
+            return self.act_on_verdict(&interaction, heuristic_verdict).await;
+        }
+
+        // Tier 4: Per-User Evaluation Rate Limiter (Anti-Denial-of-Wallet, PRD §5.2)
+        if !self.rate_limiter.check_and_record(&target_did) {
+            self.stats
+                .rate_limited_evaluations
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                target = %target_did,
+                author = %author_did,
+                "Evaluation rate limit reached for target user; skipping external model call"
+            );
+            return Ok(InteractionOutcome::RateLimited {
+                author_did,
+                target_did,
+                reason: "Tier-4 Anti-Denial-of-Wallet rate limit exceeded".to_string(),
+            });
+        }
+
+        // Enqueue candidate for background evaluation
+        match eval_tx.try_send(interaction) {
+            Ok(()) => {
+                self.stats
+                    .eval_queue_enqueued
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    author = %author_did,
+                    target = %target_did,
+                    "Candidate enqueued for background evaluation"
+                );
+                Ok(InteractionOutcome::QueuedForEvaluation {
+                    author_did,
+                    target_did,
+                    post_uri,
+                })
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.stats
+                    .eval_queue_overflows
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    author = %author_did,
+                    target = %target_did,
+                    "Evaluation queue saturated; shedding load to preserve Jetstream subscriber throughput"
+                );
+                Ok(InteractionOutcome::QueueOverflow {
+                    author_did,
+                    target_did,
+                    post_uri,
+                })
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("Evaluation queue channel closed");
+                Err(SkybouncerError::Ingestion(
+                    "Evaluation queue channel closed".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Evaluates an extracted interaction through the non-followed gate, caches, classifiers, and modlist mutator synchronously.
     ///
     /// # Errors
     /// Returns [`SkybouncerError`] if classifier evaluation, cache query, or PDS mutation fails.
@@ -784,35 +1073,7 @@ impl SkybouncerEngine {
                     });
                 }
 
-                // Context Enricher: Fetch author profile & parent post context (PRD §3 & §4.2)
-                let enriched = self.enricher.enrich(&interaction).await;
-                let interaction = if !enriched.is_empty() {
-                    self.stats
-                        .context_enrichments
-                        .fetch_add(1, Ordering::Relaxed);
-                    interaction.with_enriched_context(enriched)
-                } else {
-                    interaction
-                };
-
-                // Tier 7: Primary Model Evaluation
-                self.stats.model_evaluations.fetch_add(1, Ordering::Relaxed);
-                let model_verdict =
-                    self.classifier
-                        .classify(&interaction)
-                        .await
-                        .inspect_err(|_e| {
-                            self.stats
-                                .errors_encountered
-                                .fetch_add(1, Ordering::Relaxed);
-                        })?;
-
-                if model_verdict.is_violation() {
-                    self.stats
-                        .violations_detected
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                model_verdict
+                return self.evaluate_candidate(interaction).await;
             }
         };
 
@@ -821,7 +1082,87 @@ impl SkybouncerEngine {
             self.cache
                 .set_evaluation(&post_uri, &author_did, &verdict, self.config.evaluation_ttl);
 
+        self.act_on_verdict(&interaction, verdict).await
+    }
+
+    /// Evaluates a candidate interaction against the primary classifier model and performs PDS bounce if violated.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if classifier evaluation, cache query, or PDS mutation fails.
+    #[instrument(skip(self, interaction), fields(author = %interaction.author_did, target = %interaction.target_did, post_uri = %interaction.post_uri))]
+    pub async fn evaluate_candidate(
+        &self,
+        interaction: Interaction,
+    ) -> Result<InteractionOutcome, SkybouncerError> {
+        let author_did = interaction.author_did.clone();
+        let post_uri = interaction.post_uri.clone();
+
+        // Double check dedup cache before making expensive model call,
+        // in case a prior candidate from the same author already resulted in a bounce while this was queued!
+        if self.cache.is_bounced(&author_did)? {
+            self.stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                author = %author_did,
+                "Author bounced while candidate was queued; skipping model call"
+            );
+            return Ok(InteractionOutcome::AlreadyBounced { author_did });
+        }
+
+        // Context Enricher: Fetch author profile & parent post context (PRD §3 & §4.2)
+        let enriched = self.enricher.enrich(&interaction).await;
+        let interaction = if !enriched.is_empty() {
+            self.stats
+                .context_enrichments
+                .fetch_add(1, Ordering::Relaxed);
+            interaction.with_enriched_context(enriched)
+        } else {
+            interaction
+        };
+
+        // Tier 7: Primary Model Evaluation
+        self.stats.model_evaluations.fetch_add(1, Ordering::Relaxed);
+        let model_verdict = self
+            .classifier
+            .classify(&interaction)
+            .await
+            .inspect_err(|_e| {
+                self.stats
+                    .errors_encountered
+                    .fetch_add(1, Ordering::Relaxed);
+            })?;
+
+        if model_verdict.is_violation() {
+            self.stats
+                .violations_detected
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Cache the verdict with configured TTL
+        let _ = self.cache.set_evaluation(
+            &post_uri,
+            &author_did,
+            &model_verdict,
+            self.config.evaluation_ttl,
+        );
+
         // Tier 8: Rubric Sensitivity Gate & Sovereign PDS Bounce
+        self.act_on_verdict(&interaction, model_verdict).await
+    }
+
+    /// Evaluates a classifier verdict against the rubric sensitivity threshold and executes PDS bounce if actionable.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if PDS mutation or cache recording fails.
+    #[instrument(skip(self, interaction, verdict), fields(author = %interaction.author_did, target = %interaction.target_did, post_uri = %interaction.post_uri))]
+    pub async fn act_on_verdict(
+        &self,
+        interaction: &Interaction,
+        verdict: Verdict,
+    ) -> Result<InteractionOutcome, SkybouncerError> {
+        let author_did = interaction.author_did.clone();
+        let target_did = interaction.target_did.clone();
+        let post_uri = interaction.post_uri.clone();
+
         match verdict {
             Verdict::Permitted { reason } => {
                 self.stats.permitted.fetch_add(1, Ordering::Relaxed);
@@ -1121,6 +1462,11 @@ impl SkybouncerEngine {
 
     /// Runs the pipeline event processing loop reading from `rx` until cancelled.
     ///
+    /// Commits from Jetstream are ingested on the fast path without blocking. Surviving
+    /// candidate interactions are enqueued into a decoupled bounded evaluation channel,
+    /// where background worker(s) evaluate candidates against the primary classifier model
+    /// at controlled concurrency (`config.evaluation_concurrency`).
+    ///
     /// # Errors
     /// Returns [`SkybouncerError`] if unrecoverable pipeline failure occurs.
     pub async fn run(
@@ -1128,20 +1474,66 @@ impl SkybouncerEngine {
         mut rx: mpsc::Receiver<JetstreamCommit>,
         cancel: CancellationToken,
     ) -> Result<EngineStatsSnapshot, SkybouncerError> {
+        let (eval_tx, mut eval_rx) =
+            mpsc::channel::<Interaction>(self.config.evaluation_queue_capacity);
+        let concurrency = self.config.evaluation_concurrency.max(1);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+
+        let eval_engine = self.clone();
+        let mut eval_tasks = JoinSet::new();
+
+        // Spawn background evaluation worker
+        let queue_worker = async move {
+            let mut active_evals = JoinSet::new();
+
+            while let Ok(permit) = semaphore.clone().acquire_owned().await {
+                match eval_rx.recv().await {
+                    Some(candidate) => {
+                        let eng = eval_engine.clone();
+                        active_evals.spawn(async move {
+                            let _permit = permit;
+                            eng.stats
+                                .eval_queue_processed
+                                .fetch_add(1, Ordering::Relaxed);
+                            if let Err(e) = eng.evaluate_candidate(candidate).await {
+                                warn!(error = %e, "Background candidate evaluation failed");
+                            }
+                        });
+                    }
+                    None => {
+                        // Channel closed (eval_tx dropped) and empty
+                        drop(permit);
+                        break;
+                    }
+                }
+
+                while let Some(res) = active_evals.try_join_next() {
+                    let _ = res;
+                }
+            }
+
+            // Drain remaining active evaluations
+            while let Some(res) = active_evals.join_next().await {
+                let _ = res;
+            }
+        };
+
+        eval_tasks.spawn(queue_worker);
+
         loop {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     debug!("Engine processing loop received cancellation; draining buffered commits");
                     while let Ok(commit) = rx.try_recv() {
-                        let _ = self.process_commit(&commit).await;
+                        let _ = self.process_commit_queued(&commit, &eval_tx).await;
                     }
                     break;
                 }
                 commit_opt = rx.recv() => {
                     match commit_opt {
                         Some(commit) => {
-                            let _ = self.process_commit(&commit).await;
+                            let _ = self.process_commit_queued(&commit, &eval_tx).await;
                         }
                         None => {
                             debug!("Commit channel closed; shutting down engine loop");
@@ -1150,6 +1542,25 @@ impl SkybouncerEngine {
                     }
                 }
             }
+        }
+
+        // Drop eval_tx so queue worker receives None after draining remaining queue items
+        drop(eval_tx);
+
+        // Wait for queue worker to finish draining (bounded by shutdown timeout)
+        let drain_future = async {
+            while let Some(res) = eval_tasks.join_next().await {
+                let _ = res;
+            }
+        };
+
+        if tokio::time::timeout(DEFAULT_SHUTDOWN_TIMEOUT, drain_future)
+            .await
+            .is_err()
+        {
+            warn!("Evaluation queue worker drain timed out; aborting background evaluations");
+            eval_tasks.abort_all();
+            while eval_tasks.join_next().await.is_some() {}
         }
 
         Ok(self.stats.snapshot())
@@ -1336,6 +1747,20 @@ impl SkybouncerEngineBuilder {
     #[must_use]
     pub fn with_enricher(mut self, enricher: Arc<dyn ContextEnricher>) -> Self {
         self.enricher = Some(enricher);
+        self
+    }
+
+    /// Sets the decoupled candidate evaluation queue capacity.
+    #[must_use]
+    pub fn with_evaluation_queue_capacity(mut self, capacity: usize) -> Self {
+        self.config.evaluation_queue_capacity = capacity;
+        self
+    }
+
+    /// Sets the maximum concurrent evaluations permitted against the primary model.
+    #[must_use]
+    pub fn with_evaluation_concurrency(mut self, concurrency: usize) -> Self {
+        self.config.evaluation_concurrency = concurrency.max(1);
         self
     }
 
