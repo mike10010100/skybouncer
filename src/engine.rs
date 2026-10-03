@@ -79,6 +79,12 @@ pub struct SkybouncerConfig {
     pub rate_limiter_config: RateLimiterConfig,
     /// Whether to operate in stateless mode (resolving rules directly from sovereign PDS).
     pub stateless_mode: bool,
+    /// Whether to enable the zero-cost heuristic regex pre-filter.
+    ///
+    /// Defaults to `false` to avoid false-positive classifications on homonyms
+    /// and contextual speech (e.g. Apple AirDrop, military airdrops, security warnings),
+    /// allowing all candidate interactions to be evaluated by the primary semantic model.
+    pub enable_heuristic_prefilter: bool,
 }
 
 impl Default for SkybouncerConfig {
@@ -96,6 +102,7 @@ impl Default for SkybouncerConfig {
             list_description: None,
             rate_limiter_config: RateLimiterConfig::default(),
             stateless_mode: false,
+            enable_heuristic_prefilter: false,
         }
     }
 }
@@ -177,6 +184,13 @@ impl SkybouncerConfig {
         self
     }
 
+    /// Sets whether the zero-cost heuristic regex pre-filter is enabled.
+    #[must_use]
+    pub fn with_enable_heuristic_prefilter(mut self, enabled: bool) -> Self {
+        self.enable_heuristic_prefilter = enabled;
+        self
+    }
+
     /// Loads configuration from environment variables with fallback defaults.
     ///
     /// # Errors
@@ -234,6 +248,11 @@ impl SkybouncerConfig {
             .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
             .unwrap_or(false);
 
+        let enable_heuristic_prefilter = std::env::var("ENABLE_HEURISTIC_PREFILTER")
+            .or_else(|_| std::env::var("SKYBOUNCER_ENABLE_HEURISTIC_PREFILTER"))
+            .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
+            .unwrap_or(false);
+
         Ok(Self {
             protected_dids,
             rubric,
@@ -247,6 +266,7 @@ impl SkybouncerConfig {
             list_description: None,
             rate_limiter_config,
             stateless_mode,
+            enable_heuristic_prefilter,
         })
     }
 }
@@ -566,7 +586,11 @@ impl SkybouncerEngine {
         pds_client: Arc<PdsRepoClient>,
     ) -> Self {
         let cache = Arc::clone(modlist_manager.cache());
-        let heuristic_classifier = HeuristicClassifier::default();
+        let heuristic_classifier = if config.enable_heuristic_prefilter {
+            HeuristicClassifier::default()
+        } else {
+            HeuristicClassifier::empty()
+        };
         let protected_dids = Arc::new(RwLock::new(config.protected_dids.clone()));
         let rubric = Arc::new(RwLock::new(config.rubric.clone()));
         let rate_limiter = Arc::new(EvaluationRateLimiter::new(
@@ -1309,7 +1333,13 @@ impl SkybouncerEngineBuilder {
             .unwrap_or_else(|| Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph))));
 
         // 3. Initialize HeuristicClassifier
-        let heuristic_classifier = self.heuristic_classifier.unwrap_or_default();
+        let heuristic_classifier = self.heuristic_classifier.unwrap_or_else(|| {
+            if self.config.enable_heuristic_prefilter {
+                HeuristicClassifier::default()
+            } else {
+                HeuristicClassifier::empty()
+            }
+        });
 
         // 4. Initialize Primary Classifier
         let classifier: Arc<dyn Classifier> = match self.classifier {

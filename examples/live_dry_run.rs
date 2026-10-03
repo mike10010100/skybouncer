@@ -53,7 +53,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_retries: 1,
     };
 
-    let heuristic = HeuristicClassifier::default();
+    let enable_heuristic = std::env::var("ENABLE_HEURISTIC_PREFILTER")
+        .or_else(|_| std::env::var("SKYBOUNCER_ENABLE_HEURISTIC_PREFILTER"))
+        .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
+        .unwrap_or(false);
+
+    let heuristic = if enable_heuristic {
+        println!("   • Heuristic: ENABLED (Regex fast-path)");
+        HeuristicClassifier::default()
+    } else {
+        println!("   • Heuristic: DISABLED by default (Routing all candidates to Jev model to prevent homonym false positives)");
+        HeuristicClassifier::empty()
+    };
+    println!();
+
     let jev = JevClassifier::new(jev_config, rubric.clone())?;
     let enricher = Arc::new(AppViewContextEnricher::new());
 
@@ -288,15 +301,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let model_verdict = jev.classify(&interaction).await?;
         let model_ms = t2.elapsed().as_millis();
 
-        // Display Heuristic Result
-        match &heuristic_verdict {
-            Verdict::Violation {
-                category, reason, ..
-            } => {
-                println!("  [Heuristic ({heuristic_us}µs)]: ⚠️ VIOLATION [{category}] -> {reason}");
-            }
-            Verdict::Permitted { .. } => {
-                println!("  [Heuristic ({heuristic_us}µs)]: 🟢 PERMITTED (Pass to LLM)");
+        // Display Heuristic Result (if enabled)
+        if enable_heuristic {
+            match &heuristic_verdict {
+                Verdict::Violation {
+                    category, reason, ..
+                } => {
+                    println!(
+                        "  [Heuristic ({heuristic_us}µs)]: ⚠️ VIOLATION [{category}] -> {reason}"
+                    );
+                }
+                Verdict::Permitted { .. } => {
+                    println!("  [Heuristic ({heuristic_us}µs)]: 🟢 PERMITTED (Pass to LLM)");
+                }
             }
         }
 
@@ -376,7 +393,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("║  Accurate Spam/Abuse Bounces:    {accurate_detections:<43} ║");
     println!("║  Accurate Benign Passes:         {accurate_passes:<43} ║");
     println!("║  Borderline / Tolerated:         {below_threshold_tolerated:<43} ║");
-    println!("║  Heuristic False Positives:      {false_positives:<43} ║");
+    println!("║  False Positives:                {false_positives:<43} ║");
     println!("╚══════════════════════════════════════════════════════════════════════════════╝");
     Ok(())
 }

@@ -54,7 +54,8 @@ async fn setup_test_engine(
 
     let mut protected_dids = HashSet::new();
     protected_dids.insert(protected_did.to_string());
-    let config = SkybouncerConfig::new(protected_dids, rubric);
+    let config =
+        SkybouncerConfig::new(protected_dids, rubric).with_enable_heuristic_prefilter(true);
 
     let engine = Arc::new(SkybouncerEngine::new(
         config,

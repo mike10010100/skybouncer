@@ -67,7 +67,8 @@ async fn setup_test_web_environment(
 
     let mut protected_dids = HashSet::new();
     protected_dids.insert(protected_did.to_string());
-    let config = SkybouncerConfig::new(protected_dids, rubric);
+    let config =
+        SkybouncerConfig::new(protected_dids, rubric).with_enable_heuristic_prefilter(true);
 
     let engine = Arc::new(SkybouncerEngine::new(
         config,
@@ -396,6 +397,68 @@ async fn test_api_simulate_heuristic_match() {
     assert_eq!(result.evaluator, "heuristic_prefilter");
     assert!(result.meets_threshold);
     assert_eq!(result.category.as_deref(), Some("crypto_spam"));
+}
+
+#[tokio::test]
+async fn test_api_simulate_heuristic_disabled_by_default() {
+    let pds = MockPdsServer::start().await;
+    let cache = Arc::new(DeduplicationCache::open_in_memory().expect("in-memory cache"));
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block crypto scams", Sensitivity::Medium);
+    let modlist_manager =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let pds_client = Arc::new(pds.pds_client("did:plc:alice"));
+    let classifier = Arc::new(skybouncer::classifier::MockClassifier::new(
+        Verdict::Permitted {
+            reason: "Passed by primary classifier because heuristic is disabled".to_string(),
+        },
+    ));
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+    // Default config has enable_heuristic_prefilter = false
+    let config = SkybouncerConfig::new(protected_dids, rubric);
+    assert!(!config.enable_heuristic_prefilter);
+
+    let engine = Arc::new(SkybouncerEngine::new(
+        config,
+        follow_graph,
+        gate,
+        classifier,
+        modlist_manager,
+        pds_client,
+    ));
+
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    )
+    .with_client_name("Skybouncer Test Dashboard");
+    let app = create_web_router(Arc::clone(&engine), None, metadata);
+
+    let payload = json!({
+        "text": "FREE AIRDROP LIVE NOW! Connect wallet to claim free tokens immediately!",
+        "author_did": "did:plc:spammer123"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/simulate")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let result: SimulateResponse = serde_json::from_slice(&bytes).unwrap();
+
+    // Since heuristic pre-filter is disabled by default, the request routes to the primary classifier
+    assert!(!result.violates);
+    assert_eq!(result.evaluator, "primary_classifier");
 }
 
 #[tokio::test]

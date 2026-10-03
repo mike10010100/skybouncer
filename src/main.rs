@@ -102,6 +102,14 @@ async fn main() -> Result<(), SkybouncerError> {
         warn!("No JEV_API_BASE_URL configured; primary classifier fallback disabled");
     }
 
+    if config.enable_heuristic_prefilter {
+        info!(
+            "⚡ Zero-cost heuristic regex pre-filter: ENABLED (short-circuiting common patterns)"
+        );
+    } else {
+        info!("🧠 Heuristic regex pre-filter: DISABLED by default (all candidate speech routed to primary model to eliminate false positives)");
+    }
+
     // 4. Build the unified Skybouncer engine with context enricher
     let appview_endpoint = std::env::var("APPVIEW_ENDPOINT")
         .or_else(|_| std::env::var("SKYBOUNCER_APPVIEW_ENDPOINT"))
