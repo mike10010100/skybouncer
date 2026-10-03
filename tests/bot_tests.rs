@@ -656,7 +656,7 @@ async fn test_run_bot_poller_filters_self_authored_messages() {
 
 #[tokio::test]
 async fn test_command_handler_pause_and_resume() {
-    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let (engine, _, _pds) = setup_test_engine("did:plc:protected1").await;
     let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
 
     assert!(!engine.is_paused());
