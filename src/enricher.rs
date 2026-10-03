@@ -88,7 +88,7 @@ impl EnrichedContext {
                 author_desc.push(format!("name: \"{name}\""));
             }
             if let Some(ref bio) = author.description {
-                let bio_snippet: String = bio.chars().take(120).collect();
+                let bio_snippet: String = bio.chars().take(250).collect();
                 author_desc.push(format!("bio: \"{bio_snippet}\""));
             }
             if let Some(followers) = author.followers_count {

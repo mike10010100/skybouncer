@@ -448,7 +448,7 @@ impl JevClassifier {
                     let system_prompt = if has_images {
                         format!(
                             "You are an automated multimodal content moderation classifier. \
-                            Evaluate candidate posts and any attached visual images against this rubric: \"{rubric_prompt}\". \
+                            Evaluate candidate posts and any attached visual images (including embedded text, screenshots, or graphics) against this rubric: \"{rubric_prompt}\". \
                             Output ONLY a single valid JSON object matching: \
                             {{\"violates\": boolean, \"category\": string or null, \"confidence\": float (0.0 to 1.0), \"reason\": string}}"
                         )
@@ -516,7 +516,7 @@ impl JevClassifier {
                     criteria.insert(
                         "spam".to_string(),
                         format!(
-                            "Unsolicited promotional spam, scam bots, commercial solicitations, or content violating: {rubric_prompt}"
+                            "Unsolicited promotional spam, mass-mention tag spam, unsolicited livestream or channel promotion, scam bots, commercial solicitations, or content violating: {rubric_prompt}"
                         ),
                     );
                     criteria.insert(
