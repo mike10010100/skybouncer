@@ -918,6 +918,17 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
     });
 
     // Optional ATProto DM Bot worker
+    let bot_handle = std::env::var("BOT_HANDLE")
+        .or_else(|_| std::env::var("BOT_IDENTIFIER"))
+        .ok()
+        .filter(|h| !h.trim().is_empty());
+    let bot_password = std::env::var("BOT_APP_PASSWORD")
+        .or_else(|_| std::env::var("BLUESKY_APP_PASSWORD"))
+        .ok()
+        .filter(|p| !p.trim().is_empty() && !p.contains("xxxx"));
+    let pds_endpoint =
+        std::env::var("PDS_ENDPOINT").unwrap_or_else(|_| "https://bsky.social".to_string());
+
     let chat_endpoint = std::env::var("CHAT_ENDPOINT")
         .unwrap_or_else(|_| skybouncer::DEFAULT_CHAT_ENDPOINT.to_string());
     let chat_token = std::env::var("CHAT_ACCESS_TOKEN")
@@ -931,57 +942,70 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
         })
         .or_else(|| config.protected_dids.iter().next().cloned());
 
-    if let (Some(token), Some(did)) = (chat_token, bot_did) {
-        match skybouncer::ChatClient::new(chat_endpoint, token) {
-            Ok(chat_client) => {
-                let web_config = skybouncer::web::WebServerConfig::from_env();
-                let handler =
-                    skybouncer::BotCommandHandler::new(std::sync::Arc::new(engine.clone()), did)
-                        .with_public_url(web_config.public_url);
-                let poller_client = chat_client.clone();
-                let cancel_bot = cancel.clone();
-                join_set.spawn(async move {
-                    if let Err(e) = skybouncer::run_bot_poller(
-                        poller_client,
-                        handler,
-                        skybouncer::DEFAULT_BOT_POLL_INTERVAL,
-                        cancel_bot,
-                    )
-                    .await
-                    {
-                        error!(error = %e, "ATProto DM bot worker encountered error");
-                    }
-                    Ok(Default::default())
-                });
-                info!("🤖 ATProto DM bot poller activated");
-
-                // Spawn proactive ATProto DM bounce alert dispatcher
-                let bounce_rx = engine.subscribe_bounces();
-                let alert_client = chat_client;
-                let cancel_alerts = cancel.clone();
-                join_set.spawn(async move {
-                    if let Err(e) = skybouncer::run_bounce_alert_dispatcher(
-                        alert_client,
-                        bounce_rx,
-                        cancel_alerts,
-                    )
-                    .await
-                    {
-                        error!(
-                            error = %e,
-                            "ATProto DM bounce alert dispatcher encountered error"
-                        );
-                    }
-                    Ok(Default::default())
-                });
-                info!("📢 Proactive ATProto DM bounce alert dispatcher activated");
+    let bot_client_and_did = if let (Some(handle), Some(pass)) = (bot_handle, bot_password) {
+        info!(handle = %handle, "Authenticating ATProto DM bot via App Password...");
+        match skybouncer::ChatClient::login_with_app_password(&pds_endpoint, &handle, &pass).await {
+            Ok((client, resolved_did)) => {
+                info!(did = %resolved_did, "ATProto DM bot authenticated successfully");
+                Some((client, resolved_did))
             }
             Err(e) => {
-                warn!(error = %e, "Could not initialize ATProto DM chat client");
+                error!(error = %e, "Failed to authenticate bot with App Password");
+                None
+            }
+        }
+    } else if let (Some(token), Some(did)) = (chat_token, bot_did) {
+        match skybouncer::ChatClient::new(chat_endpoint, token) {
+            Ok(c) => Some((c, did)),
+            Err(e) => {
+                error!(error = %e, "Failed to initialize ChatClient from token");
+                None
             }
         }
     } else {
-        info!("ℹ️ ATProto DM bot disabled (CHAT_ACCESS_TOKEN / BOT_DID not configured)");
+        None
+    };
+
+    if let Some((chat_client, did)) = bot_client_and_did {
+        let web_config = skybouncer::web::WebServerConfig::from_env();
+        let handler = skybouncer::BotCommandHandler::new(std::sync::Arc::new(engine.clone()), did)
+            .with_public_url(web_config.public_url);
+        let poller_client = chat_client.clone();
+        let cancel_bot = cancel.clone();
+        join_set.spawn(async move {
+            if let Err(e) = skybouncer::run_bot_poller(
+                poller_client,
+                handler,
+                skybouncer::DEFAULT_BOT_POLL_INTERVAL,
+                cancel_bot,
+            )
+            .await
+            {
+                error!(error = %e, "ATProto DM bot worker encountered error");
+            }
+            Ok(Default::default())
+        });
+        info!("🤖 ATProto DM bot poller activated");
+
+        // Spawn proactive ATProto DM bounce alert dispatcher
+        let bounce_rx = engine.subscribe_bounces();
+        let alert_client = chat_client;
+        let cancel_alerts = cancel.clone();
+        join_set.spawn(async move {
+            if let Err(e) =
+                skybouncer::run_bounce_alert_dispatcher(alert_client, bounce_rx, cancel_alerts)
+                    .await
+            {
+                error!(
+                    error = %e,
+                    "ATProto DM bounce alert dispatcher encountered error"
+                );
+            }
+            Ok(Default::default())
+        });
+        info!("📢 Proactive ATProto DM bounce alert dispatcher activated");
+    } else {
+        info!("ℹ️ ATProto DM bot disabled (BOT_APP_PASSWORD / CHAT_ACCESS_TOKEN not configured)");
     }
 
     // Optional Sovereign Web Dashboard

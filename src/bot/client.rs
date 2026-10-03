@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use tracing::debug;
 
@@ -15,6 +15,16 @@ use crate::error::SkybouncerError;
 /// Default public Bluesky chat service endpoint.
 pub const DEFAULT_CHAT_ENDPOINT: &str = "https://api.bsky.chat";
 
+/// Service DID for Bluesky chat backend proxying through PDS.
+pub const ATPROTO_CHAT_PROXY_DID: &str = "did:web:api.bsky.chat#bsky_chat";
+
+#[derive(Debug, Deserialize)]
+struct CreateSessionResponse {
+    did: String,
+    #[serde(rename = "accessJwt")]
+    access_jwt: String,
+}
+
 /// Asynchronous HTTP client for interacting with the ATProto Chat service.
 #[derive(Clone)]
 pub struct ChatClient {
@@ -24,6 +34,9 @@ pub struct ChatClient {
 
 impl ChatClient {
     /// Creates a new [`ChatClient`] targeting the specified base URL and bearer token.
+    ///
+    /// If `base_url` is a PDS rather than `api.bsky.chat`, the required `atproto-proxy`
+    /// header is automatically attached to route chat XRPC requests through the gateway.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Config`] if HTTP client configuration or headers fail.
@@ -42,12 +55,59 @@ impl ChatClient {
         headers.insert(AUTHORIZATION, header_value);
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
+        if !base_url.contains("api.bsky.chat") {
+            headers.insert(
+                HeaderName::from_static("atproto-proxy"),
+                HeaderValue::from_static(ATPROTO_CHAT_PROXY_DID),
+            );
+        }
+
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(10))
             .build()?;
 
         Ok(Self { base_url, client })
+    }
+
+    /// Authenticates with an ATProto account identifier and App Password via `com.atproto.server.createSession`.
+    ///
+    /// Returns a configured [`ChatClient`] proxied through the PDS and the resolved account DID.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if authentication or session parsing fails.
+    pub async fn login_with_app_password(
+        pds_endpoint: &str,
+        identifier: &str,
+        password: &str,
+    ) -> Result<(Self, String), SkybouncerError> {
+        let pds_url = pds_endpoint.trim_end_matches('/');
+        let login_url = format!("{pds_url}/xrpc/com.atproto.server.createSession");
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()?;
+
+        let body = serde_json::json!({
+            "identifier": identifier,
+            "password": password,
+        });
+
+        let resp = http.post(&login_url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(SkybouncerError::Chat(format!(
+                "Failed to authenticate bot account ({identifier}) at {pds_url} (HTTP {status}): {err_body}"
+            )));
+        }
+
+        let session: CreateSessionResponse = resp.json().await.map_err(|e| {
+            SkybouncerError::Chat(format!("Failed to parse createSession response: {e}"))
+        })?;
+
+        let chat_client = Self::new(pds_url, &session.access_jwt)?;
+        Ok((chat_client, session.did))
     }
 
     /// Lists active conversations for the authenticated user.
