@@ -237,7 +237,7 @@ Adhering to [`AGENTS.md`](AGENTS.md) and [`rust-best-practices`](https://github.
 | **M3: Mod List Provisioning & PDS Mutations** | Integration with `skybase::repo`, `app.bsky.graph.list` creation, `app.bsky.graph.listitem` upsert and pardon mutations with DPoP signing. | ✅ **Completed & Published (`v0.1.0`)** |
 | **M4: ATProto DM Bot Interface** | ATProto Chat client (`chat.bsky.convo.*`), conversational command parser (`rules`, `recent`, `pardon`, `sensitivity`), automated DM alert dispatcher. | ✅ **Completed & Published (`v0.1.0`)** |
 | **M5: Web Dashboard & Automated Release** | Minimal Web UI with `skyauth` OAuth login, dry-run simulator, 100% test coverage, GitHub Actions automated crates.io publish & release pipeline. | ✅ **Completed & Published (`v0.1.0`)** |
-| **M6: Multi-Tenant Hosted Service & Onboarding** | SQLite `TenantRegistry` managing dynamic multi-user DPoP sessions, public bot conversational onboarding flow for unenrolled users, and production Docker Compose with Cloudflare Tunnel isolation. | 🚀 **In Progress** |
+| **M6: Multi-Tenant Hosted Service & Onboarding** | SQLite `TenantRegistry` managing dynamic multi-user DPoP sessions, public bot conversational onboarding flow for unenrolled users, and production Docker Compose with Cloudflare Tunnel isolation. | ✅ **Completed & Verified** |
 
 ---
 
