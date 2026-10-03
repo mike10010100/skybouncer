@@ -209,6 +209,14 @@ pub async fn update_rules(
 
     state.engine.set_rubric(rubric.clone());
 
+    // Asynchronously persist updated rubric to user's sovereign PDS repository
+    let eng = state.engine.clone();
+    tokio::spawn(async move {
+        for did in eng.protected_dids() {
+            let _ = eng.publish_sovereign_config(&did).await;
+        }
+    });
+
     Ok(Json(RulesResponse {
         prompt: rubric.prompt,
         sensitivity: rubric.sensitivity,

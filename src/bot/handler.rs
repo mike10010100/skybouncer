@@ -71,11 +71,11 @@ impl BotCommandHandler {
         }
 
         if trimmed.eq_ignore_ascii_case("set rules") {
-            return self.cmd_set_rules("");
+            return self.cmd_set_rules(sender_did, "");
         }
 
         if let Some(prompt) = strip_prefix_ci(trimmed, "set rules ") {
-            return self.cmd_set_rules(prompt);
+            return self.cmd_set_rules(sender_did, prompt);
         }
 
         if trimmed.eq_ignore_ascii_case("sensitivity") {
@@ -83,7 +83,7 @@ impl BotCommandHandler {
         }
 
         if let Some(sens) = strip_prefix_ci(trimmed, "sensitivity ") {
-            return self.cmd_set_sensitivity(sens.trim());
+            return self.cmd_set_sensitivity(sender_did, sens.trim());
         }
 
         if trimmed.eq_ignore_ascii_case("recent") {
@@ -157,7 +157,7 @@ impl BotCommandHandler {
         )
     }
 
-    fn cmd_set_rules(&self, prompt: &str) -> Result<String, SkybouncerError> {
+    fn cmd_set_rules(&self, sender_did: &str, prompt: &str) -> Result<String, SkybouncerError> {
         let prompt = prompt.trim();
         if prompt.is_empty() {
             return Ok("Please provide a moderation prompt. Example: `set rules Block crypto spam and bots.`".to_string());
@@ -165,6 +165,14 @@ impl BotCommandHandler {
 
         let parsed = RuleRubric::parse(prompt)?;
         self.engine.set_rubric(parsed.clone());
+
+        // Asynchronously persist to sender's sovereign PDS repo
+        let eng = self.engine.clone();
+        let did = sender_did.to_string();
+        tokio::spawn(async move {
+            let _ = eng.publish_sovereign_config(&did).await;
+        });
+
         Ok(format!(
             "✅ Moderation rubric updated successfully!\n\n\
              Prompt: \"{}\"\n\
@@ -173,7 +181,11 @@ impl BotCommandHandler {
         ))
     }
 
-    fn cmd_set_sensitivity(&self, level: &str) -> Result<String, SkybouncerError> {
+    fn cmd_set_sensitivity(
+        &self,
+        sender_did: &str,
+        level: &str,
+    ) -> Result<String, SkybouncerError> {
         let sens = match level {
             "low" => Sensitivity::Low,
             "medium" => Sensitivity::Medium,
@@ -188,6 +200,13 @@ impl BotCommandHandler {
         let mut rubric = self.engine.rubric();
         rubric.sensitivity = sens;
         self.engine.set_rubric(rubric);
+
+        // Asynchronously persist to sender's sovereign PDS repo
+        let eng = self.engine.clone();
+        let did = sender_did.to_string();
+        tokio::spawn(async move {
+            let _ = eng.publish_sovereign_config(&did).await;
+        });
 
         Ok(format!(
             "✅ Sensitivity threshold updated to **{}** (confidence: {:.2}).",

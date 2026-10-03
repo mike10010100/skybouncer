@@ -833,6 +833,43 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
                     );
                 }
             }
+
+            // Synchronize sovereign moderation rubric from user's PDS repository
+            match engine.sync_sovereign_config(did).await {
+                Ok(Some(pds_rubric)) => {
+                    info!(
+                        did = %did,
+                        prompt = %pds_rubric.prompt,
+                        "Synchronized sovereign rules from PDS repo (social.skybouncer.config)"
+                    );
+                }
+                Ok(None) => {
+                    // No sovereign config on PDS yet: publish initial configured rubric to PDS
+                    match engine.publish_sovereign_config(did).await {
+                        Ok(uri) => {
+                            info!(
+                                did = %did,
+                                uri = %uri,
+                                "Published initial sovereign rules to PDS repo (social.skybouncer.config)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                did = %did,
+                                error = %e,
+                                "Could not publish initial sovereign rules to PDS"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        did = %did,
+                        error = %e,
+                        "Could not sync sovereign config from PDS"
+                    );
+                }
+            }
         }
     } else if config.dry_run {
         info!("🛡️ Shadow mode active: skipping remote PDS moderation list verification");
