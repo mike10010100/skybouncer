@@ -16,13 +16,16 @@ services:
     cap_drop:
       - ALL
     ports:
-      - "${PORT_BIND:-3000}:3000"
+      - "${PORT_BIND:-3031}:3000"
     env_file:
       - .env
     environment:
       - HOST=0.0.0.0
       - PORT=3000
       - WEB_ENABLED=true
+      - HOSTNAME=${HOSTNAME:-skybouncer.mike10010100.com}
+      - PUBLIC_URL=${PUBLIC_URL:-https://skybouncer.mike10010100.com}
+      - SERVICE_DID=${SERVICE_DID:-did:web:skybouncer.mike10010100.com}
       - SKYBOUNCER_DATABASE_PATH=/data/skybouncer.db
       - RUST_LOG=${RUST_LOG:-info,skybouncer=info,skybase=info}
     stop_grace_period: 30s
