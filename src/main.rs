@@ -944,7 +944,14 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
 
     let bot_client_and_did = if let (Some(handle), Some(pass)) = (bot_handle, bot_password) {
         info!(handle = %handle, "Authenticating ATProto DM bot via App Password...");
-        match skybouncer::ChatClient::login_with_app_password(&pds_endpoint, &handle, &pass).await {
+        match skybouncer::ChatClient::login_with_app_password(
+            &pds_endpoint,
+            &chat_endpoint,
+            &handle,
+            &pass,
+        )
+        .await
+        {
             Ok((client, resolved_did)) => {
                 info!(did = %resolved_did, "ATProto DM bot authenticated successfully");
                 Some((client, resolved_did))

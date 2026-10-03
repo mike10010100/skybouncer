@@ -78,6 +78,7 @@ impl ChatClient {
     /// Returns [`SkybouncerError`] if authentication or session parsing fails.
     pub async fn login_with_app_password(
         pds_endpoint: &str,
+        chat_endpoint: &str,
         identifier: &str,
         password: &str,
     ) -> Result<(Self, String), SkybouncerError> {
@@ -106,7 +107,7 @@ impl ChatClient {
             SkybouncerError::Chat(format!("Failed to parse createSession response: {e}"))
         })?;
 
-        let chat_client = Self::new(pds_url, &session.access_jwt)?;
+        let chat_client = Self::new(chat_endpoint, &session.access_jwt)?;
         Ok((chat_client, session.did))
     }
 
