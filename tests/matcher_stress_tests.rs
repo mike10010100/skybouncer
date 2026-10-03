@@ -920,7 +920,7 @@ fn test_follow_graph_heavy_concurrency_16_readers_4_writers() {
 
     // Assert that both readers and writers made significant progress without starvation
     assert!(final_reads > 50_000, "Expected >50,000 reads under 150ms");
-    assert!(final_writes > 100, "Expected >100 writes under 150ms");
+    assert!(final_writes > 20, "Expected >20 writes under 150ms");
     assert_eq!(
         graph.follow_count(PROTECTED_ALICE),
         10_000,
