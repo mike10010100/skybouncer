@@ -253,6 +253,63 @@ impl Embed {
     pub fn is_quote(&self) -> bool {
         matches!(self, Self::Record(_) | Self::RecordWithMedia(_))
     }
+
+    /// Extracts all attached image CIDs and optional alt texts from this embed.
+    ///
+    /// Supports both direct image embeds (`app.bsky.embed.images`) and composite
+    /// quote-with-media embeds (`app.bsky.embed.recordWithMedia`).
+    #[must_use]
+    pub fn extract_images(&self) -> Vec<(String, String)> {
+        match self {
+            Self::Images(val) => Self::extract_images_from_value(val),
+            Self::RecordWithMedia(rwm) => {
+                if let Some(ref media) = rwm.media {
+                    Self::extract_images_from_value(media)
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Internal helper extracting `(cid, alt)` pairs from an arbitrary JSON value.
+    fn extract_images_from_value(val: &serde_json::Value) -> Vec<(String, String)> {
+        let mut results = Vec::new();
+        let images_array = if let Some(arr) = val.get("images").and_then(|v| v.as_array()) {
+            arr
+        } else if let Some(arr) = val.as_array() {
+            arr
+        } else {
+            return results;
+        };
+
+        for item in images_array {
+            let alt = item
+                .get("alt")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            let cid = item
+                .get("image")
+                .and_then(|img| {
+                    img.get("ref")
+                        .and_then(|r| r.get("$link"))
+                        .and_then(|l| l.as_str())
+                        .or_else(|| img.get("cid").and_then(|c| c.as_str()))
+                })
+                .or_else(|| item.get("cid").and_then(|c| c.as_str()));
+
+            if let Some(c) = cid {
+                if !c.is_empty() {
+                    results.push((c.to_string(), alt));
+                }
+            }
+        }
+
+        results
+    }
 }
 
 /// ATProto post record model (`app.bsky.feed.post`).
@@ -577,5 +634,72 @@ mod tests {
 
         let deserialized: ListItemRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(record, deserialized);
+    }
+
+    #[test]
+    fn test_embed_extract_images_direct() {
+        let json = serde_json::json!({
+            "$type": "app.bsky.embed.images",
+            "images": [
+                {
+                    "alt": "A test visual",
+                    "image": {
+                        "$type": "blob",
+                        "ref": { "$link": "bafkreicid12345" },
+                        "mimeType": "image/jpeg",
+                        "size": 1234
+                    }
+                },
+                {
+                    "alt": "Second visual",
+                    "image": {
+                        "cid": "bafkreicid67890"
+                    }
+                }
+            ]
+        });
+
+        let embed: Embed = serde_json::from_value(json).unwrap();
+        let images = embed.extract_images();
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].0, "bafkreicid12345");
+        assert_eq!(images[0].1, "A test visual");
+        assert_eq!(images[1].0, "bafkreicid67890");
+        assert_eq!(images[1].1, "Second visual");
+    }
+
+    #[test]
+    fn test_embed_extract_images_record_with_media() {
+        let json = serde_json::json!({
+            "$type": "app.bsky.embed.recordWithMedia",
+            "record": {
+                "record": {
+                    "uri": "at://did:plc:alice/app.bsky.feed.post/123",
+                    "cid": "bafyquoted"
+                }
+            },
+            "media": {
+                "$type": "app.bsky.embed.images",
+                "images": [
+                    {
+                        "alt": "Embedded image",
+                        "image": {
+                            "ref": { "$link": "bafkmediaimage1" }
+                        }
+                    }
+                ]
+            }
+        });
+
+        let embed: Embed = serde_json::from_value(json).unwrap();
+        let images = embed.extract_images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].0, "bafkmediaimage1");
+        assert_eq!(images[0].1, "Embedded image");
+        assert!(embed.is_quote());
+        assert_eq!(
+            embed.quote_uri(),
+            Some("at://did:plc:alice/app.bsky.feed.post/123")
+        );
     }
 }

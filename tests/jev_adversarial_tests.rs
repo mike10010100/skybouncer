@@ -34,6 +34,8 @@ fn sample_interaction(text: &str) -> Interaction {
         parent_uri: Some("at://did:plc:protected_target/app.bsky.feed.post/root".to_string()),
         root_uri: Some("at://did:plc:protected_target/app.bsky.feed.post/root".to_string()),
         created_at_us: 1_700_000_000_000_000,
+        image_cids: Vec::new(),
+        image_alts: Vec::new(),
         enriched_context: None,
     }
 }

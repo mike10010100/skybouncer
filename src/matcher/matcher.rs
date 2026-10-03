@@ -87,6 +87,20 @@ impl TargetMatcher {
         let mut matches = Vec::new();
         let mut seen_targets = HashSet::new();
 
+        // Extract attached image CIDs and alt texts once for this post
+        let (image_cids, image_alts) = if let Some(ref embed) = post.embed {
+            let pairs = embed.extract_images();
+            let mut cids = Vec::with_capacity(pairs.len());
+            let mut alts = Vec::with_capacity(pairs.len());
+            for (c, a) in pairs {
+                cids.push(c);
+                alts.push(a);
+            }
+            (cids, alts)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         // Vector 1: Direct Reply (parent.uri)
         if let Some(ref reply) = post.reply {
             if let Some(parent_did) = extract_did_for_collection(&reply.parent.uri, POST_COLLECTION)
@@ -103,6 +117,8 @@ impl TargetMatcher {
                         parent_uri: Some(reply.parent.uri.clone()),
                         root_uri: Some(reply.root.uri.clone()),
                         created_at_us: commit.time_us,
+                        image_cids: image_cids.clone(),
+                        image_alts: image_alts.clone(),
                         enriched_context: None,
                     });
                 }
@@ -122,6 +138,8 @@ impl TargetMatcher {
                         parent_uri: Some(reply.parent.uri.clone()),
                         root_uri: Some(reply.root.uri.clone()),
                         created_at_us: commit.time_us,
+                        image_cids: image_cids.clone(),
+                        image_alts: image_alts.clone(),
                         enriched_context: None,
                     });
                 }
@@ -145,6 +163,8 @@ impl TargetMatcher {
                                 parent_uri: post.reply.as_ref().map(|r| r.parent.uri.clone()),
                                 root_uri: post.reply.as_ref().map(|r| r.root.uri.clone()),
                                 created_at_us: commit.time_us,
+                                image_cids: image_cids.clone(),
+                                image_alts: image_alts.clone(),
                                 enriched_context: None,
                             });
                         }
@@ -169,6 +189,8 @@ impl TargetMatcher {
                             parent_uri: post.reply.as_ref().map(|r| r.parent.uri.clone()),
                             root_uri: post.reply.as_ref().map(|r| r.root.uri.clone()),
                             created_at_us: commit.time_us,
+                            image_cids: image_cids.clone(),
+                            image_alts: image_alts.clone(),
                             enriched_context: None,
                         });
                     }

@@ -146,13 +146,14 @@ impl RuleRubric {
                         reason,
                     }
                 } else {
-                    Verdict::Permitted {
-                        reason: format!(
+                    Verdict::permitted_with_confidence(
+                        format!(
                             "Confidence {confidence:.2} is below the {} sensitivity threshold ({:.2}): {reason}",
                             self.sensitivity,
                             self.sensitivity.threshold()
                         ),
-                    }
+                        confidence,
+                    )
                 }
             }
             permitted @ Verdict::Permitted { .. } => permitted,

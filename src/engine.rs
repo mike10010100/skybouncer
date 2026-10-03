@@ -28,8 +28,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
 use crate::classifier::{
-    Classifier, HeuristicClassifier, JevClassifier, JevConfig, RuleRubric, Verdict,
-    ViolationCategory,
+    CertaintyConfig, Classifier, HeuristicClassifier, JevClassifier, JevConfig, RuleRubric,
+    TieredClassifier, Verdict, ViolationCategory,
 };
 use crate::enricher::{ContextEnricher, NoopContextEnricher};
 use crate::error::SkybouncerError;
@@ -81,6 +81,10 @@ pub struct SkybouncerConfig {
     pub evaluation_concurrency: usize,
     /// Jev classification client configuration, if Jev is used as the primary model.
     pub jev_config: Option<JevConfig>,
+    /// Fallback multimodal classification client configuration (e.g. gemma4:12b, llama3.2-vision via Ollama).
+    pub fallback_jev_config: Option<JevConfig>,
+    /// Certainty threshold configuration governing when evaluations escalate to the fallback model.
+    pub certainty_config: CertaintyConfig,
     /// Title assigned to provisioned moderation lists.
     pub list_name: String,
     /// Optional description for provisioned moderation lists.
@@ -115,6 +119,8 @@ impl Default for SkybouncerConfig {
             evaluation_queue_capacity: DEFAULT_EVALUATION_QUEUE_CAPACITY,
             evaluation_concurrency: DEFAULT_EVALUATION_CONCURRENCY,
             jev_config: None,
+            fallback_jev_config: None,
+            certainty_config: CertaintyConfig::default(),
             list_name: DEFAULT_MOD_LIST_NAME.to_string(),
             list_description: None,
             rate_limiter_config: RateLimiterConfig::default(),
@@ -193,6 +199,20 @@ impl SkybouncerConfig {
     #[must_use]
     pub fn with_jev_config(mut self, config: JevConfig) -> Self {
         self.jev_config = Some(config);
+        self
+    }
+
+    /// Sets the fallback multimodal Jev classification configuration.
+    #[must_use]
+    pub fn with_fallback_jev_config(mut self, config: JevConfig) -> Self {
+        self.fallback_jev_config = Some(config);
+        self
+    }
+
+    /// Sets the certainty configuration governing tiered escalation.
+    #[must_use]
+    pub fn with_certainty_config(mut self, config: CertaintyConfig) -> Self {
+        self.certainty_config = config;
         self
     }
 
@@ -283,6 +303,52 @@ impl SkybouncerConfig {
 
         let jev_config = JevConfig::from_env().ok();
 
+        let fallback_jev_config = if let Ok(fb_model) =
+            std::env::var("FALLBACK_MODEL").or_else(|_| std::env::var("SKYBOUNCER_FALLBACK_MODEL"))
+        {
+            let fb_base = std::env::var("FALLBACK_API_BASE_URL")
+                .or_else(|_| std::env::var("SKYBOUNCER_FALLBACK_BASE_URL"))
+                .unwrap_or_else(|_| "http://localhost:11434".to_string());
+            let fb_key = std::env::var("FALLBACK_API_KEY").ok();
+            let fb_timeout_ms = std::env::var("FALLBACK_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(5000);
+            let fb_max_retries = std::env::var("FALLBACK_MAX_RETRIES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1);
+            Some(JevConfig {
+                base_url: fb_base,
+                api_key: fb_key,
+                model: fb_model,
+                timeout: Duration::from_millis(fb_timeout_ms),
+                max_retries: fb_max_retries,
+            })
+        } else {
+            None
+        };
+
+        let uncertainty_min = std::env::var("UNCERTAINTY_MIN")
+            .or_else(|_| std::env::var("SKYBOUNCER_UNCERTAINTY_MIN"))
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(crate::classifier::tiered::DEFAULT_UNCERTAINTY_MIN_CONFIDENCE);
+
+        let uncertainty_max = std::env::var("UNCERTAINTY_MAX")
+            .or_else(|_| std::env::var("SKYBOUNCER_UNCERTAINTY_MAX"))
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(crate::classifier::tiered::DEFAULT_UNCERTAINTY_MAX_CONFIDENCE);
+
+        let escalate_on_images = std::env::var("ESCALATE_ON_IMAGES")
+            .or_else(|_| std::env::var("SKYBOUNCER_ESCALATE_ON_IMAGES"))
+            .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
+            .unwrap_or(true);
+
+        let certainty_config =
+            CertaintyConfig::new(uncertainty_min, uncertainty_max, escalate_on_images);
+
         let rate_limiter_config = RateLimiterConfig::from_env();
         let stateless_mode = std::env::var("SKYBOUNCER_STATELESS_MODE")
             .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
@@ -320,6 +386,8 @@ impl SkybouncerConfig {
             evaluation_queue_capacity,
             evaluation_concurrency,
             jev_config,
+            fallback_jev_config,
+            certainty_config,
             list_name: DEFAULT_MOD_LIST_NAME.to_string(),
             list_description: None,
             rate_limiter_config,
@@ -1230,7 +1298,7 @@ impl SkybouncerEngine {
         let post_uri = interaction.post_uri.clone();
 
         match verdict {
-            Verdict::Permitted { reason } => {
+            Verdict::Permitted { reason, .. } => {
                 self.stats.permitted.fetch_add(1, Ordering::Relaxed);
                 Ok(InteractionOutcome::Permitted {
                     author_did,
@@ -1777,6 +1845,7 @@ pub struct SkybouncerEngineBuilder {
     gate: Option<Arc<NonFollowedGate>>,
     heuristic_classifier: Option<HeuristicClassifier>,
     classifier: Option<Arc<dyn Classifier>>,
+    fallback_classifier: Option<Arc<dyn Classifier>>,
     modlist_manager: Option<Arc<ModListManager>>,
     cache: Option<Arc<DeduplicationCache>>,
     pds_client: Option<Arc<PdsRepoClient>>,
@@ -1794,6 +1863,7 @@ impl SkybouncerEngineBuilder {
             gate: None,
             heuristic_classifier: None,
             classifier: None,
+            fallback_classifier: None,
             modlist_manager: None,
             cache: None,
             pds_client: None,
@@ -1827,6 +1897,13 @@ impl SkybouncerEngineBuilder {
     #[must_use]
     pub fn with_classifier(mut self, classifier: Arc<dyn Classifier>) -> Self {
         self.classifier = Some(classifier);
+        self
+    }
+
+    /// Configures an explicit secondary fallback classifier implementation (e.g. for vision or heavier reasoning).
+    #[must_use]
+    pub fn with_fallback_classifier(mut self, classifier: Arc<dyn Classifier>) -> Self {
+        self.fallback_classifier = Some(classifier);
         self
     }
 
@@ -1928,7 +2005,7 @@ impl SkybouncerEngineBuilder {
         });
 
         // 4. Initialize Primary Classifier
-        let classifier: Arc<dyn Classifier> = match self.classifier {
+        let primary_classifier: Arc<dyn Classifier> = match self.classifier {
             Some(c) => c,
             None => {
                 if let Some(ref jev_cfg) = self.config.jev_config {
@@ -1942,6 +2019,30 @@ impl SkybouncerEngineBuilder {
                     ));
                 }
             }
+        };
+
+        // Resolve optional secondary fallback classifier and wrap in TieredClassifier if present
+        let fallback_classifier: Option<Arc<dyn Classifier>> = match self.fallback_classifier {
+            Some(c) => Some(c),
+            None => {
+                if let Some(ref fallback_cfg) = self.config.fallback_jev_config {
+                    Some(Arc::new(JevClassifier::new(
+                        fallback_cfg.clone(),
+                        self.config.rubric.clone(),
+                    )?))
+                } else {
+                    None
+                }
+            }
+        };
+
+        let classifier: Arc<dyn Classifier> = match fallback_classifier {
+            Some(fallback) => Arc::new(TieredClassifier::new(
+                primary_classifier,
+                fallback,
+                self.config.certainty_config,
+            )),
+            None => primary_classifier,
         };
 
         // 5. Initialize ModListManager

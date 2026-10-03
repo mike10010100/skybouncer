@@ -27,6 +27,8 @@ fn make_test_interaction(text: &str) -> Interaction {
         parent_uri: None,
         root_uri: None,
         created_at_us: 1_700_000_000_000_000,
+        image_cids: Vec::new(),
+        image_alts: Vec::new(),
         enriched_context: None,
     }
 }

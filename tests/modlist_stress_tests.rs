@@ -79,9 +79,7 @@ fn test_concurrent_load_shared_cache_30_threads() {
                                 reason: "Spam burst".to_string(),
                             }
                         } else {
-                            Verdict::Permitted {
-                                reason: "Clean interaction".to_string(),
-                            }
+                            Verdict::permitted("Clean interaction")
                         };
                         let ttl = if op % 3 == 0 {
                             Duration::ZERO // Already expired
@@ -412,9 +410,7 @@ fn test_ttl_sub_millisecond_microsecond_precision() {
 #[test]
 fn test_clock_drift_and_timestamp_boundary_resilience() {
     let cache = DeduplicationCache::open_in_memory().unwrap();
-    let verdict = Verdict::Permitted {
-        reason: "Boundary verification".to_string(),
-    };
+    let verdict = Verdict::permitted("Boundary verification");
 
     // 1. Duration::MAX should not overflow or panic
     cache

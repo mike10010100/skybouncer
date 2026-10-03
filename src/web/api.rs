@@ -295,6 +295,8 @@ pub async fn simulate_interaction(
         parent_uri: None,
         root_uri: None,
         created_at_us: 0,
+        image_cids: Vec::new(),
+        image_alts: Vec::new(),
         enriched_context: None,
     };
 
@@ -350,10 +352,10 @@ pub async fn simulate_interaction(
                 threshold,
             }))
         }
-        Ok(Verdict::Permitted { reason }) => Ok(Json(SimulateResponse {
+        Ok(Verdict::Permitted { reason, confidence }) => Ok(Json(SimulateResponse {
             violates: false,
             category: None,
-            confidence: 0.05,
+            confidence: confidence.unwrap_or(0.05),
             reason,
             evaluator: "primary_classifier".to_string(),
             meets_threshold: false,

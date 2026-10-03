@@ -57,6 +57,12 @@ pub struct Interaction {
     pub root_uri: Option<String>,
     /// Event timestamp in monotonic microseconds since Unix epoch.
     pub created_at_us: u64,
+    /// CIDs of attached images (e.g. in `app.bsky.embed.images`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_cids: Vec<String>,
+    /// Alt text descriptions of attached images.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_alts: Vec<String>,
     /// Optional enriched author profile and parent post context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enriched_context: Option<crate::enricher::EnrichedContext>,
@@ -83,6 +89,8 @@ impl Interaction {
             parent_uri: None,
             root_uri: None,
             created_at_us: 1_700_000_000_000_000,
+            image_cids: Vec::new(),
+            image_alts: Vec::new(),
             enriched_context: None,
         }
     }
@@ -98,6 +106,20 @@ impl Interaction {
     #[must_use]
     pub fn with_root_uri(mut self, uri: impl Into<String>) -> Self {
         self.root_uri = Some(uri.into());
+        self
+    }
+
+    /// Returns `true` if the candidate post contains attached images.
+    #[must_use]
+    pub fn has_images(&self) -> bool {
+        !self.image_cids.is_empty()
+    }
+
+    /// Sets the attached image CIDs and alt texts.
+    #[must_use]
+    pub fn with_images(mut self, cids: Vec<String>, alts: Vec<String>) -> Self {
+        self.image_cids = cids;
+        self.image_alts = alts;
         self
     }
 
@@ -129,6 +151,8 @@ impl Interaction {
             )),
             root_uri: Some(format!("at://{target_did}/app.bsky.feed.post/3rootrkey123")),
             created_at_us: 1_700_000_000_000_000,
+            image_cids: Vec::new(),
+            image_alts: Vec::new(),
             enriched_context: None,
         }
     }

@@ -7,14 +7,17 @@
 
 use proptest::prelude::*;
 use serde_json::json;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use wiremock::matchers::{body_json, header, method, path};
+use wiremock::matchers::{body_json, body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use skybouncer::classifier::{
-    Classifier, HeuristicClassifier, JevClassifier, JevConfig, JevEndpointKind, MockClassifier,
-    RuleRubric, Sensitivity, Verdict, ViolationCategory,
+    CertaintyConfig, Classifier, HeuristicClassifier, JevClassifier, JevConfig, JevEndpointKind,
+    MockClassifier, RuleRubric, Sensitivity, TieredClassifier, Verdict, ViolationCategory,
 };
+use skybouncer::enricher::EnrichedContext;
 use skybouncer::error::SkybouncerError;
 use skybouncer::matcher::{extract_did_from_at_uri, Interaction, InteractionType};
 
@@ -29,6 +32,8 @@ fn sample_interaction(text: &str) -> Interaction {
         parent_uri: Some("at://did:plc:protected456/app.bsky.feed.post/root".to_string()),
         root_uri: Some("at://did:plc:protected456/app.bsky.feed.post/root".to_string()),
         created_at_us: 1_700_000_000_000_000,
+        image_cids: Vec::new(),
+        image_alts: Vec::new(),
         enriched_context: None,
     }
 }
@@ -125,7 +130,7 @@ async fn test_jev_classifier_permitted_success() {
     let verdict = classifier.classify(&interaction).await.unwrap();
 
     match verdict {
-        Verdict::Permitted { reason } => {
+        Verdict::Permitted { reason, .. } => {
             assert_eq!(reason, "Friendly greeting");
         }
         Verdict::Violation { .. } => panic!("Expected Permitted verdict"),
@@ -780,6 +785,180 @@ fn test_interaction_self_interaction() {
 
     interaction.author_did = interaction.target_did.clone();
     assert!(interaction.is_self_interaction());
+}
+
+#[tokio::test]
+async fn test_jev_classifier_multimodal_images_injected_standard_jev() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .and(body_string_contains("c3RhbmRhcmRfamV2X2ltYWdl"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "violates": true,
+            "category": "crypto_spam",
+            "confidence": 0.99,
+            "reason": "Multimodal visual wallet drainer QR detected"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = JevConfig {
+        base_url: format!("{}/v1/classify", server.uri()),
+        api_key: None,
+        model: "jev-multimodal-v1".to_string(),
+        timeout: Duration::from_millis(1000),
+        max_retries: 1,
+    };
+    let rubric = RuleRubric::new("Block crypto scams", Sensitivity::Medium);
+    let classifier = JevClassifier::new(config, rubric).unwrap();
+
+    let mut interaction = sample_interaction("Check this image");
+    let mut enriched = EnrichedContext::default();
+    enriched
+        .images_base64
+        .push("c3RhbmRhcmRfamV2X2ltYWdl".to_string());
+    interaction.enriched_context = Some(enriched);
+
+    let verdict = classifier.classify(&interaction).await.unwrap();
+    assert!(verdict.is_violation());
+    assert_eq!(verdict.category(), Some(&ViolationCategory::CryptoSpam));
+    assert_eq!(verdict.confidence(), Some(0.99));
+}
+
+#[tokio::test]
+async fn test_jev_classifier_multimodal_images_injected_ollama() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(body_string_contains("b2xsYW1hX3Zpc2lvbl9pbWFnZQ=="))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "gemma4:12b",
+            "message": {
+                "role": "assistant",
+                "content": "{\"violates\": true, \"category\": \"harassment\", \"confidence\": 0.94, \"reason\": \"Abusive visual meme detected\"}"
+            },
+            "done": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = JevConfig {
+        base_url: format!("{}/api/chat", server.uri()),
+        api_key: None,
+        model: "gemma4:12b".to_string(),
+        timeout: Duration::from_millis(1000),
+        max_retries: 1,
+    };
+    let rubric = RuleRubric::new("Block harassment", Sensitivity::Medium);
+    let classifier = JevClassifier::new(config, rubric).unwrap();
+
+    let mut interaction = sample_interaction("Look at this");
+    let mut enriched = EnrichedContext::default();
+    enriched
+        .images_base64
+        .push("b2xsYW1hX3Zpc2lvbl9pbWFnZQ==".to_string());
+    interaction.enriched_context = Some(enriched);
+
+    let verdict = classifier.classify(&interaction).await.unwrap();
+    assert!(verdict.is_violation());
+    assert_eq!(verdict.category(), Some(&ViolationCategory::Harassment));
+    assert_eq!(verdict.confidence(), Some(0.94));
+}
+
+#[tokio::test]
+async fn test_tiered_classifier_integration_escalation() {
+    // Primary classifier returns borderline/uncertain score (0.60, within [0.40, 0.85))
+    let primary = Arc::new(MockClassifier::new(Verdict::permitted_with_confidence(
+        "Borderline text",
+        0.60,
+    )));
+    // Fallback classifier (e.g. gemma4:12b) returns confident violation
+    let fallback = Arc::new(MockClassifier::new(Verdict::violation(
+        ViolationCategory::Harassment,
+        0.92,
+        "System-2 confirmed violation",
+    )));
+
+    let config = CertaintyConfig::new(0.40, 0.85, true);
+    let tiered = TieredClassifier::new(primary.clone(), fallback.clone(), config);
+
+    let interaction = sample_interaction("borderline statement");
+    let verdict = tiered.classify(&interaction).await.unwrap();
+
+    assert!(verdict.is_violation());
+    assert_eq!(verdict.category(), Some(&ViolationCategory::Harassment));
+    assert_eq!(verdict.confidence(), Some(0.92));
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(fallback.call_count(), 1);
+    assert_eq!(tiered.stats().fallback_escalated.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        tiered
+            .stats()
+            .uncertainty_escalations
+            .load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_tiered_classifier_image_escalation() {
+    // Primary classifier allows text
+    let primary = Arc::new(MockClassifier::permitted());
+    // Fallback classifier detects violation in image
+    let fallback = Arc::new(MockClassifier::violation(
+        ViolationCategory::Phishing,
+        0.95,
+        "Visual phishing credential harvest in image",
+    ));
+
+    let config = CertaintyConfig::new(0.40, 0.85, true);
+    let tiered = TieredClassifier::new(primary.clone(), fallback.clone(), config);
+
+    let mut interaction = sample_interaction("Please review attachment");
+    interaction
+        .image_cids
+        .push("bafkreitestimagecid".to_string());
+    interaction.image_alts.push("attachment.png".to_string());
+
+    let verdict = tiered.classify(&interaction).await.unwrap();
+
+    assert!(verdict.is_violation());
+    assert_eq!(verdict.category(), Some(&ViolationCategory::Phishing));
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(fallback.call_count(), 1);
+    assert_eq!(tiered.stats().image_escalations.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn test_tiered_classifier_integration_decisive_violation_bypass() {
+    // Primary classifier returns high confidence violation (0.95 >= 0.85)
+    let primary = Arc::new(MockClassifier::new(Verdict::violation(
+        ViolationCategory::CryptoSpam,
+        0.95,
+        "Unambiguous crypto drainer link in text",
+    )));
+    // Fallback classifier should NEVER be called
+    let fallback = Arc::new(MockClassifier::permitted());
+
+    let config = CertaintyConfig::new(0.40, 0.85, true);
+    let tiered = TieredClassifier::new(primary.clone(), fallback.clone(), config);
+
+    let mut interaction = sample_interaction("Claim free ETH now: https://scam.eth");
+    // Even if interaction has images attached, decisive text violation skips fallback
+    interaction.image_cids.push("bafkreiblob".to_string());
+
+    let verdict = tiered.classify(&interaction).await.unwrap();
+
+    assert!(verdict.is_violation());
+    assert_eq!(verdict.category(), Some(&ViolationCategory::CryptoSpam));
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(fallback.call_count(), 0);
+    assert_eq!(tiered.stats().primary_resolved.load(Ordering::Relaxed), 1);
+    assert_eq!(tiered.stats().fallback_escalated.load(Ordering::Relaxed), 0);
 }
 
 // =============================================================================

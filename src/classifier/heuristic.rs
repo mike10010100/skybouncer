@@ -144,9 +144,7 @@ impl HeuristicClassifier {
                 };
             }
         }
-        Verdict::Permitted {
-            reason: "No heuristic violations detected".to_string(),
-        }
+        Verdict::permitted("No heuristic violations detected")
     }
 
     /// Synchronously evaluates an incoming interaction candidate.

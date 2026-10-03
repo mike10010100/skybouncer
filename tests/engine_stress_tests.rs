@@ -835,9 +835,7 @@ async fn test_stress_engine_maintenance_loop_cancellation() {
     // Concurrently write 100 evaluation entries that expire immediately (TTL = 0)
     for i in 0..100 {
         let post_uri = format!("at://did:plc:writer/app.bsky.feed.post/{i}");
-        let verdict = Verdict::Permitted {
-            reason: "fast entry".to_string(),
-        };
+        let verdict = Verdict::permitted("fast entry");
         cache
             .set_evaluation(&post_uri, "did:plc:writer", &verdict, Duration::ZERO)
             .expect("cache set");
@@ -858,4 +856,72 @@ async fn test_stress_engine_maintenance_loop_cancellation() {
         pruned > 0,
         "Maintenance task should have pruned expired evaluations (pruned {pruned})"
     );
+}
+
+#[tokio::test]
+async fn test_engine_builder_with_tiered_classifier() {
+    let pds = MockPdsServer::start().await;
+    let protected_did = "did:plc:protected_target";
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let rubric = RuleRubric::new("Block hate speech", Sensitivity::Medium);
+    let modlist = Arc::new(
+        ModListManager::from_shared_cache(Arc::clone(&cache))
+            .with_rubric(rubric.clone())
+            .with_dry_run(true),
+    );
+    let pds_client = Arc::new(pds.pds_client(protected_did));
+
+    // Primary returns borderline/uncertain score (0.50)
+    let primary = Arc::new(MockClassifier::new(Verdict::permitted_with_confidence(
+        "Borderline insult",
+        0.50,
+    )));
+    // Fallback returns high-confidence violation (0.95)
+    let fallback = Arc::new(MockClassifier::violation(
+        skybouncer::classifier::ViolationCategory::Harassment,
+        0.95,
+        "System-2 confirmed targeted harassment",
+    ));
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert(protected_did.to_string());
+    let config = SkybouncerConfig::new(protected_dids, rubric)
+        .with_dry_run(true)
+        .with_certainty_config(skybouncer::classifier::CertaintyConfig::new(
+            0.40, 0.85, true,
+        ));
+
+    let engine = SkybouncerEngine::builder(config)
+        .with_cache(cache)
+        .with_modlist_manager(modlist)
+        .with_pds_client(pds_client)
+        .with_classifier(primary.clone())
+        .with_fallback_classifier(fallback.clone())
+        .build()
+        .expect("engine build must succeed");
+
+    let interaction = skybouncer::matcher::Interaction {
+        post_uri: "at://did:plc:attacker/app.bsky.feed.post/123".to_string(),
+        post_cid: Some("bafyreitest".to_string()),
+        author_did: "did:plc:attacker".to_string(),
+        target_did: protected_did.to_string(),
+        text: "Borderline insult targeting you".to_string(),
+        interaction_type: skybouncer::matcher::InteractionType::DirectReply,
+        parent_uri: Some(format!("at://{protected_did}/app.bsky.feed.post/root")),
+        root_uri: Some(format!("at://{protected_did}/app.bsky.feed.post/root")),
+        created_at_us: 1_700_000_000_000_000,
+        image_cids: Vec::new(),
+        image_alts: Vec::new(),
+        enriched_context: None,
+    };
+
+    let verdict = engine
+        .primary_classifier()
+        .classify(&interaction)
+        .await
+        .unwrap();
+    assert!(verdict.is_violation());
+    assert_eq!(verdict.confidence(), Some(0.95));
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(fallback.call_count(), 1);
 }

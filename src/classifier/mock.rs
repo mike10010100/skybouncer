@@ -11,7 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
-use crate::classifier::{Classifier, Verdict, ViolationCategory};
+use crate::classifier::{Classifier, RuleRubric, Verdict, ViolationCategory};
 use crate::error::SkybouncerError;
 use crate::matcher::Interaction;
 
@@ -23,6 +23,7 @@ pub struct MockClassifier {
     call_count: Arc<AtomicUsize>,
     simulated_delay: Arc<RwLock<Option<Duration>>>,
     simulated_error: Arc<RwLock<Option<String>>>,
+    rubric: Arc<RwLock<Option<RuleRubric>>>,
 }
 
 impl MockClassifier {
@@ -35,15 +36,14 @@ impl MockClassifier {
             call_count: Arc::new(AtomicUsize::new(0)),
             simulated_delay: Arc::new(RwLock::new(None)),
             simulated_error: Arc::new(RwLock::new(None)),
+            rubric: Arc::new(RwLock::new(None)),
         }
     }
 
     /// Convenience constructor returning `Verdict::Permitted` by default.
     #[must_use]
     pub fn permitted() -> Self {
-        Self::new(Verdict::Permitted {
-            reason: "Mock permitted by default".to_string(),
-        })
+        Self::new(Verdict::permitted("Mock permitted by default"))
     }
 
     /// Convenience constructor returning `Verdict::Violation` by default.
@@ -105,6 +105,12 @@ impl MockClassifier {
     pub fn reset_call_count(&self) {
         self.call_count.store(0, Ordering::SeqCst);
     }
+
+    /// Returns the currently active rubric, if set.
+    #[must_use]
+    pub fn rubric(&self) -> Option<RuleRubric> {
+        self.rubric.read().clone()
+    }
 }
 
 impl Default for MockClassifier {
@@ -115,6 +121,10 @@ impl Default for MockClassifier {
 
 #[async_trait]
 impl Classifier for MockClassifier {
+    fn set_rubric(&self, rubric: RuleRubric) {
+        *self.rubric.write() = Some(rubric);
+    }
+
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
         // Atomically record invocation
         self.call_count.fetch_add(1, Ordering::SeqCst);

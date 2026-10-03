@@ -316,6 +316,8 @@ impl BotCommandHandler {
             parent_uri: None,
             root_uri: None,
             created_at_us: 0,
+            image_cids: Vec::new(),
+            image_alts: Vec::new(),
             enriched_context: None,
         };
 
@@ -331,9 +333,7 @@ impl BotCommandHandler {
                 .primary_classifier()
                 .classify(&synthetic_interaction)
                 .await
-                .unwrap_or(Verdict::Permitted {
-                    reason: "Evaluation error or offline model".to_string(),
-                })
+                .unwrap_or_else(|_| Verdict::permitted("Evaluation error or offline model"))
         };
 
         match final_verdict {
@@ -348,10 +348,15 @@ impl BotCommandHandler {
                  • Reason: {reason}",
                 confidence * 100.0
             )),
-            Verdict::Permitted { reason } => Ok(format!(
-                "🔍 Test Evaluation: **PERMITTED**\n\n\
-                 • Rationale: {reason}"
-            )),
+            Verdict::Permitted { reason, confidence } => {
+                let conf_str = confidence
+                    .map(|c| format!("\n• Confidence: {:.1}%", c * 100.0))
+                    .unwrap_or_default();
+                Ok(format!(
+                    "🔍 Test Evaluation: **PERMITTED**\n\n\
+                     • Rationale: {reason}{conf_str}"
+                ))
+            }
         }
     }
 }

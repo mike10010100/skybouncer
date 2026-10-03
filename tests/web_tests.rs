@@ -60,9 +60,7 @@ async fn setup_test_web_environment(
         Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
     let pds_client = Arc::new(pds.pds_client(protected_did));
     let classifier = Arc::new(skybouncer::classifier::MockClassifier::new(
-        Verdict::Permitted {
-            reason: "Default test verdict: benign interaction".to_string(),
-        },
+        Verdict::permitted("Default test verdict: benign interaction"),
     ));
 
     let mut protected_dids = HashSet::new();
@@ -412,9 +410,7 @@ async fn test_api_simulate_heuristic_disabled_by_default() {
         Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
     let pds_client = Arc::new(pds.pds_client("did:plc:alice"));
     let classifier = Arc::new(skybouncer::classifier::MockClassifier::new(
-        Verdict::Permitted {
-            reason: "Passed by primary classifier because heuristic is disabled".to_string(),
-        },
+        Verdict::permitted("Passed by primary classifier because heuristic is disabled"),
     ));
 
     let mut protected_dids = HashSet::new();

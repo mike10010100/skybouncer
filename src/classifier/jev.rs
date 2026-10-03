@@ -128,6 +128,9 @@ pub struct JevClassifyRequest {
     pub context: JevRequestContext,
     /// Sensitivity string (`"low"`, `"medium"`, `"high"`).
     pub sensitivity: String,
+    /// Optional base64-encoded visual image attachments for multimodal models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
 }
 
 /// Inbound JSON response schema received from the Jev classification API.
@@ -174,6 +177,9 @@ pub struct OllamaChatMessage {
     pub role: String,
     /// Text content of the message.
     pub content: String,
+    /// Optional base64-encoded visual image attachments for multimodal models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
 }
 
 /// Outbound request payload for Ollama chat classification (`/api/chat`).
@@ -412,6 +418,12 @@ impl JevClassifier {
                 (r.prompt.clone(), r.sensitivity.as_str().to_string())
             };
 
+            let images = interaction
+                .enriched_context
+                .as_ref()
+                .map(|ctx| ctx.images_base64.clone())
+                .filter(|imgs| !imgs.is_empty());
+
             let send_result = match self.endpoint_kind {
                 JevEndpointKind::StandardJev => {
                     let payload = JevClassifyRequest {
@@ -424,16 +436,30 @@ impl JevClassifier {
                             interaction_type: interaction.interaction_type.as_str().to_string(),
                         },
                         sensitivity: sensitivity_str,
+                        images,
                     };
                     request_builder.json(&payload).send().await
                 }
                 JevEndpointKind::Ollama => {
-                    let system_prompt = format!(
-                        "You are an automated content moderation classifier. \
-                        Evaluate candidate posts against this rubric: \"{rubric_prompt}\". \
-                        Output ONLY a single valid JSON object matching: \
-                        {{\"violates\": boolean, \"category\": string or null, \"confidence\": float (0.0 to 1.0), \"reason\": string}}"
-                    );
+                    let has_images = images
+                        .as_ref()
+                        .map(|imgs| !imgs.is_empty())
+                        .unwrap_or(false);
+                    let system_prompt = if has_images {
+                        format!(
+                            "You are an automated multimodal content moderation classifier. \
+                            Evaluate candidate posts and any attached visual images against this rubric: \"{rubric_prompt}\". \
+                            Output ONLY a single valid JSON object matching: \
+                            {{\"violates\": boolean, \"category\": string or null, \"confidence\": float (0.0 to 1.0), \"reason\": string}}"
+                        )
+                    } else {
+                        format!(
+                            "You are an automated content moderation classifier. \
+                            Evaluate candidate posts against this rubric: \"{rubric_prompt}\". \
+                            Output ONLY a single valid JSON object matching: \
+                            {{\"violates\": boolean, \"category\": string or null, \"confidence\": float (0.0 to 1.0), \"reason\": string}}"
+                        )
+                    };
                     let enrichment_str = interaction
                         .enriched_context
                         .as_ref()
@@ -456,10 +482,12 @@ impl JevClassifier {
                             OllamaChatMessage {
                                 role: "system".to_string(),
                                 content: system_prompt,
+                                images: None,
                             },
                             OllamaChatMessage {
                                 role: "user".to_string(),
                                 content: user_prompt,
+                                images,
                             },
                         ],
                         format: "json".to_string(),
@@ -667,7 +695,7 @@ impl JevClassifier {
 
             Verdict::violation(category, resp.confidence, resp.reason)
         } else {
-            Verdict::permitted(resp.reason)
+            Verdict::permitted_with_confidence(resp.reason, resp.confidence)
         }
     }
 }

@@ -11,11 +11,13 @@ pub mod heuristic;
 pub mod jev;
 pub mod mock;
 pub mod rubric;
+pub mod tiered;
 
 pub use heuristic::{HeuristicClassifier, HeuristicRule};
 pub use jev::{JevClassifier, JevConfig, JevEndpointKind};
 pub use mock::MockClassifier;
 pub use rubric::{RuleRubric, Sensitivity};
+pub use tiered::{CertaintyConfig, TieredClassifier, TieredClassifierStats, TieredStatsSnapshot};
 
 /// Category classification for house rule violations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -116,6 +118,9 @@ pub enum Verdict {
     Permitted {
         /// Rationale why the interaction is permitted.
         reason: String,
+        /// Optional confidence score between 0.0 and 1.0.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence: Option<f64>,
     },
 }
 
@@ -144,6 +149,21 @@ impl Verdict {
     pub fn permitted(reason: impl Into<String>) -> Self {
         Self::Permitted {
             reason: reason.into(),
+            confidence: None,
+        }
+    }
+
+    /// Constructs a new [`Verdict::Permitted`] with the given rationale and confidence score.
+    #[must_use]
+    pub fn permitted_with_confidence(reason: impl Into<String>, confidence: f64) -> Self {
+        let sanitized = if confidence.is_nan() {
+            0.0
+        } else {
+            confidence.clamp(0.0, 1.0)
+        };
+        Self::Permitted {
+            reason: reason.into(),
+            confidence: Some(sanitized),
         }
     }
 
@@ -159,12 +179,12 @@ impl Verdict {
         matches!(self, Self::Permitted { .. })
     }
 
-    /// Returns the confidence score if a violation occurred, or `None` if permitted.
+    /// Returns the confidence score if available.
     #[must_use]
     pub fn confidence(&self) -> Option<f64> {
         match self {
             Self::Violation { confidence, .. } => Some(*confidence),
-            Self::Permitted { .. } => None,
+            Self::Permitted { confidence, .. } => *confidence,
         }
     }
 
@@ -172,7 +192,7 @@ impl Verdict {
     #[must_use]
     pub fn reason(&self) -> &str {
         match self {
-            Self::Violation { reason, .. } | Self::Permitted { reason } => reason.as_str(),
+            Self::Violation { reason, .. } | Self::Permitted { reason, .. } => reason.as_str(),
         }
     }
 

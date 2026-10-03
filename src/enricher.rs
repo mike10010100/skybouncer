@@ -15,6 +15,9 @@ use crate::matcher::Interaction;
 /// Default public Bluesky AppView endpoint for read-only XRPC resolution.
 pub const DEFAULT_APPVIEW_ENDPOINT: &str = "https://public.api.bsky.app";
 
+/// Default public Bluesky CDN endpoint for image thumbnail retrieval.
+pub const DEFAULT_CDN_ENDPOINT: &str = "https://cdn.bsky.app";
+
 /// Default timeout in milliseconds for AppView profile and post enrichment queries.
 pub const DEFAULT_ENRICHER_TIMEOUT_MS: u64 = 600;
 
@@ -46,13 +49,16 @@ pub struct ParentPostContext {
     pub cid: Option<String>,
 }
 
-/// Consolidated conversational and author context supplied to classifiers.
+/// Consolidated conversational, author, and visual context supplied to classifiers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct EnrichedContext {
     /// Resolved author profile details.
     pub author: Option<AuthorContext>,
     /// Resolved parent post content and author.
     pub parent_post: Option<ParentPostContext>,
+    /// Base64-encoded image payloads fetched from CDN for attached images.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images_base64: Vec<String>,
 }
 
 impl EnrichedContext {
@@ -62,10 +68,10 @@ impl EnrichedContext {
         Self::default()
     }
 
-    /// Returns `true` if neither author nor parent post context was resolved.
+    /// Returns `true` if neither author, parent post, nor image context was resolved.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.author.is_none() && self.parent_post.is_none()
+        self.author.is_none() && self.parent_post.is_none() && self.images_base64.is_empty()
     }
 
     /// Formats the enriched context into a concise string block for classifier prompt injection.
@@ -101,6 +107,13 @@ impl EnrichedContext {
             ));
         }
 
+        if !self.images_base64.is_empty() {
+            sections.push(format!(
+                "Image Attachments [{} image(s) attached and decoded for visual inspection]",
+                self.images_base64.len()
+            ));
+        }
+
         sections.join("\n")
     }
 }
@@ -117,6 +130,13 @@ pub trait ContextEnricher: Send + Sync {
     ///
     /// Returns `None` if the handle cannot be resolved or if the enricher does not support resolution.
     async fn resolve_handle(&self, _handle: &str) -> Option<String> {
+        None
+    }
+
+    /// Fetches a base64-encoded image thumbnail for an author and image CID.
+    ///
+    /// Returns `None` if the image cannot be retrieved or decoded.
+    async fn fetch_image_base64(&self, _author_did: &str, _cid: &str) -> Option<String> {
         None
     }
 }
@@ -138,6 +158,7 @@ pub struct MockContextEnricher {
     authors: Arc<RwLock<HashMap<String, AuthorContext>>>,
     parent_posts: Arc<RwLock<HashMap<String, ParentPostContext>>>,
     handles: Arc<RwLock<HashMap<String, String>>>,
+    images: Arc<RwLock<HashMap<(String, String), String>>>,
 }
 
 impl MockContextEnricher {
@@ -162,6 +183,18 @@ impl MockContextEnricher {
         let clean = handle.into().trim().trim_start_matches('@').to_string();
         self.handles.write().insert(clean, did.into());
     }
+
+    /// Injects a base64-encoded image payload for a given author DID and image CID.
+    pub fn set_image_base64(
+        &self,
+        author_did: impl Into<String>,
+        cid: impl Into<String>,
+        base64: impl Into<String>,
+    ) {
+        self.images
+            .write()
+            .insert((author_did.into(), cid.into()), base64.into());
+    }
 }
 
 #[async_trait]
@@ -173,9 +206,20 @@ impl ContextEnricher for MockContextEnricher {
             .as_ref()
             .and_then(|uri| self.parent_posts.read().get(uri).cloned());
 
+        let mut images_base64 = Vec::new();
+        {
+            let guard = self.images.read();
+            for cid in &interaction.image_cids {
+                if let Some(b64) = guard.get(&(interaction.author_did.clone(), cid.clone())) {
+                    images_base64.push(b64.clone());
+                }
+            }
+        }
+
         EnrichedContext {
             author,
             parent_post,
+            images_base64,
         }
     }
 
@@ -186,25 +230,42 @@ impl ContextEnricher for MockContextEnricher {
         }
         self.handles.read().get(clean).cloned()
     }
+
+    async fn fetch_image_base64(&self, author_did: &str, cid: &str) -> Option<String> {
+        self.images
+            .read()
+            .get(&(author_did.to_string(), cid.to_string()))
+            .cloned()
+    }
 }
 
 /// AppView HTTP client resolving author profiles and parent posts via public XRPC endpoints.
 #[derive(Debug, Clone)]
 pub struct AppViewContextEnricher {
     appview_url: String,
+    cdn_url: String,
     http_client: reqwest::Client,
 }
 
 impl AppViewContextEnricher {
-    /// Creates a new [`AppViewContextEnricher`] targeting the default public AppView.
+    /// Creates a new [`AppViewContextEnricher`] targeting the default public AppView and CDN.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_endpoint(DEFAULT_APPVIEW_ENDPOINT)
+        Self::with_endpoints(DEFAULT_APPVIEW_ENDPOINT, DEFAULT_CDN_ENDPOINT)
     }
 
-    /// Creates a new [`AppViewContextEnricher`] with a custom AppView endpoint.
+    /// Creates a new [`AppViewContextEnricher`] with a custom AppView endpoint and default CDN.
     #[must_use]
     pub fn with_endpoint(endpoint: impl Into<String>) -> Self {
+        Self::with_endpoints(endpoint, DEFAULT_CDN_ENDPOINT)
+    }
+
+    /// Creates a new [`AppViewContextEnricher`] with custom AppView and CDN endpoints.
+    #[must_use]
+    pub fn with_endpoints(
+        appview_endpoint: impl Into<String>,
+        cdn_endpoint: impl Into<String>,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .use_rustls_tls()
             .timeout(Duration::from_millis(DEFAULT_ENRICHER_TIMEOUT_MS))
@@ -212,7 +273,8 @@ impl AppViewContextEnricher {
             .unwrap_or_default();
 
         Self {
-            appview_url: endpoint.into().trim_end_matches('/').to_string(),
+            appview_url: appview_endpoint.into().trim_end_matches('/').to_string(),
+            cdn_url: cdn_endpoint.into().trim_end_matches('/').to_string(),
             http_client: client,
         }
     }
@@ -355,6 +417,37 @@ impl AppViewContextEnricher {
             .ok()
             .map(|r| r.did)
     }
+
+    /// Fetches an image thumbnail from the Bluesky CDN and encodes it as base64.
+    pub async fn fetch_image_base64(&self, author_did: &str, cid: &str) -> Option<String> {
+        let url = format!(
+            "{}/img/feed_thumbnail/plain/{author_did}/{cid}@jpeg",
+            self.cdn_url
+        );
+        let resp = self.http_client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let bytes = resp.bytes().await.ok()?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            return None;
+        }
+
+        use base64::Engine;
+        Some(base64::engine::general_purpose::STANDARD.encode(&bytes))
+    }
+
+    /// Fetches base64-encoded thumbnails for a set of image CIDs from the Bluesky CDN.
+    pub async fn fetch_images_base64(&self, author_did: &str, cids: &[String]) -> Vec<String> {
+        let mut results = Vec::with_capacity(cids.len().min(4));
+        for cid in cids.iter().take(4) {
+            if let Some(b64) = self.fetch_image_base64(author_did, cid).await {
+                results.push(b64);
+            }
+        }
+        results
+    }
 }
 
 impl Default for AppViewContextEnricher {
@@ -374,16 +467,75 @@ impl ContextEnricher for AppViewContextEnricher {
                 None
             }
         };
+        let images_fut = async {
+            if interaction.has_images() {
+                self.fetch_images_base64(&interaction.author_did, &interaction.image_cids)
+                    .await
+            } else {
+                Vec::new()
+            }
+        };
 
-        let (author, parent_post) = tokio::join!(author_fut, parent_fut);
+        let (author, parent_post, images_base64) = tokio::join!(author_fut, parent_fut, images_fut);
 
         EnrichedContext {
             author,
             parent_post,
+            images_base64,
         }
     }
 
     async fn resolve_handle(&self, handle: &str) -> Option<String> {
         self.resolve_handle(handle).await
+    }
+
+    async fn fetch_image_base64(&self, author_did: &str, cid: &str) -> Option<String> {
+        self.fetch_image_base64(author_did, cid).await
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_mock_context_enricher_with_images() {
+        let enricher = MockContextEnricher::new();
+        enricher.set_image_base64("did:plc:author1", "bafkimage1", "aGVsbG8gd29ybGQ=");
+        enricher.set_image_base64("did:plc:author1", "bafkimage2", "c2Vjb25kIGltYWdl");
+
+        let mut interaction = Interaction::mock_test_candidate(
+            "did:plc:author1",
+            "did:plc:target1",
+            "Check this image",
+        );
+        interaction.image_cids = vec!["bafkimage1".to_string(), "bafkimage2".to_string()];
+        interaction.image_alts = vec!["Alt 1".to_string(), "Alt 2".to_string()];
+
+        let enriched = enricher.enrich(&interaction).await;
+        assert_eq!(enriched.images_base64.len(), 2);
+        assert_eq!(enriched.images_base64[0], "aGVsbG8gd29ybGQ=");
+        assert_eq!(enriched.images_base64[1], "c2Vjb25kIGltYWdl");
+
+        let formatted = enriched.format_for_classifier();
+        assert!(formatted
+            .contains("Image Attachments [2 image(s) attached and decoded for visual inspection]"));
+    }
+
+    #[tokio::test]
+    async fn test_mock_context_enricher_fetch_image_base64() {
+        let enricher = MockContextEnricher::new();
+        enricher.set_image_base64("did:plc:author1", "bafkimage1", "aGVsbG8=");
+
+        let fetched = enricher
+            .fetch_image_base64("did:plc:author1", "bafkimage1")
+            .await;
+        assert_eq!(fetched, Some("aGVsbG8=".to_string()));
+
+        let missing = enricher
+            .fetch_image_base64("did:plc:author1", "bafkimage_unknown")
+            .await;
+        assert_eq!(missing, None);
     }
 }

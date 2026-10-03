@@ -47,9 +47,7 @@ async fn setup_test_engine(
         Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
     let pds_client = Arc::new(pds.pds_client(protected_did));
     let classifier = Arc::new(skybouncer::classifier::MockClassifier::new(
-        Verdict::Permitted {
-            reason: "Default test verdict".to_string(),
-        },
+        Verdict::permitted("Default test verdict"),
     ));
 
     let mut protected_dids = HashSet::new();
@@ -749,9 +747,7 @@ async fn test_command_handler_pardon_with_handle_resolution() {
             .with_pds_client(pds_client)
             .with_enricher(enricher)
             .with_classifier(Arc::new(skybouncer::classifier::MockClassifier::new(
-                Verdict::Permitted {
-                    reason: "ok".into(),
-                },
+                Verdict::permitted("ok"),
             )))
             .build()
             .expect("engine build"),

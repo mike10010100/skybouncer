@@ -335,7 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     confidence * 100.0
                 );
             }
-            Verdict::Permitted { reason } => {
+            Verdict::Permitted { reason, .. } => {
                 println!("  [Live Jev   ({model_ms}ms)]: 🟢 PERMITTED -> {reason}");
             }
         }
@@ -367,7 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("     Score: ❌ FALSE POSITIVE (Caught by {evaluator_name})");
                 }
             }
-            Verdict::Permitted { reason: _ } => {
+            Verdict::Permitted { .. } => {
                 println!(
                     "  => Pipeline Verdict: PERMITTED via {evaluator_name} -> ALLOW (Zero Action)"
                 );
