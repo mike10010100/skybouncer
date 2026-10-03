@@ -392,7 +392,7 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div class="kpi-card">
         <div class="kpi-label">Bounces Executed</div>
         <div class="kpi-val" id="kpi-bounces" style="color: var(--danger);">0</div>
-        <div class="kpi-sub">PDS ModList Items</div>
+        <div class="kpi-sub" id="kpi-bounces-sub">PDS ModList Items</div>
       </div>
     </section>
 
@@ -509,6 +509,16 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         document.getElementById("kpi-dedup").innerText = data.stats.dedup_cache_hits.toLocaleString();
         document.getElementById("kpi-evals").innerText = data.stats.model_evaluations.toLocaleString();
         document.getElementById("kpi-bounces").innerText = data.stats.bounces_executed.toLocaleString();
+        if (data.dry_run) {
+          const badge = document.querySelector(".status-badge");
+          if (badge) {
+            badge.style.borderColor = "var(--warning)";
+            badge.style.color = "var(--warning)";
+            badge.innerHTML = '<div class="pulse-dot" style="background: var(--warning); box-shadow: 0 0 8px var(--warning);"></div><span>🛡️ Shadow Mode (Dry Run)</span>';
+          }
+          const sub = document.getElementById("kpi-bounces-sub");
+          if (sub) sub.innerText = "Simulated Bounces (No Writes)";
+        }
       } catch (e) {
         console.error("Status fetch failed", e);
       }

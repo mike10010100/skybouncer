@@ -126,6 +126,8 @@ pub struct StatusResponse {
     pub protected_dids: Vec<String>,
     /// Currently active moderation rubric.
     pub rubric: RulesResponse,
+    /// Whether the engine operates in shadow dry-run mode.
+    pub dry_run: bool,
     /// Skybouncer package version string.
     pub version: String,
 }
@@ -145,6 +147,7 @@ pub async fn get_status(State(state): State<ApiState>) -> Json<StatusResponse> {
             sensitivity: rubric.sensitivity,
             threshold: rubric.sensitivity.threshold(),
         },
+        dry_run: state.engine.is_dry_run(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }

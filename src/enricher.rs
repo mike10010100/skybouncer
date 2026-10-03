@@ -277,6 +277,35 @@ impl AppViewContextEnricher {
             cid: first.cid,
         })
     }
+
+    /// Fetches initial followed DIDs for an actor from the public AppView (XRPC `app.bsky.graph.getFollows`).
+    ///
+    /// Used for zero-credential cold-start hydration of the local follow graph.
+    pub async fn fetch_follows(&self, actor: &str, limit: u8) -> Vec<String> {
+        let url = format!(
+            "{}/xrpc/app.bsky.graph.getFollows?actor={actor}&limit={limit}",
+            self.appview_url
+        );
+        let resp = match self.http_client.get(&url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return Vec::new(),
+        };
+
+        #[derive(Deserialize)]
+        struct FollowProfile {
+            did: String,
+        }
+
+        #[derive(Deserialize)]
+        struct GetFollowsResponse {
+            follows: Vec<FollowProfile>,
+        }
+
+        match resp.json::<GetFollowsResponse>().await {
+            Ok(body) => body.follows.into_iter().map(|f| f.did).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 impl Default for AppViewContextEnricher {

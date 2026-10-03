@@ -52,6 +52,26 @@ async fn main() -> Result<(), SkybouncerError> {
     // 1. Load .env file from current working directory if present
     load_dotenv_file(Path::new(".env"));
 
+    // Check for help flag before logger initialization
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "🛡️ Skybouncer v{} - Sovereign Automated Moderation Service for Bluesky",
+            env!("CARGO_PKG_VERSION")
+        );
+        println!();
+        println!("USAGE:");
+        println!("  skybouncer [OPTIONS]");
+        println!();
+        println!("OPTIONS:");
+        println!("  --dry-run, --shadow-mode    Run in shadow mode: stream real-time Jetstream firehose,");
+        println!("                              evaluate with live model, but simulate PDS list mutations (0 writes)");
+        println!("  --did <DID>                 Add protected DID to shield (can be specified multiple times)");
+        println!("  --rules <RULES>             Override natural-language moderation rules prompt");
+        println!("  -h, --help                  Print help information");
+        return Ok(());
+    }
+
     // 2. Initialize structured tracing subscriber
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("skybouncer=info,skybase=info,info"));
@@ -65,7 +85,7 @@ async fn main() -> Result<(), SkybouncerError> {
     info!("   Sovereign, Rule-Driven Auto-Moderation & Bouncer Service for ATProto & Bluesky");
 
     // 3. Load engine configuration from environment variables
-    let config = match SkybouncerConfig::from_env() {
+    let mut config = match SkybouncerConfig::from_env() {
         Ok(cfg) => cfg,
         Err(e) => {
             error!(error = %e, "Failed to load Skybouncer configuration from environment");
@@ -73,8 +93,35 @@ async fn main() -> Result<(), SkybouncerError> {
         }
     };
 
+    // Override or augment from CLI arguments
+    if args
+        .iter()
+        .any(|a| a == "--dry-run" || a == "--shadow-mode")
+    {
+        config.dry_run = true;
+    }
+    let mut i = 1;
+    while i < args.len() {
+        if (args[i] == "--did" || args[i] == "--protected-did") && i + 1 < args.len() {
+            config.protected_dids.insert(args[i + 1].clone());
+            i += 1;
+        } else if args[i] == "--rules" && i + 1 < args.len() {
+            config.rubric = skybouncer::classifier::RuleRubric::parse(&args[i + 1])?;
+            i += 1;
+        }
+        i += 1;
+    }
+
+    if config.dry_run {
+        info!("╔══════════════════════════════════════════════════════════════════════════════╗");
+        info!("║  🛡️  SHADOW MODE ACTIVE (--dry-run)                                         ║");
+        info!("║  Streaming real-time Jetstream firehose and running live AI evaluations.    ║");
+        info!("║  All remote PDS modlist mutations will be simulated with ZERO writes!       ║");
+        info!("╚══════════════════════════════════════════════════════════════════════════════╝");
+    }
+
     if config.protected_dids.is_empty() {
-        warn!("No PROTECTED_DIDS configured! Set PROTECTED_DIDS in .env (comma-separated).");
+        warn!("No PROTECTED_DIDS configured! Set PROTECTED_DIDS in .env or pass --did <DID>.");
         warn!("Running in monitoring mode — no accounts will be actively protected.");
     } else {
         info!(
@@ -119,7 +166,7 @@ async fn main() -> Result<(), SkybouncerError> {
     );
 
     let engine = match SkybouncerEngine::builder(config.clone())
-        .with_enricher(enricher)
+        .with_enricher(enricher.clone())
         .build()
     {
         Ok(eng) => eng,
@@ -129,8 +176,17 @@ async fn main() -> Result<(), SkybouncerError> {
         }
     };
 
+    // Cold-start follow graph hydration via public AppView
+    for did in &config.protected_dids {
+        let follows = enricher.fetch_follows(did, 100).await;
+        if !follows.is_empty() {
+            let count = engine.hydrate_follows(did, follows);
+            info!(did = %did, count = count, "Hydrated initial follow graph from AppView (cold start)");
+        }
+    }
+
     // 5. Ensure moderation list exists on PDS for configured protected DIDs
-    if config.pds_endpoint.is_some() && config.pds_access_token.is_some() {
+    if !config.dry_run && config.pds_endpoint.is_some() && config.pds_access_token.is_some() {
         for did in &config.protected_dids {
             match engine.ensure_mod_list(did).await {
                 Ok(list_uri) => {
@@ -141,6 +197,8 @@ async fn main() -> Result<(), SkybouncerError> {
                 }
             }
         }
+    } else if config.dry_run {
+        info!("🛡️ Shadow mode active: skipping remote PDS moderation list verification");
     }
 
     // 6. Setup cancellation and background task supervision

@@ -85,6 +85,11 @@ pub struct SkybouncerConfig {
     /// and contextual speech (e.g. Apple AirDrop, military airdrops, security warnings),
     /// allowing all candidate interactions to be evaluated by the primary semantic model.
     pub enable_heuristic_prefilter: bool,
+    /// Whether to operate in shadow dry-run mode.
+    ///
+    /// When active, incoming interactions from live Jetstream are processed and evaluated normally,
+    /// but remote PDS moderation list mutations are simulated with zero remote network writes.
+    pub dry_run: bool,
 }
 
 impl Default for SkybouncerConfig {
@@ -103,6 +108,7 @@ impl Default for SkybouncerConfig {
             rate_limiter_config: RateLimiterConfig::default(),
             stateless_mode: false,
             enable_heuristic_prefilter: false,
+            dry_run: false,
         }
     }
 }
@@ -191,6 +197,13 @@ impl SkybouncerConfig {
         self
     }
 
+    /// Sets whether to operate in shadow dry-run mode.
+    #[must_use]
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
     /// Loads configuration from environment variables with fallback defaults.
     ///
     /// # Errors
@@ -253,6 +266,12 @@ impl SkybouncerConfig {
             .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
             .unwrap_or(false);
 
+        let dry_run = std::env::var("DRY_RUN")
+            .or_else(|_| std::env::var("SKYBOUNCER_DRY_RUN"))
+            .or_else(|_| std::env::var("SKYBOUNCER_SHADOW_MODE"))
+            .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
+            .unwrap_or(false);
+
         Ok(Self {
             protected_dids,
             rubric,
@@ -267,6 +286,7 @@ impl SkybouncerConfig {
             rate_limiter_config,
             stateless_mode,
             enable_heuristic_prefilter,
+            dry_run,
         })
     }
 }
@@ -590,6 +610,11 @@ impl SkybouncerEngine {
             HeuristicClassifier::default()
         } else {
             HeuristicClassifier::empty()
+        };
+        let modlist_manager = if config.dry_run && !modlist_manager.is_dry_run() {
+            Arc::new((*modlist_manager).clone().with_dry_run(true))
+        } else {
+            modlist_manager
         };
         let protected_dids = Arc::new(RwLock::new(config.protected_dids.clone()));
         let rubric = Arc::new(RwLock::new(config.rubric.clone()));
@@ -980,6 +1005,12 @@ impl SkybouncerEngine {
             .await
     }
 
+    /// Returns `true` if this engine operates in shadow dry-run mode.
+    #[must_use]
+    pub fn is_dry_run(&self) -> bool {
+        self.config.dry_run
+    }
+
     /// Returns a reference to the active configuration.
     #[must_use]
     pub fn config(&self) -> &SkybouncerConfig {
@@ -1318,7 +1349,21 @@ impl SkybouncerEngineBuilder {
             None => match self.modlist_manager {
                 Some(ref m) => Arc::clone(m.cache()),
                 None => match self.config.cache_path.as_ref() {
-                    Some(path) => Arc::new(DeduplicationCache::open(path)?),
+                    Some(path) => {
+                        let target_path = if self.config.dry_run {
+                            let mut shadow = path.clone();
+                            let stem = shadow
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("skybouncer");
+                            let ext = shadow.extension().and_then(|e| e.to_str()).unwrap_or("db");
+                            shadow.set_file_name(format!("{stem}_shadow.{ext}"));
+                            shadow
+                        } else {
+                            path.clone()
+                        };
+                        Arc::new(DeduplicationCache::open(target_path)?)
+                    }
                     None => Arc::new(DeduplicationCache::open_in_memory()?),
                 },
             },
@@ -1360,11 +1405,18 @@ impl SkybouncerEngineBuilder {
 
         // 5. Initialize ModListManager
         let modlist_manager = match self.modlist_manager {
-            Some(m) => m,
+            Some(m) => {
+                if self.config.dry_run && !m.is_dry_run() {
+                    Arc::new((*m).clone().with_dry_run(true))
+                } else {
+                    m
+                }
+            }
             None => {
                 let mut manager = ModListManager::from_shared_cache(Arc::clone(&cache))
                     .with_rubric(self.config.rubric.clone())
-                    .with_list_name(self.config.list_name.clone());
+                    .with_list_name(self.config.list_name.clone())
+                    .with_dry_run(self.config.dry_run);
                 if let Some(ref desc) = self.config.list_description {
                     manager = manager.with_list_description(Some(desc.clone()));
                 }
@@ -1376,27 +1428,53 @@ impl SkybouncerEngineBuilder {
         let pds_client = match self.pds_client {
             Some(p) => p,
             None => {
-                let endpoint = self.config.pds_endpoint.as_ref().ok_or_else(|| {
-                    SkybouncerError::Config(
-                        "PDS endpoint is required to build SkybouncerEngine".to_string(),
+                if self.config.dry_run {
+                    let endpoint = self
+                        .config
+                        .pds_endpoint
+                        .as_deref()
+                        .unwrap_or("https://bsky.social");
+                    let primary_did = self
+                        .config
+                        .protected_dids
+                        .iter()
+                        .next()
+                        .map(String::as_str)
+                        .unwrap_or("did:plc:shadowmode");
+                    let token = self
+                        .config
+                        .pds_access_token
+                        .as_deref()
+                        .unwrap_or("shadow_placeholder_token");
+                    Arc::new(
+                        PdsRepoClient::from_credentials(endpoint, primary_did, token).map_err(
+                            |e| SkybouncerError::Config(format!("Failed to build PDS client: {e}")),
+                        )?,
                     )
-                })?;
-                let token = self.config.pds_access_token.as_ref().ok_or_else(|| {
-                    SkybouncerError::Config(
-                        "PDS access token is required to build SkybouncerEngine".to_string(),
+                } else {
+                    let endpoint = self.config.pds_endpoint.as_ref().ok_or_else(|| {
+                        SkybouncerError::Config(
+                            "PDS endpoint is required to build SkybouncerEngine".to_string(),
+                        )
+                    })?;
+                    let token = self.config.pds_access_token.as_ref().ok_or_else(|| {
+                        SkybouncerError::Config(
+                            "PDS access token is required to build SkybouncerEngine".to_string(),
+                        )
+                    })?;
+                    let primary_did =
+                        self.config.protected_dids.iter().next().ok_or_else(|| {
+                            SkybouncerError::Config(
+                                "At least one protected DID is required to initialize PDS client"
+                                    .to_string(),
+                            )
+                        })?;
+                    Arc::new(
+                        PdsRepoClient::from_credentials(endpoint, primary_did, token).map_err(
+                            |e| SkybouncerError::Config(format!("Failed to build PDS client: {e}")),
+                        )?,
                     )
-                })?;
-                let primary_did = self.config.protected_dids.iter().next().ok_or_else(|| {
-                    SkybouncerError::Config(
-                        "At least one protected DID is required to initialize PDS client"
-                            .to_string(),
-                    )
-                })?;
-                Arc::new(
-                    PdsRepoClient::from_credentials(endpoint, primary_did, token).map_err(|e| {
-                        SkybouncerError::Config(format!("Failed to build PDS client: {e}"))
-                    })?,
-                )
+                }
             }
         };
 

@@ -85,6 +85,7 @@ pub struct ModListManager {
     list_description: Option<String>,
     list_provision_locks: Arc<StripedAsyncLocks>,
     bounce_locks: Arc<StripedAsyncLocks>,
+    dry_run: bool,
 }
 
 impl ModListManager {
@@ -98,6 +99,7 @@ impl ModListManager {
             list_description: Some(DEFAULT_MOD_LIST_DESCRIPTION.to_string()),
             list_provision_locks: Arc::new(StripedAsyncLocks::new()),
             bounce_locks: Arc::new(StripedAsyncLocks::new()),
+            dry_run: false,
         }
     }
 
@@ -111,7 +113,21 @@ impl ModListManager {
             list_description: Some(DEFAULT_MOD_LIST_DESCRIPTION.to_string()),
             list_provision_locks: Arc::new(StripedAsyncLocks::new()),
             bounce_locks: Arc::new(StripedAsyncLocks::new()),
+            dry_run: false,
         }
+    }
+
+    /// Configures whether this manager runs in shadow dry-run mode (simulating PDS mutations).
+    #[must_use]
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// Returns `true` if this manager operates in shadow dry-run mode.
+    #[must_use]
+    pub fn is_dry_run(&self) -> bool {
+        self.dry_run
     }
 
     /// Attaches an optional [`RuleRubric`] for sensitivity threshold validation.
@@ -217,7 +233,24 @@ impl ModListManager {
             return Ok(config.list_uri);
         }
 
-        // 4. Query remote PDS com.atproto.repo.listRecords for existing modlist
+        // 4. Query remote PDS com.atproto.repo.listRecords for existing modlist (skipped in dry-run)
+        if self.dry_run {
+            let simulated_uri = format!("at://{protected_did}/app.bsky.graph.list/shadow_modlist");
+            let now_us = current_time_us();
+            let config = ModListConfig {
+                user_did: protected_did.to_string(),
+                list_uri: simulated_uri.clone(),
+                list_cid: "bafyreidryrunsimulatedlistcid0000000000000000000000000000".to_string(),
+                created_at: now_us,
+            };
+            self.cache.set_mod_list(&config)?;
+            info!(
+                list_uri = %simulated_uri,
+                "🛡️ [SHADOW MODE] Simulated moderation list on sovereign PDS"
+            );
+            return Ok(simulated_uri);
+        }
+
         if let Ok(resp) = self
             .list_pds_records::<ModListRecord>(pds_client, "app.bsky.graph.list", 50)
             .await
@@ -358,34 +391,55 @@ impl ModListManager {
         let list_uri = self.ensure_mod_list(pds_client, protected_did).await?;
 
         // 6. Construct listitem record
-        let rkey = skybase::repo::generate_tid();
+        let rkey = if self.dry_run {
+            format!("shadow_{}", skybase::repo::generate_tid())
+        } else {
+            skybase::repo::generate_tid()
+        };
         let now_iso = now_iso8601();
         let now_us = current_time_us();
 
-        let listitem = ListItemRecord::new(candidate_did, list_uri, now_iso);
+        let (result_uri, result_cid) = if self.dry_run {
+            let simulated_uri = format!("at://{protected_did}/app.bsky.graph.listitem/{rkey}");
+            let simulated_cid =
+                "bafyreidryrunsimulatedcid000000000000000000000000000000000".to_string();
+            info!(
+                violator = %candidate_did,
+                category = %category,
+                confidence = %confidence,
+                reason = %reason,
+                post_uri = %post_uri,
+                listitem_uri = %simulated_uri,
+                "🛡️ [SHADOW MODE] Simulated bounce on sovereign PDS (remote mutation bypassed)"
+            );
+            (simulated_uri, simulated_cid)
+        } else {
+            let listitem = ListItemRecord::new(candidate_did, list_uri, now_iso);
 
-        // 7. Issue DPoP-signed mutation on sovereign PDS
-        let result = pds_client
-            .create_record("app.bsky.graph.listitem", Some(&rkey), &listitem, true)
-            .await
-            .map_err(|e| {
-                SkybouncerError::Repo(format!(
-                    "Failed to create listitem record for {candidate_did} on PDS: {e}"
-                ))
-            })?;
+            // 7. Issue DPoP-signed mutation on sovereign PDS
+            let result = pds_client
+                .create_record("app.bsky.graph.listitem", Some(&rkey), &listitem, true)
+                .await
+                .map_err(|e| {
+                    SkybouncerError::Repo(format!(
+                        "Failed to create listitem record for {candidate_did} on PDS: {e}"
+                    ))
+                })?;
 
-        info!(
-            candidate_did = %candidate_did,
-            listitem_uri = %result.uri,
-            "Successfully bounced violator on sovereign PDS"
-        );
+            info!(
+                candidate_did = %candidate_did,
+                listitem_uri = %result.uri,
+                "Successfully bounced violator on sovereign PDS"
+            );
+            (result.uri, result.cid)
+        };
 
         // 8. Persist to SQLite cache
         let bounce_record = BouncedUser {
             subject_did: candidate_did.to_string(),
-            listitem_uri: result.uri.clone(),
+            listitem_uri: result_uri.clone(),
             listitem_rkey: rkey,
-            listitem_cid: result.cid,
+            listitem_cid: result_cid,
             category: category.to_string(),
             confidence,
             reason: reason.to_string(),
@@ -394,7 +448,7 @@ impl ModListManager {
         };
         self.cache.record_bounce(&bounce_record)?;
 
-        Ok(Some(result.uri))
+        Ok(Some(result_uri))
     }
 
     /// Pardons an account by deleting its `app.bsky.graph.listitem` records from the sovereign PDS
@@ -442,16 +496,25 @@ impl ModListManager {
             "Pardoning user: deleting all associated listitems from sovereign PDS"
         );
 
-        // 2. Delete all associated listitem records from PDS
-        for rkey in &rkeys {
-            pds_client
-                .delete_record("app.bsky.graph.listitem", rkey)
-                .await
-                .map_err(|e| {
-                    SkybouncerError::Repo(format!(
-                        "Failed to delete listitem {rkey} for {subject_did} on PDS: {e}"
-                    ))
-                })?;
+        // 2. Delete all associated listitem records from PDS (bypassed in dry-run)
+        if self.dry_run {
+            info!(
+                subject_did = %subject_did,
+                protected_did = %protected_did,
+                total_rkeys = %rkeys.len(),
+                "🛡️ [SHADOW MODE] Pardoning user in shadow cache (remote PDS deletion bypassed)"
+            );
+        } else {
+            for rkey in &rkeys {
+                pds_client
+                    .delete_record("app.bsky.graph.listitem", rkey)
+                    .await
+                    .map_err(|e| {
+                        SkybouncerError::Repo(format!(
+                            "Failed to delete listitem {rkey} for {subject_did} on PDS: {e}"
+                        ))
+                    })?;
+            }
         }
 
         // 3. Remove entry from local SQLite cache now that PDS deletions succeeded

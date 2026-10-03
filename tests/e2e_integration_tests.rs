@@ -796,3 +796,108 @@ async fn test_scenario_10_dpop_nonce_challenge_recovery_on_bounce() {
     assert!(fixture.is_bounced("did:plc:dpop_violator"));
     assert_eq!(fixture.count_pds_listitems_for("did:plc:dpop_violator"), 1);
 }
+
+// =============================================================================
+// Scenario 11: Shadow Mode / Dry-Run Safe Firehose Processing
+// =============================================================================
+
+#[tokio::test]
+async fn test_scenario_11_shadow_mode_simulates_bounces_with_zero_pds_writes() {
+    let pds = MockPdsServer::start().await;
+    let jev = MockJevServer::start().await;
+
+    let cache = Arc::new(DeduplicationCache::open_in_memory().expect("in-memory cache"));
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+
+    let rubric = RuleRubric::new("Block toxicity and harassment", Sensitivity::Medium);
+    let modlist_manager = Arc::new(
+        ModListManager::from_shared_cache(Arc::clone(&cache))
+            .with_rubric(rubric.clone())
+            .with_dry_run(true),
+    );
+
+    let pds_client = Arc::new(pds.pds_client("did:plc:alice"));
+    let classifier = jev.classifier(rubric.clone());
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+
+    let config = SkybouncerConfig::new(protected_dids, rubric)
+        .with_channel_capacity(100)
+        .with_dry_run(true);
+
+    let engine = Arc::new(SkybouncerEngine::new(
+        config,
+        Arc::clone(&follow_graph),
+        Arc::clone(&gate),
+        classifier,
+        Arc::clone(&modlist_manager),
+        pds_client,
+    ));
+
+    assert!(engine.is_dry_run());
+
+    // 1. Process a violating reply commit
+    let commit = make_reply_commit(
+        "did:plc:shadow_spammer",
+        "did:plc:alice",
+        "rep_shadow_1",
+        "root_1",
+        "toxic attack: you are worthless trash delete your account",
+    );
+
+    let result = engine.process_commit(&commit).await.expect("process");
+    let outcomes = result.outcomes();
+    assert_eq!(outcomes.len(), 1);
+
+    // Assert that the outcome is Bounced with a simulated URI
+    match &outcomes[0] {
+        InteractionOutcome::Bounced {
+            author_did,
+            listitem_uri,
+            ..
+        } => {
+            assert_eq!(author_did, "did:plc:shadow_spammer");
+            assert!(listitem_uri.contains("simulated_") || listitem_uri.contains("shadow_"));
+        }
+        other => panic!("Expected Bounced outcome, got: {:?}", other),
+    }
+
+    // Crucial Invariant: ZERO listitems created on remote PDS!
+    assert_eq!(pds.created_records.lock().len(), 0);
+
+    // But cached locally so deduplication works
+    assert!(cache
+        .is_bounced("did:plc:shadow_spammer")
+        .expect("cache check"));
+
+    // 2. Second interaction from same author hits the deduplication cache ($0 cost, 0 model calls)
+    let commit2 = make_reply_commit(
+        "did:plc:shadow_spammer",
+        "did:plc:alice",
+        "rep_shadow_2",
+        "root_1",
+        "more spam",
+    );
+    let result2 = engine.process_commit(&commit2).await.expect("process");
+    let outcomes2 = result2.outcomes();
+    assert_eq!(outcomes2.len(), 1);
+    assert_eq!(
+        outcomes2[0],
+        InteractionOutcome::AlreadyBounced {
+            author_did: "did:plc:shadow_spammer".to_string(),
+        }
+    );
+
+    // 3. Pardon works in shadow mode without calling PDS deleteRecord
+    let pardoned = engine
+        .pardon_user("did:plc:alice", "did:plc:shadow_spammer")
+        .await
+        .expect("pardon");
+    assert!(pardoned);
+    assert!(!cache
+        .is_bounced("did:plc:shadow_spammer")
+        .expect("cache check"));
+    assert_eq!(pds.deleted_records.lock().len(), 0);
+}
