@@ -32,9 +32,10 @@ pub mod types;
 pub mod web;
 
 pub use bot::{
-    run_bot_poller, BotCommandHandler, ChatClient, ConvoMember, ConvoView, GetMessagesResponse,
-    ListConvosResponse, MessageSender, MessageView, SendMessagePayload, SendMessageRequest,
-    UpdateReadRequest, DEFAULT_BOT_POLL_INTERVAL, DEFAULT_CHAT_ENDPOINT,
+    format_bounce_alert, run_bot_poller, run_bounce_alert_dispatcher, BotCommandHandler,
+    ChatClient, ConvoMember, ConvoView, GetMessagesResponse, ListConvosResponse, MessageSender,
+    MessageView, SendMessagePayload, SendMessageRequest, UpdateReadRequest,
+    DEFAULT_BOT_POLL_INTERVAL, DEFAULT_CHAT_ENDPOINT,
 };
 pub use enricher::{
     AppViewContextEnricher, AuthorContext, ContextEnricher, EnrichedContext, MockContextEnricher,
@@ -56,9 +57,9 @@ pub use classifier::{
     RuleRubric, Sensitivity, Verdict, ViolationCategory,
 };
 pub use engine::{
-    EngineStats, EngineStatsSnapshot, InteractionOutcome, ProcessCommitResult, ProcessOutcome,
-    SkybouncerConfig, SkybouncerEngine, SkybouncerEngineBuilder, DEFAULT_ENGINE_CHANNEL_CAPACITY,
-    DEFAULT_EVALUATION_CACHE_TTL, DEFAULT_EVALUATION_CONCURRENCY,
+    BounceNotification, EngineStats, EngineStatsSnapshot, InteractionOutcome, ProcessCommitResult,
+    ProcessOutcome, SkybouncerConfig, SkybouncerEngine, SkybouncerEngineBuilder,
+    DEFAULT_ENGINE_CHANNEL_CAPACITY, DEFAULT_EVALUATION_CACHE_TTL, DEFAULT_EVALUATION_CONCURRENCY,
     DEFAULT_EVALUATION_QUEUE_CAPACITY, DEFAULT_MAINTENANCE_INTERVAL, DEFAULT_SHUTDOWN_TIMEOUT,
 };
 pub use error::SkybouncerError;

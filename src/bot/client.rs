@@ -3,11 +3,12 @@
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use serde::Deserialize;
 use tracing::debug;
 
 use crate::bot::types::{
-    GetMessagesResponse, ListConvosResponse, MessageView, SendMessagePayload, SendMessageRequest,
-    UpdateReadRequest,
+    ConvoView, GetMessagesResponse, ListConvosResponse, MessageView, SendMessagePayload,
+    SendMessageRequest, UpdateReadRequest,
 };
 use crate::error::SkybouncerError;
 
@@ -175,5 +176,58 @@ impl ChatClient {
         }
 
         Ok(())
+    }
+
+    /// Finds or initializes a conversation for the specified member DIDs via `chat.bsky.convo.getConvoForMembers`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if the HTTP request or JSON deserialization fails.
+    pub async fn get_convo_for_members(
+        &self,
+        members: &[&str],
+    ) -> Result<ConvoView, SkybouncerError> {
+        let mut url = format!("{}/xrpc/chat.bsky.convo.getConvoForMembers?", self.base_url);
+        let params: Vec<String> = members.iter().map(|m| format!("members={m}")).collect();
+        url.push_str(&params.join("&"));
+
+        let resp = self.client.get(&url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(SkybouncerError::Chat(format!(
+                "getConvoForMembers failed with status {status}: {body}"
+            )));
+        }
+
+        #[derive(Deserialize)]
+        struct GetConvoResponse {
+            convo: ConvoView,
+        }
+
+        let result = resp.json::<GetConvoResponse>().await?;
+        Ok(result.convo)
+    }
+
+    /// Attempts to find an existing conversation containing the specified DID or initialize one.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if conversation lookup fails.
+    pub async fn find_or_create_convo_for_did(&self, did: &str) -> Result<String, SkybouncerError> {
+        // Try get_convo_for_members first
+        if let Ok(convo) = self.get_convo_for_members(&[did]).await {
+            return Ok(convo.id);
+        }
+
+        // Fallback: search existing conversations from listConvos
+        let resp = self.list_convos(Some(50), None).await?;
+        for convo in resp.convos {
+            if convo.members.iter().any(|m| m.did == did) {
+                return Ok(convo.id);
+            }
+        }
+
+        Err(SkybouncerError::Chat(format!(
+            "Could not find or establish conversation with {did}"
+        )))
     }
 }

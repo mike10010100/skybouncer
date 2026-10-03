@@ -262,10 +262,11 @@ async fn main() -> Result<(), SkybouncerError> {
             Ok(chat_client) => {
                 let handler =
                     skybouncer::BotCommandHandler::new(std::sync::Arc::new(engine.clone()), did);
+                let poller_client = chat_client.clone();
                 let cancel_bot = cancel.clone();
                 join_set.spawn(async move {
                     if let Err(e) = skybouncer::run_bot_poller(
-                        chat_client,
+                        poller_client,
                         handler,
                         skybouncer::DEFAULT_BOT_POLL_INTERVAL,
                         cancel_bot,
@@ -277,6 +278,24 @@ async fn main() -> Result<(), SkybouncerError> {
                     Ok(Default::default())
                 });
                 info!("🤖 ATProto DM bot poller activated");
+
+                // Spawn proactive ATProto DM bounce alert dispatcher
+                let bounce_rx = engine.subscribe_bounces();
+                let alert_client = chat_client;
+                let cancel_alerts = cancel.clone();
+                join_set.spawn(async move {
+                    if let Err(e) = skybouncer::run_bounce_alert_dispatcher(
+                        alert_client,
+                        bounce_rx,
+                        cancel_alerts,
+                    )
+                    .await
+                    {
+                        error!(error = %e, "ATProto DM bounce alert dispatcher encountered error");
+                    }
+                    Ok(Default::default())
+                });
+                info!("📢 Proactive ATProto DM bounce alert dispatcher activated");
             }
             Err(e) => {
                 warn!(error = %e, "Could not initialize ATProto DM chat client");

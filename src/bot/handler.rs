@@ -58,6 +58,14 @@ impl BotCommandHandler {
             return Ok(self.cmd_help());
         }
 
+        if trimmed.eq_ignore_ascii_case("pause") {
+            return Ok(self.cmd_pause());
+        }
+
+        if trimmed.eq_ignore_ascii_case("resume") {
+            return Ok(self.cmd_resume());
+        }
+
         if trimmed.eq_ignore_ascii_case("rules") {
             return Ok(self.cmd_rules());
         }
@@ -83,7 +91,7 @@ impl BotCommandHandler {
         }
 
         if trimmed.eq_ignore_ascii_case("pardon") {
-            return Ok("Usage: `pardon <did>` (e.g. `pardon did:plc:...`)".to_string());
+            return Ok("Usage: `pardon <did|@handle>` (e.g. `pardon did:plc:...` or `pardon @alice.bsky.social`)".to_string());
         }
 
         if let Some(target) = strip_prefix_ci(trimmed, "pardon ") {
@@ -112,11 +120,28 @@ impl BotCommandHandler {
          • `rules` — View your active moderation prompt & sensitivity\n\
          • `set rules <prompt>` — Update your moderation prompt\n\
          • `sensitivity <low|medium|high>` — Adjust detection sensitivity\n\
+         • `pause` — Temporarily suspend automated moderation\n\
+         • `resume` — Reactivate automated moderation\n\
          • `recent` — List the 5 most recently bounced accounts\n\
-         • `pardon <did>` — Remove an account from your moderation list\n\
+         • `pardon <did|@handle>` — Remove an account from your moderation list\n\
          • `status` — View engine telemetry & total bounces\n\
          • `test <text>` — Dry-run evaluation on sample text\n\
          • `help` — Show this help message"
+            .to_string()
+    }
+
+    fn cmd_pause(&self) -> String {
+        let _ = self.engine.pause();
+        "⏸️ Skybouncer has been **paused**.\n\n\
+         Automated moderation evaluations and PDS list mutations are temporarily suspended.\n\
+         Send `resume` when you are ready to reactivate protection."
+            .to_string()
+    }
+
+    fn cmd_resume(&self) -> String {
+        let _ = self.engine.resume();
+        "▶️ Skybouncer has been **resumed**.\n\n\
+         Automated moderation evaluations and protection are now active."
             .to_string()
     }
 
@@ -195,12 +220,26 @@ impl BotCommandHandler {
     async fn cmd_pardon(
         &self,
         sender_did: &str,
-        target_did: &str,
+        raw_target: &str,
     ) -> Result<String, SkybouncerError> {
-        let target_did = target_did.trim().trim_start_matches('@');
-        if target_did.is_empty() {
-            return Ok("Usage: `pardon <did>` (e.g. `pardon did:plc:...`)".to_string());
+        let raw_target = raw_target.trim();
+        if raw_target.is_empty() {
+            return Ok("Usage: `pardon <did|@handle>` (e.g. `pardon did:plc:...` or `pardon @alice.bsky.social`)".to_string());
         }
+
+        let clean = raw_target.trim_start_matches('@');
+        let (resolved_did, was_handle) = if clean.starts_with("did:") {
+            (clean.to_string(), false)
+        } else {
+            match self.engine.resolve_handle(clean).await {
+                Some(did) => (did, true),
+                None => {
+                    return Ok(format!(
+                        "❌ Could not resolve handle `@{clean}` to a DID. Please verify the handle or provide the account's DID directly (e.g. `pardon did:plc:...`)."
+                    ));
+                }
+            }
+        };
 
         // Use sender_did as protected user if sender is protected, otherwise use first protected DID
         let protected_did = if self.engine.is_protected(sender_did) {
@@ -213,21 +252,33 @@ impl BotCommandHandler {
                 .unwrap_or_else(|| sender_did.to_string())
         };
 
-        match self.engine.pardon_user(&protected_did, target_did).await {
+        let handle_prefix = if was_handle {
+            format!("Resolved `@{clean}` to `{resolved_did}`.\n")
+        } else {
+            String::new()
+        };
+
+        match self.engine.pardon_user(&protected_did, &resolved_did).await {
             Ok(true) => Ok(format!(
-                "✅ Account `{target_did}` has been pardoned and removed from your moderation list."
+                "{handle_prefix}✅ Account `{resolved_did}` has been pardoned and removed from your moderation list."
             )),
             Ok(false) => Ok(format!(
-                "ℹ️ Account `{target_did}` was not found in your bounced list."
+                "{handle_prefix}ℹ️ Account `{resolved_did}` was not found in your bounced list."
             )),
-            Err(e) => Ok(format!("❌ Failed to pardon account: {e}")),
+            Err(e) => Ok(format!("{handle_prefix}❌ Failed to pardon account: {e}")),
         }
     }
 
     fn cmd_status(&self) -> String {
         let stats = self.engine.stats().snapshot();
+        let state_label = if self.engine.is_paused() {
+            "⏸️ PAUSED"
+        } else {
+            "▶️ ACTIVE"
+        };
         format!(
             "📊 Skybouncer Engine Status:\n\n\
+             • State: {}\n\
              • Commits Received: {}\n\
              • Follows Synced: {}\n\
              • Interactions Matched: {}\n\
@@ -239,6 +290,7 @@ impl BotCommandHandler {
              • Violations Detected: {}\n\
              • Bounces Executed on PDS: {}\n\
              • Permitted Interactions: {}",
+            state_label,
             stats.commits_received,
             stats.follows_synced,
             stats.interactions_matched,

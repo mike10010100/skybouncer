@@ -215,6 +215,7 @@ async fn make_fast_engine(
 
     let config = SkybouncerConfig::new(protected_dids, rubric)
         .with_channel_capacity(channel_capacity)
+        .with_evaluation_queue_capacity(4096)
         .with_rate_limiter_config(RateLimiterConfig::unlimited());
 
     let engine = Arc::new(SkybouncerEngine::new(

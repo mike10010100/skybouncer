@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use skybase::ingest::{CommitOperation, JetstreamCommit};
 use skybase::repo::PdsRepoClient;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
@@ -540,6 +540,32 @@ pub enum InteractionOutcome {
         /// Canonical AT-URI of the candidate post.
         post_uri: String,
     },
+    /// Automated moderation is temporarily paused; candidate bypassed evaluation.
+    Paused {
+        /// DID of the interaction author.
+        author_did: String,
+        /// DID of the protected target account.
+        target_did: String,
+    },
+}
+
+/// Notification payload emitted when an offending account is bounced on the sovereign PDS.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BounceNotification {
+    /// DID of the protected target user who received the interaction.
+    pub target_did: String,
+    /// DID of the offending author who was bounced.
+    pub violator_did: String,
+    /// Violation category.
+    pub category: ViolationCategory,
+    /// Classification confidence score (0.0..=1.0).
+    pub confidence: f64,
+    /// Explanatory rationale or violation reason.
+    pub reason: String,
+    /// Canonical AT-URI of the offending post.
+    pub post_uri: String,
+    /// Text snippet of the offending post.
+    pub post_snippet: String,
 }
 
 impl InteractionOutcome {
@@ -554,7 +580,8 @@ impl InteractionOutcome {
             | Self::BelowThreshold { author_did, .. }
             | Self::RateLimited { author_did, .. }
             | Self::QueuedForEvaluation { author_did, .. }
-            | Self::QueueOverflow { author_did, .. } => author_did.as_str(),
+            | Self::QueueOverflow { author_did, .. }
+            | Self::Paused { author_did, .. } => author_did.as_str(),
         }
     }
 
@@ -568,7 +595,8 @@ impl InteractionOutcome {
             | Self::BelowThreshold { target_did, .. }
             | Self::RateLimited { target_did, .. }
             | Self::QueuedForEvaluation { target_did, .. }
-            | Self::QueueOverflow { target_did, .. } => Some(target_did.as_str()),
+            | Self::QueueOverflow { target_did, .. }
+            | Self::Paused { target_did, .. } => Some(target_did.as_str()),
             Self::AlreadyBounced { .. } => None,
         }
     }
@@ -601,6 +629,12 @@ impl InteractionOutcome {
     #[must_use]
     pub fn is_queue_overflow(&self) -> bool {
         matches!(self, Self::QueueOverflow { .. })
+    }
+
+    /// Returns `true` if this outcome was bypassed due to the engine being paused.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        matches!(self, Self::Paused { .. })
     }
 }
 
@@ -674,6 +708,8 @@ pub struct SkybouncerEngine {
     rate_limiter: Arc<EvaluationRateLimiter>,
     enricher: Arc<dyn ContextEnricher>,
     stats: Arc<EngineStats>,
+    paused: Arc<AtomicBool>,
+    bounce_notifier: broadcast::Sender<BounceNotification>,
 }
 
 impl SkybouncerEngine {
@@ -711,6 +747,8 @@ impl SkybouncerEngine {
         ));
         let enricher: Arc<dyn ContextEnricher> = Arc::new(NoopContextEnricher);
         let stats = Arc::new(EngineStats::default());
+        let paused = Arc::new(AtomicBool::new(false));
+        let (bounce_notifier, _) = broadcast::channel(256);
 
         Self {
             config,
@@ -726,6 +764,8 @@ impl SkybouncerEngine {
             rate_limiter,
             enricher,
             stats,
+            paused,
+            bounce_notifier,
         }
     }
 
@@ -896,6 +936,19 @@ impl SkybouncerEngine {
             });
         }
 
+        // Tier 3.5: Moderation Pause Check
+        if self.is_paused() {
+            debug!(
+                author = %author_did,
+                target = %target_did,
+                "Engine is paused; bypassing interaction evaluation"
+            );
+            return Ok(InteractionOutcome::Paused {
+                author_did,
+                target_did,
+            });
+        }
+
         // Tier 4: Deduplication Cache Check (<50µs, $0 cost)
         self.stats
             .candidates_evaluated
@@ -1022,6 +1075,19 @@ impl SkybouncerEngine {
             debug!(reason = ?reason, "Bypassed interaction at gate with zero cost");
             return Ok(InteractionOutcome::Bypassed {
                 reason,
+                author_did,
+                target_did,
+            });
+        }
+
+        // Tier 3.5: Moderation Pause Check
+        if self.is_paused() {
+            debug!(
+                author = %author_did,
+                target = %target_did,
+                "Engine is paused; bypassing interaction evaluation"
+            );
+            return Ok(InteractionOutcome::Paused {
                 author_did,
                 target_did,
             });
@@ -1228,6 +1294,18 @@ impl SkybouncerEngine {
                             confidence = %confidence,
                             "Bounced violator on sovereign PDS"
                         );
+
+                        // Emit proactive bounce notification for alert dispatchers
+                        let _ = self.bounce_notifier.send(BounceNotification {
+                            target_did: target_did.clone(),
+                            violator_did: author_did.clone(),
+                            category: category.clone(),
+                            confidence,
+                            reason: reason.clone(),
+                            post_uri: post_uri.clone(),
+                            post_snippet: interaction.text.chars().take(200).collect(),
+                        });
+
                         Ok(InteractionOutcome::Bounced {
                             author_did,
                             target_did,
@@ -1350,6 +1428,43 @@ impl SkybouncerEngine {
     #[must_use]
     pub fn is_dry_run(&self) -> bool {
         self.config.dry_run
+    }
+
+    /// Returns `true` if automated moderation actions are temporarily paused.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Temporarily pauses automated moderation evaluations and PDS list mutations.
+    ///
+    /// Returns the previous pause state.
+    pub fn pause(&self) -> bool {
+        self.paused.swap(true, Ordering::SeqCst)
+    }
+
+    /// Resumes automated moderation evaluations and PDS list mutations.
+    ///
+    /// Returns the previous pause state.
+    pub fn resume(&self) -> bool {
+        self.paused.swap(false, Ordering::SeqCst)
+    }
+
+    /// Subscribes to real-time bounce notifications emitted when accounts are bounced on PDS.
+    #[must_use]
+    pub fn subscribe_bounces(&self) -> broadcast::Receiver<BounceNotification> {
+        self.bounce_notifier.subscribe()
+    }
+
+    /// Resolves an ATProto handle to a DID using the configured context enricher.
+    ///
+    /// If the provided handle is already a DID (starts with `did:`), it is returned directly.
+    pub async fn resolve_handle(&self, handle: &str) -> Option<String> {
+        let clean = handle.trim().trim_start_matches('@');
+        if clean.starts_with("did:") {
+            return Some(clean.to_string());
+        }
+        self.enricher.resolve_handle(clean).await
     }
 
     /// Returns a reference to the active configuration.
@@ -1916,6 +2031,8 @@ impl SkybouncerEngineBuilder {
         let protected_dids = Arc::new(RwLock::new(self.config.protected_dids.clone()));
         let rubric = Arc::new(RwLock::new(self.config.rubric.clone()));
         let stats = Arc::new(EngineStats::default());
+        let paused = Arc::new(AtomicBool::new(false));
+        let (bounce_notifier, _) = broadcast::channel(256);
 
         Ok(SkybouncerEngine {
             config: self.config,
@@ -1931,6 +2048,8 @@ impl SkybouncerEngineBuilder {
             rate_limiter,
             enricher,
             stats,
+            paused,
+            bounce_notifier,
         })
     }
 }

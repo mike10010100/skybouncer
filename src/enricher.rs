@@ -112,6 +112,13 @@ pub trait ContextEnricher: Send + Sync {
     ///
     /// Must never fail or block the pipeline; failures should degrade gracefully to [`EnrichedContext::empty`].
     async fn enrich(&self, interaction: &Interaction) -> EnrichedContext;
+
+    /// Resolves an ATProto handle to a DID via XRPC `com.atproto.identity.resolveHandle`.
+    ///
+    /// Returns `None` if the handle cannot be resolved or if the enricher does not support resolution.
+    async fn resolve_handle(&self, _handle: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Zero-cost no-op enricher returning empty context immediately.
@@ -130,6 +137,7 @@ impl ContextEnricher for NoopContextEnricher {
 pub struct MockContextEnricher {
     authors: Arc<RwLock<HashMap<String, AuthorContext>>>,
     parent_posts: Arc<RwLock<HashMap<String, ParentPostContext>>>,
+    handles: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl MockContextEnricher {
@@ -148,6 +156,12 @@ impl MockContextEnricher {
     pub fn set_parent_post(&self, uri: impl Into<String>, parent: ParentPostContext) {
         self.parent_posts.write().insert(uri.into(), parent);
     }
+
+    /// Registers a mock handle-to-DID resolution mapping.
+    pub fn set_handle(&self, handle: impl Into<String>, did: impl Into<String>) {
+        let clean = handle.into().trim().trim_start_matches('@').to_string();
+        self.handles.write().insert(clean, did.into());
+    }
 }
 
 #[async_trait]
@@ -163,6 +177,14 @@ impl ContextEnricher for MockContextEnricher {
             author,
             parent_post,
         }
+    }
+
+    async fn resolve_handle(&self, handle: &str) -> Option<String> {
+        let clean = handle.trim().trim_start_matches('@');
+        if clean.starts_with("did:") {
+            return Some(clean.to_string());
+        }
+        self.handles.read().get(clean).cloned()
     }
 }
 
@@ -306,6 +328,33 @@ impl AppViewContextEnricher {
             Err(_) => Vec::new(),
         }
     }
+
+    /// Resolves an ATProto handle to a DID via XRPC `com.atproto.identity.resolveHandle`.
+    pub async fn resolve_handle(&self, handle: &str) -> Option<String> {
+        let clean = handle.trim().trim_start_matches('@');
+        if clean.starts_with("did:") {
+            return Some(clean.to_string());
+        }
+
+        let url = format!(
+            "{}/xrpc/com.atproto.identity.resolveHandle?handle={clean}",
+            self.appview_url
+        );
+        let resp = self.http_client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        #[derive(Deserialize)]
+        struct ResolveHandleResponse {
+            did: String,
+        }
+
+        resp.json::<ResolveHandleResponse>()
+            .await
+            .ok()
+            .map(|r| r.did)
+    }
 }
 
 impl Default for AppViewContextEnricher {
@@ -332,5 +381,9 @@ impl ContextEnricher for AppViewContextEnricher {
             author,
             parent_post,
         }
+    }
+
+    async fn resolve_handle(&self, handle: &str) -> Option<String> {
+        self.resolve_handle(handle).await
     }
 }
