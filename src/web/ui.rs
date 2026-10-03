@@ -427,6 +427,25 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           <button class="chip" onclick="setSimText('I enjoyed your blog post about distributed consensus systems!')">Polite Discourse</button>
         </div>
         <textarea id="sim-text" rows="3" placeholder="Enter post text to test against current rules..."></textarea>
+        
+        <div style="display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.25rem;">
+          <div style="display: flex; gap: 0.5rem; align-items: center;">
+            <input type="text" id="sim-image-url" placeholder="Optional image or meme URL (https://...)" oninput="onSimImageUrlChange()" style="flex: 1; margin: 0; font-size: 0.8rem; padding: 0.45rem 0.75rem;" />
+            <input type="file" id="sim-file-input" accept="image/*" style="display:none;" onchange="onSimFileSelected(event)" />
+            <button class="chip" type="button" style="white-space: nowrap; height: 34px;" onclick="document.getElementById('sim-file-input').click()">🖼️ Upload File</button>
+            <button class="chip" id="sim-clear-img-btn" type="button" style="display:none; color: var(--danger); border-color: rgba(239, 68, 68, 0.4); height: 34px;" onclick="clearSimImage()">✕ Clear</button>
+          </div>
+          <div id="sim-image-preview-container" style="display: none; padding: 0.5rem; background: rgba(0,0,0,0.2); border: 1px dashed var(--border-color); border-radius: 6px;">
+            <div style="display: flex; align-items: center; gap: 0.75rem;">
+              <img id="sim-image-preview" src="" alt="Simulator image preview" style="max-height: 80px; max-width: 120px; border-radius: 4px; object-fit: contain; background: rgba(0,0,0,0.4);" />
+              <div>
+                <span id="sim-image-label" style="font-size: 0.75rem; color: var(--text-main); font-weight: 600; display: block;"></span>
+                <span style="font-size: 0.7rem; color: var(--text-muted); display: block;">Image will be evaluated alongside post text via Tier 2 Multimodal / Vision fallback.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div>
           <button class="btn" onclick="runSimulation()">⚡ Evaluate Post</button>
         </div>
@@ -434,6 +453,9 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           <div class="verdict-header">
             <span class="verdict-badge" id="sim-badge">PERMITTED</span>
             <span style="font-size: 0.8rem; font-weight: 600;" id="sim-evaluator">heuristic</span>
+          </div>
+          <div id="sim-multimodal-note" style="display:none; font-size: 0.75rem; color: var(--accent); font-weight: 600;">
+            🖼️ Evaluated with attached visual context
           </div>
           <div>
             <div style="display: flex; justify-content: space-between; font-size: 0.8rem; margin-bottom: 0.35rem;">
@@ -606,6 +628,57 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       }
     }
 
+    let simBase64Image = null;
+
+    function onSimFileSelected(event) {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      if (file.size > 4 * 1024 * 1024) {
+        showToast("⚠️ Image file exceeds 4MB limit");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const fullDataUrl = e.target.result;
+        const commaIdx = fullDataUrl.indexOf(",");
+        if (commaIdx !== -1) {
+          simBase64Image = fullDataUrl.substring(commaIdx + 1);
+        } else {
+          simBase64Image = fullDataUrl;
+        }
+        document.getElementById("sim-image-preview").src = fullDataUrl;
+        document.getElementById("sim-image-label").innerText = `Uploaded: ${file.name} (${Math.round(file.size / 1024)} KB)`;
+        document.getElementById("sim-image-preview-container").style.display = "block";
+        document.getElementById("sim-clear-img-btn").style.display = "inline-flex";
+        document.getElementById("sim-image-url").value = "";
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function onSimImageUrlChange() {
+      const url = document.getElementById("sim-image-url").value.trim();
+      if (url.startsWith("http://") || url.startsWith("https://")) {
+        simBase64Image = null;
+        document.getElementById("sim-image-preview").src = url;
+        document.getElementById("sim-image-label").innerText = `Remote URL: ${url.length > 40 ? url.substring(0, 37) + '...' : url}`;
+        document.getElementById("sim-image-preview-container").style.display = "block";
+        document.getElementById("sim-clear-img-btn").style.display = "inline-flex";
+      } else if (!url) {
+        if (!simBase64Image) {
+          clearSimImage();
+        }
+      }
+    }
+
+    function clearSimImage() {
+      simBase64Image = null;
+      document.getElementById("sim-image-url").value = "";
+      document.getElementById("sim-file-input").value = "";
+      document.getElementById("sim-image-preview").src = "";
+      document.getElementById("sim-image-preview-container").style.display = "none";
+      document.getElementById("sim-clear-img-btn").style.display = "none";
+    }
+
     function setSimText(text) {
       document.getElementById("sim-text").value = text;
       runSimulation();
@@ -615,11 +688,19 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       const text = document.getElementById("sim-text").value.trim();
       if (!text) return;
 
+      const payload = { text };
+      const imgUrl = document.getElementById("sim-image-url").value.trim();
+      if (simBase64Image) {
+        payload.image_base64 = simBase64Image;
+      } else if (imgUrl && (imgUrl.startsWith("http://") || imgUrl.startsWith("https://"))) {
+        payload.image_url = imgUrl;
+      }
+
       try {
         const res = await fetch("/api/simulate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text })
+          body: JSON.stringify(payload)
         });
         if (!res.ok) return;
         const data = await res.json();
@@ -627,6 +708,7 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         const box = document.getElementById("sim-result");
         const badge = document.getElementById("sim-badge");
         const bar = document.getElementById("sim-bar");
+        const multiNote = document.getElementById("sim-multimodal-note");
 
         box.style.display = "flex";
         if (data.violates) {
@@ -643,7 +725,25 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         bar.style.width = `${pct}%`;
         document.getElementById("sim-confidence").innerText = `Confidence: ${pct}% (Threshold: ${Math.round(data.threshold * 100)}%)`;
         document.getElementById("sim-category").innerText = `Category: ${data.category || 'None'}`;
-        document.getElementById("sim-evaluator").innerText = data.evaluator === 'heuristic_prefilter' ? '⚡ Heuristic Pre-Filter' : '🧠 Jev Model';
+
+        const evalStr = (data.evaluator || "").toLowerCase();
+        if (evalStr.includes("fallback") || evalStr.includes("vision")) {
+          document.getElementById("sim-evaluator").innerText = "👁️ Vision Fallback (Tier 2 Multimodal)";
+        } else if (evalStr.includes("heuristic")) {
+          document.getElementById("sim-evaluator").innerText = "⚡ Heuristic Pre-Filter";
+        } else if (data.images_evaluated > 0 || evalStr.includes("multimodal")) {
+          document.getElementById("sim-evaluator").innerText = "🧠 Primary Model (Multimodal)";
+        } else {
+          document.getElementById("sim-evaluator").innerText = "🧠 Jev Model (Text)";
+        }
+
+        if (data.images_evaluated > 0) {
+          multiNote.style.display = "block";
+          multiNote.innerText = `🖼️ Evaluated with ${data.images_evaluated} image payload(s)`;
+        } else {
+          multiNote.style.display = "none";
+        }
+
         document.getElementById("sim-reason").innerText = data.reason;
       } catch (e) {
         console.error("Simulation failed", e);

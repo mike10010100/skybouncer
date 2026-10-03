@@ -8,6 +8,7 @@
 //! - Interactive dry-run evaluation simulator (`POST /api/simulate`).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -96,6 +97,12 @@ pub struct SimulateRequest {
     /// Optional target protected DID (defaults to first protected DID).
     #[serde(default)]
     pub target_did: Option<String>,
+    /// Optional base64-encoded image attached to the candidate post.
+    #[serde(default)]
+    pub image_base64: Option<String>,
+    /// Optional image URL to fetch and evaluate.
+    #[serde(default)]
+    pub image_url: Option<String>,
 }
 
 /// Detailed result of a dry-run evaluation simulation.
@@ -109,12 +116,15 @@ pub struct SimulateResponse {
     pub confidence: f64,
     /// Rationale or explanatory reason for the verdict.
     pub reason: String,
-    /// Which evaluator produced the verdict ("heuristic_prefilter" or "primary_classifier").
+    /// Which evaluator produced the verdict ("heuristic_prefilter", "primary_classifier", or "fallback_vision_classifier").
     pub evaluator: String,
     /// Whether the confidence score meets or exceeds the rubric threshold.
     pub meets_threshold: bool,
     /// Active sensitivity threshold required for action.
     pub threshold: f64,
+    /// Number of images decoded and inspected during evaluation.
+    #[serde(default)]
+    pub images_evaluated: usize,
 }
 
 /// Overall engine operational status and telemetry response.
@@ -263,7 +273,7 @@ pub async fn pardon_user(
     }
 }
 
-/// Handler for `POST /api/simulate`: runs a dry-run evaluation on sample text.
+/// Handler for `POST /api/simulate`: runs a dry-run evaluation on sample text and optional images.
 pub async fn simulate_interaction(
     State(state): State<ApiState>,
     Json(payload): Json<SimulateRequest>,
@@ -285,6 +295,49 @@ pub async fn simulate_interaction(
             .unwrap_or_else(|| "did:plc:protected-sample".to_string())
     });
 
+    let mut image_cids = Vec::new();
+    let mut images_base64 = Vec::new();
+
+    if let Some(b64) = payload.image_base64.filter(|s| !s.trim().is_empty()) {
+        images_base64.push(b64);
+        image_cids.push("simulate-base64-image".to_string());
+    } else if let Some(url) = payload.image_url.filter(|s| !s.trim().is_empty()) {
+        // Fetch remote image if valid HTTP/HTTPS URL
+        if url.starts_with("http://") || url.starts_with("https://") {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_millis(5000))
+                .user_agent("skybouncer/0.1.0 (+https://github.com/mike10010100/skybouncer)")
+                .build()
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("HTTP client error: {e}"),
+                    )
+                })?;
+            if let Ok(resp) = client.get(&url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(bytes) = resp.bytes().await {
+                        if bytes.len() <= 4 * 1024 * 1024 {
+                            use base64::Engine;
+                            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            images_base64.push(encoded);
+                            image_cids.push("simulate-url-image".to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let images_evaluated = images_base64.len();
+    let enriched_context = if !images_base64.is_empty() {
+        let mut ctx = crate::enricher::EnrichedContext::empty();
+        ctx.images_base64 = images_base64;
+        Some(ctx)
+    } else {
+        None
+    };
+
     let synthetic_interaction = Interaction {
         post_uri: "at://did:plc:sample/app.bsky.feed.post/sample123".to_string(),
         post_cid: Some("bafysample123".to_string()),
@@ -295,9 +348,9 @@ pub async fn simulate_interaction(
         parent_uri: None,
         root_uri: None,
         created_at_us: 0,
-        image_cids: Vec::new(),
+        image_cids,
         image_alts: Vec::new(),
-        enriched_context: None,
+        enriched_context,
     };
 
     let rubric = state.engine.rubric();
@@ -325,11 +378,12 @@ pub async fn simulate_interaction(
                 evaluator: "heuristic_prefilter".to_string(),
                 meets_threshold,
                 threshold,
+                images_evaluated,
             }));
         }
     }
 
-    // 2. Primary classifier evaluation (Jev or Mock)
+    // 2. Primary classifier evaluation (Tiered Jev / Multimodal Fallback)
     match state
         .engine
         .primary_classifier()
@@ -342,25 +396,43 @@ pub async fn simulate_interaction(
             reason,
         }) => {
             let meets_threshold = rubric.meets_threshold(&category, confidence);
+            let evaluator = if reason.contains("Fallback") || reason.contains("Tiered") {
+                "fallback_vision_classifier".to_string()
+            } else if images_evaluated > 0 {
+                "primary_classifier (multimodal)".to_string()
+            } else {
+                "primary_classifier".to_string()
+            };
             Ok(Json(SimulateResponse {
                 violates: true,
                 category: Some(category.to_string()),
                 confidence,
                 reason,
-                evaluator: "primary_classifier".to_string(),
+                evaluator,
                 meets_threshold,
                 threshold,
+                images_evaluated,
             }))
         }
-        Ok(Verdict::Permitted { reason, confidence }) => Ok(Json(SimulateResponse {
-            violates: false,
-            category: None,
-            confidence: confidence.unwrap_or(0.05),
-            reason,
-            evaluator: "primary_classifier".to_string(),
-            meets_threshold: false,
-            threshold,
-        })),
+        Ok(Verdict::Permitted { reason, confidence }) => {
+            let evaluator = if reason.contains("Fallback") || reason.contains("Tiered") {
+                "fallback_vision_classifier".to_string()
+            } else if images_evaluated > 0 {
+                "primary_classifier (multimodal)".to_string()
+            } else {
+                "primary_classifier".to_string()
+            };
+            Ok(Json(SimulateResponse {
+                violates: false,
+                category: None,
+                confidence: confidence.unwrap_or(0.05),
+                reason,
+                evaluator,
+                meets_threshold: false,
+                threshold,
+                images_evaluated,
+            }))
+        }
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Classification failed: {e}"),
