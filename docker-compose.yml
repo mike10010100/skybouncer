@@ -45,6 +45,24 @@ services:
       - skybouncer_net
 
   # ----------------------------------------------------------------------------
+  # Cloudflare Tunnel for Secure Public HTTPS Access & OAuth Callbacks
+  # Forwards traffic from your public domain (e.g. skybouncer.mike10010100.com)
+  # directly into the isolated container network without exposing router ports.
+  # ----------------------------------------------------------------------------
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: skybouncer-cloudflared
+    restart: unless-stopped
+    command: tunnel --config /etc/cloudflared/config.yml run
+    volumes:
+      - ~/.cloudflared:/etc/cloudflared:ro
+    depends_on:
+      skybouncer:
+        condition: service_healthy
+    networks:
+      - skybouncer_net
+
+  # ----------------------------------------------------------------------------
   # Optional Local AI Engine: Ollama with Multimodal Vision (Gemma 4:12B, LLaVA)
   # Activated via: docker compose --profile local-ai up -d
   # ----------------------------------------------------------------------------
