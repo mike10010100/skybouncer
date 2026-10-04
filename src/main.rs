@@ -104,6 +104,7 @@ fn print_help() {
         "                            with live model, but simulate PDS list mutations (0 writes)"
     );
     println!("  --did <DID>               Add protected DID to shield (can be repeated)");
+    println!("  --admin <DID>             Designate instance administrator DID (fleet oversight & shielded)");
     println!("  --rules <RULES>           Override natural-language moderation rules prompt");
     println!("  -h, --help                Print help information");
     println!();
@@ -730,6 +731,11 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
         if (args[i] == "--did" || args[i] == "--protected-did") && i + 1 < args.len() {
             config.protected_dids.insert(args[i + 1].clone());
             i += 1;
+        } else if (args[i] == "--admin" || args[i] == "--admin-did") && i + 1 < args.len() {
+            let admin = args[i + 1].clone();
+            config.protected_dids.insert(admin.clone());
+            config.admin_did = Some(admin);
+            i += 1;
         } else if args[i] == "--rules" && i + 1 < args.len() {
             config.rubric = skybouncer::classifier::RuleRubric::parse(&args[i + 1])?;
             i += 1;
@@ -756,6 +762,10 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
         for did in &config.protected_dids {
             info!("   Protected: {}", did);
         }
+    }
+
+    if let Some(ref admin) = config.admin_did {
+        info!("👑 System administrator: {}", admin);
     }
 
     info!(

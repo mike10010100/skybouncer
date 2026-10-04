@@ -105,6 +105,11 @@ pub struct SkybouncerConfig {
     /// When active, incoming interactions from live Jetstream are processed and evaluated normally,
     /// but remote PDS moderation list mutations are simulated with zero remote network writes.
     pub dry_run: bool,
+    /// Explicit decentralized identifier (DID) of the system administrator.
+    ///
+    /// When set, only this DID is granted administrative privileges (fleet oversight, tenant management).
+    /// The administrator is also automatically included in [`SkybouncerConfig::protected_dids`].
+    pub admin_did: Option<String>,
 }
 
 impl Default for SkybouncerConfig {
@@ -128,6 +133,7 @@ impl Default for SkybouncerConfig {
             stateless_mode: false,
             enable_heuristic_prefilter: false,
             dry_run: false,
+            admin_did: None,
         }
     }
 }
@@ -252,6 +258,15 @@ impl SkybouncerConfig {
         self
     }
 
+    /// Designates the system administrator DID, automatically shielding it in [`SkybouncerConfig::protected_dids`].
+    #[must_use]
+    pub fn with_admin_did(mut self, admin_did: impl Into<String>) -> Self {
+        let did = admin_did.into();
+        self.protected_dids.insert(did.clone());
+        self.admin_did = Some(did);
+        self
+    }
+
     /// Loads configuration from environment variables with fallback defaults.
     ///
     /// # Errors
@@ -266,6 +281,15 @@ impl SkybouncerConfig {
             if !trimmed.is_empty() {
                 protected_dids.insert(trimmed.to_string());
             }
+        }
+
+        let admin_did = std::env::var("ADMIN_DID")
+            .or_else(|_| std::env::var("SKYBOUNCER_ADMIN_DID"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(ref admin) = admin_did {
+            protected_dids.insert(admin.clone());
         }
 
         let rubric_prompt = std::env::var("MODERATION_RUBRIC")
@@ -395,6 +419,7 @@ impl SkybouncerConfig {
             stateless_mode,
             enable_heuristic_prefilter,
             dry_run,
+            admin_did,
         })
     }
 }
@@ -1799,14 +1824,38 @@ impl SkybouncerEngine {
     #[must_use]
     pub fn is_admin(&self, did: &str) -> bool {
         let clean = did.trim();
-        if self.config.protected_dids.contains(clean) {
-            return true;
+        if clean.is_empty() {
+            return false;
         }
-        if let Ok(admin_did) = std::env::var("ADMIN_DID") {
-            if admin_did.trim().eq_ignore_ascii_case(clean) {
+
+        // Explicit admin DID configured on engine takes precedence
+        if let Some(ref admin) = self.config.admin_did {
+            let admin_clean = admin.trim();
+            if !admin_clean.is_empty() && admin_clean.eq_ignore_ascii_case(clean) {
                 return true;
             }
         }
+
+        // Environment variable override (ADMIN_DID or SKYBOUNCER_ADMIN_DID)
+        if let Ok(admin_did) =
+            std::env::var("ADMIN_DID").or_else(|_| std::env::var("SKYBOUNCER_ADMIN_DID"))
+        {
+            let admin_clean = admin_did.trim();
+            if !admin_clean.is_empty() && admin_clean.eq_ignore_ascii_case(clean) {
+                return true;
+            }
+        }
+
+        // Legacy / fallback mode: if no admin DID was explicitly configured,
+        // treat any initially protected DID as an administrator.
+        if self.config.admin_did.is_none()
+            && std::env::var("ADMIN_DID").is_err()
+            && std::env::var("SKYBOUNCER_ADMIN_DID").is_err()
+            && self.config.protected_dids.contains(clean)
+        {
+            return true;
+        }
+
         false
     }
 

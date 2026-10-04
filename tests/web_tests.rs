@@ -65,8 +65,9 @@ async fn setup_test_web_environment(
 
     let mut protected_dids = HashSet::new();
     protected_dids.insert(protected_did.to_string());
-    let config =
-        SkybouncerConfig::new(protected_dids, rubric).with_enable_heuristic_prefilter(true);
+    let config = SkybouncerConfig::new(protected_dids, rubric)
+        .with_enable_heuristic_prefilter(true)
+        .with_admin_did(protected_did);
 
     let engine = Arc::new(SkybouncerEngine::new(
         config,
@@ -822,7 +823,7 @@ async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
 
     let mut protected_dids = HashSet::new();
     protected_dids.insert("did:plc:admin".to_string());
-    let config = SkybouncerConfig::new(protected_dids, rubric);
+    let config = SkybouncerConfig::new(protected_dids, rubric).with_admin_did("did:plc:admin");
 
     let engine = Arc::new(
         SkybouncerEngine::builder(config)

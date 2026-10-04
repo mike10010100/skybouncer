@@ -755,7 +755,7 @@ pub async fn get_current_user(
                 authenticated: true,
                 did: Some(did.clone()),
                 handle: resolved_handle,
-                is_admin: true,
+                is_admin,
                 is_active: !state.engine.is_tenant_paused(&did),
                 mod_list_uri,
                 rubric: Some(RulesResponse {
