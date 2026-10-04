@@ -133,6 +133,13 @@ pub trait ContextEnricher: Send + Sync {
         None
     }
 
+    /// Resolves an ATProto DID to a handle via profile lookup or directory resolution.
+    ///
+    /// Returns `None` if the DID cannot be resolved or if the enricher does not support resolution.
+    async fn resolve_did(&self, _did: &str) -> Option<String> {
+        None
+    }
+
     /// Fetches a base64-encoded image thumbnail for an author and image CID.
     ///
     /// Returns `None` if the image cannot be retrieved or decoded.
@@ -229,6 +236,24 @@ impl ContextEnricher for MockContextEnricher {
             return Some(clean.to_string());
         }
         self.handles.read().get(clean).cloned()
+    }
+
+    async fn resolve_did(&self, did: &str) -> Option<String> {
+        let clean = did.trim();
+        if let Some(author) = self.authors.read().get(clean) {
+            if let Some(ref h) = author.handle {
+                let trimmed = h.trim().trim_start_matches('@').to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+        for (h, d) in self.handles.read().iter() {
+            if d == clean {
+                return Some(h.clone());
+            }
+        }
+        None
     }
 
     async fn fetch_image_base64(&self, author_did: &str, cid: &str) -> Option<String> {
@@ -448,6 +473,50 @@ impl AppViewContextEnricher {
         }
         results
     }
+
+    /// Resolves an ATProto DID to a handle via profile lookup or PLC directory fallback.
+    pub async fn resolve_did(&self, did: &str) -> Option<String> {
+        let clean = did.trim();
+        if !clean.starts_with("did:") {
+            return None;
+        }
+
+        // 1. Try AppView actor profile
+        if let Some(profile) = self.fetch_author_profile(clean).await {
+            if let Some(h) = profile.handle {
+                let trimmed = h.trim().trim_start_matches('@').to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+
+        // 2. Fallback to PLC directory if did:plc:...
+        if clean.starts_with("did:plc:") {
+            let plc_url = format!("https://plc.directory/{clean}");
+            if let Ok(resp) = self.http_client.get(&plc_url).send().await {
+                if resp.status().is_success() {
+                    #[derive(Deserialize)]
+                    struct PlcDoc {
+                        #[serde(rename = "alsoKnownAs", default)]
+                        also_known_as: Vec<String>,
+                    }
+                    if let Ok(doc) = resp.json::<PlcDoc>().await {
+                        for alias in doc.also_known_as {
+                            if let Some(handle) = alias.strip_prefix("at://") {
+                                let trimmed = handle.trim().trim_start_matches('@').to_string();
+                                if !trimmed.is_empty() {
+                                    return Some(trimmed);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
 }
 
 impl Default for AppViewContextEnricher {
@@ -487,6 +556,10 @@ impl ContextEnricher for AppViewContextEnricher {
 
     async fn resolve_handle(&self, handle: &str) -> Option<String> {
         self.resolve_handle(handle).await
+    }
+
+    async fn resolve_did(&self, did: &str) -> Option<String> {
+        self.resolve_did(did).await
     }
 
     async fn fetch_image_base64(&self, author_did: &str, cid: &str) -> Option<String> {
@@ -537,5 +610,17 @@ mod tests {
             .fetch_image_base64("did:plc:author1", "bafkimage_unknown")
             .await;
         assert_eq!(missing, None);
+    }
+
+    #[tokio::test]
+    async fn test_mock_context_enricher_resolve_did() {
+        let enricher = MockContextEnricher::new();
+        enricher.set_handle("alice.bsky.social", "did:plc:alice123");
+
+        let resolved = enricher.resolve_did("did:plc:alice123").await;
+        assert_eq!(resolved, Some("alice.bsky.social".to_string()));
+
+        let unknown = enricher.resolve_did("did:plc:unknown").await;
+        assert_eq!(unknown, None);
     }
 }

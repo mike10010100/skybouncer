@@ -174,9 +174,19 @@ pub async fn health_check() -> (StatusCode, Json<HealthResponse>) {
     )
 }
 
-/// Handler for `GET /api/rules`: returns active moderation rubric.
-pub async fn get_rules(State(state): State<ApiState>) -> Json<RulesResponse> {
-    let rubric = state.engine.rubric();
+/// Handler for `GET /api/rules`: returns active moderation rubric for caller or engine default.
+pub async fn get_rules(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionQuery>,
+) -> Json<RulesResponse> {
+    let did_opt = extract_did_from_headers(&headers, query.did.as_deref());
+    let rubric = if let Some(ref did) = did_opt {
+        state.engine.rubric_for(did)
+    } else {
+        state.engine.rubric()
+    };
+
     Json(RulesResponse {
         prompt: rubric.prompt,
         sensitivity: rubric.sensitivity,
@@ -184,12 +194,20 @@ pub async fn get_rules(State(state): State<ApiState>) -> Json<RulesResponse> {
     })
 }
 
-/// Handler for `POST /api/rules`: updates the active moderation rubric.
+/// Handler for `POST /api/rules`: updates the active moderation rubric for caller and persists to sovereign PDS.
 pub async fn update_rules(
     State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionQuery>,
     Json(payload): Json<UpdateRulesRequest>,
 ) -> Result<Json<RulesResponse>, (StatusCode, String)> {
-    let mut rubric = state.engine.rubric();
+    let did_opt = extract_did_from_headers(&headers, query.did.as_deref());
+
+    let mut rubric = if let Some(ref did) = did_opt {
+        state.engine.rubric_for(did)
+    } else {
+        state.engine.rubric()
+    };
 
     if let Some(prompt) = payload.prompt {
         let trimmed = prompt.trim();
@@ -208,12 +226,35 @@ pub async fn update_rules(
         rubric.sensitivity = sens;
     }
 
-    state.engine.set_rubric(rubric.clone());
+    let is_admin_or_protected = if let Some(ref did) = did_opt {
+        let is_enrolled = state
+            .engine
+            .tenant_registry()
+            .is_enrolled(did)
+            .unwrap_or(false);
+        if is_enrolled {
+            let _ = state.engine.tenant_registry().update_rubric(did, &rubric);
+        }
+        state.engine.is_admin(did) || state.engine.is_protected(did)
+    } else {
+        true
+    };
+
+    // If caller is admin or global protected user, or no tenant isolation, update engine's active rubric
+    if is_admin_or_protected {
+        state.engine.set_rubric(rubric.clone());
+    }
 
     // Asynchronously persist updated rubric to user's sovereign PDS repository
     let eng = state.engine.clone();
+    let target_dids: Vec<String> = if let Some(ref did) = did_opt {
+        vec![did.clone()]
+    } else {
+        eng.protected_dids().into_iter().collect()
+    };
+
     tokio::spawn(async move {
-        for did in eng.protected_dids() {
+        for did in target_dids {
             let _ = eng.publish_sovereign_config(&did).await;
         }
     });
@@ -586,12 +627,16 @@ pub async fn get_current_user(
             .map(|c| c.list_uri);
         let is_list_blocked = state.engine.cache().is_list_blocked(&did).unwrap_or(false);
 
+        // Dynamically resolve handle if missing or empty
+        let resolved_handle = state.engine.resolve_did_to_handle(&did).await;
+
         if let Ok(Some(tenant)) = state.engine.tenant_registry().get(&did) {
             let rubric = tenant.rubric.unwrap_or_else(|| state.engine.rubric());
+            let handle = tenant.handle.or(resolved_handle);
             return Json(UserSessionResponse {
                 authenticated: true,
                 did: Some(tenant.did),
-                handle: tenant.handle,
+                handle,
                 is_admin,
                 is_active: tenant.is_active,
                 mod_list_uri,
@@ -609,7 +654,7 @@ pub async fn get_current_user(
             return Json(UserSessionResponse {
                 authenticated: true,
                 did: Some(did.clone()),
-                handle: None,
+                handle: resolved_handle,
                 is_admin: true,
                 is_active: !state.engine.is_tenant_paused(&did),
                 mod_list_uri,
@@ -676,9 +721,15 @@ pub async fn get_admin_tenants(
             .flatten()
             .map(|c| c.list_uri);
 
+        let handle = if let Some(h) = t.handle {
+            Some(h)
+        } else {
+            state.engine.resolve_did_to_handle(&t.did).await
+        };
+
         summaries.push(TenantSummary {
             did: t.did,
-            handle: t.handle,
+            handle,
             is_active: t.is_active,
             has_session: t.session.is_some(),
             mod_list_uri,

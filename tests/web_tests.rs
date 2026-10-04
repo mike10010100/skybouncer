@@ -745,3 +745,141 @@ async fn test_api_session_and_admin_endpoints() {
     assert!(cookie_str.contains("skybouncer_did="));
     assert!(cookie_str.contains("Max-Age=0"));
 }
+
+#[tokio::test]
+async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
+    let pds = MockPdsServer::start().await;
+    let cache = Arc::new(DeduplicationCache::open_in_memory().expect("in-memory cache"));
+    let enricher = Arc::new(skybouncer::enricher::MockContextEnricher::new());
+
+    // Register a handle in mock enricher
+    enricher.set_handle("alice.custom.domain", "did:plc:tenant-dynamic");
+
+    let rubric = RuleRubric::new("Default global rubric: block spam", Sensitivity::Medium);
+    let modlist =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let pds_client = Arc::new(pds.pds_client("did:plc:admin"));
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:admin".to_string());
+    let config = SkybouncerConfig::new(protected_dids, rubric);
+
+    let engine = Arc::new(
+        SkybouncerEngine::builder(config)
+            .with_cache(cache.clone())
+            .with_modlist_manager(modlist)
+            .with_pds_client(pds_client)
+            .with_enricher(enricher)
+            .with_classifier(Arc::new(skybouncer::classifier::MockClassifier::new(
+                Verdict::permitted("ok"),
+            )))
+            .build()
+            .expect("engine build"),
+    );
+
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let app = create_web_router(Arc::clone(&engine), None, metadata);
+
+    // 1. Enroll tenant WITHOUT handle
+    let tenant = skybouncer::tenant::Tenant::new("did:plc:tenant-dynamic");
+    engine
+        .tenant_registry()
+        .register_or_update(&tenant)
+        .unwrap();
+
+    // 2. Call /api/me?did=did:plc:tenant-dynamic -> handle should resolve dynamically to alice.custom.domain!
+    let req = Request::builder()
+        .uri("/api/me?did=did:plc:tenant-dynamic")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let me: skybouncer::web::UserSessionResponse = serde_json::from_slice(&bytes).unwrap();
+    assert!(me.authenticated);
+    assert_eq!(me.handle.as_deref(), Some("alice.custom.domain"));
+
+    // 3. Verify handle was cached into SQLite
+    let cached_tenant = engine
+        .tenant_registry()
+        .get("did:plc:tenant-dynamic")
+        .unwrap()
+        .unwrap();
+    assert_eq!(cached_tenant.handle.as_deref(), Some("alice.custom.domain"));
+
+    // 4. Update rules for this tenant via POST /api/rules?did=did:plc:tenant-dynamic
+    let custom_payload = json!({
+        "prompt": "Custom tenant rubric: block aggressive political baiting",
+        "sensitivity": "Low"
+    });
+    let post_req = Request::builder()
+        .method("POST")
+        .uri("/api/rules?did=did:plc:tenant-dynamic")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&custom_payload).unwrap()))
+        .unwrap();
+    let post_resp = app.clone().oneshot(post_req).await.unwrap();
+    assert_eq!(post_resp.status(), StatusCode::OK);
+    let post_bytes = axum::body::to_bytes(post_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let updated: RulesResponse = serde_json::from_slice(&post_bytes).unwrap();
+    assert_eq!(updated.sensitivity, Sensitivity::Low);
+    assert_eq!(
+        updated.prompt,
+        "Custom tenant rubric: block aggressive political baiting"
+    );
+
+    // 5. Global GET /api/rules returns default rubric unchanged
+    let global_req = Request::builder()
+        .uri("/api/rules")
+        .body(Body::empty())
+        .unwrap();
+    let global_resp = app.clone().oneshot(global_req).await.unwrap();
+    let global_bytes = axum::body::to_bytes(global_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let global_rules: RulesResponse = serde_json::from_slice(&global_bytes).unwrap();
+    assert_eq!(global_rules.sensitivity, Sensitivity::Medium);
+    assert_eq!(global_rules.prompt, "Default global rubric: block spam");
+
+    // 6. Tenant GET /api/rules?did=did:plc:tenant-dynamic returns their custom rubric
+    let tenant_req = Request::builder()
+        .uri("/api/rules?did=did:plc:tenant-dynamic")
+        .body(Body::empty())
+        .unwrap();
+    let tenant_resp = app.clone().oneshot(tenant_req).await.unwrap();
+    let tenant_bytes = axum::body::to_bytes(tenant_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tenant_rules: RulesResponse = serde_json::from_slice(&tenant_bytes).unwrap();
+    assert_eq!(tenant_rules.sensitivity, Sensitivity::Low);
+    assert_eq!(
+        tenant_rules.prompt,
+        "Custom tenant rubric: block aggressive political baiting"
+    );
+
+    // 7. GET /api/me?did=did:plc:tenant-dynamic propagates custom rubric in session response
+    let me_req = Request::builder()
+        .uri("/api/me?did=did:plc:tenant-dynamic")
+        .body(Body::empty())
+        .unwrap();
+    let me_resp = app.oneshot(me_req).await.unwrap();
+    let me_bytes = axum::body::to_bytes(me_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let me_final: skybouncer::web::UserSessionResponse = serde_json::from_slice(&me_bytes).unwrap();
+    assert_eq!(
+        me_final.rubric.as_ref().map(|r| r.prompt.as_str()),
+        Some("Custom tenant rubric: block aggressive political baiting")
+    );
+    assert_eq!(
+        me_final.rubric.as_ref().map(|r| r.sensitivity),
+        Some(Sensitivity::Low)
+    );
+}

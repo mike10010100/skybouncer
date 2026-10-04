@@ -1669,6 +1669,36 @@ impl SkybouncerEngine {
         self.enricher.resolve_handle(clean).await
     }
 
+    /// Resolves an ATProto DID to a handle using cached tenant data or the configured context enricher.
+    ///
+    /// If the handle was not already cached in the local tenant registry and is successfully resolved
+    /// via the enricher, it is automatically cached into SQLite for future instant retrieval.
+    pub async fn resolve_did_to_handle(&self, did: &str) -> Option<String> {
+        let clean = did.trim();
+        if !clean.starts_with("did:") {
+            return None;
+        }
+
+        // 1. Check local tenant cache
+        if let Ok(Some(tenant)) = self.tenant_registry.get(clean) {
+            if let Some(handle) = tenant.handle {
+                let trimmed = handle.trim().trim_start_matches('@').to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+
+        // 2. Resolve via enricher
+        if let Some(resolved) = self.enricher.resolve_did(clean).await {
+            // Update local registry if enrolled
+            let _ = self.tenant_registry.update_handle(clean, &resolved);
+            return Some(resolved);
+        }
+
+        None
+    }
+
     /// Returns a reference to the active configuration.
     #[must_use]
     pub fn config(&self) -> &SkybouncerConfig {

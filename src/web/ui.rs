@@ -650,8 +650,10 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     async function loadRules() {
+      const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
+      const url = "/api/rules" + (storedDid ? `?did=${encodeURIComponent(storedDid)}` : "");
       try {
-        const res = await fetch("/api/rules");
+        const res = await fetch(url);
         if (!res.ok) return;
         const data = await res.json();
         document.getElementById("rules-prompt").value = data.prompt;
@@ -670,16 +672,23 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
     async function saveRules() {
       const prompt = document.getElementById("rules-prompt").value;
+      const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
+      const url = "/api/rules" + (storedDid ? `?did=${encodeURIComponent(storedDid)}` : "");
       try {
-        const res = await fetch("/api/rules", {
+        const res = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ prompt, sensitivity: activeSensitivity })
         });
         if (res.ok) {
+          const data = await res.json();
+          if (currentUser) {
+            currentUser.rubric = data;
+          }
           showToast("✅ Moderation rubric updated successfully!");
         } else {
-          showToast("❌ Failed to save rubric");
+          const err = await res.text();
+          showToast(`❌ Failed to save rubric: ${err}`);
         }
       } catch (e) {
         showToast("❌ Network error saving rubric");
@@ -907,6 +916,10 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             localStorage.setItem("skybouncer_did", data.did);
           }
           renderAuthenticated(data);
+          if (data.rubric) {
+            document.getElementById("rules-prompt").value = data.rubric.prompt;
+            setSensitivity(data.rubric.sensitivity);
+          }
           if (data.is_admin) {
             const adminCard = document.getElementById("admin-fleet-card");
             if (adminCard) adminCard.style.display = "block";
@@ -1025,6 +1038,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       localStorage.removeItem("skybouncer_did");
       currentUser = null;
       renderUnauthenticated();
+      loadRules();
       showToast("👋 Signed out successfully");
     }
 

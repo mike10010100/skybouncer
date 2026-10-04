@@ -515,6 +515,24 @@ impl TenantRegistry {
         Ok(count > 0)
     }
 
+    /// Updates the handle for an enrolled tenant.
+    ///
+    /// Returns `true` if the tenant was found and updated.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if update query fails.
+    pub fn update_handle(&self, did: &str, handle: &str) -> Result<bool, SkybouncerError> {
+        let now_us = current_time_us();
+        let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
+
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare_cached("UPDATE tenants SET handle = ?1, updated_at = ?2 WHERE did = ?3;")?;
+
+        let count = stmt.execute(params![handle, now_i64, did])?;
+        Ok(count > 0)
+    }
+
     /// Deletes a tenant from the registry.
     ///
     /// Returns `true` if the tenant was found and deleted.

@@ -144,6 +144,7 @@ pub async fn oauth_callback(
                     let eng = Arc::clone(engine);
                     let enroll_did = did.clone();
                     tokio::spawn(async move {
+                        let _ = eng.resolve_did_to_handle(&enroll_did).await;
                         let _ = eng.ensure_mod_list(&enroll_did).await;
                         let _ = eng.sync_sovereign_config(&enroll_did).await;
                     });
