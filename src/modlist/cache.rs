@@ -245,9 +245,9 @@ impl DeduplicationCache {
             })?;
         conn.pragma_update(None, "mmap_size", 268_435_456_i64)
             .map_err(|e| SkybouncerError::Database(format!("Failed to set mmap_size: {e}")))?;
-        conn.pragma_update(None, "foreign_keys", "ON")
+        conn.pragma_update(None, "foreign_keys", "OFF")
             .map_err(|e| {
-                SkybouncerError::Database(format!("Failed to set foreign_keys ON: {e}"))
+                SkybouncerError::Database(format!("Failed to set foreign_keys OFF: {e}"))
             })?;
         Ok(())
     }
@@ -402,6 +402,43 @@ impl DeduplicationCache {
             })?;
         }
 
+        // 3.5. Migrate legacy bounced_user_rkeys table if it has a foreign key referencing bounced_users
+        let has_legacy_rkeys_fk: bool = {
+            let mut stmt = conn.prepare("PRAGMA foreign_key_list(bounced_user_rkeys);")?;
+            let mut rows = stmt.query([])?;
+            let mut found = false;
+            while let Some(row) = rows.next()? {
+                let table: String = row.get(2)?;
+                if table == "bounced_users" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+
+        if has_legacy_rkeys_fk {
+            conn.execute_batch(
+                "
+                CREATE TABLE bounced_user_rkeys_v2 (
+                    protected_did TEXT NOT NULL DEFAULT '',
+                    subject_did TEXT NOT NULL,
+                    listitem_rkey TEXT NOT NULL PRIMARY KEY,
+                    listitem_uri TEXT NOT NULL,
+                    listitem_cid TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO bounced_user_rkeys_v2 (protected_did, subject_did, listitem_rkey, listitem_uri, listitem_cid, created_at)
+                    SELECT COALESCE(protected_did, ''), subject_did, listitem_rkey, listitem_uri, listitem_cid, created_at FROM bounced_user_rkeys;
+                DROP TABLE bounced_user_rkeys;
+                ALTER TABLE bounced_user_rkeys_v2 RENAME TO bounced_user_rkeys;
+                ",
+            )
+            .map_err(|e| {
+                SkybouncerError::Database(format!("Failed to migrate bounced_user_rkeys FK: {e}"))
+            })?;
+        }
+
         // 4. Dependent indexes
         conn.execute_batch(
             "
@@ -456,6 +493,11 @@ impl DeduplicationCache {
         .map_err(|e| {
             SkybouncerError::Database(format!("Failed to initialize cache schema indexes: {e}"))
         })?;
+
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| {
+                SkybouncerError::Database(format!("Failed to set foreign_keys ON: {e}"))
+            })?;
 
         Ok(())
     }
