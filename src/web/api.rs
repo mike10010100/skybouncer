@@ -60,10 +60,12 @@ pub struct UpdateRulesRequest {
 }
 
 /// Query parameters for fetching bounced accounts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct BouncesQuery {
     /// Maximum number of records to return (defaults to 50, maximum 200).
     pub limit: Option<usize>,
+    /// Optional protected DID to filter bounces for a specific user.
+    pub user_did: Option<String>,
 }
 
 /// Request payload to pardon and remove a user from the moderation list.
@@ -385,9 +387,10 @@ pub async fn get_bounces(
     Query(query): Query<BouncesQuery>,
 ) -> Result<Json<Vec<BouncedUser>>, (StatusCode, String)> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let user_did = query.user_did.as_deref().filter(|s| !s.trim().is_empty());
     let bounces = state
         .engine
-        .list_recent_bounces(limit)
+        .list_recent_bounces_for(user_did, limit)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(bounces))
 }

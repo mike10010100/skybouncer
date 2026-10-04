@@ -1482,6 +1482,7 @@ impl SkybouncerEngine {
         let author_did = interaction.author_did.clone();
         let target_did = interaction.target_did.clone();
         let post_uri = interaction.post_uri.clone();
+        let post_text = interaction.text.clone();
 
         match verdict {
             Verdict::Permitted { reason, .. } => {
@@ -1522,7 +1523,7 @@ impl SkybouncerEngine {
                 let pds_client = self.pds_client_for(&target_did);
                 let bounce_result = self
                     .modlist_manager
-                    .bounce_user(
+                    .bounce_user_with_text(
                         &pds_client,
                         &target_did,
                         &author_did,
@@ -1530,6 +1531,7 @@ impl SkybouncerEngine {
                         confidence,
                         &reason,
                         &post_uri,
+                        &post_text,
                     )
                     .await
                     .inspect_err(|_e| {
@@ -1653,6 +1655,19 @@ impl SkybouncerEngine {
     /// Returns [`SkybouncerError::Database`] if SQLite query fails.
     pub fn list_recent_bounces(&self, limit: usize) -> Result<Vec<BouncedUser>, SkybouncerError> {
         self.cache.list_recent_bounces(limit)
+    }
+
+    /// Lists recently bounced violators filtered by an optional protected user DID,
+    /// ordered by most recent bounce timestamp descending.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn list_recent_bounces_for(
+        &self,
+        protected_did: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<BouncedUser>, SkybouncerError> {
+        self.cache.list_recent_bounces_for(protected_did, limit)
     }
 
     /// Pardons an account by deleting its listitems from the PDS and purging the cache.

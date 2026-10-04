@@ -380,6 +380,7 @@ async fn test_command_handler_recent_and_pardon() {
     cache
         .record_bounce(&BouncedUser {
             subject_did: "did:plc:spammer1".to_string(),
+            protected_did: "did:plc:protected1".to_string(),
             listitem_uri: "at://did:plc:protected1/app.bsky.graph.listitem/item1".to_string(),
             listitem_rkey: "item1".to_string(),
             listitem_cid: "bafyitem1cid".to_string(),
@@ -387,6 +388,7 @@ async fn test_command_handler_recent_and_pardon() {
             confidence: 0.96,
             reason: "Detected crypto scam keyword".to_string(),
             post_uri: "at://did:plc:spammer1/app.bsky.feed.post/post1".to_string(),
+            post_text: "Scam post".to_string(),
             bounced_at: 1_700_000_000,
         })
         .expect("record bounce");
@@ -759,6 +761,7 @@ async fn test_command_handler_pardon_with_handle_resolution() {
     cache
         .record_bounce(&BouncedUser {
             subject_did: "did:plc:alice123".to_string(),
+            protected_did: "did:plc:protected1".to_string(),
             listitem_uri: "at://did:plc:protected1/app.bsky.graph.listitem/item_alice".to_string(),
             listitem_rkey: "item_alice".to_string(),
             listitem_cid: "bafyalice".to_string(),
@@ -766,6 +769,7 @@ async fn test_command_handler_pardon_with_handle_resolution() {
             confidence: 0.95,
             reason: "spam".to_string(),
             post_uri: "at://did:plc:alice123/post/1".to_string(),
+            post_text: "Spam content".to_string(),
             bounced_at: 1_700_000_000,
         })
         .expect("record");

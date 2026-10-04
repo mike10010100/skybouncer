@@ -51,6 +51,7 @@ fn test_sqlite_cache_bounced_user_deduplication() {
     let cache = DeduplicationCache::open_in_memory().unwrap();
     let entry = BouncedUser {
         subject_did: "did:plc:spammer1".to_string(),
+        protected_did: "did:plc:alice".to_string(),
         listitem_uri: "at://did:plc:alice/app.bsky.graph.listitem/item123".to_string(),
         listitem_rkey: "item123".to_string(),
         listitem_cid: "bafyitemcid".to_string(),
@@ -58,6 +59,7 @@ fn test_sqlite_cache_bounced_user_deduplication() {
         confidence: 0.95,
         reason: "Crypto giveaway bot".to_string(),
         post_uri: "at://did:plc:spammer1/app.bsky.feed.post/1".to_string(),
+        post_text: "Crypto giveaway link".to_string(),
         bounced_at: 1_720_000_000_000_000,
     };
 
@@ -576,6 +578,7 @@ async fn test_multi_rkey_tracking_and_pardon_cleanup() {
     for i in 1..=3 {
         let entry = BouncedUser {
             subject_did: target_did.to_string(),
+            protected_did: "did:plc:alice".to_string(),
             listitem_uri: format!("at://did:plc:alice/app.bsky.graph.listitem/rkey_{i}"),
             listitem_rkey: format!("rkey_{i}"),
             listitem_cid: format!("bafycid_{i}"),
@@ -583,6 +586,7 @@ async fn test_multi_rkey_tracking_and_pardon_cleanup() {
             confidence: 0.95,
             reason: format!("Repeated attack attempt {i}"),
             post_uri: format!("at://{target_did}/app.bsky.feed.post/{i}"),
+            post_text: format!("Attack post {i}"),
             bounced_at: 1_720_000_000_000_000 + (i as u64),
         };
         cache.record_bounce(&entry).unwrap();

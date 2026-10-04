@@ -448,6 +448,41 @@ impl ModListManager {
         reason: &str,
         post_uri: &str,
     ) -> Result<Option<String>, SkybouncerError> {
+        self.bounce_user_with_text(
+            pds_client,
+            protected_did,
+            candidate_did,
+            category,
+            confidence,
+            reason,
+            post_uri,
+            "",
+        )
+        .await
+    }
+
+    /// Bounces a violating user on the sovereign PDS, recording the offending post URI and post text in the cache.
+    #[instrument(
+        skip(self, pds_client),
+        fields(
+            protected_did = %protected_did,
+            candidate_did = %candidate_did,
+            category = %category,
+            confidence = %confidence
+        )
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bounce_user_with_text(
+        &self,
+        pds_client: &PdsRepoClient,
+        protected_did: &str,
+        candidate_did: &str,
+        category: &ViolationCategory,
+        confidence: f64,
+        reason: &str,
+        post_uri: &str,
+        post_text: &str,
+    ) -> Result<Option<String>, SkybouncerError> {
         // 1. Check rubric threshold if rubric is configured
         if let Some(ref rubric) = *self.rubric.read() {
             if !rubric.meets_threshold(category, confidence) {
@@ -501,6 +536,7 @@ impl ModListManager {
                 "bafyreidryrunsimulatedcid000000000000000000000000000000000".to_string();
             info!(
                 violator = %candidate_did,
+                protected_did = %protected_did,
                 category = %category,
                 confidence = %confidence,
                 reason = %reason,
@@ -524,6 +560,7 @@ impl ModListManager {
 
             info!(
                 candidate_did = %candidate_did,
+                protected_did = %protected_did,
                 listitem_uri = %result.uri,
                 "Successfully bounced violator on sovereign PDS"
             );
@@ -533,6 +570,7 @@ impl ModListManager {
         // 8. Persist to SQLite cache
         let bounce_record = BouncedUser {
             subject_did: candidate_did.to_string(),
+            protected_did: protected_did.to_string(),
             listitem_uri: result_uri.clone(),
             listitem_rkey: rkey,
             listitem_cid: result_cid,
@@ -540,6 +578,7 @@ impl ModListManager {
             confidence,
             reason: reason.to_string(),
             post_uri: post_uri.to_string(),
+            post_text: post_text.to_string(),
             bounced_at: now_us,
         };
         self.cache.record_bounce(&bounce_record)?;

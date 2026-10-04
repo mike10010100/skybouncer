@@ -273,6 +273,7 @@ async fn test_adversarial_pds_socket_drop_on_delete_record() {
     // Seed cache with a bounced user
     let bounce = skybouncer::modlist::BouncedUser {
         subject_did: "did:plc:socket_drop_pardon".to_string(),
+        protected_did: "did:plc:alice".to_string(),
         listitem_uri: "at://did:plc:alice/app.bsky.graph.listitem/item1".to_string(),
         listitem_rkey: "item1".to_string(),
         listitem_cid: "bafyitemcid".to_string(),
@@ -280,6 +281,7 @@ async fn test_adversarial_pds_socket_drop_on_delete_record() {
         confidence: 0.9,
         reason: "spam".to_string(),
         post_uri: "at://did:plc:socket_drop_pardon/app.bsky.feed.post/1".to_string(),
+        post_text: "spam message".to_string(),
         bounced_at: 1_700_000_000,
     };
     manager.cache().record_bounce(&bounce).unwrap();
