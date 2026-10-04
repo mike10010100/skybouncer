@@ -100,9 +100,26 @@ impl StreamConfig {
     }
 }
 
+fn apply_jitter(duration: Duration) -> Duration {
+    let nanos = duration.as_nanos();
+    let jitter_range = nanos / 4;
+    if jitter_range == 0 {
+        return duration;
+    }
+    let rand = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos() as u128);
+    let offset = rand % jitter_range;
+    let jittered = nanos.saturating_add(offset);
+    let capped = jittered.min(MAX_BACKOFF.as_nanos());
+    #[allow(clippy::cast_possible_truncation)]
+    Duration::from_nanos(capped as u64)
+}
+
 /// Connects to Jetstream and forwards parsed commits to `tx` until `cancel` is triggered.
 ///
-/// Automatically reconnects with exponential backoff on connection drops.
+/// Automatically reconnects with exponential backoff on connection drops and restores
+/// last seen cursor to prevent dropped events during reconnects.
 ///
 /// # Errors
 /// Returns [`SkybouncerError`] if unrecoverable stream configuration errors occur.
@@ -112,15 +129,21 @@ pub async fn run_jetstream_streamer(
     cancel: CancellationToken,
 ) -> Result<(), SkybouncerError> {
     let mut backoff = INITIAL_BACKOFF;
+    let mut current_cursor: Option<u64> = config.cursor;
 
     while !cancel.is_cancelled() {
-        let url = config.build_url();
-        info!(endpoint = %url, "Connecting to Jetstream firehose");
+        let mut active_config = config.clone();
+        if let Some(cursor) = current_cursor {
+            // Rewind 5s (5,000,000 µs) on reconnect to prevent missed events across network drops
+            active_config.cursor = Some(cursor.saturating_sub(5_000_000));
+        }
+        let url = active_config.build_url();
+        info!(endpoint = %url, cursor = ?active_config.cursor, "Connecting to Jetstream firehose");
 
+        let mut frames_processed: usize = 0;
         match connect_async(&url).await {
             Ok((ws_stream, response)) => {
                 debug!(status = %response.status(), "WebSocket connection established");
-                backoff = INITIAL_BACKOFF; // Reset backoff on successful handshake
 
                 let (mut write_half, mut read_half) = ws_stream.split();
 
@@ -138,6 +161,11 @@ pub async fn run_jetstream_streamer(
                                     if let Some(JetstreamEvent::Commit(commit)) =
                                         parse_jetstream_frame(&text)
                                     {
+                                        frames_processed = frames_processed.saturating_add(1);
+                                        current_cursor = Some(commit.time_us);
+                                        if frames_processed >= 5 {
+                                            backoff = INITIAL_BACKOFF;
+                                        }
                                         if tx.send(commit).await.is_err() {
                                             debug!("Commit receiver dropped; stopping streamer");
                                             return Ok(());
@@ -149,6 +177,11 @@ pub async fn run_jetstream_streamer(
                                         if let Some(JetstreamEvent::Commit(commit)) =
                                             parse_jetstream_frame(text)
                                         {
+                                            frames_processed = frames_processed.saturating_add(1);
+                                            current_cursor = Some(commit.time_us);
+                                            if frames_processed >= 5 {
+                                                backoff = INITIAL_BACKOFF;
+                                            }
                                             if tx.send(commit).await.is_err() {
                                                 debug!("Commit receiver dropped; stopping streamer");
                                                 return Ok(());
@@ -184,13 +217,14 @@ pub async fn run_jetstream_streamer(
             }
         }
 
-        // Backoff delay before attempting reconnect
+        // Backoff delay before attempting reconnect with jitter
+        let jittered_delay = apply_jitter(backoff);
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 return Ok(());
             }
-            _ = tokio::time::sleep(backoff) => {
+            _ = tokio::time::sleep(jittered_delay) => {
                 backoff = (backoff.saturating_mul(2)).min(MAX_BACKOFF);
             }
         }

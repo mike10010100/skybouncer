@@ -8,7 +8,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::Deserialize;
 use skybase::repo::PdsRepoClient;
-use tracing::{debug, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::classifier::{RuleRubric, ViolationCategory};
 use crate::error::SkybouncerError;
@@ -86,6 +86,7 @@ pub struct ModListManager {
     list_name: String,
     list_description: Option<String>,
     list_provision_locks: Arc<StripedAsyncLocks>,
+    listblock_provision_locks: Arc<StripedAsyncLocks>,
     bounce_locks: Arc<StripedAsyncLocks>,
     dry_run: bool,
 }
@@ -100,6 +101,7 @@ impl ModListManager {
             list_name: DEFAULT_MOD_LIST_NAME.to_string(),
             list_description: Some(DEFAULT_MOD_LIST_DESCRIPTION.to_string()),
             list_provision_locks: Arc::new(StripedAsyncLocks::new()),
+            listblock_provision_locks: Arc::new(StripedAsyncLocks::new()),
             bounce_locks: Arc::new(StripedAsyncLocks::new()),
             dry_run: false,
         }
@@ -114,6 +116,7 @@ impl ModListManager {
             list_name: DEFAULT_MOD_LIST_NAME.to_string(),
             list_description: Some(DEFAULT_MOD_LIST_DESCRIPTION.to_string()),
             list_provision_locks: Arc::new(StripedAsyncLocks::new()),
+            listblock_provision_locks: Arc::new(StripedAsyncLocks::new()),
             bounce_locks: Arc::new(StripedAsyncLocks::new()),
             dry_run: false,
         }
@@ -262,29 +265,31 @@ impl ModListManager {
             return Ok(simulated_uri);
         }
 
-        if let Ok(resp) = self
+        let resp = self
             .list_pds_records::<ModListRecord>(pds_client, "app.bsky.graph.list", 50)
-            .await
-        {
-            for item in resp.records {
-                if item.value.is_modlist() {
-                    info!(
-                        list_uri = %item.uri,
-                        "Discovered existing remote moderation list on PDS; caching locally"
-                    );
-                    let now_us = current_time_us();
-                    let config = ModListConfig {
-                        user_did: protected_did.to_string(),
-                        list_uri: item.uri.clone(),
-                        list_cid: item.cid,
-                        created_at: now_us,
-                    };
-                    self.cache.set_mod_list(&config)?;
-                    let _ = self
-                        .ensure_list_blocked(pds_client, protected_did, &item.uri)
-                        .await;
-                    return Ok(item.uri);
+            .await?;
+
+        for item in resp.records {
+            if item.value.is_modlist() {
+                info!(
+                    list_uri = %item.uri,
+                    "Discovered existing remote moderation list on PDS; caching locally"
+                );
+                let now_us = current_time_us();
+                let config = ModListConfig {
+                    user_did: protected_did.to_string(),
+                    list_uri: item.uri.clone(),
+                    list_cid: item.cid,
+                    created_at: now_us,
+                };
+                self.cache.set_mod_list(&config)?;
+                if let Err(e) = self
+                    .ensure_list_blocked(pds_client, protected_did, &item.uri)
+                    .await
+                {
+                    warn!(error = %e, protected_did = %protected_did, "Failed to ensure list blocked");
                 }
+                return Ok(item.uri);
             }
         }
 
@@ -321,9 +326,12 @@ impl ModListManager {
             created_at: now_us,
         };
         self.cache.set_mod_list(&config)?;
-        let _ = self
+        if let Err(e) = self
             .ensure_list_blocked(pds_client, protected_did, &result.uri)
-            .await;
+            .await
+        {
+            warn!(error = %e, protected_did = %protected_did, "Failed to ensure list blocked");
+        }
 
         Ok(result.uri)
     }
@@ -351,6 +359,14 @@ impl ModListManager {
             return Ok(());
         }
 
+        // Acquire shard async lock for this protected DID to serialize concurrent listblock setup
+        let shard = self.listblock_provision_locks.shard_for(protected_did);
+        let _guard = shard.lock().await;
+
+        if self.cache.is_list_blocked(protected_did)? {
+            return Ok(());
+        }
+
         if self.dry_run {
             self.cache.set_list_blocked(protected_did, list_uri)?;
             info!(
@@ -362,20 +378,19 @@ impl ModListManager {
         }
 
         // Check if remote PDS already has a listblock targeting this list_uri
-        if let Ok(resp) = self
+        let resp = self
             .list_pds_records::<ListBlockRecord>(pds_client, "app.bsky.graph.listblock", 50)
-            .await
-        {
-            for item in resp.records {
-                if item.value.subject == list_uri {
-                    info!(
-                        protected_did = %protected_did,
-                        list_uri = %list_uri,
-                        "Discovered existing remote listblock on PDS; caching locally"
-                    );
-                    self.cache.set_list_blocked(protected_did, list_uri)?;
-                    return Ok(());
-                }
+            .await?;
+
+        for item in resp.records {
+            if item.value.subject == list_uri {
+                info!(
+                    protected_did = %protected_did,
+                    list_uri = %list_uri,
+                    "Discovered existing remote listblock on PDS; caching locally"
+                );
+                self.cache.set_list_blocked(protected_did, list_uri)?;
+                return Ok(());
             }
         }
 
@@ -496,24 +511,27 @@ impl ModListManager {
         }
 
         // 2. Fast cache-first short-circuit: already bounced? (Lock-free fast path)
-        if self.cache.is_bounced(candidate_did)? {
+        if self.cache.is_bounced_for(protected_did, candidate_did)? {
             debug!(
                 candidate_did = %candidate_did,
-                "Candidate is already recorded as bounced in cache; skipping duplicate mutation"
+                protected_did = %protected_did,
+                "Candidate is already recorded as bounced for this user in cache; skipping duplicate mutation"
             );
             return Ok(None);
         }
 
-        // 3. Acquire shard async lock for candidate_did to serialize concurrent bounces
-        let shard = self.bounce_locks.shard_for(candidate_did);
+        // 3. Acquire shard async lock for composite key to serialize concurrent bounces
+        let lock_key = format!("{protected_did}:{candidate_did}");
+        let shard = self.bounce_locks.shard_for(&lock_key);
         let _guard = shard.lock().await;
 
         // 4. Double-check cache under the lock: another task may have bounced this violator
         // while we were waiting for the lock
-        if self.cache.is_bounced(candidate_did)? {
+        if self.cache.is_bounced_for(protected_did, candidate_did)? {
             debug!(
                 candidate_did = %candidate_did,
-                "Candidate was bounced by a concurrent task; short-circuiting duplicate mutation"
+                protected_did = %protected_did,
+                "Candidate was bounced by a concurrent task for this user; short-circuiting duplicate mutation"
             );
             return Ok(None);
         }
@@ -567,12 +585,12 @@ impl ModListManager {
             (result.uri, result.cid)
         };
 
-        // 8. Persist to SQLite cache
+        // 8. Persist to SQLite cache with compensating deletion on failure
         let bounce_record = BouncedUser {
             subject_did: candidate_did.to_string(),
             protected_did: protected_did.to_string(),
             listitem_uri: result_uri.clone(),
-            listitem_rkey: rkey,
+            listitem_rkey: rkey.clone(),
             listitem_cid: result_cid,
             category: category.to_string(),
             confidence,
@@ -581,7 +599,28 @@ impl ModListManager {
             post_text: post_text.to_string(),
             bounced_at: now_us,
         };
-        self.cache.record_bounce(&bounce_record)?;
+        if let Err(cache_err) = self.cache.record_bounce(&bounce_record) {
+            error!(
+                candidate_did = %candidate_did,
+                protected_did = %protected_did,
+                rkey = %rkey,
+                error = %cache_err,
+                "Failed to record bounce in cache after PDS write succeeded; attempting compensating PDS deletion"
+            );
+            if !self.dry_run {
+                if let Err(comp_err) = pds_client
+                    .delete_record("app.bsky.graph.listitem", &rkey)
+                    .await
+                {
+                    error!(
+                        rkey = %rkey,
+                        error = %comp_err,
+                        "Compensating PDS deletion failed; orphaned listitem may exist"
+                    );
+                }
+            }
+            return Err(cache_err);
+        }
 
         Ok(Some(result_uri))
     }
@@ -589,13 +628,13 @@ impl ModListManager {
     /// Pardons an account by deleting its `app.bsky.graph.listitem` records from the sovereign PDS
     /// and purging the record from the local SQLite deduplication cache.
     ///
-    /// Synchronizes on the candidate's shard lock to prevent races with concurrent bounces.
-    /// Deletes all known `listitem_rkey` values associated with the subject to guarantee zero
-    /// orphaned records on the PDS.
+    /// Synchronizes on the composite shard lock to prevent races with concurrent bounces.
+    /// Deletes all known `listitem_rkey` values associated with the subject for this protected user
+    /// to guarantee zero orphaned records on the PDS.
     ///
     /// # Pipeline
-    /// 1. Acquire shard async lock for `subject_did`.
-    /// 2. Look up all bounced `listitem_rkey` values in the local SQLite cache.
+    /// 1. Acquire shard async lock for `(protected_did, subject_did)`.
+    /// 2. Look up all bounced `listitem_rkey` values for this protected user in the local SQLite cache.
     /// 3. If none found, returns `Ok(false)` immediately ($0 cost, 0 network calls).
     /// 4. For each recorded `rkey`, issues a DPoP-signed `com.atproto.repo.deleteRecord` to the PDS.
     /// 5. On successful deletion, purges the user from the SQLite cache.
@@ -611,15 +650,19 @@ impl ModListManager {
         protected_did: &str,
         subject_did: &str,
     ) -> Result<bool, SkybouncerError> {
-        let shard = self.bounce_locks.shard_for(subject_did);
+        let lock_key = format!("{protected_did}:{subject_did}");
+        let shard = self.bounce_locks.shard_for(&lock_key);
         let _guard = shard.lock().await;
 
-        // 1. Look up all bounced rkeys in local SQLite cache
-        let rkeys = self.cache.get_all_bounced_rkeys(subject_did)?;
+        // 1. Look up all bounced rkeys for this protected user in local SQLite cache
+        let rkeys = self
+            .cache
+            .get_all_bounced_rkeys_for(protected_did, subject_did)?;
         if rkeys.is_empty() {
             debug!(
                 subject_did = %subject_did,
-                "Subject is not recorded in bounced users cache; cannot pardon"
+                protected_did = %protected_did,
+                "Subject is not recorded in bounced users cache for this user; cannot pardon"
             );
             return Ok(false);
         }
@@ -653,10 +696,11 @@ impl ModListManager {
         }
 
         // 3. Remove entry from local SQLite cache now that PDS deletions succeeded
-        let _ = self.cache.remove_bounce(subject_did)?;
+        let _ = self.cache.remove_bounce_for(protected_did, subject_did)?;
 
         info!(
             subject_did = %subject_did,
+            protected_did = %protected_did,
             "Successfully pardoned user and purged from cache"
         );
 
@@ -675,6 +719,18 @@ impl ModListManager {
     ) -> Result<bool, SkybouncerError> {
         self.pardon_user(pds_client, pds_client.did(), subject_did)
             .await
+    }
+
+    /// Checks whether the subject DID is recorded as bounced for a specific protected user in the local cache.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if cache access fails.
+    pub fn is_bounced_for(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<bool, SkybouncerError> {
+        self.cache.is_bounced_for(protected_did, subject_did)
     }
 
     /// Checks whether the subject DID is recorded as bounced in the local cache.

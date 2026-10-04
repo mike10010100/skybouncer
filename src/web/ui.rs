@@ -1122,7 +1122,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       const clean = String(actorOrDid).trim().replace(/^@/, "");
       // Bluesky profile routes require literal colons for DIDs (e.g. did:plc:... or did:web:...)
       if (clean.startsWith("did:")) {
-        return `https://bsky.app/profile/${clean}`;
+        const sanitized = clean.replace(/[^a-zA-Z0-9:._%-]/g, "");
+        return `https://bsky.app/profile/${sanitized}`;
       }
       return `https://bsky.app/profile/${encodeURIComponent(clean)}`;
     }
@@ -1130,7 +1131,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     function bskyPostUrl(actor, rkey) {
       if (!actor || !rkey) return "#";
       const profile = bskyProfileUrl(actor);
-      return `${profile}/post/${encodeURIComponent(rkey)}`;
+      const cleanRkey = String(rkey).replace(/[^a-zA-Z0-9._~-]/g, "");
+      return `${profile}/post/${encodeURIComponent(cleanRkey)}`;
     }
 
     function formatDid(did) {
@@ -1164,7 +1166,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       if (bskyUrl) {
         return `
           <div style="display: flex; flex-direction: column; gap: 0.2rem; max-width: 220px;">
-            <a href="${bskyUrl}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); text-decoration: none; font-size: 0.82rem; font-weight: 600; display: inline-flex; align-items: center; gap: 0.3rem;" title="Open offending post on Bluesky">
+            <a href="${escapeHtml(bskyUrl)}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); text-decoration: none; font-size: 0.82rem; font-weight: 600; display: inline-flex; align-items: center; gap: 0.3rem;" title="Open offending post on Bluesky">
               <span>💬</span> <span style="text-decoration: underline; text-underline-offset: 2px;">${escapeHtml(displayText)}</span> ↗
             </a>
             ${hasText ? `<div style="font-size: 0.72rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(text)}">${escapeHtml(text)}</div>` : ''}
@@ -1193,7 +1195,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           return `
           <tr>
             <td>
-              <a href="${profileUrl}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none;" title="Open profile on Bluesky">
+              <a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none;" title="Open profile on Bluesky">
                 <code style="font-size: 0.8rem; background: rgba(0,0,0,0.2); padding: 0.2rem 0.4rem; border-radius: 4px; color: var(--text-main); font-family: monospace;">${escapeHtml(b.subject_did)}</code>
               </a>
             </td>
@@ -1687,12 +1689,12 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           <td style="font-size: 0.75rem; white-space: nowrap; color: var(--text-muted);">${escapeHtml(ts)}</td>
           <td>${sourceBadge}</td>
           <td style="font-size: 0.8rem; white-space: nowrap;">
-            <a href="${targetLink}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); text-decoration: none;">
+            <a href="${escapeHtml(targetLink)}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); text-decoration: none;">
               ${targetDisplay}
             </a>
           </td>
           <td style="font-size: 0.8rem; white-space: nowrap;">
-            <a href="${authorLink}" target="_blank" rel="noopener noreferrer" style="color: var(--text-color); text-decoration: none;">
+            <a href="${escapeHtml(authorLink)}" target="_blank" rel="noopener noreferrer" style="color: var(--text-color); text-decoration: none;">
               ${authorDisplay}
             </a>
           </td>

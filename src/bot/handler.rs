@@ -91,54 +91,93 @@ impl BotCommandHandler {
         }
 
         if trimmed.eq_ignore_ascii_case("pause") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return Ok(self.cmd_pause(sender_did));
         }
 
         if trimmed.eq_ignore_ascii_case("resume") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return Ok(self.cmd_resume(sender_did));
         }
 
         if trimmed.eq_ignore_ascii_case("rules") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return Ok(self.cmd_rules(sender_did));
         }
 
         if trimmed.eq_ignore_ascii_case("set rules") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return self.cmd_set_rules(sender_did, "");
         }
 
         if let Some(prompt) = strip_prefix_ci(trimmed, "set rules ") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return self.cmd_set_rules(sender_did, prompt);
         }
 
         if trimmed.eq_ignore_ascii_case("sensitivity") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return Ok("Usage: `sensitivity <low|medium|high>`".to_string());
         }
 
         if let Some(sens) = strip_prefix_ci(trimmed, "sensitivity ") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return self.cmd_set_sensitivity(sender_did, sens.trim());
         }
 
         if trimmed.eq_ignore_ascii_case("recent") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return self.cmd_recent(sender_did);
         }
 
         if trimmed.eq_ignore_ascii_case("pardon") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return Ok("Usage: `pardon <did|@handle>` (e.g. `pardon did:plc:...` or `pardon @alice.bsky.social`)".to_string());
         }
 
         if let Some(target) = strip_prefix_ci(trimmed, "pardon ") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return self.cmd_pardon(sender_did, target.trim()).await;
         }
 
         if trimmed.eq_ignore_ascii_case("status") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return Ok(self.cmd_status(sender_did));
         }
 
         if trimmed.eq_ignore_ascii_case("test") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return Ok("Usage: `test <text>` (dry-run evaluation on sample text)".to_string());
         }
 
         if let Some(sample) = strip_prefix_ci(trimmed, "test ") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
             return self.cmd_test(sender_did, sample.trim()).await;
         }
 
@@ -171,9 +210,16 @@ impl BotCommandHandler {
 
     fn cmd_pause(&self, sender_did: &str) -> String {
         if self.engine.is_enrolled(sender_did) {
-            let _ = self.engine.tenant_registry().set_active(sender_did, false);
-        } else {
+            if let Err(e) = self.engine.tenant_registry().set_active(sender_did, false) {
+                tracing::warn!(error = %e, sender_did, "Failed to pause tenant in registry");
+                return format!("⚠️ Failed to update pause status: {e}");
+            }
+        } else if self.engine.is_admin(sender_did)
+            || (self.engine.is_single_tenant() && self.engine.is_protected(sender_did))
+        {
             let _ = self.engine.pause();
+        } else {
+            return "❌ You can only pause moderation for your own enrolled account.".to_string();
         }
         "⏸️ Skybouncer has been **paused**.\n\n\
          Automated moderation evaluations and PDS list mutations are temporarily suspended.\n\
@@ -183,9 +229,16 @@ impl BotCommandHandler {
 
     fn cmd_resume(&self, sender_did: &str) -> String {
         if self.engine.is_enrolled(sender_did) {
-            let _ = self.engine.tenant_registry().set_active(sender_did, true);
-        } else {
+            if let Err(e) = self.engine.tenant_registry().set_active(sender_did, true) {
+                tracing::warn!(error = %e, sender_did, "Failed to resume tenant in registry");
+                return format!("⚠️ Failed to update resume status: {e}");
+            }
+        } else if self.engine.is_admin(sender_did)
+            || (self.engine.is_single_tenant() && self.engine.is_protected(sender_did))
+        {
             let _ = self.engine.resume();
+        } else {
+            return "❌ You can only resume moderation for your own enrolled account.".to_string();
         }
         "▶️ Skybouncer has been **resumed**.\n\n\
          Automated moderation evaluations and protection are now active."
@@ -212,19 +265,29 @@ impl BotCommandHandler {
 
         let parsed = RuleRubric::parse(prompt)?;
         if self.engine.is_enrolled(sender_did) {
-            let _ = self
+            if let Err(e) = self
                 .engine
                 .tenant_registry()
-                .update_rubric(sender_did, &parsed);
-        } else {
+                .update_rubric(sender_did, &parsed)
+            {
+                tracing::warn!(error = %e, sender_did, "Failed to update tenant rubric in registry");
+                return Ok(format!("❌ Failed to update rubric: {e}"));
+            }
+        } else if self.engine.is_admin(sender_did)
+            || (self.engine.is_single_tenant() && self.engine.is_protected(sender_did))
+        {
             self.engine.set_rubric(parsed.clone());
+        } else {
+            return Ok("❌ You can only update rules for your own enrolled account.".to_string());
         }
 
         // Asynchronously persist to sender's sovereign PDS repo
         let eng = self.engine.clone();
         let did = sender_did.to_string();
         tokio::spawn(async move {
-            let _ = eng.publish_sovereign_config(&did).await;
+            if let Err(e) = eng.publish_sovereign_config(&did).await {
+                tracing::warn!(error = %e, did = %did, "Failed to publish sovereign config to PDS");
+            }
         });
 
         Ok(format!(
@@ -254,19 +317,31 @@ impl BotCommandHandler {
         let mut rubric = self.engine.rubric_for(sender_did);
         rubric.sensitivity = sens;
         if self.engine.is_enrolled(sender_did) {
-            let _ = self
+            if let Err(e) = self
                 .engine
                 .tenant_registry()
-                .update_rubric(sender_did, &rubric);
-        } else {
+                .update_rubric(sender_did, &rubric)
+            {
+                tracing::warn!(error = %e, sender_did, "Failed to update tenant sensitivity in registry");
+                return Ok(format!("❌ Failed to update sensitivity: {e}"));
+            }
+        } else if self.engine.is_admin(sender_did)
+            || (self.engine.is_single_tenant() && self.engine.is_protected(sender_did))
+        {
             self.engine.set_rubric(rubric);
+        } else {
+            return Ok(
+                "❌ You can only update sensitivity for your own enrolled account.".to_string(),
+            );
         }
 
         // Asynchronously persist to sender's sovereign PDS repo
         let eng = self.engine.clone();
         let did = sender_did.to_string();
         tokio::spawn(async move {
-            let _ = eng.publish_sovereign_config(&did).await;
+            if let Err(e) = eng.publish_sovereign_config(&did).await {
+                tracing::warn!(error = %e, did = %did, "Failed to publish sovereign config to PDS");
+            }
         });
 
         Ok(format!(
@@ -321,15 +396,17 @@ impl BotCommandHandler {
             }
         };
 
-        // Use sender_did as protected user if sender is protected, otherwise use first protected DID
-        let protected_did = if self.engine.is_protected(sender_did) {
+        // Sender is strictly the protected user whose modlist is being updated
+        let protected_did = if self.engine.is_protected(sender_did)
+            || self.engine.is_enrolled(sender_did)
+            || self.engine.is_admin(sender_did)
+        {
             sender_did.to_string()
         } else {
-            self.engine
-                .protected_dids()
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| sender_did.to_string())
+            return Ok(
+                "❌ You do not have permission to pardon users on this moderation list."
+                    .to_string(),
+            );
         };
 
         let handle_prefix = if was_handle {
@@ -488,6 +565,25 @@ impl BotCommandHandler {
                 ))
             }
         }
+    }
+
+    /// Checks whether the sender is authorized to execute bouncer commands (enrolled tenant, admin, or protected DID).
+    #[must_use]
+    pub fn is_authorized_sender(&self, sender_did: &str) -> bool {
+        self.engine.is_admin(sender_did)
+            || self.engine.is_enrolled(sender_did)
+            || self.engine.is_protected(sender_did)
+    }
+
+    /// Generates an onboarding response for unauthorized senders.
+    #[must_use]
+    pub fn unauthorized_response(&self) -> String {
+        format!(
+            "🛡️ Skybouncer: You do not have an active bouncer session.\n\n\
+             To activate 1-click sovereign auto-moderation for your Bluesky account, visit:\n{}\n\n\
+             Once activated, you can manage your moderation rules directly via DMs here!",
+            self.auth_url()
+        )
     }
 }
 

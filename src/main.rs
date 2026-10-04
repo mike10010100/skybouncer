@@ -879,14 +879,24 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
 
     // Cold-start follow graph hydration via public AppView
     for did in &config.protected_dids {
-        let follows = enricher.fetch_follows(did, 100).await;
-        if !follows.is_empty() {
-            let count = engine.hydrate_follows(did, follows);
+        let follow_records = enricher.fetch_follow_records(did, 100).await;
+        if !follow_records.is_empty() {
+            let count = engine.hydrate_follow_records(did, follow_records);
             info!(
                 did = %did,
                 count = count,
-                "Hydrated initial follow graph from AppView (cold start)"
+                "Hydrated initial follow graph with real rkeys from AppView (cold start)"
             );
+        } else {
+            let follows = enricher.fetch_follows(did, 100).await;
+            if !follows.is_empty() {
+                let count = engine.hydrate_follows(did, follows);
+                info!(
+                    did = %did,
+                    count = count,
+                    "Hydrated initial follow graph from AppView (fallback)"
+                );
+            }
         }
     }
 

@@ -295,7 +295,12 @@ impl AppViewContextEnricher {
             .use_rustls_tls()
             .timeout(Duration::from_millis(DEFAULT_ENRICHER_TIMEOUT_MS))
             .build()
-            .unwrap_or_default();
+            .unwrap_or_else(|_| {
+                reqwest::Client::builder()
+                    .timeout(Duration::from_millis(DEFAULT_ENRICHER_TIMEOUT_MS))
+                    .build()
+                    .unwrap_or_default()
+            });
 
         Self {
             appview_url: appview_endpoint.into().trim_end_matches('/').to_string(),
@@ -306,11 +311,14 @@ impl AppViewContextEnricher {
 
     /// Fetches author profile metadata from the AppView.
     async fn fetch_author_profile(&self, did: &str) -> Option<AuthorContext> {
-        let url = format!(
-            "{}/xrpc/app.bsky.actor.getProfile?actor={did}",
-            self.appview_url
-        );
-        let resp = self.http_client.get(&url).send().await.ok()?;
+        let url = format!("{}/xrpc/app.bsky.actor.getProfile", self.appview_url);
+        let resp = self
+            .http_client
+            .get(&url)
+            .query(&[("actor", did)])
+            .send()
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -342,11 +350,14 @@ impl AppViewContextEnricher {
 
     /// Fetches parent post text content from the AppView.
     async fn fetch_parent_post(&self, uri: &str) -> Option<ParentPostContext> {
-        let url = format!(
-            "{}/xrpc/app.bsky.feed.getPosts?uris={uri}",
-            self.appview_url
-        );
-        let resp = self.http_client.get(&url).send().await.ok()?;
+        let url = format!("{}/xrpc/app.bsky.feed.getPosts", self.appview_url);
+        let resp = self
+            .http_client
+            .get(&url)
+            .query(&[("uris", uri)])
+            .send()
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -390,30 +401,117 @@ impl AppViewContextEnricher {
     /// Fetches initial followed DIDs for an actor from the public AppView (XRPC `app.bsky.graph.getFollows`).
     ///
     /// Used for zero-credential cold-start hydration of the local follow graph.
+    /// Paginates through follow records up to 10,000 follows to ensure complete coverage.
     pub async fn fetch_follows(&self, actor: &str, limit: u8) -> Vec<String> {
-        let url = format!(
-            "{}/xrpc/app.bsky.graph.getFollows?actor={actor}&limit={limit}",
-            self.appview_url
-        );
-        let resp = match self.http_client.get(&url).send().await {
-            Ok(r) if r.status().is_success() => r,
-            _ => return Vec::new(),
-        };
+        let mut all_follows = Vec::new();
+        let mut cursor: Option<String> = None;
+        let page_limit = limit.clamp(1, 100);
 
-        #[derive(Deserialize)]
-        struct FollowProfile {
-            did: String,
+        for _ in 0..100 {
+            let url = format!("{}/xrpc/app.bsky.graph.getFollows", self.appview_url);
+            let mut req = self
+                .http_client
+                .get(&url)
+                .query(&[("actor", actor), ("limit", &page_limit.to_string())]);
+            if let Some(ref c) = cursor {
+                req = req.query(&[("cursor", c)]);
+            }
+
+            let resp = match req.send().await {
+                Ok(r) if r.status().is_success() => r,
+                _ => break,
+            };
+
+            #[derive(Deserialize)]
+            struct FollowProfile {
+                did: String,
+            }
+
+            #[derive(Deserialize)]
+            struct GetFollowsResponse {
+                follows: Vec<FollowProfile>,
+                cursor: Option<String>,
+            }
+
+            match resp.json::<GetFollowsResponse>().await {
+                Ok(body) => {
+                    let count = body.follows.len();
+                    all_follows.extend(body.follows.into_iter().map(|f| f.did));
+                    if count == 0 || body.cursor.is_none() {
+                        break;
+                    }
+                    cursor = body.cursor;
+                }
+                Err(_) => break,
+            }
         }
 
-        #[derive(Deserialize)]
-        struct GetFollowsResponse {
-            follows: Vec<FollowProfile>,
+        all_follows
+    }
+
+    /// Fetches follow records `(rkey, followed_did)` for an actor via `com.atproto.repo.listRecords`.
+    ///
+    /// Used for cold-start hydration of the local follow graph with real repository rkeys,
+    /// enabling real-time unfollow reconciliation when `CommitOperation::Delete` arrives.
+    pub async fn fetch_follow_records(&self, actor: &str, limit: u8) -> Vec<(String, String)> {
+        let mut all_records = Vec::new();
+        let mut cursor: Option<String> = None;
+        let page_limit = limit.clamp(1, 100);
+
+        for _ in 0..100 {
+            let url = format!("{}/xrpc/com.atproto.repo.listRecords", self.appview_url);
+            let mut req = self.http_client.get(&url).query(&[
+                ("repo", actor),
+                ("collection", "app.bsky.graph.follow"),
+                ("limit", &page_limit.to_string()),
+            ]);
+            if let Some(ref c) = cursor {
+                req = req.query(&[("cursor", c)]);
+            }
+
+            let resp = match req.send().await {
+                Ok(r) if r.status().is_success() => r,
+                _ => break,
+            };
+
+            #[derive(Deserialize)]
+            struct FollowValue {
+                subject: Option<String>,
+            }
+
+            #[derive(Deserialize)]
+            struct RecordItem {
+                uri: String,
+                value: FollowValue,
+            }
+
+            #[derive(Deserialize)]
+            struct ListRecordsResp {
+                records: Vec<RecordItem>,
+                cursor: Option<String>,
+            }
+
+            match resp.json::<ListRecordsResp>().await {
+                Ok(body) => {
+                    let count = body.records.len();
+                    for rec in body.records {
+                        if let Some(subject) = rec.value.subject {
+                            let rkey = rec.uri.rsplit('/').next().unwrap_or_default().to_string();
+                            if !rkey.is_empty() && !subject.is_empty() {
+                                all_records.push((rkey, subject));
+                            }
+                        }
+                    }
+                    if count == 0 || body.cursor.is_none() {
+                        break;
+                    }
+                    cursor = body.cursor;
+                }
+                Err(_) => break,
+            }
         }
 
-        match resp.json::<GetFollowsResponse>().await {
-            Ok(body) => body.follows.into_iter().map(|f| f.did).collect(),
-            Err(_) => Vec::new(),
-        }
+        all_records
     }
 
     /// Resolves an ATProto handle to a DID via XRPC `com.atproto.identity.resolveHandle`.
@@ -424,10 +522,16 @@ impl AppViewContextEnricher {
         }
 
         let url = format!(
-            "{}/xrpc/com.atproto.identity.resolveHandle?handle={clean}",
+            "{}/xrpc/com.atproto.identity.resolveHandle",
             self.appview_url
         );
-        let resp = self.http_client.get(&url).send().await.ok()?;
+        let resp = self
+            .http_client
+            .get(&url)
+            .query(&[("handle", clean)])
+            .send()
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -445,8 +549,20 @@ impl AppViewContextEnricher {
 
     /// Fetches an image thumbnail from the Bluesky CDN and encodes it as base64.
     pub async fn fetch_image_base64(&self, author_did: &str, cid: &str) -> Option<String> {
+        let clean_did: String = author_did
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == ':' || *c == '.' || *c == '-' || *c == '_')
+            .collect();
+        let clean_cid: String = cid
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+            .collect();
+        if clean_did.is_empty() || clean_cid.is_empty() {
+            return None;
+        }
+
         let url = format!(
-            "{}/img/feed_thumbnail/plain/{author_did}/{cid}@jpeg",
+            "{}/img/feed_thumbnail/plain/{clean_did}/{clean_cid}@jpeg",
             self.cdn_url
         );
         let resp = self.http_client.get(&url).send().await.ok()?;
@@ -454,9 +570,15 @@ impl AppViewContextEnricher {
             return None;
         }
 
-        let bytes = resp.bytes().await.ok()?;
-        if bytes.len() > 2 * 1024 * 1024 {
-            return None;
+        use futures_util::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res.ok()?;
+            if bytes.len().saturating_add(chunk.len()) > 2 * 1024 * 1024 {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk);
         }
 
         use base64::Engine;
@@ -493,7 +615,11 @@ impl AppViewContextEnricher {
 
         // 2. Fallback to PLC directory if did:plc:...
         if clean.starts_with("did:plc:") {
-            let plc_url = format!("https://plc.directory/{clean}");
+            let clean_plc: String = clean
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == ':')
+                .collect();
+            let plc_url = format!("https://plc.directory/{clean_plc}");
             if let Ok(resp) = self.http_client.get(&plc_url).send().await {
                 if resp.status().is_success() {
                     #[derive(Deserialize)]

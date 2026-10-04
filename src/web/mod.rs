@@ -229,7 +229,7 @@ async fn security_headers_middleware(
     headers.insert(
         header::HeaderName::from_static("content-security-policy"),
         axum::http::HeaderValue::from_static(
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none';",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none';",
         ),
     );
     resp

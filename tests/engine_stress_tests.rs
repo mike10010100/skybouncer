@@ -558,8 +558,8 @@ async fn test_stress_multi_protected_targets_high_concurrency() {
     let stats = engine.stats().snapshot();
     assert_eq!(stats.commits_received, 40);
     assert_eq!(stats.interactions_matched, 40);
-    assert_eq!(stats.bounces_executed, 10);
-    assert_eq!(stats.dedup_cache_hits, 30);
+    assert_eq!(stats.bounces_executed, 40);
+    assert_eq!(stats.dedup_cache_hits, 0);
 }
 
 // =============================================================================

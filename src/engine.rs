@@ -908,8 +908,13 @@ impl SkybouncerEngine {
         let cache = Arc::clone(modlist_manager.cache());
         let tenant_registry = Arc::new(
             TenantRegistry::from_connection(cache.connection())
-                .or_else(|_| TenantRegistry::open_in_memory())
-                .unwrap_or_else(|_| TenantRegistry::fallback()),
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "Failed to initialize TenantRegistry from cache connection; falling back to in-memory registry");
+                    TenantRegistry::open_in_memory().unwrap_or_else(|e2| {
+                        tracing::error!(error = %e2, "Failed to initialize in-memory TenantRegistry; using emergency fallback");
+                        TenantRegistry::fallback()
+                    })
+                }),
         );
         let heuristic_classifier = if config.enable_heuristic_prefilter {
             HeuristicClassifier::default()
@@ -984,12 +989,10 @@ impl SkybouncerEngine {
 
         // Tier 0: Follow Collection Intercept
         if commit.collection.as_str() == "app.bsky.graph.follow" {
-            let p_dids = {
+            let sync_event = {
                 let guard = self.protected_dids.read();
-                guard.clone()
+                self.follow_graph.handle_commit(commit, &guard)
             };
-
-            let sync_event = self.follow_graph.handle_commit(commit, &p_dids);
             if sync_event != FollowSyncEvent::Ignored {
                 self.stats
                     .follow_sync_events
@@ -1002,8 +1005,7 @@ impl SkybouncerEngine {
 
         // Tier 0.5: Sovereign Config Collection Intercept (PRD §2.2)
         if commit.collection.as_str() == crate::modlist::SOVEREIGN_CONFIG_COLLECTION {
-            let p_dids = self.protected_dids.read().clone();
-            if p_dids.contains(&commit.did) {
+            if self.is_protected(&commit.did) {
                 return Ok(self.handle_sovereign_config_commit(commit));
             }
             return Ok(ProcessCommitResult::Ignored);
@@ -1011,8 +1013,7 @@ impl SkybouncerEngine {
 
         // Tier 0.6: List Metadata Intercept (PRD §2.2)
         if commit.collection.as_str() == "app.bsky.graph.list" {
-            let p_dids = self.protected_dids.read().clone();
-            if p_dids.contains(&commit.did) {
+            if self.is_protected(&commit.did) {
                 return Ok(self.handle_list_commit(commit));
             }
             return Ok(ProcessCommitResult::Ignored);
@@ -1026,12 +1027,10 @@ impl SkybouncerEngine {
         }
 
         // Tier 2: Target Matcher Extraction
-        let p_dids = {
+        let interactions = {
             let guard = self.protected_dids.read();
-            guard.clone()
+            TargetMatcher::match_all_interactions(commit, &guard)
         };
-
-        let interactions = TargetMatcher::match_all_interactions(commit, &p_dids);
         if interactions.is_empty() {
             return Ok(ProcessCommitResult::NoMatch);
         }
@@ -1068,12 +1067,10 @@ impl SkybouncerEngine {
 
         // Tier 0: Follow Collection Intercept
         if commit.collection.as_str() == "app.bsky.graph.follow" {
-            let p_dids = {
+            let sync_event = {
                 let guard = self.protected_dids.read();
-                guard.clone()
+                self.follow_graph.handle_commit(commit, &guard)
             };
-
-            let sync_event = self.follow_graph.handle_commit(commit, &p_dids);
             if sync_event != FollowSyncEvent::Ignored {
                 self.stats
                     .follow_sync_events
@@ -1086,8 +1083,7 @@ impl SkybouncerEngine {
 
         // Tier 0.5: Sovereign Config Collection Intercept (PRD §2.2)
         if commit.collection.as_str() == crate::modlist::SOVEREIGN_CONFIG_COLLECTION {
-            let p_dids = self.protected_dids.read().clone();
-            if p_dids.contains(&commit.did) {
+            if self.is_protected(&commit.did) {
                 return Ok(self.handle_sovereign_config_commit(commit));
             }
             return Ok(ProcessCommitResult::Ignored);
@@ -1095,8 +1091,7 @@ impl SkybouncerEngine {
 
         // Tier 0.6: List Metadata Intercept (PRD §2.2)
         if commit.collection.as_str() == "app.bsky.graph.list" {
-            let p_dids = self.protected_dids.read().clone();
-            if p_dids.contains(&commit.did) {
+            if self.is_protected(&commit.did) {
                 return Ok(self.handle_list_commit(commit));
             }
             return Ok(ProcessCommitResult::Ignored);
@@ -1110,12 +1105,10 @@ impl SkybouncerEngine {
         }
 
         // Tier 2: Target Matcher Extraction
-        let p_dids = {
+        let interactions = {
             let guard = self.protected_dids.read();
-            guard.clone()
+            TargetMatcher::match_all_interactions(commit, &guard)
         };
-
-        let interactions = TargetMatcher::match_all_interactions(commit, &p_dids);
         if interactions.is_empty() {
             return Ok(ProcessCommitResult::NoMatch);
         }
@@ -1191,14 +1184,15 @@ impl SkybouncerEngine {
         self.stats
             .candidates_evaluated
             .fetch_add(1, Ordering::Relaxed);
-        if self.cache.is_bounced(&author_did)? {
+        if self.cache.is_bounced_for(&target_did, &author_did)? {
             self.stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
             debug!("Author already bounced in deduplication cache; skipping evaluation");
             return Ok(InteractionOutcome::AlreadyBounced { author_did });
         }
 
         // Tier 5: Evaluation TTL Cache Check (<50µs, $0 cost)
-        let cached_verdict = self.cache.get_evaluation(&post_uri)?;
+        let eval_cache_key = format!("{}:{}", post_uri, target_did);
+        let cached_verdict = self.cache.get_evaluation(&eval_cache_key)?;
         if let Some(verdict) = cached_verdict {
             self.stats.eval_cache_hits.fetch_add(1, Ordering::Relaxed);
             debug!("Evaluation cache hit for post; reusing verdict");
@@ -1216,29 +1210,12 @@ impl SkybouncerEngine {
                 .fetch_add(1, Ordering::Relaxed);
             debug!("Heuristic regex pre-filter detected violation at zero cost");
             let _ = self.cache.set_evaluation(
-                &post_uri,
+                &eval_cache_key,
                 &author_did,
                 &heuristic_verdict,
                 self.config.evaluation_ttl,
             );
             return self.act_on_verdict(&interaction, heuristic_verdict).await;
-        }
-
-        // Tier 4: Per-User Evaluation Rate Limiter (Anti-Denial-of-Wallet, PRD §5.2)
-        if !self.rate_limiter.check_and_record(&target_did) {
-            self.stats
-                .rate_limited_evaluations
-                .fetch_add(1, Ordering::Relaxed);
-            warn!(
-                target = %target_did,
-                author = %author_did,
-                "Evaluation rate limit reached for target user; skipping external model call"
-            );
-            return Ok(InteractionOutcome::RateLimited {
-                author_did,
-                target_did,
-                reason: "Tier-4 Anti-Denial-of-Wallet rate limit exceeded".to_string(),
-            });
         }
 
         // Enqueue candidate for background evaluation
@@ -1335,125 +1312,107 @@ impl SkybouncerEngine {
         self.stats
             .candidates_evaluated
             .fetch_add(1, Ordering::Relaxed);
-        if self.cache.is_bounced(&author_did)? {
+        if self.cache.is_bounced_for(&target_did, &author_did)? {
             self.stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
             debug!("Author already bounced in deduplication cache; skipping evaluation");
             return Ok(InteractionOutcome::AlreadyBounced { author_did });
         }
 
         // Tier 5: Evaluation TTL Cache Check (<50µs, $0 cost)
-        let cached_verdict = self.cache.get_evaluation(&post_uri)?;
-        let verdict = if let Some(verdict) = cached_verdict {
+        let eval_cache_key = format!("{}:{}", post_uri, target_did);
+        let cached_verdict = self.cache.get_evaluation(&eval_cache_key)?;
+        if let Some(verdict) = cached_verdict {
             self.stats.eval_cache_hits.fetch_add(1, Ordering::Relaxed);
             debug!("Evaluation cache hit for post; reusing verdict");
-            verdict
-        } else {
-            // Tier 6: Zero-Cost Regex Heuristic Pre-Filter (<500ns, $0 cost)
-            let heuristic_verdict = self.heuristic_classifier.evaluate(&interaction);
-            if heuristic_verdict.is_violation() {
-                self.stats
-                    .heuristic_violations
-                    .fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .violations_detected
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!("Heuristic regex pre-filter detected violation at zero cost");
+            return self.act_on_verdict(&interaction, verdict).await;
+        }
 
-                // Cache the verdict with configured TTL
-                let _ = self.cache.set_evaluation(
-                    &post_uri,
-                    &author_did,
-                    &heuristic_verdict,
-                    self.config.evaluation_ttl,
-                );
+        // Tier 6: Zero-Cost Regex Heuristic Pre-Filter (<500ns, $0 cost)
+        let heuristic_verdict = self.heuristic_classifier.evaluate(&interaction);
+        if heuristic_verdict.is_violation() {
+            self.stats
+                .heuristic_violations
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .violations_detected
+                .fetch_add(1, Ordering::Relaxed);
+            debug!("Heuristic regex pre-filter detected violation at zero cost");
 
-                let outcome = self
-                    .act_on_verdict(&interaction, heuristic_verdict.clone())
-                    .await;
+            // Cache the verdict with configured TTL
+            let _ = self.cache.set_evaluation(
+                &eval_cache_key,
+                &author_did,
+                &heuristic_verdict,
+                self.config.evaluation_ttl,
+            );
 
-                let outcome_str = match &outcome {
-                    Ok(InteractionOutcome::Bounced { .. }) => "Bounced (Regex Pre-filter)",
-                    Ok(InteractionOutcome::BelowThreshold { .. }) => {
-                        "Below Threshold (Regex Pre-filter)"
-                    }
-                    Ok(InteractionOutcome::AlreadyBounced { .. }) => "Already Bounced",
-                    Ok(InteractionOutcome::RateLimited { .. }) => "Rate Limited",
-                    Ok(InteractionOutcome::Paused { .. }) => "Paused",
-                    Ok(InteractionOutcome::Permitted { .. }) => "Permitted",
-                    Ok(InteractionOutcome::Bypassed { .. }) => "Bypassed",
-                    Ok(InteractionOutcome::QueuedForEvaluation { .. }) => "Queued",
-                    Ok(InteractionOutcome::QueueOverflow { .. }) => "Queue Overflow",
-                    Err(_) => "Error (Regex Pre-filter)",
-                };
+            let outcome = self
+                .act_on_verdict(&interaction, heuristic_verdict.clone())
+                .await;
 
-                let target_handle = self
-                    .tenant_registry
-                    .get(&target_did)
-                    .ok()
-                    .flatten()
-                    .and_then(|t| t.handle)
-                    .unwrap_or_default();
-
-                let log_entry = crate::modlist::cache::NewEvaluationLog {
-                    timestamp_us: crate::modlist::cache::current_time_us(),
-                    source: "live".to_string(),
-                    post_uri: interaction.post_uri.clone(),
-                    post_text: interaction.text.clone(),
-                    author_did: interaction.author_did.clone(),
-                    author_handle: String::new(),
-                    target_did: interaction.target_did.clone(),
-                    target_handle,
-                    has_images: interaction.has_images(),
-                    primary_model: "heuristic_prefilter".to_string(),
-                    primary_action: "violation".to_string(),
-                    primary_confidence: 1.0,
-                    primary_category: heuristic_verdict
-                        .category()
-                        .map(|c| c.to_string())
-                        .unwrap_or_default(),
-                    primary_reason: heuristic_verdict.reason().to_string(),
-                    escalated: false,
-                    escalation_reason: Some("Heuristic regex instant match".to_string()),
-                    fallback_model: None,
-                    fallback_action: None,
-                    fallback_confidence: None,
-                    fallback_category: None,
-                    fallback_reason: None,
-                    final_action: "violation".to_string(),
-                    final_confidence: 1.0,
-                    outcome: outcome_str.to_string(),
-                };
-                let _ = self.cache.record_evaluation_log(&log_entry);
-
-                return outcome;
-            } else {
-                // Tier 4: Per-User Evaluation Rate Limiter (Anti-Denial-of-Wallet, PRD §5.2)
-                if !self.rate_limiter.check_and_record(&target_did) {
-                    self.stats
-                        .rate_limited_evaluations
-                        .fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        target = %target_did,
-                        author = %author_did,
-                        "Evaluation rate limit reached for target user; skipping external model call"
-                    );
-                    return Ok(InteractionOutcome::RateLimited {
-                        author_did,
-                        target_did,
-                        reason: "Tier-4 Anti-Denial-of-Wallet rate limit exceeded".to_string(),
-                    });
+            let outcome_str = match &outcome {
+                Ok(InteractionOutcome::Bounced { .. }) => "Bounced (Regex Pre-filter)",
+                Ok(InteractionOutcome::BelowThreshold { .. }) => {
+                    "Below Threshold (Regex Pre-filter)"
                 }
+                Ok(InteractionOutcome::AlreadyBounced { .. }) => "Already Bounced",
+                Ok(InteractionOutcome::RateLimited { .. }) => "Rate Limited",
+                Ok(InteractionOutcome::Paused { .. }) => "Paused",
+                Ok(InteractionOutcome::Permitted { .. }) => "Permitted",
+                Ok(InteractionOutcome::Bypassed { .. }) => "Bypassed",
+                Ok(InteractionOutcome::QueuedForEvaluation { .. }) => "Queued",
+                Ok(InteractionOutcome::QueueOverflow { .. }) => "Queue Overflow",
+                Err(_) => "Error (Regex Pre-filter)",
+            };
 
-                return self.evaluate_candidate(interaction).await;
+            let target_handle = self
+                .tenant_registry
+                .get(&target_did)
+                .ok()
+                .flatten()
+                .and_then(|t| t.handle)
+                .unwrap_or_default();
+
+            let log_entry = crate::modlist::cache::NewEvaluationLog {
+                timestamp_us: crate::modlist::cache::current_time_us(),
+                source: "live".to_string(),
+                post_uri: interaction.post_uri.clone(),
+                post_text: interaction.text.clone(),
+                author_did: interaction.author_did.clone(),
+                author_handle: String::new(),
+                target_did: interaction.target_did.clone(),
+                target_handle,
+                has_images: interaction.has_images(),
+                primary_model: "heuristic_prefilter".to_string(),
+                primary_action: "violation".to_string(),
+                primary_confidence: 1.0,
+                primary_category: heuristic_verdict
+                    .category()
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+                primary_reason: heuristic_verdict.reason().to_string(),
+                escalated: false,
+                escalation_reason: Some("Heuristic regex instant match".to_string()),
+                fallback_model: None,
+                fallback_action: None,
+                fallback_confidence: None,
+                fallback_category: None,
+                fallback_reason: None,
+                final_action: "violation".to_string(),
+                final_confidence: 1.0,
+                outcome: outcome_str.to_string(),
+            };
+            if let Err(e) = self.cache.record_evaluation_log(&log_entry) {
+                tracing::warn!(error = %e, "Failed to record evaluation log in cache");
+                self.stats
+                    .errors_encountered
+                    .fetch_add(1, Ordering::Relaxed);
             }
-        };
 
-        // Cache the verdict with configured TTL
-        let _ =
-            self.cache
-                .set_evaluation(&post_uri, &author_did, &verdict, self.config.evaluation_ttl);
+            return outcome;
+        }
 
-        self.act_on_verdict(&interaction, verdict).await
+        self.evaluate_candidate(interaction).await
     }
 
     /// Evaluates a candidate interaction against the primary classifier model and performs PDS bounce if violated.
@@ -1483,13 +1442,31 @@ impl SkybouncerEngine {
 
         // Double check dedup cache before making expensive model call,
         // in case a prior candidate from the same author already resulted in a bounce while this was queued!
-        if self.cache.is_bounced(&author_did)? {
+        if self.cache.is_bounced_for(&target_did, &author_did)? {
             self.stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
             debug!(
                 author = %author_did,
+                target = %target_did,
                 "Author bounced while candidate was queued; skipping model call"
             );
             return Ok(InteractionOutcome::AlreadyBounced { author_did });
+        }
+
+        // Tier 4: Per-User Evaluation Rate Limiter (Anti-Denial-of-Wallet, PRD §5.2) - checked at dequeue
+        if !self.rate_limiter.check_and_record(&target_did) {
+            self.stats
+                .rate_limited_evaluations
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                target = %target_did,
+                author = %author_did,
+                "Evaluation rate limit reached for target user; skipping external model call"
+            );
+            return Ok(InteractionOutcome::RateLimited {
+                author_did,
+                target_did,
+                reason: "Tier-4 Anti-Denial-of-Wallet rate limit exceeded".to_string(),
+            });
         }
 
         // Context Enricher: Fetch author profile & parent post context (PRD §3 & §4.2)
@@ -1542,8 +1519,9 @@ impl SkybouncerEngine {
         }
 
         // Cache the verdict with configured TTL
+        let eval_cache_key = format!("{}:{}", post_uri, target_did);
         let _ = self.cache.set_evaluation(
-            &post_uri,
+            &eval_cache_key,
             &author_did,
             &model_verdict,
             self.config.evaluation_ttl,
@@ -1648,7 +1626,12 @@ impl SkybouncerEngine {
             outcome: outcome_str.to_string(),
         };
 
-        let _ = self.cache.record_evaluation_log(&log_entry);
+        if let Err(e) = self.cache.record_evaluation_log(&log_entry) {
+            tracing::warn!(error = %e, "Failed to record evaluation log in cache");
+            self.stats
+                .errors_encountered
+                .fetch_add(1, Ordering::Relaxed);
+        }
 
         outcome
     }
@@ -1704,7 +1687,7 @@ impl SkybouncerEngine {
                 }
 
                 // Actionable violation: bounce on sovereign PDS
-                let pds_client = self.pds_client_for(&target_did).await;
+                let pds_client = self.resolve_pds_client_for(&target_did).await?;
                 let bounce_result = self
                     .modlist_manager
                     .bounce_user_with_text(
@@ -1814,6 +1797,27 @@ impl SkybouncerEngine {
         count
     }
 
+    /// Pre-seeds followed DIDs with real repository rkeys on cold start.
+    pub fn hydrate_follow_records<I, K, S>(
+        &self,
+        protected_did: impl Into<String>,
+        records: I,
+    ) -> usize
+    where
+        I: IntoIterator<Item = (K, S)>,
+        K: Into<String>,
+        S: Into<String>,
+    {
+        let target = protected_did.into();
+        let mut count: usize = 0;
+        for (rkey, did) in records {
+            self.follow_graph
+                .add_follow(&target, rkey.into(), did.into());
+            count = count.saturating_add(1);
+        }
+        count
+    }
+
     /// Checks whether an account is currently recorded as bounced in the SQLite cache.
     ///
     /// # Errors
@@ -1863,7 +1867,7 @@ impl SkybouncerEngine {
         protected_did: &str,
         subject_did: &str,
     ) -> Result<bool, SkybouncerError> {
-        let pds_client = self.pds_client_for(protected_did).await;
+        let pds_client = self.resolve_pds_client_for(protected_did).await?;
         self.modlist_manager
             .pardon_user(&pds_client, protected_did, subject_did)
             .await
@@ -1874,7 +1878,7 @@ impl SkybouncerEngine {
     /// # Errors
     /// Returns [`SkybouncerError`] if list provisioning fails.
     pub async fn ensure_mod_list(&self, protected_did: &str) -> Result<String, SkybouncerError> {
-        let pds_client = self.pds_client_for(protected_did).await;
+        let pds_client = self.resolve_pds_client_for(protected_did).await?;
         self.modlist_manager
             .ensure_mod_list(&pds_client, protected_did)
             .await
@@ -1889,7 +1893,7 @@ impl SkybouncerEngine {
         protected_did: &str,
         list_uri: &str,
     ) -> Result<(), SkybouncerError> {
-        let pds_client = self.pds_client_for(protected_did).await;
+        let pds_client = self.resolve_pds_client_for(protected_did).await?;
         self.modlist_manager
             .ensure_list_blocked(&pds_client, protected_did, list_uri)
             .await
@@ -1968,10 +1972,12 @@ impl SkybouncerEngine {
         None
     }
 
-    /// Returns a reference to the active configuration.
+    /// Returns a copy of the active configuration with the current live rubric.
     #[must_use]
-    pub fn config(&self) -> &SkybouncerConfig {
-        &self.config
+    pub fn config(&self) -> SkybouncerConfig {
+        let mut cfg = self.config.clone();
+        cfg.rubric = self.rubric();
+        cfg
     }
 
     /// Returns a copy of the active rule rubric.
@@ -2082,6 +2088,17 @@ impl SkybouncerEngine {
         false
     }
 
+    /// Returns true if running in single-tenant mode (at most one protected DID besides admin, and no multi-tenant enrollments).
+    #[must_use]
+    pub fn is_single_tenant(&self) -> bool {
+        if self.tenant_registry.count().unwrap_or(0) > 1 {
+            return false;
+        }
+        let guard = self.protected_dids.read();
+        let non_admin_count = guard.iter().filter(|d| !self.is_admin(d)).count();
+        non_admin_count <= 1
+    }
+
     /// Checks whether a tenant is paused (or the entire engine is paused).
     #[must_use]
     pub fn is_tenant_paused(&self, did: &str) -> bool {
@@ -2090,7 +2107,11 @@ impl SkybouncerEngine {
         }
         match self.tenant_registry.get(did) {
             Ok(Some(tenant)) => !tenant.is_active,
-            _ => false,
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(did = %did, error = %e, "Failed to query tenant status; failing closed (paused)");
+                true
+            }
         }
     }
 
@@ -2105,15 +2126,50 @@ impl SkybouncerEngine {
         self.rubric()
     }
 
+    /// Resolves the [`PdsRepoClient`] for a specific protected user, failing closed if tenant resolution fails.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if the tenant is enrolled but client resolution or token refresh fails,
+    /// or if no client is available for the given DID.
+    pub async fn resolve_pds_client_for(
+        &self,
+        did: &str,
+    ) -> Result<Arc<PdsRepoClient>, SkybouncerError> {
+        let oc = self.oauth_client.read().clone();
+        match self.tenant_registry.get_pds_client(did, oc.as_ref()).await {
+            Ok(Some(client)) => Ok(client),
+            Ok(None) => {
+                let has_enrolled_tenants = self.tenant_registry.count().unwrap_or(0) > 0;
+                if self.pds_client.did() == did
+                    || self.is_admin(did)
+                    || (!has_enrolled_tenants && self.is_protected(did))
+                    || (self.is_single_tenant() && self.is_protected(did))
+                {
+                    Ok(Arc::clone(&self.pds_client))
+                } else {
+                    Err(SkybouncerError::Config(format!(
+                        "No PDS client or OAuth credentials found for tenant {did}"
+                    )))
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    did = %did,
+                    error = %e,
+                    "Failed to resolve PDS client for tenant; refusing to fall back to admin client"
+                );
+                Err(e)
+            }
+        }
+    }
+
     /// Retrieves the [`PdsRepoClient`] for a specific protected user, falling back to default engine client.
     ///
-    /// If the tenant's OAuth session has expired or is expiring soon, it is automatically refreshed using the configured [`AtprotoOAuthClient`].
+    /// Prefer [`Self::resolve_pds_client_for`] to propagate resolution and authentication errors safely.
     pub async fn pds_client_for(&self, did: &str) -> Arc<PdsRepoClient> {
-        let oc = self.oauth_client.read().clone();
-        if let Ok(Some(client)) = self.tenant_registry.get_pds_client(did, oc.as_ref()).await {
-            return client;
-        }
-        Arc::clone(&self.pds_client)
+        self.resolve_pds_client_for(did)
+            .await
+            .unwrap_or_else(|_| Arc::clone(&self.pds_client))
     }
 
     /// Synchronizes sovereign moderation rules from the protected user's PDS repository.
@@ -2126,13 +2182,17 @@ impl SkybouncerEngine {
         &self,
         protected_did: &str,
     ) -> Result<Option<RuleRubric>, SkybouncerError> {
-        let pds_client = self.pds_client_for(protected_did).await;
+        let pds_client = self.resolve_pds_client_for(protected_did).await?;
         let pds_rubric = crate::modlist::fetch_sovereign_config(&pds_client, protected_did).await?;
         if let Some(ref rubric) = pds_rubric {
             if self.is_enrolled(protected_did) {
                 let _ = self.tenant_registry.update_rubric(protected_did, rubric);
             }
-            self.set_rubric(rubric.clone());
+            if self.is_admin(protected_did)
+                || (self.is_single_tenant() && self.is_protected(protected_did))
+            {
+                self.set_rubric(rubric.clone());
+            }
             info!(
                 did = %protected_did,
                 rubric = %rubric.prompt,
@@ -2151,7 +2211,7 @@ impl SkybouncerEngine {
         protected_did: &str,
     ) -> Result<String, SkybouncerError> {
         let rubric = self.rubric_for(protected_did);
-        let pds_client = self.pds_client_for(protected_did).await;
+        let pds_client = self.resolve_pds_client_for(protected_did).await?;
         crate::modlist::publish_sovereign_config(&pds_client, protected_did, &rubric).await
     }
 
@@ -2168,7 +2228,11 @@ impl SkybouncerEngine {
                             if self.is_enrolled(&commit.did) {
                                 let _ = self.tenant_registry.update_rubric(&commit.did, &rubric);
                             }
-                            self.set_rubric(rubric.clone());
+                            if self.is_admin(&commit.did)
+                                || (self.is_single_tenant() && self.is_protected(&commit.did))
+                            {
+                                self.set_rubric(rubric.clone());
+                            }
                             self.stats
                                 .sovereign_configs_synced
                                 .fetch_add(1, Ordering::Relaxed);
@@ -2232,7 +2296,11 @@ impl SkybouncerEngine {
                     if self.is_enrolled(&commit.did) {
                         let _ = self.tenant_registry.update_rubric(&commit.did, &rubric);
                     }
-                    self.set_rubric(rubric.clone());
+                    if self.is_admin(&commit.did)
+                        || (self.is_single_tenant() && self.is_protected(&commit.did))
+                    {
+                        self.set_rubric(rubric.clone());
+                    }
                     self.stats
                         .sovereign_configs_synced
                         .fetch_add(1, Ordering::Relaxed);
@@ -2269,8 +2337,8 @@ impl SkybouncerEngine {
         mut rx: mpsc::Receiver<JetstreamCommit>,
         cancel: CancellationToken,
     ) -> Result<EngineStatsSnapshot, SkybouncerError> {
-        let (eval_tx, mut eval_rx) =
-            mpsc::channel::<Interaction>(self.config.evaluation_queue_capacity);
+        let queue_capacity = self.config.evaluation_queue_capacity.max(100);
+        let (eval_tx, mut eval_rx) = mpsc::channel::<Interaction>(queue_capacity);
         let concurrency = self.config.evaluation_concurrency.max(1);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
@@ -2400,6 +2468,17 @@ impl SkybouncerEngine {
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to prune expired evaluations in maintenance task");
+                        }
+                    }
+                    self.rate_limiter.prune_stale();
+                    match self.tenant_registry.prune_expired_web_sessions() {
+                        Ok(count) => {
+                            if count > 0 {
+                                debug!(count, "Pruned expired web sessions");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to prune expired web sessions in maintenance task");
                         }
                     }
                 }

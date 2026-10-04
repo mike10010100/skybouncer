@@ -103,7 +103,10 @@ impl EvaluationRateLimiter {
     /// Returns `true` if permitted and recorded, or `false` if the rate limit ceiling is reached.
     #[must_use]
     pub fn check_and_record(&self, target_did: &str) -> bool {
-        if self.config.max_evaluations == 0 || self.config.max_evaluations == usize::MAX {
+        if self.config.max_evaluations == 0 {
+            return false;
+        }
+        if self.config.max_evaluations == usize::MAX {
             return true;
         }
 
@@ -128,6 +131,13 @@ impl EvaluationRateLimiter {
     /// Returns the number of remaining evaluations for `target_did` in the current window.
     #[must_use]
     pub fn remaining(&self, target_did: &str) -> usize {
+        if self.config.max_evaluations == 0 {
+            return 0;
+        }
+        if self.config.max_evaluations == usize::MAX {
+            return usize::MAX;
+        }
+
         let now = Instant::now();
         let idx = self.shard_idx(target_did);
         let mut shard = self.shards[idx].lock();

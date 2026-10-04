@@ -93,6 +93,7 @@ pub struct TenantRegistry {
     pds_clients: Arc<RwLock<HashMap<String, Arc<PdsRepoClient>>>>,
     oauth_client: Arc<RwLock<Option<Arc<AtprotoOAuthClient>>>>,
     cipher: SessionCipher,
+    refresh_locks: Arc<crate::modlist::manager::StripedAsyncLocks>,
 }
 
 impl TenantRegistry {
@@ -124,6 +125,7 @@ impl TenantRegistry {
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
             cipher: SessionCipher::from_env(),
+            refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
         })
     }
 
@@ -144,6 +146,7 @@ impl TenantRegistry {
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
             cipher: SessionCipher::from_env(),
+            refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
         })
     }
 
@@ -153,30 +156,41 @@ impl TenantRegistry {
         if let Ok(reg) = Self::open_in_memory() {
             return reg;
         }
-        let conn_opt = Connection::open_in_memory()
+        let conn = Connection::open_in_memory()
             .or_else(|_| Connection::open(":memory:"))
             .or_else(|_| Connection::open(""))
-            .or_else(|_| Connection::open("skybouncer_fallback.db"))
             .or_else(|_| {
+                Connection::open(std::env::temp_dir().join(format!(
+                    "skybouncer_fallback_{}.db",
+                    current_time_us()
+                )))
+            })
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    error = %e,
+                    "Could not open SQLite connection for fallback; opening in-memory database with default flags"
+                );
                 Connection::open_with_flags(
-                    "",
+                    ":memory:",
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                        | rusqlite::OpenFlags::SQLITE_OPEN_MEMORY,
+                        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
                 )
+                .unwrap_or_else(|e2| {
+                    tracing::error!(error = %e2, "Emergency: opening private temp SQLite database");
+                    Connection::open_with_flags(
+                        "",
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+                    )
+                    .unwrap_or_else(|_| std::process::exit(1))
+                })
             });
-        let conn = match conn_opt {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "CRITICAL: Could not open any SQLite connection");
-                std::process::abort();
-            }
-        };
         Self {
             conn: Arc::new(Mutex::new(conn)),
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
             cipher: SessionCipher::from_env(),
+            refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
         }
     }
 
@@ -195,6 +209,7 @@ impl TenantRegistry {
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
             cipher: SessionCipher::from_env(),
+            refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
         })
     }
 
@@ -282,7 +297,10 @@ impl TenantRegistry {
                 let json = serde_json::to_string(s).map_err(|e| {
                     SkybouncerError::Config(format!("Failed to serialize tenant session: {e}"))
                 })?;
-                Some(self.cipher.encrypt(json.as_bytes())?)
+                Some(
+                    self.cipher
+                        .encrypt_with_aad(json.as_bytes(), tenant.did.as_bytes())?,
+                )
             }
             None => None,
         };
@@ -375,13 +393,16 @@ impl TenantRegistry {
             )) => {
                 let session: Option<OAuthSession> = match session_json {
                     Some(ref raw) if !raw.trim().is_empty() => {
-                        let decrypted = self.cipher.decrypt_or_passthrough(raw).map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Text,
-                                Box::new(e),
-                            )
-                        })?;
+                        let decrypted = self
+                            .cipher
+                            .decrypt_or_passthrough_with_aad(raw, did.as_bytes())
+                            .map_err(|e| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(e),
+                                )
+                            })?;
                         let session: OAuthSession =
                             serde_json::from_str(&decrypted).map_err(|e| {
                                 rusqlite::Error::FromSqlConversionFailure(
@@ -632,7 +653,9 @@ impl TenantRegistry {
         let serialized = serde_json::to_string(session).map_err(|e| {
             SkybouncerError::Database(format!("Failed to serialize OAuthSession for {did}: {e}"))
         })?;
-        let encrypted = self.cipher.encrypt(serialized.as_bytes())?;
+        let encrypted = self
+            .cipher
+            .encrypt_with_aad(serialized.as_bytes(), did.as_bytes())?;
         let now_us = current_time_us();
         let conn = self.conn.lock();
         let rows = conn
@@ -663,6 +686,7 @@ impl TenantRegistry {
 
         // Generate 256 bits of cryptographic entropy (43-char URL-safe base64 string)
         let token = skyauth::pkce::PkcePair::generate().verifier;
+        let token_hash = hash_session_token(&token);
         let now_us = current_time_us();
         let ttl_us = u64::try_from(ttl.as_micros()).unwrap_or(u64::MAX / 2);
         let expires_at_us = now_us.saturating_add(ttl_us);
@@ -673,7 +697,7 @@ impl TenantRegistry {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO web_sessions (token, did, created_at, expires_at) VALUES (?1, ?2, ?3, ?4);",
-            params![token, clean_did, created_at_i64, expires_at_i64],
+            params![token_hash, clean_did, created_at_i64, expires_at_i64],
         )
         .map_err(|e| SkybouncerError::Database(format!("Failed to store web session: {e}")))?;
 
@@ -692,15 +716,17 @@ impl TenantRegistry {
             return Ok(None);
         }
 
+        let token_hash = hash_session_token(clean_token);
         let now_us = current_time_us();
         let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
 
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare_cached("SELECT did, expires_at FROM web_sessions WHERE token = ?1;")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT did, expires_at FROM web_sessions WHERE token = ?1 OR token = ?2;",
+        )?;
 
         let row = stmt
-            .query_row(params![clean_token], |row| {
+            .query_row(params![token_hash, clean_token], |row| {
                 let did: String = row.get(0)?;
                 let expires_at: i64 = row.get(1)?;
                 Ok((did, expires_at))
@@ -712,8 +738,8 @@ impl TenantRegistry {
                 if now_i64 > expires_at {
                     // Expired, purge token
                     let _ = conn.execute(
-                        "DELETE FROM web_sessions WHERE token = ?1;",
-                        params![clean_token],
+                        "DELETE FROM web_sessions WHERE token = ?1 OR token = ?2;",
+                        params![token_hash, clean_token],
                     );
                     Ok(None)
                 } else {
@@ -734,11 +760,12 @@ impl TenantRegistry {
             return Ok(false);
         }
 
+        let token_hash = hash_session_token(clean_token);
         let conn = self.conn.lock();
         let rows = conn
             .execute(
-                "DELETE FROM web_sessions WHERE token = ?1;",
-                params![clean_token],
+                "DELETE FROM web_sessions WHERE token = ?1 OR token = ?2;",
+                params![token_hash, clean_token],
             )
             .map_err(|e| SkybouncerError::Database(format!("Failed to delete web session: {e}")))?;
 
@@ -790,7 +817,23 @@ impl TenantRegistry {
             }
         }
 
-        // 2. Load tenant from database
+        // 2. Acquire per-DID serialization lock to eliminate concurrent refresh races (single-flight)
+        let _refresh_guard = self.refresh_locks.shard_for(did).lock().await;
+
+        // 3. Double-check cache under the lock: another task may have refreshed while we waited
+        {
+            let guard = self.pds_clients.read();
+            if let Some(client) = guard.get(did) {
+                if !client
+                    .session()
+                    .is_expired_with_leeway(Duration::from_secs(60))
+                {
+                    return Ok(Some(Arc::clone(client)));
+                }
+            }
+        }
+
+        // 4. Load tenant from database
         let tenant = match self.get(did)? {
             Some(t) => t,
             None => return Ok(None),
@@ -874,6 +917,18 @@ fn current_time_us() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or_default())
+}
+
+/// Hashes a web session token using SHA-256 for secure database storage at rest.
+fn hash_session_token(token: &str) -> String {
+    use ring::digest::{digest, SHA256};
+    let d = digest(&SHA256, token.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for b in d.as_ref() {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    hex
 }
 
 #[cfg(test)]

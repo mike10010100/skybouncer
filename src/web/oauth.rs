@@ -146,8 +146,12 @@ pub async fn oauth_callback(
                     let enroll_did = did.clone();
                     tokio::spawn(async move {
                         let _ = eng.resolve_did_to_handle(&enroll_did).await;
-                        let _ = eng.ensure_mod_list(&enroll_did).await;
-                        let _ = eng.sync_sovereign_config(&enroll_did).await;
+                        if let Err(e) = eng.ensure_mod_list(&enroll_did).await {
+                            tracing::warn!(error = %e, did = %enroll_did, "Failed to ensure mod list on enrollment");
+                        }
+                        if let Err(e) = eng.sync_sovereign_config(&enroll_did).await {
+                            tracing::warn!(error = %e, did = %enroll_did, "Failed to sync sovereign config on enrollment");
+                        }
                     });
                 }
             }
@@ -160,11 +164,13 @@ pub async fn oauth_callback(
                     Ok(t) => t,
                     Err(e) => {
                         error!(error = %e, did = %did, "Failed to create web session in SQLite");
-                        String::new()
+                        return Ok(
+                            Redirect::to("/?auth=error&reason=session_failed").into_response()
+                        );
                     }
                 }
             } else {
-                String::new()
+                return Ok(Redirect::to("/?auth=error&reason=no_engine").into_response());
             };
 
             let redirect_target = "/?auth=success";

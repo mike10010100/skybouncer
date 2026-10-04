@@ -307,9 +307,16 @@ async fn test_command_handler_rules_and_set_rules() {
     let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
     let handler = BotCommandHandler::new(engine, "did:plc:bot");
 
+    // Stranger sending rules is rejected (Finding C1 auth gate)
+    let reply_unauth = handler
+        .handle_command("did:plc:stranger", "rules")
+        .await
+        .expect("handle");
+    assert!(reply_unauth.contains("You do not have an active bouncer session"));
+
     // View default rules
     let reply_rules = handler
-        .handle_command("did:plc:user", "rules")
+        .handle_command("did:plc:protected1", "rules")
         .await
         .expect("handle");
     assert!(reply_rules.contains("Current Moderation Rubric:"));
@@ -319,7 +326,7 @@ async fn test_command_handler_rules_and_set_rules() {
     // Set new rules
     let reply_set = handler
         .handle_command(
-            "did:plc:user",
+            "did:plc:protected1",
             "set rules Block NFTs, airdrops, and harassment",
         )
         .await
@@ -329,7 +336,7 @@ async fn test_command_handler_rules_and_set_rules() {
 
     // Set rules with empty prompt
     let reply_empty_set = handler
-        .handle_command("did:plc:user", "set rules   ")
+        .handle_command("did:plc:protected1", "set rules   ")
         .await
         .expect("handle");
     assert!(reply_empty_set.contains("Please provide a moderation prompt"));
@@ -340,26 +347,33 @@ async fn test_command_handler_sensitivity() {
     let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
     let handler = BotCommandHandler::new(engine, "did:plc:bot");
 
+    // Stranger sending sensitivity is rejected
+    let reply_unauth = handler
+        .handle_command("did:plc:stranger", "sensitivity low")
+        .await
+        .expect("handle");
+    assert!(reply_unauth.contains("You do not have an active bouncer session"));
+
     let reply_low = handler
-        .handle_command("did:plc:user", "sensitivity low")
+        .handle_command("did:plc:protected1", "sensitivity low")
         .await
         .expect("handle");
     assert!(reply_low.contains("Sensitivity threshold updated to **low** (confidence: 0.90)"));
 
     let reply_high = handler
-        .handle_command("did:plc:user", "sensitivity high")
+        .handle_command("did:plc:protected1", "sensitivity high")
         .await
         .expect("handle");
     assert!(reply_high.contains("Sensitivity threshold updated to **high** (confidence: 0.60)"));
 
     let reply_invalid = handler
-        .handle_command("did:plc:user", "sensitivity extreme")
+        .handle_command("did:plc:protected1", "sensitivity extreme")
         .await
         .expect("handle");
     assert!(reply_invalid.contains("Invalid sensitivity level"));
 
     let reply_no_arg = handler
-        .handle_command("did:plc:user", "sensitivity")
+        .handle_command("did:plc:protected1", "sensitivity")
         .await
         .expect("handle");
     assert!(reply_no_arg.contains("Usage: `sensitivity <low|medium|high>`"));
@@ -368,7 +382,7 @@ async fn test_command_handler_sensitivity() {
 #[tokio::test]
 async fn test_command_handler_recent_and_pardon() {
     let (engine, cache, pds) = setup_test_engine("did:plc:protected1").await;
-    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
 
     // Initially empty recent list for protected1
     let reply_empty = handler
@@ -405,6 +419,9 @@ async fn test_command_handler_recent_and_pardon() {
     assert!(reply_recent.contains("Detected crypto scam keyword"));
 
     // Multi-tenant privacy: another tenant does NOT see protected1's bounces
+    engine
+        .enroll_tenant(skybouncer::tenant::Tenant::new("did:plc:other_tenant"))
+        .expect("enroll");
     let reply_other = handler
         .handle_command("did:plc:other_tenant", "recent")
         .await
@@ -440,7 +457,7 @@ async fn test_command_handler_status_and_test() {
 
     // Tenant Status output (scoped privacy)
     let reply_status = handler
-        .handle_command("did:plc:user", "status")
+        .handle_command("did:plc:protected1", "status")
         .await
         .expect("handle");
     assert!(reply_status.contains("Skybouncer Status for Your Account:"));
@@ -459,7 +476,7 @@ async fn test_command_handler_status_and_test() {
     // Test command: heuristic matches "crypto scam"
     let reply_test_violation = handler
         .handle_command(
-            "did:plc:user",
+            "did:plc:protected1",
             "test Check out this free airdrop crypto scam!",
         )
         .await
@@ -469,14 +486,14 @@ async fn test_command_handler_status_and_test() {
 
     // Test command: polite message
     let reply_test_clean = handler
-        .handle_command("did:plc:user", "test Hello, having a nice day!")
+        .handle_command("did:plc:protected1", "test Hello, having a nice day!")
         .await
         .expect("handle");
     assert!(reply_test_clean.contains("Test Evaluation: **PERMITTED**"));
 
     // Unknown command
     let reply_unknown = handler
-        .handle_command("did:plc:user", "launch missiles")
+        .handle_command("did:plc:protected1", "launch missiles")
         .await
         .expect("handle");
     assert!(reply_unknown.contains("Unknown command: `launch missiles`"));
@@ -680,9 +697,17 @@ async fn test_command_handler_pause_and_resume() {
 
     assert!(!engine.is_paused());
 
-    // 1. Send pause command
+    // Stranger sending pause is rejected (Finding C1 auth gate)
+    let reply_unauth = handler
+        .handle_command("did:plc:stranger", "pause")
+        .await
+        .expect("handle");
+    assert!(reply_unauth.contains("You do not have an active bouncer session"));
+    assert!(!engine.is_paused());
+
+    // 1. Send pause command as protected user
     let reply_pause = handler
-        .handle_command("did:plc:user", "pause")
+        .handle_command("did:plc:protected1", "pause")
         .await
         .expect("handle");
     assert!(reply_pause.contains("Skybouncer has been **paused**"));
@@ -690,10 +715,10 @@ async fn test_command_handler_pause_and_resume() {
 
     // 2. Status shows paused state
     let reply_status = handler
-        .handle_command("did:plc:user", "status")
+        .handle_command("did:plc:protected1", "status")
         .await
         .expect("handle");
-    assert!(reply_status.contains("State: ⏸️ PAUSED"));
+    assert!(reply_status.contains("Defense State: ⏸️ PAUSED"));
 
     // 3. Process an interaction candidate while paused -> returns Paused
     let commit = make_reply_commit(
@@ -714,7 +739,7 @@ async fn test_command_handler_pause_and_resume() {
 
     // 4. Send resume command
     let reply_resume = handler
-        .handle_command("did:plc:user", "resume")
+        .handle_command("did:plc:protected1", "resume")
         .await
         .expect("handle");
     assert!(reply_resume.contains("Skybouncer has been **resumed**"));
@@ -722,10 +747,10 @@ async fn test_command_handler_pause_and_resume() {
 
     // 5. Status shows active state
     let reply_status_active = handler
-        .handle_command("did:plc:user", "status")
+        .handle_command("did:plc:protected1", "status")
         .await
         .expect("handle");
-    assert!(reply_status_active.contains("State: ▶️ ACTIVE"));
+    assert!(reply_status_active.contains("Defense State: ▶️ ACTIVE"));
 
     // 6. Process interaction now -> evaluated and bounced (matches heuristic)
     let commit_resumed = make_reply_commit(
