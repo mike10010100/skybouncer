@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-10-04
+
+### Fixed
+
+- **Bluesky Post & Profile URL Formatting**:
+  - Fixed an issue where clicking offending post links (`at://did:plc:.../app.bsky.feed.post/...`) navigated to `https://bsky.app/profile/did%3Aplc%3A.../post/...` which caused Bluesky's web router to fail with `Error: Invalid DID or handle`.
+  - Introduced `bskyProfileUrl` and `bskyPostUrl` helpers in the web dashboard preserving literal colons in DID path segments (`https://bsky.app/profile/did:plc:.../post/...`) and trimming leading `@` symbols on handles.
+  - Defined missing `formatDid` helper for evaluation logs to prevent `ReferenceError` on raw DID rendering.
+
 ## [0.1.7] - 2026-10-04
 
 ### Security & Hardening
