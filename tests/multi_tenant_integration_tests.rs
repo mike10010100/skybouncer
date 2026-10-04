@@ -23,7 +23,7 @@ use skybouncer::bot::BotCommandHandler;
 use skybouncer::classifier::{RuleRubric, Sensitivity, Verdict};
 use skybouncer::engine::{InteractionOutcome, SkybouncerConfig, SkybouncerEngine};
 use skybouncer::matcher::{FollowGraph, NonFollowedGate};
-use skybouncer::modlist::{DeduplicationCache, ModListManager};
+use skybouncer::modlist::{BouncedUser, DeduplicationCache, ModListManager};
 use skybouncer::tenant::Tenant;
 use skybouncer::web::create_web_router;
 
@@ -284,4 +284,45 @@ async fn test_web_auth_redirect_endpoint() {
             .and_then(|v| v.to_str().ok()),
         Some("/oauth/login?handle=carol.bsky.social")
     );
+}
+
+#[tokio::test]
+async fn test_temporary_ttl_timeout_pruning_in_engine() {
+    let (engine, cache, _pds) = setup_multi_tenant_engine().await;
+    let now_us = 1_720_000_000_000_000;
+
+    // Enroll a tenant
+    let tenant_did = "did:plc:alice_tenant";
+    let tenant = Tenant::new(tenant_did).with_handle("alice.bsky.social");
+    engine.enroll_tenant(tenant).expect("enroll");
+
+    // Populate an expired temporary bounce
+    let expired_user = BouncedUser {
+        subject_did: "did:plc:timed_out_spammer".to_string(),
+        protected_did: tenant_did.to_string(),
+        listitem_uri: format!("at://{tenant_did}/app.bsky.graph.listitem/item_expired"),
+        listitem_rkey: "item_expired".to_string(),
+        listitem_cid: "bafyitemexpired".to_string(),
+        category: "crypto_spam".to_string(),
+        confidence: 0.96,
+        reason: "24h cooldown".to_string(),
+        post_uri: "at://did:plc:timed_out_spammer/app.bsky.feed.post/1".to_string(),
+        post_text: "Crypto spam".to_string(),
+        bounced_at: now_us - 100_000_000,
+        expires_at: Some(now_us - 10_000_000), // Expired
+    };
+    cache.record_bounce(&expired_user).expect("record bounce");
+    assert!(cache
+        .is_bounced_for(tenant_did, "did:plc:timed_out_spammer")
+        .unwrap());
+
+    // Run engine pruning
+    let pruned = engine.prune_expired_bounces().await.expect("prune");
+    assert_eq!(pruned, 1);
+
+    // Verify violator is no longer recorded as bounced for this tenant
+    assert!(!cache
+        .is_bounced_for(tenant_did, "did:plc:timed_out_spammer")
+        .unwrap());
+    assert_eq!(cache.count_bounced().expect("count"), 0);
 }

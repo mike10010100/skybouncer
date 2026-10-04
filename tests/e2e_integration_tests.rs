@@ -22,7 +22,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use skybase::ingest::events::JetstreamCommit;
 use skybouncer::classifier::{
-    Classifier, JevClassifier, JevConfig, RuleRubric, Sensitivity, ViolationCategory,
+    Classifier, JevClassifier, JevConfig, RuleRubric, Sensitivity, Verdict, ViolationCategory,
 };
 use skybouncer::engine::{
     InteractionOutcome, ProcessCommitResult, SkybouncerConfig, SkybouncerEngine,
@@ -887,6 +887,7 @@ async fn test_scenario_11_shadow_mode_simulates_bounces_with_zero_pds_writes() {
         outcomes2[0],
         InteractionOutcome::AlreadyBounced {
             author_did: "did:plc:shadow_spammer".to_string(),
+            target_did: "did:plc:alice".to_string(),
         }
     );
 
@@ -900,4 +901,205 @@ async fn test_scenario_11_shadow_mode_simulates_bounces_with_zero_pds_writes() {
         .is_bounced("did:plc:shadow_spammer")
         .expect("cache check"));
     assert_eq!(pds.deleted_records.lock().len(), 0);
+}
+
+#[tokio::test]
+async fn test_allowlist_bypass_latency_and_pardon_immunization_pipeline() {
+    let pds = MockPdsServer::start().await;
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("skybouncer_allowlist_e2e.db");
+
+    let cache = Arc::new(DeduplicationCache::open(&db_path).expect("open persistent cache"));
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+
+    let rubric = RuleRubric::new("Block spam and harassment", Sensitivity::Medium);
+    let modlist_manager =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let pds_client = Arc::new(pds.pds_client("did:plc:alice"));
+
+    // Classifier flags violations
+    let classifier = Arc::new(skybouncer::classifier::MockClassifier::new(
+        Verdict::violation(
+            ViolationCategory::Spam,
+            0.95,
+            "Detected crypto promotion spam",
+        ),
+    ));
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+    let config = SkybouncerConfig::new(protected_dids, rubric);
+
+    let engine = Arc::new(SkybouncerEngine::new(
+        config.clone(),
+        Arc::clone(&follow_graph),
+        Arc::clone(&gate),
+        Arc::clone(&classifier) as Arc<dyn skybouncer::classifier::Classifier>,
+        Arc::clone(&modlist_manager),
+        pds_client,
+    ));
+
+    // 1. Pre-allowlist a trusted friend
+    engine
+        .add_to_allowlist(
+            "did:plc:alice",
+            "did:plc:friend_bob",
+            Some("Trusted colleague"),
+        )
+        .expect("add to allowlist");
+    assert!(engine.is_allowlisted("did:plc:alice", "did:plc:friend_bob"));
+
+    // 2. Measure in-memory gate evaluation SLA (<1.0µs)
+    let sample_interaction = skybouncer::matcher::Interaction::new(
+        "did:plc:friend_bob",
+        "did:plc:alice",
+        skybouncer::matcher::InteractionType::DirectReply,
+        "at://did:plc:friend_bob/app.bsky.feed.post/post_1",
+        "bafy1",
+        "Hello Alice!",
+    );
+
+    let iterations = 10_000;
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let decision = gate.evaluate(sample_interaction.clone());
+        assert_eq!(
+            decision.bypass_reason(),
+            Some(BypassReason::AllowlistedAuthor)
+        );
+    }
+    let total_elapsed = start.elapsed();
+    let avg_per_op = total_elapsed / iterations;
+    println!(
+        "\n⚡ [Allowlist Gate Latency Benchmark] Total: {:?} for {} ops | Avg: {:?} (<1.0µs SLA)",
+        total_elapsed, iterations, avg_per_op
+    );
+    assert!(
+        avg_per_op < std::time::Duration::from_micros(1),
+        "Allowlist check must complete well within the <1µs SLA (measured {:?})",
+        avg_per_op
+    );
+
+    // 3. Friend Bob interacts via engine -> bypassed at gate at zero model/PDS cost
+    let commit_bob = make_reply_commit(
+        "did:plc:friend_bob",
+        "did:plc:alice",
+        "rep_bob_1",
+        "root_1",
+        "Hey Alice, check this out!",
+    );
+    let result_bob = engine.process_commit(&commit_bob).await.expect("process");
+    let outcomes_bob = result_bob.outcomes();
+    assert_eq!(outcomes_bob.len(), 1);
+    assert_eq!(
+        outcomes_bob[0],
+        InteractionOutcome::Bypassed {
+            reason: BypassReason::AllowlistedAuthor,
+            author_did: "did:plc:friend_bob".to_string(),
+            target_did: "did:plc:alice".to_string(),
+        }
+    );
+    assert_eq!(classifier.call_count(), 0);
+    assert_eq!(
+        engine
+            .stats()
+            .gate_bypassed_allowlist
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    // 4. Stranger Charlie sends spam -> evaluated and bounced on PDS
+    let commit_charlie = make_reply_commit(
+        "did:plc:charlie",
+        "did:plc:alice",
+        "rep_charlie_1",
+        "root_1",
+        "Join free crypto airdrop now!",
+    );
+    let result_charlie = engine
+        .process_commit(&commit_charlie)
+        .await
+        .expect("process");
+    let outcomes_charlie = result_charlie.outcomes();
+    assert_eq!(outcomes_charlie.len(), 1);
+    assert!(outcomes_charlie[0].is_bounced());
+    assert_eq!(classifier.call_count(), 1);
+    let initial_created_count = pds.created_records.lock().len();
+    assert!(initial_created_count >= 1);
+    assert!(cache
+        .is_bounced_for("did:plc:alice", "did:plc:charlie")
+        .expect("cache check"));
+
+    // 5. User executes pardon_and_allowlist (PRD §7.1 pardon immunization)
+    let pardoned = engine
+        .pardon_and_allowlist(
+            "did:plc:alice",
+            "did:plc:charlie",
+            Some("Pardoned and immunized by owner"),
+        )
+        .await
+        .expect("pardon and allowlist");
+    assert!(pardoned);
+    assert_eq!(pds.deleted_records.lock().len(), 1);
+    assert!(!cache
+        .is_bounced_for("did:plc:alice", "did:plc:charlie")
+        .expect("cache check"));
+    assert!(engine.is_allowlisted("did:plc:alice", "did:plc:charlie"));
+
+    // 6. Charlie sends another reply -> bypasses gate directly! Zero pardon loop, zero re-bounce!
+    let commit_charlie2 = make_reply_commit(
+        "did:plc:charlie",
+        "did:plc:alice",
+        "rep_charlie_2",
+        "root_1",
+        "Thanks for pardoning me, Alice!",
+    );
+    let result_charlie2 = engine
+        .process_commit(&commit_charlie2)
+        .await
+        .expect("process");
+    let outcomes_charlie2 = result_charlie2.outcomes();
+    assert_eq!(outcomes_charlie2.len(), 1);
+    assert_eq!(
+        outcomes_charlie2[0],
+        InteractionOutcome::Bypassed {
+            reason: BypassReason::AllowlistedAuthor,
+            author_did: "did:plc:charlie".to_string(),
+            target_did: "did:plc:alice".to_string(),
+        }
+    );
+    // Model call count remains 1; no new classification occurred!
+    assert_eq!(classifier.call_count(), 1);
+    // Gate allowlist bypass count is now 2 (Bob + Charlie)
+    assert_eq!(
+        engine
+            .stats()
+            .gate_bypassed_allowlist
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    // No new PDS record was created
+    assert_eq!(pds.created_records.lock().len(), initial_created_count);
+
+    // 7. Restart test: Instantiate a brand new engine pointing to the same SQLite database
+    let cache2 = Arc::new(DeduplicationCache::open(&db_path).expect("reopen persistent cache"));
+    let gate2 = Arc::new(NonFollowedGate::new(Arc::new(FollowGraph::new())));
+    let modlist_manager2 = Arc::new(
+        ModListManager::from_shared_cache(Arc::clone(&cache2)).with_rubric(RuleRubric::default()),
+    );
+    let pds_client2 = Arc::new(pds.pds_client("did:plc:alice"));
+
+    let engine2 = SkybouncerEngine::new(
+        config,
+        Arc::new(FollowGraph::new()),
+        Arc::clone(&gate2),
+        Arc::clone(&classifier) as Arc<dyn skybouncer::classifier::Classifier>,
+        modlist_manager2,
+        pds_client2,
+    );
+
+    // Verify all allowlisted users were automatically hydrated into memory on startup
+    assert!(engine2.is_allowlisted("did:plc:alice", "did:plc:friend_bob"));
+    assert!(engine2.is_allowlisted("did:plc:alice", "did:plc:charlie"));
 }

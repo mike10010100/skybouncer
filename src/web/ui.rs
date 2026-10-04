@@ -591,8 +591,26 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           </div>
           <div style="margin-bottom: 1rem;">
             <label style="font-size: 0.75rem; text-transform: uppercase; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">
-              Moderation Prompt
+              Violation Duration (Time-Out / Cooldown)
             </label>
+            <div class="segmented-control">
+              <button class="segmented-btn active" id="dur-perm" onclick="setBounceDuration('permanent')">Permanent</button>
+              <button class="segmented-btn" id="dur-24h" onclick="setBounceDuration('24h')">24h Cooldown</button>
+              <button class="segmented-btn" id="dur-7d" onclick="setBounceDuration('7d')">7d Timeout</button>
+              <button class="segmented-btn" id="dur-30d" onclick="setBounceDuration('30d')">30d Timeout</button>
+            </div>
+          </div>
+          <div style="margin-bottom: 1rem;">
+            <div style="display: flex; gap: 0.35rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.35rem;">
+              <label style="font-size: 0.75rem; text-transform: uppercase; font-weight: 600; color: var(--text-muted); margin-right: 0.25rem;">
+                Moderation Prompt
+              </label>
+              <span style="font-size: 0.7rem; color: var(--text-muted);">Presets:</span>
+              <button type="button" class="btn btn-secondary" style="padding: 0.15rem 0.45rem; font-size: 0.7rem;" onclick="applyRubricPreset('balanced')">🛡️ Balanced</button>
+              <button type="button" class="btn btn-secondary" style="padding: 0.15rem 0.45rem; font-size: 0.7rem;" onclick="applyRubricPreset('anti_crypto')">🚫 Zero Crypto</button>
+              <button type="button" class="btn btn-secondary" style="padding: 0.15rem 0.45rem; font-size: 0.7rem;" onclick="applyRubricPreset('anti_hostility')">🛑 Anti-Hostility</button>
+              <button type="button" class="btn btn-secondary" style="padding: 0.15rem 0.45rem; font-size: 0.7rem;" onclick="applyRubricPreset('anti_ragebait')">🎣 Anti-Ragebait</button>
+            </div>
             <textarea id="rules-prompt" rows="4" placeholder="Describe what content should be automatically filtered..."></textarea>
           </div>
           <div>
@@ -607,6 +625,9 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       <div class="card-header">
         <div class="card-title">🚫 Recently Bounced Violators</div>
         <button class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="loadBounces()">🔄 Refresh</button>
+      </div>
+      <div style="margin-bottom: 0.75rem;">
+        <input type="text" id="bounces-search-input" class="form-input" placeholder="🔍 Search bounces by handle, DID, or keyword..." oninput="filterBounces()" style="width: 100%; font-size: 0.85rem;">
       </div>
       <div class="table-container">
         <table>
@@ -623,6 +644,51 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           <tbody id="bounces-table">
             <tr>
               <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 2rem;">Loading recent bounces...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Moderation Allowlist Management -->
+    <section class="card" id="allowlist-card" style="display: none; margin-top: 1.5rem;">
+      <div class="card-header" style="flex-wrap: wrap; gap: 0.75rem;">
+        <div>
+          <div class="card-title">🛡️ Moderation Allowlist (Immunization)</div>
+          <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.2rem;">
+            Accounts exempted from AI evaluation and blocking (<strong id="total-allowlisted">0</strong> allowlisted)
+          </div>
+        </div>
+        <div style="display: flex; gap: 0.5rem; align-items: center;">
+          <button class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="loadAllowlist()">🔄 Refresh</button>
+        </div>
+      </div>
+      <div style="display: flex; gap: 0.75rem; margin-bottom: 1.25rem; flex-wrap: wrap; align-items: flex-end;">
+        <div style="flex: 2; min-width: 200px;">
+          <label style="font-size: 0.75rem; text-transform: uppercase; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">Bluesky Handle or DID</label>
+          <input type="text" id="allowlist-input-subject" class="form-input" placeholder="@handle.bsky.social or did:plc:..." style="width: 100%;">
+        </div>
+        <div style="flex: 2; min-width: 200px;">
+          <label style="font-size: 0.75rem; text-transform: uppercase; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">Reason (Optional)</label>
+          <input type="text" id="allowlist-input-reason" class="form-input" placeholder="e.g. Trusted friend / collaborator" style="width: 100%;">
+        </div>
+        <div style="flex: 1; min-width: 120px;">
+          <button class="btn" style="width: 100%;" onclick="addAllowlistEntry()">➕ Add to Allowlist</button>
+        </div>
+      </div>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Allowlisted Account</th>
+              <th>Reason</th>
+              <th>Added At</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="allowlist-table">
+            <tr>
+              <td colspan="4" style="text-align: center; color: var(--text-muted); padding: 2rem;">Loading allowlist...</td>
             </tr>
           </tbody>
         </table>
@@ -665,7 +731,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <section class="card" id="admin-eval-card" style="display: none; margin-top: 1.5rem;">
       <div class="card-header" style="flex-wrap: wrap; gap: 0.75rem;">
         <div>
-          <div class="card-title">👑 Tier 1 &amp; Tier 2 Evaluation Log</div>
+          <div class="card-title" id="eval-card-title">👑 Tier 1 &amp; Tier 2 Evaluation Log</div>
           <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.2rem;">
             Full AI arbitration audit: <strong id="admin-total-evals">0</strong> evaluations recorded
           </div>
@@ -816,6 +882,27 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
     }
 
+    let activeBounceDuration = "permanent";
+
+    function setBounceDuration(val) {
+      activeBounceDuration = val || "permanent";
+      const norm = (activeBounceDuration || "").toLowerCase();
+      const is24h = norm === "cooldown24h" || norm === "24h" || norm === "1d";
+      const is7d = norm === "timeout7d" || norm === "7d" || norm === "1w";
+      const is30d = norm === "timeout30d" || norm === "30d" || norm === "1m";
+      const isPerm = !is24h && !is7d && !is30d;
+
+      const permBtn = document.getElementById("dur-perm");
+      const b24hBtn = document.getElementById("dur-24h");
+      const b7dBtn = document.getElementById("dur-7d");
+      const b30dBtn = document.getElementById("dur-30d");
+
+      if (permBtn) permBtn.classList.toggle("active", isPerm);
+      if (b24hBtn) b24hBtn.classList.toggle("active", is24h);
+      if (b7dBtn) b7dBtn.classList.toggle("active", is7d);
+      if (b30dBtn) b30dBtn.classList.toggle("active", is30d);
+    }
+
     function renderRulesAuthenticated(rubric) {
       const unauthBox = document.getElementById("rules-unauth-container");
       const authBox = document.getElementById("rules-auth-container");
@@ -824,6 +911,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       if (rubric) {
         document.getElementById("rules-prompt").value = rubric.prompt || "";
         setSensitivity(rubric.sensitivity || "medium");
+        setBounceDuration(rubric.bounce_duration || "permanent");
       }
     }
 
@@ -878,7 +966,11 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             "Content-Type": "application/json"
           },
           credentials: "same-origin",
-          body: JSON.stringify({ prompt, sensitivity: activeSensitivity })
+          body: JSON.stringify({
+            prompt,
+            sensitivity: activeSensitivity,
+            bounce_duration: activeBounceDuration
+          })
         });
         if (res.ok) {
           const data = await res.json();
@@ -1177,45 +1269,105 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       return `<span style="font-size: 0.8rem; color: var(--text-muted);" title="${escapeHtml(uri)}">${escapeHtml(displayText)}</span>`;
     }
 
+    const RUBRIC_PRESETS = {
+      balanced: {
+        prompt: "Filter blatant spam, automated bot promotions, crypto/NFT shilling, unwanted commercial links, and direct harassment or personal attacks. Allow constructive critique, benign banter, and standard disagreements.",
+        sensitivity: "medium"
+      },
+      anti_crypto: {
+        prompt: "Aggressively filter all cryptocurrency, token, airdrop, memecoin, pump-and-dump, web3 wallet, NFT promotions, unsolicited WhatsApp/Telegram investment invitations, and high-frequency automated bot links.",
+        sensitivity: "high"
+      },
+      anti_hostility: {
+        prompt: "Strictly filter hostile language, targeted harassment, abusive insults, slurs, doxxing threats, demeaning personal attacks, and aggressive intimidation directed at users.",
+        sensitivity: "high"
+      },
+      anti_ragebait: {
+        prompt: "Filter bad-faith sealioning, deceptive ragebait, troll provocations intended to incite conflict, and bad-faith harassment campaigns.",
+        sensitivity: "medium"
+      }
+    };
+
+    function applyRubricPreset(key) {
+      const p = RUBRIC_PRESETS[key];
+      if (!p) return;
+      const promptEl = document.getElementById("rules-prompt");
+      if (promptEl) promptEl.value = p.prompt;
+      setSensitivity(p.sensitivity);
+      showToast(`Applied "${key}" rubric preset`);
+    }
+
+    let allBounces = [];
+
+    function filterBounces() {
+      const query = (document.getElementById("bounces-search-input")?.value || "").toLowerCase().trim();
+      if (!query) {
+        renderBouncesList(allBounces);
+        return;
+      }
+      const filtered = allBounces.filter(b => {
+        return (b.subject_did && b.subject_did.toLowerCase().includes(query)) ||
+               (b.category && b.category.toLowerCase().includes(query)) ||
+               (b.reason && b.reason.toLowerCase().includes(query)) ||
+               (b.post_text && b.post_text.toLowerCase().includes(query));
+      });
+      renderBouncesList(filtered);
+    }
+
+    function renderBouncesList(bounces) {
+      const tbody = document.getElementById("bounces-table");
+      if (!tbody) return;
+
+      if (bounces.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 2rem;">No matching bounced accounts found.</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = bounces.map(b => {
+        const profileUrl = bskyProfileUrl(b.subject_did);
+        const postLinkHtml = formatPostLink(b.post_uri, b.post_text);
+        const ttlBadge = b.expires_at ?
+          `<span class="status-badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; font-size: 0.7rem; margin-left: 0.35rem;" title="Expires at ${new Date(b.expires_at / 1000).toLocaleString()}">⏳ TTL</span>` :
+          `<span class="status-badge" style="background: rgba(148, 163, 184, 0.15); color: var(--text-muted); font-size: 0.7rem; margin-left: 0.35rem;">Permanent</span>`;
+        return `
+        <tr>
+          <td>
+            <a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none;" title="Open profile on Bluesky">
+              <code style="font-size: 0.8rem; background: rgba(0,0,0,0.2); padding: 0.2rem 0.4rem; border-radius: 4px; color: var(--text-main); font-family: monospace;">${escapeHtml(b.subject_did)}</code>
+            </a>
+          </td>
+          <td>${postLinkHtml}</td>
+          <td><span class="status-badge" style="background: var(--danger-bg); color: var(--danger); font-size: 0.75rem;">${escapeHtml(b.category)}</span>${ttlBadge}</td>
+          <td><strong>${Math.round(b.confidence * 100)}%</strong></td>
+          <td><span style="font-size: 0.82rem;" title="${escapeHtml(b.reason)}">${escapeHtml(b.reason)}</span></td>
+          <td style="white-space: nowrap;">
+            <button class="btn btn-danger btn-pardon" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" data-did="${escapeHtml(b.subject_did)}" title="Remove from moderation list">Pardon</button>
+            <button class="btn btn-secondary btn-pardon-allow" style="padding: 0.25rem 0.65rem; font-size: 0.75rem; margin-left: 0.25rem;" data-did="${escapeHtml(b.subject_did)}" title="Pardon and add to allowlist to immunize against future bounces">Pardon &amp; Allow</button>
+          </td>
+        </tr>
+      `;
+      }).join("");
+    }
+
     async function loadBounces() {
       try {
         const res = await fetch("/api/bounces?limit=50", { credentials: "same-origin" });
         if (!res.ok) return;
-        const bounces = await res.json();
+        allBounces = await res.json();
+        filterBounces();
+
         const tbody = document.getElementById("bounces-table");
-
-        if (bounces.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 2rem;">No accounts have been bounced yet. Shield is active!</td></tr>';
-          return;
-        }
-
-        tbody.innerHTML = bounces.map(b => {
-          const profileUrl = bskyProfileUrl(b.subject_did);
-          const postLinkHtml = formatPostLink(b.post_uri, b.post_text);
-          return `
-          <tr>
-            <td>
-              <a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none;" title="Open profile on Bluesky">
-                <code style="font-size: 0.8rem; background: rgba(0,0,0,0.2); padding: 0.2rem 0.4rem; border-radius: 4px; color: var(--text-main); font-family: monospace;">${escapeHtml(b.subject_did)}</code>
-              </a>
-            </td>
-            <td>${postLinkHtml}</td>
-            <td><span class="status-badge" style="background: var(--danger-bg); color: var(--danger); font-size: 0.75rem;">${escapeHtml(b.category)}</span></td>
-            <td><strong>${Math.round(b.confidence * 100)}%</strong></td>
-            <td><span style="font-size: 0.82rem;" title="${escapeHtml(b.reason)}">${escapeHtml(b.reason)}</span></td>
-            <td>
-              <button class="btn btn-danger btn-pardon" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" data-did="${escapeHtml(b.subject_did)}">Pardon</button>
-            </td>
-          </tr>
-        `;
-        }).join("");
-
-        if (!tbody.hasAttribute("data-pardon-attached")) {
+        if (tbody && !tbody.hasAttribute("data-pardon-attached")) {
           tbody.setAttribute("data-pardon-attached", "true");
           tbody.addEventListener("click", (e) => {
-            const btn = e.target.closest(".btn-pardon");
-            if (btn && btn.dataset.did) {
-              pardonUser(btn.dataset.did);
+            const btnPardon = e.target.closest(".btn-pardon");
+            if (btnPardon && btnPardon.dataset.did) {
+              pardonUser(btnPardon.dataset.did, false);
+              return;
+            }
+            const btnPardonAllow = e.target.closest(".btn-pardon-allow");
+            if (btnPardonAllow && btnPardonAllow.dataset.did) {
+              pardonUser(btnPardonAllow.dataset.did, true);
             }
           });
         }
@@ -1224,8 +1376,11 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
     }
 
-    async function pardonUser(did) {
-      if (!confirm(`Are you sure you want to pardon ${did} and remove them from your moderation list?`)) return;
+    async function pardonUser(did, allowlist = false) {
+      const confirmMsg = allowlist
+        ? `Are you sure you want to pardon ${did} AND add them to your allowlist (immunize)?`
+        : `Are you sure you want to pardon ${did} and remove them from your moderation list?`;
+      if (!confirm(confirmMsg)) return;
 
       try {
         const res = await fetch("/api/pardon", {
@@ -1233,18 +1388,122 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           headers: { "Content-Type": "application/json" },
           credentials: "same-origin",
           body: JSON.stringify({
-            subject_did: did
+            subject_did: did,
+            allowlist: !!allowlist,
+            reason: allowlist ? "Pardoned & allowlisted via Web Dashboard" : undefined
           })
         });
         if (res.ok) {
-          showToast(`✅ Pardoned ${did}`);
+          showToast(allowlist ? `🛡️ Pardoned & allowlisted ${did}` : `✅ Pardoned ${did}`);
           loadBounces();
+          loadAllowlist();
           fetchStatus();
         } else {
           showToast("❌ Failed to pardon user");
         }
       } catch (e) {
         showToast("❌ Network error pardoning user");
+      }
+    }
+
+    async function loadAllowlist() {
+      try {
+        const res = await fetch("/api/allowlist", { credentials: "same-origin" });
+        if (!res.ok) return;
+        const entries = await res.json();
+        const totalEl = document.getElementById("total-allowlisted");
+        if (totalEl) totalEl.innerText = entries.length;
+        const tbody = document.getElementById("allowlist-table");
+        if (!tbody) return;
+
+        if (entries.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-muted); padding: 2rem;">No accounts on your allowlist yet.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = entries.map(e => {
+          const profileUrl = bskyProfileUrl(e.allowed_did);
+          return `
+            <tr>
+              <td>
+                <a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none;" title="Open profile on Bluesky">
+                  <code style="font-size: 0.8rem; background: rgba(0,0,0,0.2); padding: 0.2rem 0.4rem; border-radius: 4px; color: var(--text-main); font-family: monospace;">${escapeHtml(e.allowed_did)}</code>
+                </a>
+              </td>
+              <td><span style="font-size: 0.82rem; color: var(--text-muted);">${escapeHtml(e.reason || "No reason specified")}</span></td>
+              <td style="font-size: 0.8rem; color: var(--text-muted);">${formatDate(e.created_at)}</td>
+              <td>
+                <button class="btn btn-secondary btn-allowlist-remove" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" data-did="${escapeHtml(e.allowed_did)}">Remove</button>
+              </td>
+            </tr>
+          `;
+        }).join("");
+
+        if (!tbody.hasAttribute("data-allowlist-remove-attached")) {
+          tbody.setAttribute("data-allowlist-remove-attached", "true");
+          tbody.addEventListener("click", (evt) => {
+            const btn = evt.target.closest(".btn-allowlist-remove");
+            if (btn && btn.dataset.did) {
+              removeAllowlistEntry(btn.dataset.did);
+            }
+          });
+        }
+      } catch (e) {
+        console.error("Allowlist fetch failed", e);
+      }
+    }
+
+    async function addAllowlistEntry() {
+      const subjectInput = document.getElementById("allowlist-input-subject");
+      const reasonInput = document.getElementById("allowlist-input-reason");
+      if (!subjectInput || !subjectInput.value.trim()) {
+        showToast("⚠️ Please enter a handle or DID");
+        return;
+      }
+      const subject = subjectInput.value.trim();
+      const reason = reasonInput ? reasonInput.value.trim() : "";
+
+      try {
+        const res = await fetch("/api/allowlist", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({
+            subject: subject,
+            reason: reason || undefined
+          })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          showToast(`🛡️ Added ${data.subject_did} to allowlist`);
+          subjectInput.value = "";
+          if (reasonInput) reasonInput.value = "";
+          loadAllowlist();
+        } else {
+          const err = await res.text();
+          showToast(`❌ Failed to add: ${err}`);
+        }
+      } catch (e) {
+        showToast("❌ Network error adding to allowlist");
+      }
+    }
+
+    async function removeAllowlistEntry(did) {
+      if (!confirm(`Are you sure you want to remove ${did} from your allowlist?`)) return;
+      try {
+        const res = await fetch(`/api/allowlist/${encodeURIComponent(did)}`, {
+          method: "DELETE",
+          credentials: "same-origin"
+        });
+        if (res.ok) {
+          showToast(`Removed ${did} from allowlist`);
+          loadAllowlist();
+        } else {
+          const err = await res.text();
+          showToast(`❌ Failed to remove: ${err}`);
+        }
+      } catch (e) {
+        showToast("❌ Network error removing from allowlist");
       }
     }
 
@@ -1319,18 +1578,32 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           currentUser = data;
           renderAuthenticated(data);
           renderRulesAuthenticated(data.rubric);
+
+          const allowlistCard = document.getElementById("allowlist-card");
+          if (allowlistCard) {
+            allowlistCard.style.display = "block";
+            loadAllowlist();
+          }
+
+          const evalCard = document.getElementById("admin-eval-card");
+          if (evalCard) {
+            evalCard.style.display = "block";
+            const titleEl = document.getElementById("eval-card-title");
+            if (titleEl) {
+              titleEl.innerHTML = data.is_admin
+                ? "👑 Multi-Tenant Evaluation Audit Log (Admin)"
+                : "🔍 Your Interaction Evaluation Log";
+            }
+            loadAdminEvaluations();
+          }
+
           if (data.is_admin) {
             const adminCard = document.getElementById("admin-fleet-card");
             if (adminCard) adminCard.style.display = "block";
-            const evalCard = document.getElementById("admin-eval-card");
-            if (evalCard) evalCard.style.display = "block";
             loadAdminTenants();
-            loadAdminEvaluations();
           } else {
             const adminCard = document.getElementById("admin-fleet-card");
             if (adminCard) adminCard.style.display = "none";
-            const evalCard = document.getElementById("admin-eval-card");
-            if (evalCard) evalCard.style.display = "none";
           }
         } else {
           currentUser = null;
@@ -1443,6 +1716,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       if (banner) banner.style.display = "none";
       const adminCard = document.getElementById("admin-fleet-card");
       if (adminCard) adminCard.style.display = "none";
+      const allowlistCard = document.getElementById("allowlist-card");
+      if (allowlistCard) allowlistCard.style.display = "none";
       const evalCard = document.getElementById("admin-eval-card");
       if (evalCard) evalCard.style.display = "none";
       const monCard = document.getElementById("kpi-monitored-card");
@@ -1603,7 +1878,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
     async function loadAdminEvaluations() {
       const sourceFilter = document.getElementById("admin-eval-source-filter")?.value || "all";
-      const url = "/api/admin/evaluations?limit=50&source=" + encodeURIComponent(sourceFilter);
+      const url = "/api/evaluations?limit=50&source=" + encodeURIComponent(sourceFilter);
 
       try {
         const res = await fetch(url, { credentials: "same-origin" });

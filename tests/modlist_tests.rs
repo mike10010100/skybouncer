@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::MockPdsServer;
-use skybouncer::classifier::{RuleRubric, Sensitivity, Verdict, ViolationCategory};
+use skybouncer::classifier::{BounceDuration, RuleRubric, Sensitivity, Verdict, ViolationCategory};
 use skybouncer::modlist::{BouncedUser, DeduplicationCache, ModListConfig, ModListManager};
 
 // ============================================================================
@@ -61,6 +61,7 @@ fn test_sqlite_cache_bounced_user_deduplication() {
         post_uri: "at://did:plc:spammer1/app.bsky.feed.post/1".to_string(),
         post_text: "Crypto giveaway link".to_string(),
         bounced_at: 1_720_000_000_000_000,
+        expires_at: None,
     };
 
     assert!(!cache.is_bounced("did:plc:spammer1").unwrap());
@@ -588,6 +589,7 @@ async fn test_multi_rkey_tracking_and_pardon_cleanup() {
             post_uri: format!("at://{target_did}/app.bsky.feed.post/{i}"),
             post_text: format!("Attack post {i}"),
             bounced_at: 1_720_000_000_000_000 + (i as u64),
+            expires_at: None,
         };
         cache.record_bounce(&entry).unwrap();
     }
@@ -621,4 +623,111 @@ async fn test_multi_rkey_tracking_and_pardon_cleanup() {
     assert!(!manager.is_bounced(target_did).unwrap());
     assert!(cache.get_all_bounced_rkeys(target_did).unwrap().is_empty());
     assert_eq!(cache.count_bounced().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_temporary_ttl_bounce_expiration_and_cache_pruning() {
+    let cache = DeduplicationCache::open_in_memory().unwrap();
+    let now_us = 1_720_000_000_000_000;
+
+    // 1. Verify BounceDuration string parsing and roundtrip
+    assert_eq!(
+        "24h".parse::<BounceDuration>().unwrap(),
+        BounceDuration::Cooldown24h
+    );
+    assert_eq!(
+        "7d".parse::<BounceDuration>().unwrap(),
+        BounceDuration::Timeout7d
+    );
+    assert_eq!(
+        "30d".parse::<BounceDuration>().unwrap(),
+        BounceDuration::Timeout30d
+    );
+    assert_eq!(
+        "permanent".parse::<BounceDuration>().unwrap(),
+        BounceDuration::Permanent
+    );
+    assert_eq!(
+        "3600".parse::<BounceDuration>().unwrap(),
+        BounceDuration::Custom(3600)
+    );
+
+    // 2. Verify RuleRubric directive parsing with timeout/duration
+    let rubric =
+        RuleRubric::parse("[duration: 24h]\n[sensitivity: high]\nBlock all crypto scams").unwrap();
+    assert_eq!(rubric.bounce_duration, BounceDuration::Cooldown24h);
+    assert_eq!(rubric.sensitivity, Sensitivity::High);
+
+    // 3. Populate 3 records: expired, unexpired, permanent
+    let expired_user = BouncedUser {
+        subject_did: "did:plc:expired_violator".to_string(),
+        protected_did: "did:plc:alice".to_string(),
+        listitem_uri: "at://did:plc:alice/app.bsky.graph.listitem/item_exp".to_string(),
+        listitem_rkey: "item_exp".to_string(),
+        listitem_cid: "bafyitemexp".to_string(),
+        category: "spam".to_string(),
+        confidence: 0.95,
+        reason: "Temporary spam timeout".to_string(),
+        post_uri: "at://did:plc:expired_violator/app.bsky.feed.post/1".to_string(),
+        post_text: "Spam text".to_string(),
+        bounced_at: now_us - 100_000_000,
+        expires_at: Some(now_us - 50_000_000), // Expired in the past
+    };
+
+    let active_user = BouncedUser {
+        subject_did: "did:plc:active_violator".to_string(),
+        protected_did: "did:plc:alice".to_string(),
+        listitem_uri: "at://did:plc:alice/app.bsky.graph.listitem/item_act".to_string(),
+        listitem_rkey: "item_act".to_string(),
+        listitem_cid: "bafyitemact".to_string(),
+        category: "harassment".to_string(),
+        confidence: 0.98,
+        reason: "Active 7-day timeout".to_string(),
+        post_uri: "at://did:plc:active_violator/app.bsky.feed.post/1".to_string(),
+        post_text: "Harassment text".to_string(),
+        bounced_at: now_us,
+        expires_at: Some(now_us + 100_000_000), // Active into future
+    };
+
+    let perm_user = BouncedUser {
+        subject_did: "did:plc:permanent_violator".to_string(),
+        protected_did: "did:plc:alice".to_string(),
+        listitem_uri: "at://did:plc:alice/app.bsky.graph.listitem/item_perm".to_string(),
+        listitem_rkey: "item_perm".to_string(),
+        listitem_cid: "bafyitemperm".to_string(),
+        category: "crypto_scam".to_string(),
+        confidence: 0.99,
+        reason: "Permanent ban".to_string(),
+        post_uri: "at://did:plc:permanent_violator/app.bsky.feed.post/1".to_string(),
+        post_text: "Airdrop link".to_string(),
+        bounced_at: now_us,
+        expires_at: None,
+    };
+
+    assert!(expired_user.is_expired(now_us));
+    assert!(!active_user.is_expired(now_us));
+    assert!(!perm_user.is_expired(now_us));
+
+    cache.record_bounce(&expired_user).unwrap();
+    cache.record_bounce(&active_user).unwrap();
+    cache.record_bounce(&perm_user).unwrap();
+
+    // 4. Query list_expired_bounces
+    let expired_list = cache.list_expired_bounces(now_us).unwrap();
+    assert_eq!(expired_list.len(), 1);
+    assert_eq!(expired_list[0].subject_did, "did:plc:expired_violator");
+    assert_eq!(expired_list[0].expires_at, Some(now_us - 50_000_000));
+
+    // 5. Test PDS pardon on expired violator
+    let pds = MockPdsServer::start().await;
+    let client = pds.pds_client("did:plc:alice");
+    let manager = ModListManager::open_in_memory().unwrap();
+    manager.cache().record_bounce(&expired_user).unwrap();
+
+    let pardoned = manager
+        .pardon_user(&client, "did:plc:alice", &expired_user.subject_did)
+        .await
+        .unwrap();
+    assert!(pardoned);
+    assert!(!manager.is_bounced(&expired_user.subject_did).unwrap());
 }

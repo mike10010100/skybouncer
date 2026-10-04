@@ -753,6 +753,9 @@ async fn test_multi_target_post_with_self_interaction_and_friend_and_stranger() 
                     assert_eq!(interaction.author_did, PROTECTED_ALICE);
                     friend_bypassed += 1;
                 }
+                BypassReason::AllowlistedAuthor => {
+                    panic!("Unexpected allowlisted author in this test");
+                }
             },
         }
     }

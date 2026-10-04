@@ -5,6 +5,7 @@ use crate::error::SkybouncerError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 /// Sensitivity level determining confidence thresholds for automated list actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -80,6 +81,86 @@ impl FromStr for Sensitivity {
     }
 }
 
+/// Configurable duration for moderation list entries (permanent vs temporary timeout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BounceDuration {
+    /// Permanent moderation list entry (no expiration).
+    #[default]
+    Permanent,
+    /// 24-hour temporary timeout.
+    Cooldown24h,
+    /// 7-day temporary timeout.
+    Timeout7d,
+    /// 30-day temporary timeout.
+    Timeout30d,
+    /// Custom duration in seconds.
+    Custom(u64),
+}
+
+impl BounceDuration {
+    /// Returns the timeout duration as a [`Duration`], or `None` if permanent.
+    #[must_use]
+    pub fn to_duration(&self) -> Option<Duration> {
+        match self {
+            Self::Permanent => None,
+            Self::Cooldown24h => Some(Duration::from_secs(86_400)),
+            Self::Timeout7d => Some(Duration::from_secs(7 * 86_400)),
+            Self::Timeout30d => Some(Duration::from_secs(30 * 86_400)),
+            Self::Custom(secs) => Some(Duration::from_secs(*secs)),
+        }
+    }
+
+    /// Computes the expiration microsecond timestamp relative to `now_us`.
+    #[must_use]
+    pub fn expires_at_us(&self, now_us: u64) -> Option<u64> {
+        let dur = self.to_duration()?;
+        let dur_us = u64::try_from(dur.as_micros()).unwrap_or(u64::MAX);
+        Some(now_us.saturating_add(dur_us))
+    }
+
+    /// Returns a human-readable display label.
+    #[must_use]
+    pub fn display_label(&self) -> &'static str {
+        match self {
+            Self::Permanent => "Permanent",
+            Self::Cooldown24h => "24-Hour Cooldown",
+            Self::Timeout7d => "7-Day Timeout",
+            Self::Timeout30d => "30-Day Timeout",
+            Self::Custom(_) => "Custom",
+        }
+    }
+}
+
+impl FromStr for BounceDuration {
+    type Err = SkybouncerError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let normalized = s.trim().to_lowercase();
+        match normalized.as_str() {
+            "permanent" | "perm" | "none" | "forever" => Ok(Self::Permanent),
+            "cooldown24h" | "24h" | "24-hour" | "24_hours" | "1d" | "day" => Ok(Self::Cooldown24h),
+            "timeout7d" | "7d" | "7-day" | "7_days" | "1w" | "week" => Ok(Self::Timeout7d),
+            "timeout30d" | "30d" | "30-day" | "30_days" | "1m" | "month" => Ok(Self::Timeout30d),
+            _ => {
+                if let Ok(secs) = normalized.parse::<u64>() {
+                    Ok(Self::Custom(secs))
+                } else {
+                    Err(SkybouncerError::Config(format!(
+                        "Unknown bounce duration: `{s}`. Valid values: permanent, 24h, 7d, 30d, or seconds."
+                    )))
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for BounceDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.display_label())
+    }
+}
+
 /// Configured house rules and sensitivity rubric for moderation evaluation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuleRubric {
@@ -87,6 +168,9 @@ pub struct RuleRubric {
     pub prompt: String,
     /// Operating sensitivity level governing confidence thresholds.
     pub sensitivity: Sensitivity,
+    /// Configurable bounce duration / timeout for violations (defaults to Permanent).
+    #[serde(default)]
+    pub bounce_duration: BounceDuration,
 }
 
 impl RuleRubric {
@@ -96,6 +180,7 @@ impl RuleRubric {
         Self {
             prompt: prompt.into(),
             sensitivity,
+            bounce_duration: BounceDuration::Permanent,
         }
     }
 
@@ -105,7 +190,15 @@ impl RuleRubric {
         Self {
             prompt: prompt.into(),
             sensitivity: Sensitivity::default(),
+            bounce_duration: BounceDuration::Permanent,
         }
+    }
+
+    /// Sets the bounce duration / timeout.
+    #[must_use]
+    pub fn with_bounce_duration(mut self, bounce_duration: BounceDuration) -> Self {
+        self.bounce_duration = bounce_duration;
+        self
     }
 
     /// Evaluates whether a raw confidence score meets or exceeds the actionable threshold.
@@ -177,6 +270,7 @@ impl RuleRubric {
         }
 
         let mut sensitivity = Sensitivity::Medium;
+        let mut bounce_duration = BounceDuration::Permanent;
         let mut prompt_lines = Vec::new();
 
         for line in trimmed.lines() {
@@ -192,6 +286,18 @@ impl RuleRubric {
             } else if let Some(rest) = directive.strip_prefix("sensitivity =") {
                 let level_str = rest.trim().trim_matches('"');
                 sensitivity = level_str.parse::<Sensitivity>()?;
+            } else if let Some(rest) = directive.strip_prefix("duration:") {
+                let dur_str = rest.trim();
+                bounce_duration = dur_str.parse::<BounceDuration>()?;
+            } else if let Some(rest) = directive.strip_prefix("duration =") {
+                let dur_str = rest.trim().trim_matches('"');
+                bounce_duration = dur_str.parse::<BounceDuration>()?;
+            } else if let Some(rest) = directive.strip_prefix("timeout:") {
+                let dur_str = rest.trim();
+                bounce_duration = dur_str.parse::<BounceDuration>()?;
+            } else if let Some(rest) = directive.strip_prefix("timeout =") {
+                let dur_str = rest.trim().trim_matches('"');
+                bounce_duration = dur_str.parse::<BounceDuration>()?;
             } else {
                 prompt_lines.push(line);
             }
@@ -208,6 +314,7 @@ impl RuleRubric {
         Ok(Self {
             prompt,
             sensitivity,
+            bounce_duration,
         })
     }
 }
@@ -217,6 +324,7 @@ impl Default for RuleRubric {
         Self {
             prompt: "Block crypto airdrop spam, scam bots, phishing, targeted harassment, and bad-faith sea-lioning.".to_string(),
             sensitivity: Sensitivity::Medium,
+            bounce_duration: BounceDuration::Permanent,
         }
     }
 }

@@ -39,6 +39,7 @@ use crate::matcher::{
     BypassReason, FollowGraph, FollowSyncEvent, GateDecision, Interaction, NonFollowedGate,
     TargetMatcher,
 };
+use crate::modlist::cache::current_time_us;
 use crate::modlist::{BouncedUser, DeduplicationCache, ModListManager, DEFAULT_MOD_LIST_NAME};
 use crate::tenant::{Tenant, TenantRegistry};
 
@@ -54,8 +55,8 @@ pub const DEFAULT_EVALUATION_CONCURRENCY: usize = 1;
 /// Default evaluation verdict cache TTL (24 hours).
 pub const DEFAULT_EVALUATION_CACHE_TTL: Duration = Duration::from_secs(86400);
 
-/// Default periodic cache maintenance interval (1 hour).
-pub const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
+/// Default periodic cache maintenance interval (60 seconds).
+pub const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default graceful shutdown timeout (5 seconds).
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -440,6 +441,8 @@ pub struct EngineStats {
     pub gate_bypassed_self: AtomicU64,
     /// Interactions dropped because author is actively followed by the protected user.
     pub gate_bypassed_followed: AtomicU64,
+    /// Interactions dropped because author is on the protected user's persistent moderation allowlist.
+    pub gate_bypassed_allowlist: AtomicU64,
     /// Interactions that passed the gate and were evaluated.
     pub candidates_evaluated: AtomicU64,
     /// Interactions dropped because author was already recorded as bounced in cache.
@@ -495,6 +498,7 @@ impl EngineStats {
             interactions_matched: self.interactions_matched.load(Ordering::Relaxed),
             gate_bypassed_self: self.gate_bypassed_self.load(Ordering::Relaxed),
             gate_bypassed_followed: self.gate_bypassed_followed.load(Ordering::Relaxed),
+            gate_bypassed_allowlist: self.gate_bypassed_allowlist.load(Ordering::Relaxed),
             candidates_evaluated: self.candidates_evaluated.load(Ordering::Relaxed),
             dedup_cache_hits: self.dedup_cache_hits.load(Ordering::Relaxed),
             eval_cache_hits: self.eval_cache_hits.load(Ordering::Relaxed),
@@ -537,6 +541,9 @@ pub struct EngineStatsSnapshot {
     pub gate_bypassed_self: u64,
     /// Interactions dropped because author is actively followed by the protected user.
     pub gate_bypassed_followed: u64,
+    /// Interactions dropped because author is on the protected user's persistent moderation allowlist.
+    #[serde(default)]
+    pub gate_bypassed_allowlist: u64,
     /// Interactions that passed the gate and were evaluated.
     pub candidates_evaluated: u64,
     /// Interactions dropped because author was already recorded as bounced in cache.
@@ -589,7 +596,7 @@ pub struct EngineStatsSnapshot {
 /// Outcome of evaluating an interaction candidate through the moderation pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InteractionOutcome {
-    /// Dropped at the gate (self-interaction or followed author) with zero network/model cost.
+    /// Dropped at the gate (self-interaction, followed author, or allowlisted author) with zero network/model cost.
     Bypassed {
         /// Reason for bypassing evaluation.
         reason: BypassReason,
@@ -602,6 +609,8 @@ pub enum InteractionOutcome {
     AlreadyBounced {
         /// DID of the already-bounced author.
         author_did: String,
+        /// DID of the protected target account.
+        target_did: String,
     },
     /// Interaction is permitted / benign.
     Permitted {
@@ -701,7 +710,7 @@ impl InteractionOutcome {
     pub fn author_did(&self) -> &str {
         match self {
             Self::Bypassed { author_did, .. }
-            | Self::AlreadyBounced { author_did }
+            | Self::AlreadyBounced { author_did, .. }
             | Self::Permitted { author_did, .. }
             | Self::Bounced { author_did, .. }
             | Self::BelowThreshold { author_did, .. }
@@ -717,6 +726,7 @@ impl InteractionOutcome {
     pub fn target_did(&self) -> Option<&str> {
         match self {
             Self::Bypassed { target_did, .. }
+            | Self::AlreadyBounced { target_did, .. }
             | Self::Permitted { target_did, .. }
             | Self::Bounced { target_did, .. }
             | Self::BelowThreshold { target_did, .. }
@@ -724,7 +734,6 @@ impl InteractionOutcome {
             | Self::QueuedForEvaluation { target_did, .. }
             | Self::QueueOverflow { target_did, .. }
             | Self::Paused { target_did, .. } => Some(target_did.as_str()),
-            Self::AlreadyBounced { .. } => None,
         }
     }
 
@@ -943,6 +952,13 @@ impl SkybouncerEngine {
         let (bounce_notifier, _) = broadcast::channel(256);
         let oauth_client = Arc::new(RwLock::new(None));
 
+        if let Ok(loaded_allowlists) = cache.load_all_allowlists() {
+            let mut guard = gate.allowlist().write();
+            for (prot, authors) in loaded_allowlists {
+                guard.entry(prot).or_default().extend(authors);
+            }
+        }
+
         Self {
             config,
             protected_dids,
@@ -1158,6 +1174,11 @@ impl SkybouncerEngine {
                         .gate_bypassed_followed
                         .fetch_add(1, Ordering::Relaxed);
                 }
+                BypassReason::AllowlistedAuthor => {
+                    self.stats
+                        .gate_bypassed_allowlist
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             debug!(reason = ?reason, "Bypassed interaction at gate with zero cost");
             return Ok(InteractionOutcome::Bypassed {
@@ -1187,7 +1208,10 @@ impl SkybouncerEngine {
         if self.cache.is_bounced_for(&target_did, &author_did)? {
             self.stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
             debug!("Author already bounced in deduplication cache; skipping evaluation");
-            return Ok(InteractionOutcome::AlreadyBounced { author_did });
+            return Ok(InteractionOutcome::AlreadyBounced {
+                author_did,
+                target_did,
+            });
         }
 
         // Tier 5: Evaluation TTL Cache Check (<50µs, $0 cost)
@@ -1286,6 +1310,11 @@ impl SkybouncerEngine {
                         .gate_bypassed_followed
                         .fetch_add(1, Ordering::Relaxed);
                 }
+                BypassReason::AllowlistedAuthor => {
+                    self.stats
+                        .gate_bypassed_allowlist
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             debug!(reason = ?reason, "Bypassed interaction at gate with zero cost");
             return Ok(InteractionOutcome::Bypassed {
@@ -1315,7 +1344,10 @@ impl SkybouncerEngine {
         if self.cache.is_bounced_for(&target_did, &author_did)? {
             self.stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
             debug!("Author already bounced in deduplication cache; skipping evaluation");
-            return Ok(InteractionOutcome::AlreadyBounced { author_did });
+            return Ok(InteractionOutcome::AlreadyBounced {
+                author_did,
+                target_did,
+            });
         }
 
         // Tier 5: Evaluation TTL Cache Check (<50µs, $0 cost)
@@ -1449,7 +1481,10 @@ impl SkybouncerEngine {
                 target = %target_did,
                 "Author bounced while candidate was queued; skipping model call"
             );
-            return Ok(InteractionOutcome::AlreadyBounced { author_did });
+            return Ok(InteractionOutcome::AlreadyBounced {
+                author_did,
+                target_did,
+            });
         }
 
         // Tier 4: Per-User Evaluation Rate Limiter (Anti-Denial-of-Wallet, PRD §5.2) - checked at dequeue
@@ -1560,20 +1595,14 @@ impl SkybouncerEngine {
             .and_then(|t| t.handle)
             .unwrap_or_default();
 
-        #[allow(clippy::cast_possible_truncation)]
-        let primary_confidence = detailed_eval
-            .primary_verdict
-            .confidence()
-            .map_or(1.0, |c| c as f32);
+        let primary_confidence = detailed_eval.primary_verdict.confidence().unwrap_or(1.0);
 
-        #[allow(clippy::cast_possible_truncation)]
         let fallback_confidence = detailed_eval
             .fallback_verdict
             .as_ref()
-            .and_then(|v| v.confidence().map(|c| c as f32));
+            .and_then(|v| v.confidence());
 
-        #[allow(clippy::cast_possible_truncation)]
-        let final_confidence = model_verdict.confidence().map_or(1.0, |c| c as f32);
+        let final_confidence = model_verdict.confidence().unwrap_or(1.0);
 
         let log_entry = crate::modlist::cache::NewEvaluationLog {
             timestamp_us: crate::modlist::cache::current_time_us(),
@@ -1687,6 +1716,7 @@ impl SkybouncerEngine {
                 }
 
                 // Actionable violation: bounce on sovereign PDS
+                let expires_at = rubric.bounce_duration.expires_at_us(current_time_us());
                 let pds_client = self.resolve_pds_client_for(&target_did).await?;
                 let bounce_result = self
                     .modlist_manager
@@ -1699,6 +1729,7 @@ impl SkybouncerEngine {
                         &reason,
                         &post_uri,
                         &post_text,
+                        expires_at,
                     )
                     .await
                     .inspect_err(|_e| {
@@ -1742,7 +1773,10 @@ impl SkybouncerEngine {
                     None => {
                         // Double-checked locking detected concurrent task already bounced author
                         self.stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
-                        Ok(InteractionOutcome::AlreadyBounced { author_did })
+                        Ok(InteractionOutcome::AlreadyBounced {
+                            author_did,
+                            target_did,
+                        })
                     }
                 }
             }
@@ -1871,6 +1905,75 @@ impl SkybouncerEngine {
         self.modlist_manager
             .pardon_user(&pds_client, protected_did, subject_did)
             .await
+    }
+
+    /// Pardons an account by deleting its listitems from the PDS, purging the cache,
+    /// and immunizes them from future moderation actions by adding them to the allowlist.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if PDS deletion, cache mutation, or allowlist insertion fails.
+    pub async fn pardon_and_allowlist(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+        reason: Option<&str>,
+    ) -> Result<bool, SkybouncerError> {
+        let pardoned = self.pardon_user(protected_did, subject_did).await?;
+        self.add_to_allowlist(
+            protected_did,
+            subject_did,
+            reason.or(Some("Immunized via pardon")),
+        )?;
+        Ok(pardoned)
+    }
+
+    /// Checks whether an author is in the protected user's allowlist (<1µs in-memory lookup).
+    #[must_use]
+    pub fn is_allowlisted(&self, protected_did: &str, author_did: &str) -> bool {
+        self.gate.is_allowlisted(protected_did, author_did)
+    }
+
+    /// Adds an author to both persistent SQLite cache and in-memory allowlist for a protected user.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if database insertion fails.
+    pub fn add_to_allowlist(
+        &self,
+        protected_did: &str,
+        author_did: &str,
+        reason: Option<&str>,
+    ) -> Result<(), SkybouncerError> {
+        self.cache
+            .add_to_allowlist(protected_did, author_did, reason)?;
+        self.gate.add_to_allowlist(protected_did, author_did);
+        Ok(())
+    }
+
+    /// Removes an author from both persistent SQLite cache and in-memory allowlist for a protected user.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if database deletion fails.
+    pub fn remove_from_allowlist(
+        &self,
+        protected_did: &str,
+        author_did: &str,
+    ) -> Result<bool, SkybouncerError> {
+        let removed = self
+            .cache
+            .remove_from_allowlist(protected_did, author_did)?;
+        self.gate.remove_from_allowlist(protected_did, author_did);
+        Ok(removed)
+    }
+
+    /// Lists all allowlisted authors for a protected user from the persistent database.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if database query fails.
+    pub fn list_allowlist(
+        &self,
+        protected_did: &str,
+    ) -> Result<Vec<crate::modlist::AllowlistEntry>, SkybouncerError> {
+        self.cache.list_allowlist(protected_did)
     }
 
     /// Ensures that the parent moderation list exists on the sovereign PDS.
@@ -2441,6 +2544,52 @@ impl SkybouncerEngine {
         self.run(rx, cancel).await
     }
 
+    /// Prunes expired temporary bounces from both sovereign PDS moderation lists and the SQLite cache.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if querying expired bounces fails.
+    pub async fn prune_expired_bounces(&self) -> Result<usize, SkybouncerError> {
+        let now_us = current_time_us();
+        let expired = self.cache.list_expired_bounces(now_us)?;
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        let mut pruned_count = 0;
+        for record in expired {
+            match self
+                .pardon_user(&record.protected_did, &record.subject_did)
+                .await
+            {
+                Ok(true) => {
+                    pruned_count += 1;
+                    info!(
+                        subject_did = %record.subject_did,
+                        protected_did = %record.protected_did,
+                        "Pruned expired temporary bounce from PDS and cache"
+                    );
+                }
+                Ok(false) => {
+                    debug!(
+                        subject_did = %record.subject_did,
+                        protected_did = %record.protected_did,
+                        "Expired bounce record was already removed"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        subject_did = %record.subject_did,
+                        protected_did = %record.protected_did,
+                        error = %e,
+                        "Failed to pardon expired bounce on PDS"
+                    );
+                }
+            }
+        }
+
+        Ok(pruned_count)
+    }
+
     /// Runs the periodic background maintenance loop to prune expired evaluation cache entries.
     ///
     /// # Errors
@@ -2479,6 +2628,16 @@ impl SkybouncerEngine {
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to prune expired web sessions in maintenance task");
+                        }
+                    }
+                    match self.prune_expired_bounces().await {
+                        Ok(count) => {
+                            if count > 0 {
+                                info!(count, "Pruned expired temporary bounces from PDS and cache");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to prune expired bounces in maintenance task");
                         }
                     }
                 }
@@ -2703,6 +2862,13 @@ impl SkybouncerEngineBuilder {
         let gate = self
             .gate
             .unwrap_or_else(|| Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph))));
+
+        if let Ok(loaded_allowlists) = cache.load_all_allowlists() {
+            let mut guard = gate.allowlist().write();
+            for (prot, authors) in loaded_allowlists {
+                guard.entry(prot).or_default().extend(authors);
+            }
+        }
 
         // 3. Initialize HeuristicClassifier
         let heuristic_classifier = self.heuristic_classifier.unwrap_or_else(|| {

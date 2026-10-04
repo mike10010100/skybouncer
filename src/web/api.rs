@@ -10,13 +10,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::classifier::{RuleRubric, Sensitivity, Verdict};
+use crate::classifier::{BounceDuration, RuleRubric, Sensitivity, Verdict};
 use crate::engine::{EngineStatsSnapshot, SkybouncerEngine};
 use crate::matcher::{Interaction, InteractionType};
 use crate::modlist::cache::{EvaluationLogEntry, NewEvaluationLog};
@@ -47,6 +47,9 @@ pub struct RulesResponse {
     pub sensitivity: Sensitivity,
     /// Minimum confidence threshold for automated action.
     pub threshold: f64,
+    /// Configured bounce duration / timeout.
+    #[serde(default)]
+    pub bounce_duration: BounceDuration,
 }
 
 /// Request payload to update the moderation rubric prompt and/or sensitivity.
@@ -58,6 +61,9 @@ pub struct UpdateRulesRequest {
     /// Optional updated sensitivity level.
     #[serde(default)]
     pub sensitivity: Option<Sensitivity>,
+    /// Optional updated bounce duration / timeout.
+    #[serde(default)]
+    pub bounce_duration: Option<BounceDuration>,
 }
 
 /// Query parameters for fetching bounced accounts.
@@ -77,6 +83,12 @@ pub struct PardonRequest {
     /// Optional protected DID whose list the violator should be removed from.
     #[serde(default)]
     pub protected_did: Option<String>,
+    /// Whether to permanently immunize the user against future moderation by adding them to the allowlist.
+    #[serde(default)]
+    pub allowlist: bool,
+    /// Optional explanatory reason for allowlisting.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Response payload following a pardon execution.
@@ -84,7 +96,50 @@ pub struct PardonRequest {
 pub struct PardonResponse {
     /// Whether an existing bounced record was found and deleted.
     pub pardoned: bool,
+    /// Whether the user was immunized on the allowlist.
+    #[serde(default)]
+    pub allowlisted: bool,
     /// The subject DID that was processed.
+    pub subject_did: String,
+    /// Status description message.
+    pub message: String,
+}
+
+/// Query parameters for listing allowlisted accounts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AllowlistQuery {
+    /// Optional protected DID to filter allowlist for a specific user.
+    pub user_did: Option<String>,
+}
+
+/// Request payload to add an account to the moderation allowlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddAllowlistRequest {
+    /// Decentralized identifier (DID) or @handle of the account to allowlist.
+    pub subject: String,
+    /// Optional protected DID whose allowlist should be updated.
+    #[serde(default)]
+    pub protected_did: Option<String>,
+    /// Optional reason or justification for allowlisting.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Response payload following allowlist addition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddAllowlistResponse {
+    /// The allowlisted subject DID.
+    pub subject_did: String,
+    /// Status description message.
+    pub message: String,
+}
+
+/// Response payload following allowlist removal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveAllowlistResponse {
+    /// Whether the entry was found and removed.
+    pub removed: bool,
+    /// The removed subject DID.
     pub subject_did: String,
     /// Status description message.
     pub message: String,
@@ -208,6 +263,7 @@ pub async fn get_status(State(state): State<ApiState>, headers: HeaderMap) -> Js
         RuleRubric {
             prompt: "[Protected sovereign rubric - sign in to view]".to_string(),
             sensitivity: state.engine.rubric().sensitivity,
+            bounce_duration: state.engine.rubric().bounce_duration,
         }
     };
 
@@ -224,6 +280,7 @@ pub async fn get_status(State(state): State<ApiState>, headers: HeaderMap) -> Js
             prompt: rubric.prompt,
             sensitivity: rubric.sensitivity,
             threshold: rubric.sensitivity.threshold(),
+            bounce_duration: rubric.bounce_duration,
         },
         dry_run: state.engine.is_dry_run(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -240,6 +297,285 @@ pub async fn health_check() -> (StatusCode, Json<HealthResponse>) {
             version: env!("CARGO_PKG_VERSION").to_string(),
         }),
     )
+}
+
+/// Handler for `GET /metrics` and `GET /api/metrics`: exports telemetry counters and gauges in Prometheus text exposition format.
+pub async fn get_prometheus_metrics(State(state): State<ApiState>) -> Response {
+    let stats = state.engine.stats().snapshot();
+    let protected_count = state.engine.protected_dids().len();
+    let tenant_count = state.engine.tenant_registry().count().unwrap_or(0);
+    let dry_run = if state.engine.is_dry_run() { 1 } else { 0 };
+    let queue_depth = stats
+        .eval_queue_enqueued
+        .saturating_sub(stats.eval_queue_processed);
+
+    let mut out = String::with_capacity(4096);
+    use std::fmt::Write;
+
+    let _ = writeln!(
+        out,
+        "# HELP skybouncer_commits_received_total Total incoming Jetstream commits processed."
+    );
+    let _ = writeln!(out, "# TYPE skybouncer_commits_received_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_commits_received_total {}",
+        stats.commits_received
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_follow_sync_events_total Total follow/unfollow events synchronized to the follow graph.");
+    let _ = writeln!(out, "# TYPE skybouncer_follow_sync_events_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_follow_sync_events_total {}",
+        stats.follow_sync_events
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_interactions_matched_total Total candidate interactions extracted targeting protected users.");
+    let _ = writeln!(out, "# TYPE skybouncer_interactions_matched_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_interactions_matched_total {}",
+        stats.interactions_matched
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_gate_bypassed_total Interactions dropped by zero-cost pre-evaluation gates.");
+    let _ = writeln!(out, "# TYPE skybouncer_gate_bypassed_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_gate_bypassed_total{{reason=\"self\"}} {}",
+        stats.gate_bypassed_self
+    );
+    let _ = writeln!(
+        out,
+        "skybouncer_gate_bypassed_total{{reason=\"followed\"}} {}",
+        stats.gate_bypassed_followed
+    );
+    let _ = writeln!(
+        out,
+        "skybouncer_gate_bypassed_total{{reason=\"allowlist\"}} {}",
+        stats.gate_bypassed_allowlist
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_candidates_evaluated_total Interactions that passed all gates and were evaluated.");
+    let _ = writeln!(out, "# TYPE skybouncer_candidates_evaluated_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_candidates_evaluated_total {}",
+        stats.candidates_evaluated
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_dedup_cache_hits_total Interactions dropped because author was already recorded as bounced.");
+    let _ = writeln!(out, "# TYPE skybouncer_dedup_cache_hits_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_dedup_cache_hits_total {}",
+        stats.dedup_cache_hits
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_eval_cache_hits_total Candidate evaluations served from SQLite TTL evaluation cache.");
+    let _ = writeln!(out, "# TYPE skybouncer_eval_cache_hits_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_eval_cache_hits_total {}",
+        stats.eval_cache_hits
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_heuristic_violations_total High-confidence violations matched instantly by heuristic regex rules.");
+    let _ = writeln!(out, "# TYPE skybouncer_heuristic_violations_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_heuristic_violations_total {}",
+        stats.heuristic_violations
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_model_evaluations_total Candidate interactions evaluated by primary and secondary classifiers.");
+    let _ = writeln!(out, "# TYPE skybouncer_model_evaluations_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_model_evaluations_total {}",
+        stats.model_evaluations
+    );
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_tier1_evaluations_total Tier-1 primary model evaluations."
+    );
+    let _ = writeln!(out, "# TYPE skybouncer_tier1_evaluations_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_tier1_evaluations_total {}",
+        stats.tier1_evaluations
+    );
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_tier2_evaluations_total Tier-2 fallback model escalations."
+    );
+    let _ = writeln!(out, "# TYPE skybouncer_tier2_evaluations_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_tier2_evaluations_total {}",
+        stats.tier2_evaluations
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_tier2_image_escalations_total Tier-2 escalations triggered by attached images.");
+    let _ = writeln!(
+        out,
+        "# TYPE skybouncer_tier2_image_escalations_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "skybouncer_tier2_image_escalations_total {}",
+        stats.tier2_image_escalations
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_tier2_uncertainty_escalations_total Tier-2 escalations triggered by confidence uncertainty band.");
+    let _ = writeln!(
+        out,
+        "# TYPE skybouncer_tier2_uncertainty_escalations_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "skybouncer_tier2_uncertainty_escalations_total {}",
+        stats.tier2_uncertainty_escalations
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_eval_queue_enqueued_total Candidate interactions enqueued to background evaluation queue.");
+    let _ = writeln!(out, "# TYPE skybouncer_eval_queue_enqueued_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_eval_queue_enqueued_total {}",
+        stats.eval_queue_enqueued
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_eval_queue_processed_total Candidate interactions processed by background evaluation worker.");
+    let _ = writeln!(out, "# TYPE skybouncer_eval_queue_processed_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_eval_queue_processed_total {}",
+        stats.eval_queue_processed
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_eval_queue_overflows_total Candidate interactions dropped due to evaluation queue capacity saturation.");
+    let _ = writeln!(out, "# TYPE skybouncer_eval_queue_overflows_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_eval_queue_overflows_total {}",
+        stats.eval_queue_overflows
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_rate_limited_evaluations_total Evaluations dropped due to per-user evaluation rate limits.");
+    let _ = writeln!(
+        out,
+        "# TYPE skybouncer_rate_limited_evaluations_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "skybouncer_rate_limited_evaluations_total {}",
+        stats.rate_limited_evaluations
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_context_enrichments_total Candidates enriched with author profile and parent post context.");
+    let _ = writeln!(out, "# TYPE skybouncer_context_enrichments_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_context_enrichments_total {}",
+        stats.context_enrichments
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_violations_detected_total Total violations confirmed across heuristic and model classifiers.");
+    let _ = writeln!(out, "# TYPE skybouncer_violations_detected_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_violations_detected_total {}",
+        stats.violations_detected
+    );
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_bounces_total Successful listitem mutations created on sovereign PDS."
+    );
+    let _ = writeln!(out, "# TYPE skybouncer_bounces_total counter");
+    let _ = writeln!(out, "skybouncer_bounces_total {}", stats.bounces_executed);
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_permitted_total Total interactions classified as permitted or benign."
+    );
+    let _ = writeln!(out, "# TYPE skybouncer_permitted_total counter");
+    let _ = writeln!(out, "skybouncer_permitted_total {}", stats.permitted);
+
+    let _ = writeln!(out, "\n# HELP skybouncer_bounces_skipped_rubric_total Violations dropped because confidence fell below rubric sensitivity threshold.");
+    let _ = writeln!(
+        out,
+        "# TYPE skybouncer_bounces_skipped_rubric_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "skybouncer_bounces_skipped_rubric_total {}",
+        stats.bounces_skipped_rubric
+    );
+
+    let _ = writeln!(out, "\n# HELP skybouncer_errors_total Total operational or network errors encountered during pipeline execution.");
+    let _ = writeln!(out, "# TYPE skybouncer_errors_total counter");
+    let _ = writeln!(out, "skybouncer_errors_total {}", stats.errors_encountered);
+
+    let _ = writeln!(out, "\n# HELP skybouncer_sovereign_configs_synced_total Sovereign configuration hot-reload events synchronized from the firehose.");
+    let _ = writeln!(
+        out,
+        "# TYPE skybouncer_sovereign_configs_synced_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "skybouncer_sovereign_configs_synced_total {}",
+        stats.sovereign_configs_synced
+    );
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_protected_users Number of protected accounts currently monitored."
+    );
+    let _ = writeln!(out, "# TYPE skybouncer_protected_users gauge");
+    let _ = writeln!(out, "skybouncer_protected_users {protected_count}");
+
+    let _ = writeln!(out, "\n# HELP skybouncer_eval_queue_depth Current number of candidate interactions queued awaiting evaluation.");
+    let _ = writeln!(out, "# TYPE skybouncer_eval_queue_depth gauge");
+    let _ = writeln!(out, "skybouncer_eval_queue_depth {queue_depth}");
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_enrolled_tenants Number of sovereign multi-tenant users registered."
+    );
+    let _ = writeln!(out, "# TYPE skybouncer_enrolled_tenants gauge");
+    let _ = writeln!(out, "skybouncer_enrolled_tenants {tenant_count}");
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_dry_run Whether dry-run shadow mode is active (1) or disabled (0)."
+    );
+    let _ = writeln!(out, "# TYPE skybouncer_dry_run gauge");
+    let _ = writeln!(out, "skybouncer_dry_run {dry_run}");
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_build_info Build and version metadata."
+    );
+    let _ = writeln!(out, "# TYPE skybouncer_build_info gauge");
+    let _ = writeln!(
+        out,
+        "skybouncer_build_info{{version=\"{}\"}} 1",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
+        .into_response()
 }
 
 /// Extracts the verified authenticated caller DID strictly from a valid session token in Cookie or Authorization header.
@@ -346,6 +682,7 @@ pub async fn get_rules(
         prompt: rubric.prompt,
         sensitivity: rubric.sensitivity,
         threshold: rubric.sensitivity.threshold(),
+        bounce_duration: rubric.bounce_duration,
     }))
 }
 
@@ -380,6 +717,10 @@ pub async fn update_rules(
 
     if let Some(sens) = payload.sensitivity {
         rubric.sensitivity = sens;
+    }
+
+    if let Some(dur) = payload.bounce_duration {
+        rubric.bounce_duration = dur;
     }
 
     let is_enrolled = state
@@ -417,6 +758,7 @@ pub async fn update_rules(
         prompt: rubric.prompt,
         sensitivity: rubric.sensitivity,
         threshold: rubric.sensitivity.threshold(),
+        bounce_duration: rubric.bounce_duration,
     }))
 }
 
@@ -499,22 +841,207 @@ pub async fn pardon_user(
         caller_did.clone()
     };
 
-    match state.engine.pardon_user(&protected_did, &subject_did).await {
-        Ok(true) => Ok(Json(PardonResponse {
-            pardoned: true,
+    if payload.allowlist {
+        match state
+            .engine
+            .pardon_and_allowlist(
+                &protected_did,
+                &subject_did,
+                payload
+                    .reason
+                    .as_deref()
+                    .or(Some("Immunized via web API pardon")),
+            )
+            .await
+        {
+            Ok(pardoned) => Ok(Json(PardonResponse {
+                pardoned,
+                allowlisted: true,
+                subject_did: subject_did.clone(),
+                message: format!(
+                    "Account {subject_did} was pardoned and immunized on the allowlist."
+                ),
+            })),
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to pardon and allowlist: {e}"),
+            )),
+        }
+    } else {
+        match state.engine.pardon_user(&protected_did, &subject_did).await {
+            Ok(true) => Ok(Json(PardonResponse {
+                pardoned: true,
+                allowlisted: false,
+                subject_did: subject_did.clone(),
+                message: format!(
+                    "Account {subject_did} was pardoned and removed from moderation list."
+                ),
+            })),
+            Ok(false) => Ok(Json(PardonResponse {
+                pardoned: false,
+                allowlisted: false,
+                subject_did: subject_did.clone(),
+                message: format!("Account {subject_did} was not found in the bounced cache."),
+            })),
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to pardon: {e}"),
+            )),
+        }
+    }
+}
+
+/// Handler for `GET /api/allowlist`: lists allowlisted accounts for the authenticated user or target user (admin).
+pub async fn get_allowlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<AllowlistQuery>,
+) -> Result<Json<Vec<crate::modlist::AllowlistEntry>>, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to view allowlist. Please sign in with Bluesky.".to_string(),
+        )
+    })?;
+
+    let is_admin = state.engine.is_admin(&caller_did);
+    let target_did = if let Some(ref ud) = query.user_did {
+        let requested = ud.trim();
+        if requested != caller_did && !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Access denied: you may only view your own allowlist.".to_string(),
+            ));
+        }
+        requested
+    } else {
+        &caller_did
+    };
+
+    match state.engine.list_allowlist(target_did) {
+        Ok(entries) => Ok(Json(entries)),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list allowlist: {e}"),
+        )),
+    }
+}
+
+/// Handler for `POST /api/allowlist`: adds an account to the moderation allowlist.
+pub async fn add_to_allowlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<AddAllowlistRequest>,
+) -> Result<Json<AddAllowlistResponse>, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to update allowlist. Please sign in with Bluesky.".to_string(),
+        )
+    })?;
+
+    let is_admin = state.engine.is_admin(&caller_did);
+    let protected_did = if let Some(ref pd) = payload.protected_did {
+        let requested = pd.trim();
+        if requested != caller_did && !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Access denied: you may only update your own allowlist.".to_string(),
+            ));
+        }
+        requested.to_string()
+    } else {
+        caller_did.clone()
+    };
+
+    let raw_subject = payload.subject.trim();
+    if raw_subject.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "subject cannot be empty".to_string(),
+        ));
+    }
+
+    let clean = raw_subject.trim_start_matches('@');
+    let subject_did = if clean.starts_with("did:") {
+        clean.to_string()
+    } else {
+        match state.engine.resolve_handle(clean).await {
+            Some(did) => did,
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Could not resolve handle `@{clean}` to a DID."),
+                ));
+            }
+        }
+    };
+
+    match state.engine.add_to_allowlist(
+        &protected_did,
+        &subject_did,
+        payload.reason.as_deref().or(Some("Added via web API")),
+    ) {
+        Ok(()) => Ok(Json(AddAllowlistResponse {
             subject_did: subject_did.clone(),
-            message: format!(
-                "Account {subject_did} was pardoned and removed from moderation list."
-            ),
-        })),
-        Ok(false) => Ok(Json(PardonResponse {
-            pardoned: false,
-            subject_did: subject_did.clone(),
-            message: format!("Account {subject_did} was not found in the bounced cache."),
+            message: format!("Account {subject_did} was added to the allowlist."),
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to pardon: {e}"),
+            format!("Failed to add to allowlist: {e}"),
+        )),
+    }
+}
+
+/// Handler for `DELETE /api/allowlist/:did`: removes an account from the moderation allowlist.
+pub async fn remove_from_allowlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(subject_did): Path<String>,
+    Query(query): Query<AllowlistQuery>,
+) -> Result<Json<RemoveAllowlistResponse>, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to update allowlist. Please sign in with Bluesky.".to_string(),
+        )
+    })?;
+
+    let is_admin = state.engine.is_admin(&caller_did);
+    let protected_did = if let Some(ref ud) = query.user_did {
+        let requested = ud.trim();
+        if requested != caller_did && !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Access denied: you may only update your own allowlist.".to_string(),
+            ));
+        }
+        requested
+    } else {
+        &caller_did
+    };
+
+    let clean_did = subject_did.trim();
+    if clean_did.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "DID path parameter cannot be empty".to_string(),
+        ));
+    }
+
+    match state.engine.remove_from_allowlist(protected_did, clean_did) {
+        Ok(removed) => Ok(Json(RemoveAllowlistResponse {
+            removed,
+            subject_did: clean_did.to_string(),
+            message: if removed {
+                format!("Account {clean_did} was removed from the allowlist.")
+            } else {
+                format!("Account {clean_did} was not found on the allowlist.")
+            },
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to remove from allowlist: {e}"),
         )),
     }
 }
@@ -894,11 +1421,7 @@ pub async fn simulate_interaction(
         .unwrap_or_default();
 
     let final_violates = detailed.final_verdict.is_violation();
-    #[allow(clippy::cast_possible_truncation)]
-    let final_confidence_f32 = detailed
-        .final_verdict
-        .confidence()
-        .map_or(1.0, |c| c as f32);
+    let final_confidence = detailed.final_verdict.confidence().unwrap_or(1.0);
 
     let sim_outcome_str = match &detailed.final_verdict {
         Verdict::Violation {
@@ -915,14 +1438,12 @@ pub async fn simulate_interaction(
         Verdict::Permitted { .. } => "Simulated: Permitted",
     };
 
-    #[allow(clippy::cast_possible_truncation)]
-    let fallback_confidence_f32 = detailed
+    let fallback_confidence = detailed
         .fallback_verdict
         .as_ref()
-        .and_then(|v| v.confidence().map(|c| c as f32));
+        .and_then(|v| v.confidence());
 
-    #[allow(clippy::cast_possible_truncation)]
-    let primary_conf_f32 = tier1_conf as f32;
+    let primary_conf = tier1_conf;
 
     if let Err(e) = state
         .engine
@@ -943,7 +1464,7 @@ pub async fn simulate_interaction(
             } else {
                 "allow".to_string()
             },
-            primary_confidence: primary_conf_f32,
+            primary_confidence: primary_conf,
             primary_category: tier1_cat.clone().unwrap_or_default(),
             primary_reason: tier1_reason.clone(),
             escalated: detailed.escalated,
@@ -956,7 +1477,7 @@ pub async fn simulate_interaction(
                     "allow".to_string()
                 }
             }),
-            fallback_confidence: fallback_confidence_f32,
+            fallback_confidence,
             fallback_category: detailed
                 .fallback_verdict
                 .as_ref()
@@ -970,7 +1491,7 @@ pub async fn simulate_interaction(
             } else {
                 "allow".to_string()
             },
-            final_confidence: final_confidence_f32,
+            final_confidence,
             outcome: sim_outcome_str.to_string(),
         })
     {
@@ -1162,6 +1683,7 @@ pub async fn get_current_user(
                     prompt: rubric.prompt,
                     sensitivity: rubric.sensitivity,
                     threshold: rubric.sensitivity.threshold(),
+                    bounce_duration: rubric.bounce_duration,
                 }),
                 is_list_blocked,
                 monitored_users_count,
@@ -1181,6 +1703,7 @@ pub async fn get_current_user(
                     prompt: rubric.prompt,
                     sensitivity: rubric.sensitivity,
                     threshold: rubric.sensitivity.threshold(),
+                    bounce_duration: rubric.bounce_duration,
                 }),
                 is_list_blocked,
                 monitored_users_count,
@@ -1296,6 +1819,78 @@ pub struct AdminEvaluationsResponse {
     pub total: usize,
     /// List of evaluation log entries.
     pub evaluations: Vec<EvaluationLogEntry>,
+}
+
+/// Query parameters for tenant evaluation logs (`GET /api/evaluations`).
+#[derive(Debug, Deserialize)]
+pub struct EvaluationsQuery {
+    /// Optional target DID filter (for admins; regular users can only view their own).
+    pub target_did: Option<String>,
+    /// Optional source filter: "all", "live", or "simulation".
+    pub source: Option<String>,
+    /// Max entries to return (default: 50, max: 200).
+    pub limit: Option<usize>,
+    /// Pagination offset.
+    pub offset: Option<usize>,
+}
+
+/// Response payload containing evaluation logs for tenant or administrative audit.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EvaluationsResponse {
+    /// Total count of evaluation logs matching filter.
+    pub total: usize,
+    /// List of evaluation log entries.
+    pub evaluations: Vec<EvaluationLogEntry>,
+}
+
+/// Handler for `GET /api/evaluations`: returns evaluation audit logs scoped to the authenticated caller
+/// (or target DID for admins) adhering to PRD §7.1 Item 3.
+pub async fn get_evaluations(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<EvaluationsQuery>,
+) -> Result<Json<EvaluationsResponse>, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to access evaluation audit logs. Please sign in with Bluesky."
+                .to_string(),
+        )
+    })?;
+
+    let is_admin = state.engine.is_admin(&caller_did);
+    let target_filter = if is_admin {
+        query.target_did.as_deref().filter(|s| !s.trim().is_empty())
+    } else {
+        if let Some(requested_did) = query.target_did.as_deref().filter(|s| !s.trim().is_empty()) {
+            if requested_did != caller_did {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Access denied: you may only view evaluation logs for your own account."
+                        .to_string(),
+                ));
+            }
+        }
+        Some(caller_did.as_str())
+    };
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0);
+    let source_filter = query.source.as_deref();
+
+    let total = state
+        .engine
+        .cache()
+        .count_evaluation_logs(target_filter, source_filter)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let evaluations = state
+        .engine
+        .cache()
+        .list_evaluation_logs(target_filter, source_filter, limit, offset)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(EvaluationsResponse { total, evaluations }))
 }
 
 /// Handler for `GET /api/admin/evaluations`: returns comprehensive Tier 1 & Tier 2 evaluation log (admin only).

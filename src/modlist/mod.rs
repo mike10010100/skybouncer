@@ -7,7 +7,7 @@ pub mod cache;
 pub mod manager;
 pub mod sovereign_config;
 
-pub use cache::{BouncedUser, DeduplicationCache, ModListConfig};
+pub use cache::{AllowlistEntry, BouncedUser, DeduplicationCache, ModListConfig};
 pub use manager::{ModListManager, DEFAULT_MOD_LIST_DESCRIPTION, DEFAULT_MOD_LIST_NAME};
 pub use sovereign_config::{
     extract_rubric_from_list_description, fetch_sovereign_config,

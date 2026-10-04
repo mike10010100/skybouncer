@@ -53,14 +53,16 @@ pub use limiter::{
 };
 pub use stream::{run_jetstream_streamer, StreamConfig, DEFAULT_JETSTREAM_ENDPOINT};
 pub use web::{
-    create_web_router, run_web_server, ApiState, BouncesQuery, LoginQuery, OAuthState,
-    PardonRequest, PardonResponse, RulesResponse, SimulateRequest, SimulateResponse,
-    StatusResponse, UpdateRulesRequest, WebServerConfig, DEFAULT_WEB_HOST, DEFAULT_WEB_PORT,
+    create_web_router, get_prometheus_metrics, run_web_server, AddAllowlistRequest,
+    AddAllowlistResponse, AllowlistQuery, ApiState, BouncesQuery, EvaluationsQuery,
+    EvaluationsResponse, LoginQuery, OAuthState, PardonRequest, PardonResponse,
+    RemoveAllowlistResponse, RulesResponse, SimulateRequest, SimulateResponse, StatusResponse,
+    UpdateRulesRequest, WebServerConfig, DEFAULT_WEB_HOST, DEFAULT_WEB_PORT,
 };
 
 pub use classifier::{
-    Classifier, HeuristicClassifier, HeuristicRule, JevClassifier, JevConfig, MockClassifier,
-    RuleRubric, Sensitivity, Verdict, ViolationCategory,
+    BounceDuration, Classifier, HeuristicClassifier, HeuristicRule, JevClassifier, JevConfig,
+    MockClassifier, RuleRubric, Sensitivity, Verdict, ViolationCategory,
 };
 pub use engine::{
     BounceNotification, EngineStats, EngineStatsSnapshot, InteractionOutcome, ProcessCommitResult,
@@ -76,9 +78,10 @@ pub use matcher::{
 };
 pub use modlist::{
     extract_rubric_from_list_description, fetch_sovereign_config,
-    format_list_description_with_rubric, publish_sovereign_config, BouncedUser, DeduplicationCache,
-    ModListConfig, ModListManager, SovereignConfigRecord, DEFAULT_MOD_LIST_DESCRIPTION,
-    DEFAULT_MOD_LIST_NAME, SOVEREIGN_CONFIG_COLLECTION, SOVEREIGN_CONFIG_RKEY,
+    format_list_description_with_rubric, publish_sovereign_config, AllowlistEntry, BouncedUser,
+    DeduplicationCache, ModListConfig, ModListManager, SovereignConfigRecord,
+    DEFAULT_MOD_LIST_DESCRIPTION, DEFAULT_MOD_LIST_NAME, SOVEREIGN_CONFIG_COLLECTION,
+    SOVEREIGN_CONFIG_RKEY,
 };
 pub use types::{
     format_system_time_iso8601, now_iso8601, ByteSlice, Embed, Facet, FacetFeature, FollowRecord,

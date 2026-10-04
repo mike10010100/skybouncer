@@ -8,6 +8,7 @@
 //! Enforces zero lock holding across `.await` points by wrapping connections in
 //! synchronous locks that are acquired and released exclusively inside method calls.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +60,31 @@ pub struct BouncedUser {
     pub post_text: String,
     /// Microsecond Unix timestamp when the bounce was recorded.
     pub bounced_at: u64,
+    /// Optional microsecond Unix timestamp when the temporary bounce expires (or `None` for permanent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+}
+
+impl BouncedUser {
+    /// Returns true if this bounce has an expiration timestamp and it has expired relative to `now_us`.
+    #[must_use]
+    pub fn is_expired(&self, now_us: u64) -> bool {
+        self.expires_at.is_some_and(|exp| exp <= now_us)
+    }
+}
+
+/// An account immunized on a protected user's moderation allowlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowlistEntry {
+    /// Decentralized identifier (DID) of the protected user owning this allowlist.
+    pub protected_did: String,
+    /// Decentralized identifier (DID) of the allowed/immunized subject.
+    pub subject_did: String,
+    /// Optional rationale explaining why the account was allowlisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Microsecond Unix timestamp when the entry was created.
+    pub created_at: u64,
 }
 
 /// Comprehensive audit record of an AI evaluation (Tier 1 & Tier 2 breakdown) persisted in SQLite.
@@ -89,7 +115,7 @@ pub struct EvaluationLogEntry {
     /// Action emitted by Tier 1 ("allow" or "violation").
     pub primary_action: String,
     /// Confidence score from Tier 1 (0.0 to 1.0).
-    pub primary_confidence: f32,
+    pub primary_confidence: f64,
     /// Moderation category from Tier 1, if any.
     pub primary_category: String,
     /// Rationale emitted by Tier 1.
@@ -103,7 +129,7 @@ pub struct EvaluationLogEntry {
     /// Action emitted by Tier 2 ("allow" or "violation"), if escalated.
     pub fallback_action: Option<String>,
     /// Confidence score from Tier 2 (0.0 to 1.0), if escalated.
-    pub fallback_confidence: Option<f32>,
+    pub fallback_confidence: Option<f64>,
     /// Moderation category from Tier 2, if escalated.
     pub fallback_category: Option<String>,
     /// Rationale emitted by Tier 2, if escalated.
@@ -111,7 +137,7 @@ pub struct EvaluationLogEntry {
     /// Final verdict action adopted by the engine ("allow" or "violation").
     pub final_action: String,
     /// Final confidence score adopted by the engine.
-    pub final_confidence: f32,
+    pub final_confidence: f64,
     /// Final operational outcome (e.g. "Bounced", "Permitted", "Below Rubric Threshold", "Rate Limited", etc.).
     pub outcome: String,
 }
@@ -142,7 +168,7 @@ pub struct NewEvaluationLog {
     /// Action emitted by Tier 1 ("allow" or "violation").
     pub primary_action: String,
     /// Confidence score from Tier 1 (0.0 to 1.0).
-    pub primary_confidence: f32,
+    pub primary_confidence: f64,
     /// Moderation category from Tier 1, if any.
     pub primary_category: String,
     /// Rationale emitted by Tier 1.
@@ -156,7 +182,7 @@ pub struct NewEvaluationLog {
     /// Action emitted by Tier 2 ("allow" or "violation"), if escalated.
     pub fallback_action: Option<String>,
     /// Confidence score from Tier 2 (0.0 to 1.0), if escalated.
-    pub fallback_confidence: Option<f32>,
+    pub fallback_confidence: Option<f64>,
     /// Moderation category from Tier 2, if escalated.
     pub fallback_category: Option<String>,
     /// Rationale emitted by Tier 2, if escalated.
@@ -164,7 +190,7 @@ pub struct NewEvaluationLog {
     /// Final verdict action adopted by the engine.
     pub final_action: String,
     /// Final confidence score adopted by the engine.
-    pub final_confidence: f32,
+    pub final_confidence: f64,
     /// Final operational outcome.
     pub outcome: String,
 }
@@ -275,6 +301,7 @@ impl DeduplicationCache {
                 bounced_at INTEGER NOT NULL,
                 protected_did TEXT NOT NULL DEFAULT '',
                 post_text TEXT NOT NULL DEFAULT '',
+                expires_at INTEGER,
                 PRIMARY KEY (protected_did, subject_did)
             );
 
@@ -328,6 +355,14 @@ impl DeduplicationCache {
                 final_confidence REAL NOT NULL,
                 outcome TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS allowlist (
+                protected_did TEXT NOT NULL,
+                subject_did TEXT NOT NULL,
+                reason TEXT,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (protected_did, subject_did)
+            );
             ",
         )
         .map_err(|e| {
@@ -349,6 +384,10 @@ impl DeduplicationCache {
         );
         let _ = conn.execute(
             "ALTER TABLE evaluation_log ADD COLUMN source TEXT NOT NULL DEFAULT 'live';",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE bounced_users ADD COLUMN expires_at INTEGER;",
             [],
         );
 
@@ -386,12 +425,13 @@ impl DeduplicationCache {
                     bounced_at INTEGER NOT NULL,
                     protected_did TEXT NOT NULL DEFAULT '',
                     post_text TEXT NOT NULL DEFAULT '',
+                    expires_at INTEGER,
                     PRIMARY KEY (protected_did, subject_did)
                 );
                 INSERT OR IGNORE INTO bounced_users_v2
                     SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
                            category, confidence, reason, post_uri, bounced_at,
-                           COALESCE(protected_did, ''), COALESCE(post_text, '')
+                           COALESCE(protected_did, ''), COALESCE(post_text, ''), expires_at
                     FROM bounced_users;
                 DROP TABLE bounced_users;
                 ALTER TABLE bounced_users_v2 RENAME TO bounced_users;
@@ -451,6 +491,9 @@ impl DeduplicationCache {
             CREATE INDEX IF NOT EXISTS idx_bounced_users_protected
                 ON bounced_users(protected_did);
 
+            CREATE INDEX IF NOT EXISTS idx_bounced_users_expires
+                ON bounced_users(expires_at) WHERE expires_at IS NOT NULL;
+
             CREATE INDEX IF NOT EXISTS idx_bounced_user_rkeys_subject
                 ON bounced_user_rkeys(subject_did);
 
@@ -488,6 +531,9 @@ impl DeduplicationCache {
 
             CREATE INDEX IF NOT EXISTS idx_evaluation_log_source
                 ON evaluation_log(source);
+
+            CREATE INDEX IF NOT EXISTS idx_allowlist_protected
+                ON allowlist(protected_did);
             ",
         )
         .map_err(|e| {
@@ -651,7 +697,7 @@ impl DeduplicationCache {
         let mut stmt = conn.prepare_cached(
             "SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
                         category, confidence, reason, post_uri, bounced_at,
-                        protected_did, post_text
+                        protected_did, post_text, expires_at
                  FROM bounced_users
                  WHERE subject_did = ?1
                  LIMIT 1;",
@@ -661,6 +707,9 @@ impl DeduplicationCache {
             .query_row(params![subject_did], |row| {
                 let bounced_at_i64: i64 = row.get(8)?;
                 let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
+                let expires_at = row
+                    .get::<_, Option<i64>>(11)?
+                    .map(|v| u64::try_from(v.max(0)).unwrap_or_default());
                 Ok(BouncedUser {
                     subject_did: row.get(0)?,
                     listitem_uri: row.get(1)?,
@@ -673,6 +722,7 @@ impl DeduplicationCache {
                     bounced_at,
                     protected_did: row.get(9)?,
                     post_text: row.get(10)?,
+                    expires_at,
                 })
             })
             .optional()?;
@@ -693,7 +743,7 @@ impl DeduplicationCache {
         let mut stmt = conn.prepare_cached(
             "SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
                         category, confidence, reason, post_uri, bounced_at,
-                        protected_did, post_text
+                        protected_did, post_text, expires_at
                  FROM bounced_users
                  WHERE subject_did = ?1 AND protected_did = ?2;",
         )?;
@@ -702,6 +752,9 @@ impl DeduplicationCache {
             .query_row(params![subject_did, protected_did], |row| {
                 let bounced_at_i64: i64 = row.get(8)?;
                 let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
+                let expires_at = row
+                    .get::<_, Option<i64>>(11)?
+                    .map(|v| u64::try_from(v.max(0)).unwrap_or_default());
                 Ok(BouncedUser {
                     subject_did: row.get(0)?,
                     listitem_uri: row.get(1)?,
@@ -714,6 +767,7 @@ impl DeduplicationCache {
                     bounced_at,
                     protected_did: row.get(9)?,
                     post_text: row.get(10)?,
+                    expires_at,
                 })
             })
             .optional()?;
@@ -732,6 +786,9 @@ impl DeduplicationCache {
     /// Returns [`SkybouncerError::Database`] if the insert fails.
     pub fn record_bounce(&self, entry: &BouncedUser) -> Result<(), SkybouncerError> {
         let bounced_at_i64 = i64::try_from(entry.bounced_at).unwrap_or(i64::MAX);
+        let expires_at_i64 = entry
+            .expires_at
+            .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
 
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(|e| {
@@ -746,8 +803,8 @@ impl DeduplicationCache {
                 "INSERT INTO bounced_users (
                         subject_did, listitem_uri, listitem_rkey, listitem_cid,
                         category, confidence, reason, post_uri, bounced_at,
-                        protected_did, post_text
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                        protected_did, post_text, expires_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                      ON CONFLICT(protected_did, subject_did) DO UPDATE SET
                          listitem_uri = excluded.listitem_uri,
                          listitem_rkey = excluded.listitem_rkey,
@@ -757,7 +814,8 @@ impl DeduplicationCache {
                          reason = excluded.reason,
                          post_uri = excluded.post_uri,
                          bounced_at = excluded.bounced_at,
-                         post_text = excluded.post_text;",
+                         post_text = excluded.post_text,
+                         expires_at = excluded.expires_at;",
             )?;
 
             user_stmt.execute(params![
@@ -772,6 +830,7 @@ impl DeduplicationCache {
                 bounced_at_i64,
                 entry.protected_did,
                 entry.post_text,
+                expires_at_i64,
             ])?;
         }
 
@@ -920,7 +979,7 @@ impl DeduplicationCache {
             let mut stmt = conn.prepare_cached(
                 "SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
                         category, confidence, reason, post_uri, bounced_at,
-                        protected_did, post_text
+                        protected_did, post_text, expires_at
                  FROM bounced_users
                  WHERE protected_did = ?1
                  ORDER BY bounced_at DESC
@@ -930,6 +989,9 @@ impl DeduplicationCache {
             let rows = stmt.query_map(params![target, limit_i64], |row| {
                 let bounced_at_i64: i64 = row.get(8)?;
                 let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
+                let expires_at = row
+                    .get::<_, Option<i64>>(11)?
+                    .map(|v| u64::try_from(v.max(0)).unwrap_or_default());
                 Ok(BouncedUser {
                     subject_did: row.get(0)?,
                     listitem_uri: row.get(1)?,
@@ -942,6 +1004,7 @@ impl DeduplicationCache {
                     bounced_at,
                     protected_did: row.get(9)?,
                     post_text: row.get(10)?,
+                    expires_at,
                 })
             })?;
 
@@ -952,7 +1015,7 @@ impl DeduplicationCache {
             let mut stmt = conn.prepare_cached(
                 "SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
                         category, confidence, reason, post_uri, bounced_at,
-                        protected_did, post_text
+                        protected_did, post_text, expires_at
                  FROM bounced_users
                  ORDER BY bounced_at DESC
                  LIMIT ?1;",
@@ -961,6 +1024,9 @@ impl DeduplicationCache {
             let rows = stmt.query_map(params![limit_i64], |row| {
                 let bounced_at_i64: i64 = row.get(8)?;
                 let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
+                let expires_at = row
+                    .get::<_, Option<i64>>(11)?
+                    .map(|v| u64::try_from(v.max(0)).unwrap_or_default());
                 Ok(BouncedUser {
                     subject_did: row.get(0)?,
                     listitem_uri: row.get(1)?,
@@ -973,6 +1039,7 @@ impl DeduplicationCache {
                     bounced_at,
                     protected_did: row.get(9)?,
                     post_text: row.get(10)?,
+                    expires_at,
                 })
             })?;
 
@@ -981,6 +1048,51 @@ impl DeduplicationCache {
             }
         }
 
+        Ok(list)
+    }
+
+    /// Lists all temporary bounces that have expired relative to `now_us`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    pub fn list_expired_bounces(&self, now_us: u64) -> Result<Vec<BouncedUser>, SkybouncerError> {
+        let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
+                    category, confidence, reason, post_uri, bounced_at,
+                    protected_did, post_text, expires_at
+             FROM bounced_users
+             WHERE expires_at IS NOT NULL AND expires_at <= ?1
+             ORDER BY expires_at ASC;",
+        )?;
+
+        let rows = stmt.query_map(params![now_i64], |row| {
+            let bounced_at_i64: i64 = row.get(8)?;
+            let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
+            let expires_at = row
+                .get::<_, Option<i64>>(11)?
+                .map(|v| u64::try_from(v.max(0)).unwrap_or_default());
+            Ok(BouncedUser {
+                subject_did: row.get(0)?,
+                listitem_uri: row.get(1)?,
+                listitem_rkey: row.get(2)?,
+                listitem_cid: row.get(3)?,
+                category: row.get(4)?,
+                confidence: row.get(5)?,
+                reason: row.get(6)?,
+                post_uri: row.get(7)?,
+                bounced_at,
+                protected_did: row.get(9)?,
+                post_text: row.get(10)?,
+                expires_at,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
         Ok(list)
     }
 
@@ -1250,9 +1362,9 @@ impl DeduplicationCache {
         let timestamp_i64 = i64::try_from(entry.timestamp_us).unwrap_or(i64::MAX);
         let has_images_i64 = if entry.has_images { 1 } else { 0 };
         let escalated_i64 = if entry.escalated { 1 } else { 0 };
-        let primary_conf_f64 = f64::from(entry.primary_confidence);
-        let fallback_conf_f64 = entry.fallback_confidence.map(f64::from);
-        let final_conf_f64 = f64::from(entry.final_confidence);
+        let primary_conf_f64 = entry.primary_confidence;
+        let fallback_conf_f64 = entry.fallback_confidence;
+        let final_conf_f64 = entry.final_confidence;
 
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
@@ -1357,21 +1469,18 @@ impl DeduplicationCache {
             let has_images: bool = row.get::<_, i64>(9)? != 0;
             let primary_model: String = row.get(10)?;
             let primary_action: String = row.get(11)?;
-            #[allow(clippy::cast_possible_truncation)]
-            let primary_confidence = row.get::<_, f64>(12)? as f32;
+            let primary_confidence: f64 = row.get(12)?;
             let primary_category: String = row.get(13)?;
             let primary_reason: String = row.get(14)?;
             let escalated: bool = row.get::<_, i64>(15)? != 0;
             let escalation_reason: Option<String> = row.get(16)?;
             let fallback_model: Option<String> = row.get(17)?;
             let fallback_action: Option<String> = row.get(18)?;
-            #[allow(clippy::cast_possible_truncation)]
-            let fallback_confidence: Option<f32> = row.get::<_, Option<f64>>(19)?.map(|c| c as f32);
+            let fallback_confidence: Option<f64> = row.get(19)?;
             let fallback_category: Option<String> = row.get(20)?;
             let fallback_reason: Option<String> = row.get(21)?;
             let final_action: String = row.get(22)?;
-            #[allow(clippy::cast_possible_truncation)]
-            let final_confidence = row.get::<_, f64>(23)? as f32;
+            let final_confidence: f64 = row.get(23)?;
             let outcome: String = row.get(24)?;
 
             Ok(EvaluationLogEntry {
@@ -1455,6 +1564,126 @@ impl DeduplicationCache {
         let deleted = stmt.execute(params![max_i64])?;
         Ok(deleted)
     }
+
+    /// Adds an account to the protected user's moderation allowlist.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite persistence fails.
+    pub fn add_to_allowlist(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+        reason: Option<&str>,
+    ) -> Result<(), SkybouncerError> {
+        let conn = self.conn.lock();
+        let now_us = current_time_us();
+        let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
+
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO allowlist (protected_did, subject_did, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(protected_did, subject_did) DO UPDATE SET
+                 reason = excluded.reason,
+                 created_at = excluded.created_at;",
+        )?;
+
+        stmt.execute(params![protected_did, subject_did, reason, now_i64])?;
+        Ok(())
+    }
+
+    /// Removes an account from the protected user's moderation allowlist.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite delete fails.
+    pub fn remove_from_allowlist(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<bool, SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "DELETE FROM allowlist WHERE protected_did = ?1 AND subject_did = ?2;",
+        )?;
+        let affected = stmt.execute(params![protected_did, subject_did])?;
+        Ok(affected > 0)
+    }
+
+    /// Checks whether an account is currently on the protected user's moderation allowlist in SQLite.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn is_allowlisted(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<bool, SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT 1 FROM allowlist WHERE protected_did = ?1 AND subject_did = ?2 LIMIT 1;",
+        )?;
+        let exists = stmt
+            .query_row(params![protected_did, subject_did], |_| Ok(()))
+            .optional()?
+            .is_some();
+        Ok(exists)
+    }
+
+    /// Lists all accounts on the protected user's moderation allowlist.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn list_allowlist(
+        &self,
+        protected_did: &str,
+    ) -> Result<Vec<AllowlistEntry>, SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT protected_did, subject_did, reason, created_at
+             FROM allowlist
+             WHERE protected_did = ?1
+             ORDER BY created_at DESC;",
+        )?;
+        let rows = stmt.query_map(params![protected_did], |row| {
+            let p_did: String = row.get(0)?;
+            let s_did: String = row.get(1)?;
+            let reason: Option<String> = row.get(2)?;
+            let created_at_i64: i64 = row.get(3)?;
+            let created_at = u64::try_from(created_at_i64.max(0)).unwrap_or_default();
+            Ok(AllowlistEntry {
+                protected_did: p_did,
+                subject_did: s_did,
+                reason,
+                created_at,
+            })
+        })?;
+
+        let mut entries = Vec::new();
+        for r in rows {
+            entries.push(r?);
+        }
+        Ok(entries)
+    }
+
+    /// Loads all allowlist records across all protected users into a nested HashMap.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn load_all_allowlists(&self) -> Result<HashMap<String, HashSet<String>>, SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached("SELECT protected_did, subject_did FROM allowlist;")?;
+        let rows = stmt.query_map([], |row| {
+            let p_did: String = row.get(0)?;
+            let s_did: String = row.get(1)?;
+            Ok((p_did, s_did))
+        })?;
+
+        let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+        for r in rows {
+            let (p, s) = r?;
+            map.entry(p).or_default().insert(s);
+        }
+        Ok(map)
+    }
 }
 
 /// Computes clock-warp safe microsecond timestamp since Unix epoch.
@@ -1512,6 +1741,7 @@ mod tests {
             post_uri: "at://did:plc:badactor/app.bsky.feed.post/post1".to_string(),
             post_text: "Free airdrop at scam link".to_string(),
             bounced_at: 1_700_000_100,
+            expires_at: None,
         };
 
         assert!(!cache.is_bounced("did:plc:badactor").unwrap());
@@ -1625,6 +1855,7 @@ mod tests {
             post_uri: "at://did:plc:migrated_user/app.bsky.feed.post/1".to_string(),
             post_text: "Migrated text".to_string(),
             bounced_at: 1_700_000_000,
+            expires_at: None,
         };
         cache.record_bounce(&bounce).unwrap();
         let fetched = cache
@@ -1795,6 +2026,7 @@ mod tests {
             post_uri: "at://did:plc:spammer/app.bsky.feed.post/1".to_string(),
             post_text: "Spam text".to_string(),
             bounced_at: 1_700_000_000,
+            expires_at: None,
         };
 
         let bounce_b = BouncedUser {
@@ -1809,6 +2041,7 @@ mod tests {
             post_uri: "at://did:plc:spammer/app.bsky.feed.post/2".to_string(),
             post_text: "Harassment text".to_string(),
             bounced_at: 1_700_000_100,
+            expires_at: None,
         };
 
         // Record bounces for both tenants
@@ -1863,5 +2096,61 @@ mod tests {
             .unwrap();
         assert_eq!(list_b_after.len(), 1);
         assert_eq!(list_b_after[0].listitem_rkey, "item_b");
+    }
+
+    #[test]
+    fn test_allowlist_crud_and_loading() {
+        let cache = DeduplicationCache::open_in_memory().unwrap();
+
+        assert!(!cache
+            .is_allowlisted("did:plc:alice", "did:plc:friend")
+            .unwrap());
+
+        cache
+            .add_to_allowlist("did:plc:alice", "did:plc:friend", Some("Friend of mine"))
+            .unwrap();
+        cache
+            .add_to_allowlist("did:plc:alice", "did:plc:colleague", None)
+            .unwrap();
+        cache
+            .add_to_allowlist("did:plc:bob", "did:plc:partner", Some("Work partner"))
+            .unwrap();
+
+        assert!(cache
+            .is_allowlisted("did:plc:alice", "did:plc:friend")
+            .unwrap());
+        assert!(cache
+            .is_allowlisted("did:plc:alice", "did:plc:colleague")
+            .unwrap());
+        assert!(!cache
+            .is_allowlisted("did:plc:alice", "did:plc:partner")
+            .unwrap());
+        assert!(cache
+            .is_allowlisted("did:plc:bob", "did:plc:partner")
+            .unwrap());
+
+        let alice_list = cache.list_allowlist("did:plc:alice").unwrap();
+        assert_eq!(alice_list.len(), 2);
+        assert!(alice_list
+            .iter()
+            .any(|e| e.subject_did == "did:plc:friend"
+                && e.reason.as_deref() == Some("Friend of mine")));
+
+        let all_map = cache.load_all_allowlists().unwrap();
+        assert_eq!(all_map.get("did:plc:alice").unwrap().len(), 2);
+        assert_eq!(all_map.get("did:plc:bob").unwrap().len(), 1);
+
+        let removed = cache
+            .remove_from_allowlist("did:plc:alice", "did:plc:friend")
+            .unwrap();
+        assert!(removed);
+        assert!(!cache
+            .is_allowlisted("did:plc:alice", "did:plc:friend")
+            .unwrap());
+
+        let removed_again = cache
+            .remove_from_allowlist("did:plc:alice", "did:plc:friend")
+            .unwrap();
+        assert!(!removed_again);
     }
 }
