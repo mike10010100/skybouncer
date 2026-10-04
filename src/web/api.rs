@@ -1526,6 +1526,78 @@ pub struct AdminEvaluationsResponse {
     pub evaluations: Vec<EvaluationLogEntry>,
 }
 
+/// Query parameters for tenant evaluation logs (`GET /api/evaluations`).
+#[derive(Debug, Deserialize)]
+pub struct EvaluationsQuery {
+    /// Optional target DID filter (for admins; regular users can only view their own).
+    pub target_did: Option<String>,
+    /// Optional source filter: "all", "live", or "simulation".
+    pub source: Option<String>,
+    /// Max entries to return (default: 50, max: 200).
+    pub limit: Option<usize>,
+    /// Pagination offset.
+    pub offset: Option<usize>,
+}
+
+/// Response payload containing evaluation logs for tenant or administrative audit.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EvaluationsResponse {
+    /// Total count of evaluation logs matching filter.
+    pub total: usize,
+    /// List of evaluation log entries.
+    pub evaluations: Vec<EvaluationLogEntry>,
+}
+
+/// Handler for `GET /api/evaluations`: returns evaluation audit logs scoped to the authenticated caller
+/// (or target DID for admins) adhering to PRD §7.1 Item 3.
+pub async fn get_evaluations(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<EvaluationsQuery>,
+) -> Result<Json<EvaluationsResponse>, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to access evaluation audit logs. Please sign in with Bluesky."
+                .to_string(),
+        )
+    })?;
+
+    let is_admin = state.engine.is_admin(&caller_did);
+    let target_filter = if is_admin {
+        query.target_did.as_deref().filter(|s| !s.trim().is_empty())
+    } else {
+        if let Some(requested_did) = query.target_did.as_deref().filter(|s| !s.trim().is_empty()) {
+            if requested_did != caller_did {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Access denied: you may only view evaluation logs for your own account."
+                        .to_string(),
+                ));
+            }
+        }
+        Some(caller_did.as_str())
+    };
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0);
+    let source_filter = query.source.as_deref();
+
+    let total = state
+        .engine
+        .cache()
+        .count_evaluation_logs(target_filter, source_filter)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let evaluations = state
+        .engine
+        .cache()
+        .list_evaluation_logs(target_filter, source_filter, limit, offset)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(EvaluationsResponse { total, evaluations }))
+}
+
 /// Handler for `GET /api/admin/evaluations`: returns comprehensive Tier 1 & Tier 2 evaluation log (admin only).
 pub async fn get_admin_evaluations(
     State(state): State<ApiState>,

@@ -29,9 +29,10 @@ use skyauth::client::OAuthClientMetadata;
 use skybouncer::classifier::{RuleRubric, Sensitivity, Verdict};
 use skybouncer::engine::{SkybouncerConfig, SkybouncerEngine};
 use skybouncer::matcher::{FollowGraph, NonFollowedGate};
+use skybouncer::modlist::cache::NewEvaluationLog;
 use skybouncer::modlist::{AllowlistEntry, BouncedUser, DeduplicationCache, ModListManager};
 use skybouncer::web::{
-    create_web_router, run_web_server, AddAllowlistResponse, PardonResponse,
+    create_web_router, run_web_server, AddAllowlistResponse, EvaluationsResponse, PardonResponse,
     RemoveAllowlistResponse, RulesResponse, SimulateResponse, StatusResponse, WebServerConfig,
 };
 
@@ -134,6 +135,11 @@ async fn test_serve_dashboard_html() {
     assert!(body_str.contains("bskyProfileUrl"));
     assert!(body_str.contains("bskyPostUrl"));
     assert!(body_str.contains("formatDid"));
+    assert!(body_str.contains("allowlist-card"));
+    assert!(body_str.contains("bounces-search-input"));
+    assert!(body_str.contains("applyRubricPreset"));
+    assert!(body_str.contains("btn-pardon-allow"));
+    assert!(body_str.contains("total-allowlisted"));
 }
 
 #[tokio::test]
@@ -1473,4 +1479,168 @@ async fn test_web_allowlist_endpoints_and_pardon_immunization() {
     assert!(!cache.is_bounced_for(protected_did, violator_did).unwrap());
     // Verify present on allowlist
     assert!(engine.is_allowlisted(protected_did, violator_did));
+}
+
+#[tokio::test]
+async fn test_tenant_scoped_evaluations_api() {
+    let alice_did = "did:plc:alice";
+    let bob_did = "did:plc:bob";
+    let admin_did = "did:plc:admin_user";
+
+    let (engine, cache, _pds, app) = setup_test_web_environment(admin_did).await;
+
+    // Enroll alice and bob as tenants
+    let alice_tenant = skybouncer::tenant::Tenant::new(alice_did);
+    engine
+        .tenant_registry()
+        .register_or_update(&alice_tenant)
+        .unwrap();
+    let bob_tenant = skybouncer::tenant::Tenant::new(bob_did);
+    engine
+        .tenant_registry()
+        .register_or_update(&bob_tenant)
+        .unwrap();
+
+    let alice_token = create_test_session(&engine, alice_did);
+    let bob_token = create_test_session(&engine, bob_did);
+    let admin_token = create_test_session(&engine, admin_did);
+
+    // Record an evaluation targeting Alice (source: live)
+    cache
+        .record_evaluation_log(&NewEvaluationLog {
+            timestamp_us: 1_700_000_000_000_000,
+            source: "live".to_string(),
+            post_uri: "at://did:plc:spammer1/app.bsky.feed.post/p1".to_string(),
+            post_text: "Crypto spam targeting Alice".to_string(),
+            author_did: "did:plc:spammer1".to_string(),
+            author_handle: "spammer1.bsky.social".to_string(),
+            target_did: alice_did.to_string(),
+            target_handle: "alice.bsky.social".to_string(),
+            has_images: false,
+            primary_model: "gemma-27b".to_string(),
+            primary_action: "violation".to_string(),
+            primary_confidence: 0.98,
+            primary_category: "spam".to_string(),
+            primary_reason: "Blatant shilling".to_string(),
+            escalated: false,
+            escalation_reason: None,
+            fallback_model: None,
+            fallback_action: None,
+            fallback_confidence: None,
+            fallback_category: None,
+            fallback_reason: None,
+            final_action: "violation".to_string(),
+            final_confidence: 0.98,
+            outcome: "Bounced".to_string(),
+        })
+        .unwrap();
+
+    // Record an evaluation targeting Bob (source: simulation)
+    cache
+        .record_evaluation_log(&NewEvaluationLog {
+            timestamp_us: 1_700_000_010_000_000,
+            source: "simulation".to_string(),
+            post_uri: "at://did:plc:tester/app.bsky.feed.post/p2".to_string(),
+            post_text: "Test simulated post for Bob".to_string(),
+            author_did: "did:plc:tester".to_string(),
+            author_handle: "tester.bsky.social".to_string(),
+            target_did: bob_did.to_string(),
+            target_handle: "bob.bsky.social".to_string(),
+            has_images: false,
+            primary_model: "gemma-27b".to_string(),
+            primary_action: "allow".to_string(),
+            primary_confidence: 0.95,
+            primary_category: "".to_string(),
+            primary_reason: "Benign text".to_string(),
+            escalated: false,
+            escalation_reason: None,
+            fallback_model: None,
+            fallback_action: None,
+            fallback_confidence: None,
+            fallback_category: None,
+            fallback_reason: None,
+            final_action: "allow".to_string(),
+            final_confidence: 0.95,
+            outcome: "Permitted".to_string(),
+        })
+        .unwrap();
+
+    // 1. Unauthenticated request to /api/evaluations should return 401
+    let unauth_req = Request::builder()
+        .uri("/api/evaluations")
+        .body(Body::empty())
+        .unwrap();
+    let unauth_resp = app.clone().oneshot(unauth_req).await.unwrap();
+    assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. Alice requests /api/evaluations -> gets ONLY evaluations targeting Alice (1 entry)
+    let alice_req = Request::builder()
+        .uri("/api/evaluations")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let alice_resp = app.clone().oneshot(alice_req).await.unwrap();
+    assert_eq!(alice_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(alice_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let eval_res: EvaluationsResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(eval_res.total, 1);
+    assert_eq!(eval_res.evaluations.len(), 1);
+    assert_eq!(eval_res.evaluations[0].target_did, alice_did);
+    assert_eq!(eval_res.evaluations[0].source, "live");
+
+    // 3. Alice tries to inspect Bob's evaluations via ?target_did=bob -> 403 Forbidden!
+    let alice_bob_req = Request::builder()
+        .uri(format!("/api/evaluations?target_did={bob_did}"))
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let alice_bob_resp = app.clone().oneshot(alice_bob_req).await.unwrap();
+    assert_eq!(alice_bob_resp.status(), StatusCode::FORBIDDEN);
+
+    // 4. Bob requests /api/evaluations -> gets ONLY evaluations targeting Bob (1 entry)
+    let bob_req = Request::builder()
+        .uri("/api/evaluations")
+        .header("cookie", format!("skybouncer_session={bob_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let bob_resp = app.clone().oneshot(bob_req).await.unwrap();
+    assert_eq!(bob_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(bob_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let eval_res_bob: EvaluationsResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(eval_res_bob.total, 1);
+    assert_eq!(eval_res_bob.evaluations[0].target_did, bob_did);
+    assert_eq!(eval_res_bob.evaluations[0].source, "simulation");
+
+    // 5. Admin requests /api/evaluations -> sees fleet-wide logs (2 entries)
+    let admin_req = Request::builder()
+        .uri("/api/evaluations")
+        .header("cookie", format!("skybouncer_session={admin_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let admin_resp = app.clone().oneshot(admin_req).await.unwrap();
+    assert_eq!(admin_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(admin_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let eval_res_admin: EvaluationsResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(eval_res_admin.total, 2);
+
+    // 6. Admin filters by source=simulation -> 1 entry
+    let admin_sim_req = Request::builder()
+        .uri("/api/evaluations?source=simulation")
+        .header("cookie", format!("skybouncer_session={admin_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let admin_sim_resp = app.clone().oneshot(admin_sim_req).await.unwrap();
+    assert_eq!(admin_sim_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(admin_sim_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let eval_res_sim: EvaluationsResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(eval_res_sim.total, 1);
+    assert_eq!(eval_res_sim.evaluations[0].source, "simulation");
 }

@@ -24,9 +24,10 @@ use tracing::info;
 pub use api::{
     health_check, AddAllowlistRequest, AddAllowlistResponse, AdminEvaluationsQuery,
     AdminEvaluationsResponse, AdminTenantsResponse, AllowlistQuery, ApiState, BouncesQuery,
-    HealthResponse, PardonRequest, PardonResponse, RemoveAllowlistResponse, RulesResponse,
-    SimulateRequest, SimulateResponse, StatusResponse, TenantSummary, ToggleTenantRequest,
-    ToggleTenantResponse, UpdateRulesRequest, UserSessionResponse,
+    EvaluationsQuery, EvaluationsResponse, HealthResponse, PardonRequest, PardonResponse,
+    RemoveAllowlistResponse, RulesResponse, SimulateRequest, SimulateResponse, StatusResponse,
+    TenantSummary, ToggleTenantRequest, ToggleTenantResponse, UpdateRulesRequest,
+    UserSessionResponse,
 };
 pub use oauth::{LoginQuery, OAuthState};
 pub use ui::serve_dashboard;
@@ -188,6 +189,7 @@ pub fn create_web_router(
         .route("/me", get(api::get_current_user))
         .route("/admin/tenants", get(api::get_admin_tenants))
         .route("/admin/evaluations", get(api::get_admin_evaluations))
+        .route("/evaluations", get(api::get_evaluations))
         .route("/tenant/toggle", post(api::toggle_tenant))
         .route("/auth/logout", post(api::logout))
         .with_state(api_state);
