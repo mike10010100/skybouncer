@@ -144,11 +144,21 @@ pub struct StatusResponse {
 }
 
 /// Handler for `GET /api/status`: returns engine operational telemetry.
-pub async fn get_status(State(state): State<ApiState>) -> Json<StatusResponse> {
+pub async fn get_status(State(state): State<ApiState>, headers: HeaderMap) -> Json<StatusResponse> {
     let stats = state.engine.stats().snapshot();
     let mut protected_dids: Vec<String> = state.engine.protected_dids().into_iter().collect();
     protected_dids.sort();
-    let rubric = state.engine.rubric();
+
+    // Redact private prompt for unauthenticated callers
+    let caller_did = extract_authenticated_caller(&headers);
+    let rubric = if let Some(ref did) = caller_did {
+        state.engine.rubric_for(did)
+    } else {
+        RuleRubric {
+            prompt: "[Protected sovereign rubric - sign in to view]".to_string(),
+            sensitivity: state.engine.rubric().sensitivity,
+        }
+    };
 
     Json(StatusResponse {
         stats,
@@ -174,40 +184,113 @@ pub async fn health_check() -> (StatusCode, Json<HealthResponse>) {
     )
 }
 
-/// Handler for `GET /api/rules`: returns active moderation rubric for caller or engine default.
+/// Extracts the verified authenticated caller DID strictly from Cookie or x-skybouncer-did header.
+pub fn extract_authenticated_caller(headers: &HeaderMap) -> Option<String> {
+    if let Some(cookie_header) = headers.get(header::COOKIE) {
+        if let Ok(s) = cookie_header.to_str() {
+            for part in s.split(';') {
+                let part = part.trim();
+                if let Some(val) = part.strip_prefix("skybouncer_did=") {
+                    let trimmed = val.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(h) = headers.get("x-skybouncer-did") {
+        if let Ok(s) = h.to_str() {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolves the authenticated caller identity and enforces authorization on the target DID for rules endpoints.
+///
+/// # Errors
+/// Returns `StatusCode::UNAUTHORIZED` if caller is not authenticated,
+/// or `StatusCode::FORBIDDEN` if caller attempts to access another user's rules without admin privileges.
+pub fn resolve_rules_target_did(
+    engine: &SkybouncerEngine,
+    headers: &HeaderMap,
+    query_did: Option<&str>,
+    action_desc: &str,
+) -> Result<String, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            format!("Authentication required to {action_desc}. Please sign in with Bluesky."),
+        )
+    })?;
+
+    let is_admin = engine.is_admin(&caller_did);
+    let is_enrolled = engine.is_enrolled(&caller_did);
+    let is_protected = engine.is_protected(&caller_did);
+
+    if !is_admin && !is_enrolled && !is_protected {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!("Account {caller_did} is not enrolled or recognized. Please sign in."),
+        ));
+    }
+
+    // Target DID: if caller requests a different target, must be admin
+    if let Some(target) = query_did.map(str::trim).filter(|s| !s.is_empty()) {
+        if target != caller_did && !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("Access denied: you may only {action_desc} for your own account."),
+            ));
+        }
+        Ok(target.to_string())
+    } else {
+        Ok(caller_did)
+    }
+}
+
+/// Handler for `GET /api/rules`: returns active moderation rubric for authenticated caller.
 pub async fn get_rules(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<SessionQuery>,
-) -> Json<RulesResponse> {
-    let did_opt = extract_did_from_headers(&headers, query.did.as_deref());
-    let rubric = if let Some(ref did) = did_opt {
-        state.engine.rubric_for(did)
-    } else {
-        state.engine.rubric()
-    };
+) -> Result<Json<RulesResponse>, (StatusCode, String)> {
+    let target_did = resolve_rules_target_did(
+        &state.engine,
+        &headers,
+        query.did.as_deref(),
+        "view moderation rules",
+    )?;
 
-    Json(RulesResponse {
+    let rubric = state.engine.rubric_for(&target_did);
+    Ok(Json(RulesResponse {
         prompt: rubric.prompt,
         sensitivity: rubric.sensitivity,
         threshold: rubric.sensitivity.threshold(),
-    })
+    }))
 }
 
-/// Handler for `POST /api/rules`: updates the active moderation rubric for caller and persists to sovereign PDS.
+/// Handler for `POST /api/rules`: updates the active moderation rubric for authenticated caller and persists to sovereign PDS.
 pub async fn update_rules(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<SessionQuery>,
     Json(payload): Json<UpdateRulesRequest>,
 ) -> Result<Json<RulesResponse>, (StatusCode, String)> {
-    let did_opt = extract_did_from_headers(&headers, query.did.as_deref());
+    let target_did = resolve_rules_target_did(
+        &state.engine,
+        &headers,
+        query.did.as_deref(),
+        "modify moderation rules",
+    )?;
 
-    let mut rubric = if let Some(ref did) = did_opt {
-        state.engine.rubric_for(did)
-    } else {
-        state.engine.rubric()
-    };
+    let mut rubric = state.engine.rubric_for(&target_did);
 
     if let Some(prompt) = payload.prompt {
         let trimmed = prompt.trim();
@@ -226,37 +309,27 @@ pub async fn update_rules(
         rubric.sensitivity = sens;
     }
 
-    let is_admin_or_protected = if let Some(ref did) = did_opt {
-        let is_enrolled = state
+    let is_enrolled = state
+        .engine
+        .tenant_registry()
+        .is_enrolled(&target_did)
+        .unwrap_or(false);
+    if is_enrolled {
+        let _ = state
             .engine
             .tenant_registry()
-            .is_enrolled(did)
-            .unwrap_or(false);
-        if is_enrolled {
-            let _ = state.engine.tenant_registry().update_rubric(did, &rubric);
-        }
-        state.engine.is_admin(did) || state.engine.is_protected(did)
-    } else {
-        true
-    };
+            .update_rubric(&target_did, &rubric);
+    }
 
-    // If caller is admin or global protected user, or no tenant isolation, update engine's active rubric
-    if is_admin_or_protected {
+    if state.engine.is_admin(&target_did) || state.engine.is_protected(&target_did) {
         state.engine.set_rubric(rubric.clone());
     }
 
     // Asynchronously persist updated rubric to user's sovereign PDS repository
     let eng = state.engine.clone();
-    let target_dids: Vec<String> = if let Some(ref did) = did_opt {
-        vec![did.clone()]
-    } else {
-        eng.protected_dids().into_iter().collect()
-    };
-
+    let publish_did = target_did.clone();
     tokio::spawn(async move {
-        for did in target_dids {
-            let _ = eng.publish_sovereign_config(&did).await;
-        }
+        let _ = eng.publish_sovereign_config(&publish_did).await;
     });
 
     Ok(Json(RulesResponse {

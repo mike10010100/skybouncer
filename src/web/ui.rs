@@ -497,32 +497,46 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       </section>
 
       <!-- House Rules & Controls Card -->
-      <section class="card">
+      <section class="card" id="rules-card">
         <div class="card-header">
           <div class="card-title">📋 House Rules & Sensitivity</div>
-          <span style="font-size: 0.8rem; color: var(--text-muted);">Live Sync</span>
+          <span style="font-size: 0.8rem; color: var(--text-muted);" id="rules-sync-indicator">Live Sync</span>
         </div>
-        <p style="font-size: 0.85rem; color: var(--text-muted);">
-          Natural-language moderation prompt evaluated by classifiers.
-        </p>
-        <div>
-          <label style="font-size: 0.75rem; text-transform: uppercase; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">
-            Detection Sensitivity
-          </label>
-          <div class="segmented-control">
-            <button class="segmented-btn" id="sens-low" onclick="setSensitivity('low')">Low (0.90)</button>
-            <button class="segmented-btn active" id="sens-med" onclick="setSensitivity('medium')">Medium (0.75)</button>
-            <button class="segmented-btn" id="sens-high" onclick="setSensitivity('high')">High (0.60)</button>
+
+        <!-- Unauthenticated Locked Placeholder (shown when not logged in) -->
+        <div id="rules-unauth-container" style="display: none; padding: 2rem 1rem; text-align: center;">
+          <div style="font-size: 2.2rem; margin-bottom: 0.5rem;">🔒</div>
+          <div style="font-weight: 700; font-size: 1.05rem; margin-bottom: 0.35rem;">House Rules Private</div>
+          <p style="font-size: 0.85rem; color: var(--text-muted); max-width: 380px; margin: 0 auto 1.25rem auto;">
+            Moderation rubrics and sensitivity settings are private to each user. Sign in with your Bluesky account to view and customize your rules.
+          </p>
+          <button class="btn" onclick="showLoginModal()">Sign In with Bluesky</button>
+        </div>
+
+        <!-- Authenticated Rules Controls (shown when logged in) -->
+        <div id="rules-auth-container" style="display: none;">
+          <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">
+            Natural-language moderation prompt evaluated by classifiers.
+          </p>
+          <div style="margin-bottom: 1rem;">
+            <label style="font-size: 0.75rem; text-transform: uppercase; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">
+              Detection Sensitivity
+            </label>
+            <div class="segmented-control">
+              <button class="segmented-btn" id="sens-low" onclick="setSensitivity('low')">Low (0.90)</button>
+              <button class="segmented-btn active" id="sens-med" onclick="setSensitivity('medium')">Medium (0.75)</button>
+              <button class="segmented-btn" id="sens-high" onclick="setSensitivity('high')">High (0.60)</button>
+            </div>
           </div>
-        </div>
-        <div>
-          <label style="font-size: 0.75rem; text-transform: uppercase; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">
-            Moderation Prompt
-          </label>
-          <textarea id="rules-prompt" rows="4" placeholder="Describe what content should be automatically filtered..."></textarea>
-        </div>
-        <div>
-          <button class="btn" onclick="saveRules()">💾 Save Rubric</button>
+          <div style="margin-bottom: 1rem;">
+            <label style="font-size: 0.75rem; text-transform: uppercase; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">
+              Moderation Prompt
+            </label>
+            <textarea id="rules-prompt" rows="4" placeholder="Describe what content should be automatically filtered..."></textarea>
+          </div>
+          <div>
+            <button class="btn" onclick="saveRules()">💾 Save Rubric</button>
+          </div>
         </div>
       </section>
     </div>
@@ -649,15 +663,44 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
     }
 
+    function renderRulesAuthenticated(rubric) {
+      const unauthBox = document.getElementById("rules-unauth-container");
+      const authBox = document.getElementById("rules-auth-container");
+      if (unauthBox) unauthBox.style.display = "none";
+      if (authBox) authBox.style.display = "block";
+      if (rubric) {
+        document.getElementById("rules-prompt").value = rubric.prompt || "";
+        setSensitivity(rubric.sensitivity || "medium");
+      }
+    }
+
+    function renderRulesUnauthenticated() {
+      const unauthBox = document.getElementById("rules-unauth-container");
+      const authBox = document.getElementById("rules-auth-container");
+      if (unauthBox) unauthBox.style.display = "block";
+      if (authBox) authBox.style.display = "none";
+      const promptEl = document.getElementById("rules-prompt");
+      if (promptEl) promptEl.value = "";
+    }
+
     async function loadRules() {
-      const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
-      const url = "/api/rules" + (storedDid ? `?did=${encodeURIComponent(storedDid)}` : "");
+      const authDid = (currentUser && currentUser.did) || localStorage.getItem("skybouncer_did");
+      if (!authDid) {
+        renderRulesUnauthenticated();
+        return;
+      }
       try {
-        const res = await fetch(url);
-        if (!res.ok) return;
+        const res = await fetch("/api/rules", {
+          headers: { "x-skybouncer-did": authDid }
+        });
+        if (!res.ok) {
+          if (res.status === 401 || res.status === 403) {
+            renderRulesUnauthenticated();
+          }
+          return;
+        }
         const data = await res.json();
-        document.getElementById("rules-prompt").value = data.prompt;
-        setSensitivity(data.sensitivity);
+        renderRulesAuthenticated(data);
       } catch (e) {
         console.error("Rules fetch failed", e);
       }
@@ -671,13 +714,19 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     async function saveRules() {
+      const authDid = (currentUser && currentUser.did) || localStorage.getItem("skybouncer_did");
+      if (!authDid) {
+        showToast("⚠️ Please sign in to save your moderation rubric");
+        return;
+      }
       const prompt = document.getElementById("rules-prompt").value;
-      const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
-      const url = "/api/rules" + (storedDid ? `?did=${encodeURIComponent(storedDid)}` : "");
       try {
-        const res = await fetch(url, {
+        const res = await fetch("/api/rules", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "x-skybouncer-did": authDid
+          },
           body: JSON.stringify({ prompt, sensitivity: activeSensitivity })
         });
         if (res.ok) {
@@ -685,7 +734,10 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           if (currentUser) {
             currentUser.rubric = data;
           }
+          renderRulesAuthenticated(data);
           showToast("✅ Moderation rubric updated successfully!");
+        } else if (res.status === 401 || res.status === 403) {
+          showToast("❌ Permission denied: cannot modify rules");
         } else {
           const err = await res.text();
           showToast(`❌ Failed to save rubric: ${err}`);
@@ -916,10 +968,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             localStorage.setItem("skybouncer_did", data.did);
           }
           renderAuthenticated(data);
-          if (data.rubric) {
-            document.getElementById("rules-prompt").value = data.rubric.prompt;
-            setSensitivity(data.rubric.sensitivity);
-          }
+          renderRulesAuthenticated(data.rubric);
           if (data.is_admin) {
             const adminCard = document.getElementById("admin-fleet-card");
             if (adminCard) adminCard.style.display = "block";
@@ -1027,6 +1076,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       if (banner) banner.style.display = "none";
       const adminCard = document.getElementById("admin-fleet-card");
       if (adminCard) adminCard.style.display = "none";
+      renderRulesUnauthenticated();
     }
 
     async function signOut() {
@@ -1038,7 +1088,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       localStorage.removeItem("skybouncer_did");
       currentUser = null;
       renderUnauthenticated();
-      loadRules();
+      renderRulesUnauthenticated();
       showToast("👋 Signed out successfully");
     }
 
@@ -1183,8 +1233,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     // Initial load
+    renderRulesUnauthenticated();
     fetchStatus();
-    loadRules();
     loadBounces();
     checkUserSession();
     setInterval(fetchStatus, 3000);

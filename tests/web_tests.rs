@@ -212,9 +212,18 @@ async fn test_api_status_endpoint() {
 async fn test_api_get_and_update_rules() {
     let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
 
-    // 1. GET /api/rules returns initial rubric
+    // 0. Unauthenticated GET /api/rules returns 401 Unauthorized
+    let unauth_req = Request::builder()
+        .uri("/api/rules")
+        .body(Body::empty())
+        .unwrap();
+    let unauth_resp = app.clone().oneshot(unauth_req).await.unwrap();
+    assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 1. Authenticated GET /api/rules returns initial rubric
     let get_req = Request::builder()
         .uri("/api/rules")
+        .header("x-skybouncer-did", "did:plc:alice")
         .body(Body::empty())
         .unwrap();
     let get_resp = app.clone().oneshot(get_req).await.unwrap();
@@ -225,7 +234,23 @@ async fn test_api_get_and_update_rules() {
     let initial_rules: RulesResponse = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(initial_rules.sensitivity, Sensitivity::Medium);
 
-    // 2. POST /api/rules updates rubric to High sensitivity
+    // 2. Unauthenticated POST /api/rules returns 401 Unauthorized
+    let unauth_post = Request::builder()
+        .method("POST")
+        .uri("/api/rules")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "prompt": "Test unauth update",
+                "sensitivity": "High"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let unauth_post_resp = app.clone().oneshot(unauth_post).await.unwrap();
+    assert_eq!(unauth_post_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Authenticated POST /api/rules updates rubric to High sensitivity
     let update_payload = json!({
         "prompt": "Strict anti-spam policy: drop all unsolicited promotions",
         "sensitivity": "High"
@@ -233,6 +258,7 @@ async fn test_api_get_and_update_rules() {
     let post_req = Request::builder()
         .method("POST")
         .uri("/api/rules")
+        .header("x-skybouncer-did", "did:plc:alice")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&update_payload).unwrap()))
         .unwrap();
@@ -249,7 +275,7 @@ async fn test_api_get_and_update_rules() {
         "Strict anti-spam policy: drop all unsolicited promotions"
     );
 
-    // 3. Verify underlying engine reflects update
+    // 4. Verify underlying engine reflects update
     let active_rubric = engine.rubric();
     assert_eq!(active_rubric.sensitivity, Sensitivity::High);
     assert_eq!(
@@ -257,7 +283,7 @@ async fn test_api_get_and_update_rules() {
         "Strict anti-spam policy: drop all unsolicited promotions"
     );
 
-    // 4. Verify bad request on empty prompt
+    // 5. Verify bad request on empty prompt
     let invalid_payload = json!({
         "prompt": "   ",
         "sensitivity": "Low"
@@ -265,6 +291,7 @@ async fn test_api_get_and_update_rules() {
     let bad_req = Request::builder()
         .method("POST")
         .uri("/api/rules")
+        .header("x-skybouncer-did", "did:plc:alice")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&invalid_payload).unwrap()))
         .unwrap();
@@ -812,14 +839,15 @@ async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
         .unwrap();
     assert_eq!(cached_tenant.handle.as_deref(), Some("alice.custom.domain"));
 
-    // 4. Update rules for this tenant via POST /api/rules?did=did:plc:tenant-dynamic
+    // 4. Update rules for this tenant via POST /api/rules (authenticated)
     let custom_payload = json!({
         "prompt": "Custom tenant rubric: block aggressive political baiting",
         "sensitivity": "Low"
     });
     let post_req = Request::builder()
         .method("POST")
-        .uri("/api/rules?did=did:plc:tenant-dynamic")
+        .uri("/api/rules")
+        .header("x-skybouncer-did", "did:plc:tenant-dynamic")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&custom_payload).unwrap()))
         .unwrap();
@@ -835,25 +863,33 @@ async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
         "Custom tenant rubric: block aggressive political baiting"
     );
 
-    // 5. Global GET /api/rules returns default rubric unchanged
-    let global_req = Request::builder()
+    // 5. Unauthenticated GET /api/rules returns 401 Unauthorized
+    let unauth_req = Request::builder()
         .uri("/api/rules")
         .body(Body::empty())
         .unwrap();
-    let global_resp = app.clone().oneshot(global_req).await.unwrap();
-    let global_bytes = axum::body::to_bytes(global_resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let global_rules: RulesResponse = serde_json::from_slice(&global_bytes).unwrap();
-    assert_eq!(global_rules.sensitivity, Sensitivity::Medium);
-    assert_eq!(global_rules.prompt, "Default global rubric: block spam");
+    let unauth_resp = app.clone().oneshot(unauth_req).await.unwrap();
+    assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
 
-    // 6. Tenant GET /api/rules?did=did:plc:tenant-dynamic returns their custom rubric
-    let tenant_req = Request::builder()
+    // 5b. Authenticated user Bob attempting to view Alice's rules returns 403 Forbidden
+    let bob = skybouncer::tenant::Tenant::new("did:plc:bob");
+    engine.tenant_registry().register_or_update(&bob).unwrap();
+    let snoop_req = Request::builder()
         .uri("/api/rules?did=did:plc:tenant-dynamic")
+        .header("x-skybouncer-did", "did:plc:bob")
+        .body(Body::empty())
+        .unwrap();
+    let snoop_resp = app.clone().oneshot(snoop_req).await.unwrap();
+    assert_eq!(snoop_resp.status(), StatusCode::FORBIDDEN);
+
+    // 6. Tenant GET /api/rules returns their own custom rubric
+    let tenant_req = Request::builder()
+        .uri("/api/rules")
+        .header("x-skybouncer-did", "did:plc:tenant-dynamic")
         .body(Body::empty())
         .unwrap();
     let tenant_resp = app.clone().oneshot(tenant_req).await.unwrap();
+    assert_eq!(tenant_resp.status(), StatusCode::OK);
     let tenant_bytes = axum::body::to_bytes(tenant_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -863,6 +899,15 @@ async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
         tenant_rules.prompt,
         "Custom tenant rubric: block aggressive political baiting"
     );
+
+    // 6b. Admin inspecting tenant's rubric via query param returns 200 OK
+    let admin_req = Request::builder()
+        .uri("/api/rules?did=did:plc:tenant-dynamic")
+        .header("x-skybouncer-did", "did:plc:admin")
+        .body(Body::empty())
+        .unwrap();
+    let admin_resp = app.clone().oneshot(admin_req).await.unwrap();
+    assert_eq!(admin_resp.status(), StatusCode::OK);
 
     // 7. GET /api/me?did=did:plc:tenant-dynamic propagates custom rubric in session response
     let me_req = Request::builder()
