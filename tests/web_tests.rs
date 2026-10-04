@@ -533,6 +533,101 @@ async fn test_api_simulate_validation_error() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn test_api_simulate_tiered_inspection_escalation() {
+    use skybouncer::classifier::{CertaintyConfig, MockClassifier, TieredClassifier};
+
+    let pds = MockPdsServer::start().await;
+    let cache = Arc::new(DeduplicationCache::open_in_memory().expect("in-memory cache"));
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block toxicity", Sensitivity::Medium);
+    let modlist_manager =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let pds_client = Arc::new(pds.pds_client("did:plc:alice"));
+
+    // Primary returns borderline confidence 0.65 (in uncertainty band 0.40..0.85)
+    let primary = Arc::new(MockClassifier::new(Verdict::permitted_with_confidence(
+        "Borderline question with critical phrasing",
+        0.65,
+    )));
+    // Fallback returns decisive permitted 0.95
+    let fallback = Arc::new(MockClassifier::new(Verdict::permitted_with_confidence(
+        "Clarifying question, no harassment",
+        0.95,
+    )));
+
+    let certainty = CertaintyConfig::new(0.40, 0.85, true);
+    let tiered = Arc::new(TieredClassifier::new(primary, fallback, certainty));
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+    let config = SkybouncerConfig::new(protected_dids, rubric);
+
+    let engine = Arc::new(SkybouncerEngine::new(
+        config,
+        follow_graph,
+        gate,
+        tiered,
+        modlist_manager,
+        pds_client,
+    ));
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let app = create_web_router(Arc::clone(&engine), None, metadata);
+
+    let payload = json!({
+        "text": "Can you explain why you said that earlier? Seems contradictory.",
+        "author_did": "did:plc:questioner"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/simulate")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let result: SimulateResponse = serde_json::from_slice(&bytes).unwrap();
+
+    assert!(!result.violates);
+    assert_eq!(result.evaluator, "fallback_uncertainty_classifier");
+    assert_eq!(result.confidence, 0.95);
+
+    // Verify Tier 1 breakdown box
+    let tier1 = result.tier1.expect("tier1 details present");
+    assert_eq!(tier1.status, "escalated");
+    assert_eq!(tier1.confidence, 0.65);
+    assert!(tier1.reason.contains("Borderline question"));
+
+    // Verify Tier 2 breakdown box
+    let tier2 = result.tier2.expect("tier2 details present");
+    assert_eq!(tier2.status, "resolved");
+    assert_eq!(tier2.confidence, 0.95);
+    assert!(tier2.reason.contains("Clarifying question"));
+
+    // Verify simulation isolation: engine stats remained 0
+    let status_req = Request::builder()
+        .uri("/api/status")
+        .body(Body::empty())
+        .unwrap();
+    let status_resp = app.oneshot(status_req).await.unwrap();
+    let status_bytes = axum::body::to_bytes(status_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status: StatusResponse = serde_json::from_slice(&status_bytes).unwrap();
+    assert_eq!(status.stats.model_evaluations, 0);
+    assert_eq!(status.stats.tier1_evaluations, 0);
+    assert_eq!(status.stats.tier2_evaluations, 0);
+}
+
 // =============================================================================
 // ATProto OAuth 2.0 PKCE Endpoint Tests
 // =============================================================================

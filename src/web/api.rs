@@ -106,6 +106,26 @@ pub struct SimulateRequest {
     pub image_url: Option<String>,
 }
 
+/// Detailed stage breakdown for a single tier in the simulation pipeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TierStageDetail {
+    /// Stage title (e.g. "Tier 1 • System-1 Primary (Text)").
+    pub stage_name: String,
+    /// Model identifier (e.g. "nimble" or "gemma4:12b").
+    pub model: String,
+    /// Execution status ("resolved", "escalated", or "bypassed").
+    pub status: String,
+    /// Whether this stage classified the post as a violation.
+    pub violates: bool,
+    /// Violation category if violation occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Model confidence score (0.0 to 1.0).
+    pub confidence: f64,
+    /// Rationale provided by this model or bypass explanation.
+    pub reason: String,
+}
+
 /// Detailed result of a dry-run evaluation simulation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimulateResponse {
@@ -126,6 +146,12 @@ pub struct SimulateResponse {
     /// Number of images decoded and inspected during evaluation.
     #[serde(default)]
     pub images_evaluated: usize,
+    /// Detailed Tier-1 System-1 evaluation stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier1: Option<TierStageDetail>,
+    /// Detailed Tier-2 System-2 fallback evaluation stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier2: Option<TierStageDetail>,
 }
 
 /// Overall engine operational status and telemetry response.
@@ -507,6 +533,24 @@ pub async fn simulate_interaction(
         } = heuristic_verdict
         {
             let meets_threshold = rubric.meets_threshold(&category, confidence);
+            let tier1 = TierStageDetail {
+                stage_name: "Tier 1 • System-1 Fast Text".to_string(),
+                model: "nimble".to_string(),
+                status: "bypassed".to_string(),
+                violates: false,
+                category: None,
+                confidence: 0.0,
+                reason: "Bypassed: Heuristic regex pre-filter matched instantly (0ms)".to_string(),
+            };
+            let tier2 = TierStageDetail {
+                stage_name: "Tier 2 • System-2 Fallback".to_string(),
+                model: "gemma4:12b".to_string(),
+                status: "bypassed".to_string(),
+                violates: false,
+                category: None,
+                confidence: 0.0,
+                reason: "Bypassed: Heuristic regex pre-filter matched instantly (0ms)".to_string(),
+            };
             return Ok(Json(SimulateResponse {
                 violates: true,
                 category: Some(category.to_string()),
@@ -516,22 +560,99 @@ pub async fn simulate_interaction(
                 meets_threshold,
                 threshold,
                 images_evaluated,
+                tier1: Some(tier1),
+                tier2: Some(tier2),
             }));
         }
     }
 
     // 2. Primary classifier evaluation (Tiered Jev / Multimodal Fallback)
-    match state
+    let detailed = match state
         .engine
         .primary_classifier()
-        .classify(&synthetic_interaction)
+        .classify_detailed(&synthetic_interaction)
         .await
     {
-        Ok(Verdict::Violation {
+        Ok(res) => res,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Classification failed: {e}"),
+            ));
+        }
+    };
+
+    let tier1_violates = detailed.primary_verdict.is_violation();
+    let tier1_cat = detailed.primary_verdict.category().map(|c| c.to_string());
+    let tier1_conf = detailed.primary_verdict.confidence().unwrap_or(0.0);
+    let tier1_reason = detailed.primary_verdict.reason().to_string();
+    let tier1_status = if detailed.escalated {
+        "escalated".to_string()
+    } else {
+        "resolved".to_string()
+    };
+
+    let tier1 = TierStageDetail {
+        stage_name: "Tier 1 • System-1 Fast Text".to_string(),
+        model: detailed.primary_model,
+        status: tier1_status,
+        violates: tier1_violates,
+        category: tier1_cat,
+        confidence: tier1_conf,
+        reason: tier1_reason,
+    };
+
+    let tier2 = if detailed.escalated {
+        if let Some(ref fb) = detailed.fallback_verdict {
+            TierStageDetail {
+                stage_name: "Tier 2 • System-2 Fallback".to_string(),
+                model: detailed
+                    .fallback_model
+                    .clone()
+                    .unwrap_or_else(|| "fallback".to_string()),
+                status: "resolved".to_string(),
+                violates: fb.is_violation(),
+                category: fb.category().map(|c| c.to_string()),
+                confidence: fb.confidence().unwrap_or(0.0),
+                reason: fb.reason().to_string(),
+            }
+        } else {
+            TierStageDetail {
+                stage_name: "Tier 2 • System-2 Fallback".to_string(),
+                model: detailed
+                    .fallback_model
+                    .clone()
+                    .unwrap_or_else(|| "fallback".to_string()),
+                status: "escalated".to_string(),
+                violates: false,
+                category: None,
+                confidence: 0.0,
+                reason: detailed.escalation_reason.clone().unwrap_or_default(),
+            }
+        }
+    } else {
+        TierStageDetail {
+            stage_name: "Tier 2 • System-2 Fallback".to_string(),
+            model: detailed
+                .fallback_model
+                .clone()
+                .unwrap_or_else(|| "fallback".to_string()),
+            status: "bypassed".to_string(),
+            violates: false,
+            category: None,
+            confidence: 0.0,
+            reason: detailed.escalation_reason.clone().unwrap_or_else(|| {
+                "Bypassed: Tier 1 resolved decisively (System-2 GPU inference spared)".to_string()
+            }),
+        }
+    };
+
+    match detailed.final_verdict {
+        Verdict::Violation {
             category,
             confidence,
             reason,
-        }) => {
+        } => {
             let meets_threshold = rubric.meets_threshold(&category, confidence);
             let evaluator = if reason.contains("uncertainty escalation") {
                 "fallback_uncertainty_classifier".to_string()
@@ -551,9 +672,11 @@ pub async fn simulate_interaction(
                 meets_threshold,
                 threshold,
                 images_evaluated,
+                tier1: Some(tier1),
+                tier2: Some(tier2),
             }))
         }
-        Ok(Verdict::Permitted { reason, confidence }) => {
+        Verdict::Permitted { reason, confidence } => {
             let evaluator = if reason.contains("uncertainty escalation") {
                 "fallback_uncertainty_classifier".to_string()
             } else if reason.contains("Fallback") || reason.contains("Tiered") {
@@ -572,12 +695,10 @@ pub async fn simulate_interaction(
                 meets_threshold: false,
                 threshold,
                 images_evaluated,
+                tier1: Some(tier1),
+                tier2: Some(tier2),
             }))
         }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Classification failed: {e}"),
-        )),
     }
 }
 

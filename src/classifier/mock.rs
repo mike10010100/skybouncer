@@ -171,4 +171,8 @@ impl Classifier for MockClassifier {
         };
         Ok(default_v)
     }
+
+    fn model_name(&self) -> &str {
+        "mock"
+    }
 }

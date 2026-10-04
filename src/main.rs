@@ -618,6 +618,8 @@ async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
                 } else {
                     0
                 },
+                tier1: None,
+                tier2: None,
             }
         }
         skybouncer::classifier::Verdict::Permitted { .. } => {
@@ -645,6 +647,8 @@ async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
                             } else {
                                 0
                             },
+                            tier1: None,
+                            tier2: None,
                         }
                     }
                     Ok(skybouncer::classifier::Verdict::Permitted { reason, confidence }) => {
@@ -661,6 +665,8 @@ async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
                             } else {
                                 0
                             },
+                            tier1: None,
+                            tier2: None,
                         }
                     }
                     Err(e) => skybouncer::web::api::SimulateResponse {
@@ -672,6 +678,8 @@ async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
                         evaluator: "offline_fallback".to_string(),
                         meets_threshold: false,
                         images_evaluated: 0,
+                        tier1: None,
+                        tier2: None,
                     },
                 }
             } else {
@@ -684,6 +692,8 @@ async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
                     evaluator: "heuristic_only".to_string(),
                     meets_threshold: false,
                     images_evaluated: 0,
+                    tier1: None,
+                    tier2: None,
                 }
             }
         }

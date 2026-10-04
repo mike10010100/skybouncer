@@ -17,7 +17,10 @@ pub use heuristic::{HeuristicClassifier, HeuristicRule};
 pub use jev::{JevClassifier, JevConfig, JevEndpointKind};
 pub use mock::MockClassifier;
 pub use rubric::{RuleRubric, Sensitivity};
-pub use tiered::{CertaintyConfig, TieredClassifier, TieredClassifierStats, TieredStatsSnapshot};
+pub use tiered::{
+    CertaintyConfig, TieredClassifier, TieredClassifierStats, TieredEvaluationResult,
+    TieredStatsSnapshot,
+};
 
 /// Category classification for house rule violations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -216,6 +219,32 @@ pub trait Classifier: Send + Sync {
     /// Returns [`SkybouncerError`] if external API evaluation fails or times out.
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError>;
 
+    /// Returns the model identifier or name for this classifier.
+    fn model_name(&self) -> &str {
+        "model"
+    }
+
+    /// Returns detailed multi-tier inspection breakdown if this classifier performs tiered evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkybouncerError`] if underlying model evaluation fails.
+    async fn classify_detailed(
+        &self,
+        interaction: &Interaction,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        let verdict = self.classify(interaction).await?;
+        Ok(TieredEvaluationResult {
+            primary_verdict: verdict.clone(),
+            primary_model: self.model_name().to_string(),
+            escalated: false,
+            escalation_reason: Some("Single-tier standalone classifier configured".to_string()),
+            fallback_verdict: None,
+            fallback_model: None,
+            final_verdict: verdict,
+        })
+    }
+
     /// Dynamically updates the active moderation rubric across the classifier.
     fn set_rubric(&self, _rubric: RuleRubric) {}
 }
@@ -224,6 +253,17 @@ pub trait Classifier: Send + Sync {
 impl<T: Classifier + ?Sized> Classifier for std::sync::Arc<T> {
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
         (**self).classify(interaction).await
+    }
+
+    fn model_name(&self) -> &str {
+        (**self).model_name()
+    }
+
+    async fn classify_detailed(
+        &self,
+        interaction: &Interaction,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        (**self).classify_detailed(interaction).await
     }
 
     fn set_rubric(&self, rubric: RuleRubric) {
@@ -235,6 +275,17 @@ impl<T: Classifier + ?Sized> Classifier for std::sync::Arc<T> {
 impl<T: Classifier + ?Sized> Classifier for Box<T> {
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
         (**self).classify(interaction).await
+    }
+
+    fn model_name(&self) -> &str {
+        (**self).model_name()
+    }
+
+    async fn classify_detailed(
+        &self,
+        interaction: &Interaction,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        (**self).classify_detailed(interaction).await
     }
 
     fn set_rubric(&self, rubric: RuleRubric) {

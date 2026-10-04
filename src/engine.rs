@@ -449,6 +449,14 @@ pub struct EngineStats {
     pub heuristic_violations: AtomicU64,
     /// Candidate interactions dispatched to the primary classifier (e.g. Jev model).
     pub model_evaluations: AtomicU64,
+    /// Tier-1 primary model evaluations.
+    pub tier1_evaluations: AtomicU64,
+    /// Tier-2 fallback model escalations.
+    pub tier2_evaluations: AtomicU64,
+    /// Tier-2 escalations triggered by attached images.
+    pub tier2_image_escalations: AtomicU64,
+    /// Tier-2 escalations triggered by confidence uncertainty band.
+    pub tier2_uncertainty_escalations: AtomicU64,
     /// Candidate interactions enqueued to the background evaluation queue.
     pub eval_queue_enqueued: AtomicU64,
     /// Candidate interactions processed by the background evaluation worker.
@@ -491,6 +499,12 @@ impl EngineStats {
             eval_cache_hits: self.eval_cache_hits.load(Ordering::Relaxed),
             heuristic_violations: self.heuristic_violations.load(Ordering::Relaxed),
             model_evaluations: self.model_evaluations.load(Ordering::Relaxed),
+            tier1_evaluations: self.tier1_evaluations.load(Ordering::Relaxed),
+            tier2_evaluations: self.tier2_evaluations.load(Ordering::Relaxed),
+            tier2_image_escalations: self.tier2_image_escalations.load(Ordering::Relaxed),
+            tier2_uncertainty_escalations: self
+                .tier2_uncertainty_escalations
+                .load(Ordering::Relaxed),
             eval_queue_enqueued: self.eval_queue_enqueued.load(Ordering::Relaxed),
             eval_queue_processed: self.eval_queue_processed.load(Ordering::Relaxed),
             eval_queue_overflows: self.eval_queue_overflows.load(Ordering::Relaxed),
@@ -532,6 +546,18 @@ pub struct EngineStatsSnapshot {
     pub heuristic_violations: u64,
     /// Candidate interactions dispatched to the primary classifier (e.g. Jev model).
     pub model_evaluations: u64,
+    /// Tier-1 primary model evaluations.
+    #[serde(default)]
+    pub tier1_evaluations: u64,
+    /// Tier-2 fallback model escalations.
+    #[serde(default)]
+    pub tier2_evaluations: u64,
+    /// Tier-2 escalations triggered by attached images.
+    #[serde(default)]
+    pub tier2_image_escalations: u64,
+    /// Tier-2 escalations triggered by confidence uncertainty band.
+    #[serde(default)]
+    pub tier2_uncertainty_escalations: u64,
     /// Candidate interactions enqueued to the background evaluation queue.
     pub eval_queue_enqueued: u64,
     /// Candidate interactions processed by the background evaluation worker.
@@ -1396,6 +1422,7 @@ impl SkybouncerEngine {
 
         // Tier 7: Primary Model Evaluation
         self.stats.model_evaluations.fetch_add(1, Ordering::Relaxed);
+        self.stats.tier1_evaluations.fetch_add(1, Ordering::Relaxed);
         let model_verdict = self
             .classifier
             .classify(&interaction)
@@ -1405,6 +1432,24 @@ impl SkybouncerEngine {
                     .errors_encountered
                     .fetch_add(1, Ordering::Relaxed);
             })?;
+
+        if model_verdict
+            .reason()
+            .contains("[Tiered Fallback: visual image]")
+        {
+            self.stats.tier2_evaluations.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .tier2_image_escalations
+                .fetch_add(1, Ordering::Relaxed);
+        } else if model_verdict
+            .reason()
+            .contains("[Tiered Fallback: uncertainty escalation]")
+        {
+            self.stats.tier2_evaluations.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .tier2_uncertainty_escalations
+                .fetch_add(1, Ordering::Relaxed);
+        }
 
         if model_verdict.is_violation() {
             self.stats

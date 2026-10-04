@@ -134,6 +134,25 @@ impl TieredClassifierStats {
     }
 }
 
+/// Comprehensive multi-tier inspection result breakdown.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TieredEvaluationResult {
+    /// Initial verdict emitted by the primary Tier-1 System-1 classifier.
+    pub primary_verdict: Verdict,
+    /// Model name of the primary Tier-1 classifier.
+    pub primary_model: String,
+    /// Whether evaluation escalated to the secondary Tier-2 fallback classifier.
+    pub escalated: bool,
+    /// Detailed rationale explaining why escalation was triggered or bypassed.
+    pub escalation_reason: Option<String>,
+    /// Secondary verdict emitted by the fallback Tier-2 classifier, if escalated.
+    pub fallback_verdict: Option<Verdict>,
+    /// Model name of the secondary Tier-2 fallback classifier.
+    pub fallback_model: Option<String>,
+    /// Final arbitration verdict adopted by the engine.
+    pub final_verdict: Verdict,
+}
+
 /// Point-in-time immutable snapshot of [`TieredClassifierStats`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TieredStatsSnapshot {
@@ -198,73 +217,143 @@ impl TieredClassifier {
     pub fn stats(&self) -> &Arc<TieredClassifierStats> {
         &self.stats
     }
-}
 
-#[async_trait]
-impl Classifier for TieredClassifier {
-    async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
-        self.stats.total_evaluations.fetch_add(1, Ordering::Relaxed);
+    /// Evaluates an incoming candidate interaction with complete multi-tier inspection breakdown.
+    ///
+    /// # Arguments
+    /// * `interaction` - The candidate ATProto post interaction to evaluate.
+    /// * `record_stats` - When `true`, operational telemetry counters are incremented.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if classifier evaluation fails or times out.
+    pub async fn evaluate_tiered(
+        &self,
+        interaction: &Interaction,
+        record_stats: bool,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        if record_stats {
+            self.stats.total_evaluations.fetch_add(1, Ordering::Relaxed);
+        }
 
         // 1. Evaluate candidate using the fast primary System-1 classifier
         let primary_verdict = self.primary.classify(interaction).await?;
-
+        let primary_model = self.primary.model_name().to_string();
+        let fallback_model = Some(self.fallback.model_name().to_string());
         let has_images = interaction.has_images();
 
         // 2. Check escalation criteria
         if self.certainty.should_escalate(&primary_verdict, has_images) {
-            self.stats
-                .fallback_escalated
-                .fetch_add(1, Ordering::Relaxed);
+            if record_stats {
+                self.stats
+                    .fallback_escalated
+                    .fetch_add(1, Ordering::Relaxed);
+            }
 
-            if has_images {
-                self.stats.image_escalations.fetch_add(1, Ordering::Relaxed);
+            let (escalation_prefix, escalation_reason) = if has_images {
+                if record_stats {
+                    self.stats.image_escalations.fetch_add(1, Ordering::Relaxed);
+                }
                 debug!(
                     post_uri = %interaction.post_uri,
                     image_count = interaction.image_cids.len(),
                     "Escalating candidate to secondary multimodal classifier due to attached images"
                 );
+                (
+                    "[Tiered Fallback: visual image]",
+                    "Attached visual media requires multimodal inspection".to_string(),
+                )
             } else {
-                self.stats
-                    .uncertainty_escalations
-                    .fetch_add(1, Ordering::Relaxed);
+                if record_stats {
+                    self.stats
+                        .uncertainty_escalations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 debug!(
                     post_uri = %interaction.post_uri,
                     confidence = ?primary_verdict.confidence(),
                     "Escalating candidate to secondary classifier due to uncertainty band"
                 );
-            }
-
-            let escalation_prefix = if has_images {
-                "[Tiered Fallback: visual image]"
-            } else {
-                "[Tiered Fallback: uncertainty escalation]"
+                (
+                    "[Tiered Fallback: uncertainty escalation]",
+                    format!(
+                        "Confidence {:.2} in uncertainty band [{:.2}..{:.2})",
+                        primary_verdict.confidence().unwrap_or(0.0),
+                        self.certainty.min_confidence,
+                        self.certainty.max_confidence
+                    ),
+                )
             };
 
             // 3. Evaluate candidate with the heavier System-2 fallback model
-            match self.fallback.classify(interaction).await? {
+            let fallback_raw = self.fallback.classify(interaction).await?;
+            let final_verdict = match fallback_raw.clone() {
                 Verdict::Violation {
                     category,
                     confidence,
                     reason,
-                } => Ok(Verdict::violation(
+                } => Verdict::violation(
                     category,
                     confidence,
                     format!("{escalation_prefix} {reason}"),
-                )),
+                ),
                 Verdict::Permitted { reason, confidence } => {
                     let formatted = format!("{escalation_prefix} {reason}");
                     if let Some(c) = confidence {
-                        Ok(Verdict::permitted_with_confidence(formatted, c))
+                        Verdict::permitted_with_confidence(formatted, c)
                     } else {
-                        Ok(Verdict::permitted(formatted))
+                        Verdict::permitted(formatted)
                     }
                 }
-            }
+            };
+
+            Ok(TieredEvaluationResult {
+                primary_verdict,
+                primary_model,
+                escalated: true,
+                escalation_reason: Some(escalation_reason),
+                fallback_verdict: Some(fallback_raw),
+                fallback_model,
+                final_verdict,
+            })
         } else {
             // Decisive result: resolved directly by primary classifier
-            self.stats.primary_resolved.fetch_add(1, Ordering::Relaxed);
-            Ok(primary_verdict)
+            if record_stats {
+                self.stats.primary_resolved.fetch_add(1, Ordering::Relaxed);
+            }
+            let reason = if has_images {
+                "Decisive high-confidence violation on text alone (multimodal inspection bypassed)"
+            } else {
+                "Decisive confidence outside uncertainty band (System-2 escalation bypassed)"
+            };
+            Ok(TieredEvaluationResult {
+                primary_verdict: primary_verdict.clone(),
+                primary_model,
+                escalated: false,
+                escalation_reason: Some(reason.to_string()),
+                fallback_verdict: None,
+                fallback_model,
+                final_verdict: primary_verdict,
+            })
         }
+    }
+}
+
+#[async_trait]
+impl Classifier for TieredClassifier {
+    async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
+        let result = self.evaluate_tiered(interaction, true).await?;
+        Ok(result.final_verdict)
+    }
+
+    fn model_name(&self) -> &str {
+        "tiered"
+    }
+
+    async fn classify_detailed(
+        &self,
+        interaction: &Interaction,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        self.evaluate_tiered(interaction, false).await
     }
 
     fn set_rubric(&self, rubric: RuleRubric) {

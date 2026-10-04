@@ -165,4 +165,8 @@ impl Classifier for HeuristicClassifier {
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
         Ok(self.evaluate(interaction))
     }
+
+    fn model_name(&self) -> &str {
+        "heuristic_regex"
+    }
 }

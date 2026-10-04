@@ -673,6 +673,12 @@ impl JevClassifier {
         }))
     }
 
+    /// Returns the model identifier configured for this classifier.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.config.model
+    }
+
     /// Evaluates raw Jev response against configured rubric sensitivity.
     fn build_verdict(&self, resp: JevClassifyResponse) -> Verdict {
         let is_actionable = self.rubric.read().is_actionable(resp.confidence);
@@ -704,6 +710,10 @@ impl JevClassifier {
 impl Classifier for JevClassifier {
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
         self.evaluate(interaction).await
+    }
+
+    fn model_name(&self) -> &str {
+        &self.config.model
     }
 
     fn set_rubric(&self, rubric: RuleRubric) {

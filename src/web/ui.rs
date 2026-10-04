@@ -151,6 +151,9 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     @media (max-width: 900px) {
       .dashboard-grid { grid-template-columns: 1fr; }
     }
+    @media (max-width: 640px) {
+      .sim-tiers-grid { grid-template-columns: 1fr !important; }
+    }
 
     .card {
       background: var(--bg-card);
@@ -419,11 +422,17 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <div class="kpi-val" id="kpi-dedup">0</div>
         <div class="kpi-sub">24h SQLite Cache</div>
       </div>
-      <div class="kpi-card">
-        <div class="kpi-label">Model Evaluations</div>
-        <div class="kpi-val" id="kpi-evals">0</div>
-        <div class="kpi-sub">Jev System-1 Classifier</div>
+      <div class="kpi-card" id="kpi-tier1-card">
+        <div class="kpi-label">Tier 1 Evaluations</div>
+        <div class="kpi-val" id="kpi-tier1-evals" style="color: var(--accent);">0</div>
+        <div class="kpi-sub" id="kpi-tier1-sub">System-1 Fast Text (~115ms)</div>
       </div>
+      <div class="kpi-card" id="kpi-tier2-card">
+        <div class="kpi-label">Tier 2 Escalations</div>
+        <div class="kpi-val" id="kpi-tier2-evals" style="color: #a855f7;">0</div>
+        <div class="kpi-sub" id="kpi-tier2-sub">0 Image &bull; 0 Uncertainty</div>
+      </div>
+      <span id="kpi-evals" style="display: none;">0</span>
       <div class="kpi-card">
         <div class="kpi-label">Evaluation Queue</div>
         <div class="kpi-val" id="kpi-queue-backlog" style="color: var(--accent);">0</div>
@@ -499,6 +508,52 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </div>
           </div>
           <p style="font-size: 0.85rem;" id="sim-reason"></p>
+
+          <!-- Two-Tier Pipeline Inspection Stage Boxes -->
+          <div id="sim-tiers-container" style="display: none; margin-top: 0.85rem; border-top: 1px solid var(--border-color); padding-top: 0.85rem;">
+            <div style="font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.4rem;">
+              <span>🔬 Multi-Tier Pipeline Execution</span>
+            </div>
+            <div class="sim-tiers-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;">
+              <!-- Tier 1 Box -->
+              <div class="card" id="sim-tier1-box" style="padding: 0.85rem; background: rgba(0,0,0,0.2); border: 1px solid var(--border-color); gap: 0.5rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                  <span style="font-size: 0.85rem; font-weight: 700;">🧠 Tier 1: System-1 (Text)</span>
+                  <span id="sim-tier1-badge" class="chip" style="font-weight: 700; font-size: 0.65rem; padding: 0.2rem 0.5rem;">Decisive</span>
+                </div>
+                <div style="font-size: 0.7rem; color: var(--text-muted);" id="sim-tier1-model">Model: nimble</div>
+                <div>
+                  <div style="display: flex; justify-content: space-between; font-size: 0.75rem; margin-bottom: 0.2rem;">
+                    <span id="sim-tier1-cat">Category: None</span>
+                    <span id="sim-tier1-conf">Confidence: 0%</span>
+                  </div>
+                  <div class="progress-bar-container" style="height: 6px;">
+                    <div class="progress-fill" id="sim-tier1-bar" style="width: 0%; background: var(--accent);"></div>
+                  </div>
+                </div>
+                <p id="sim-tier1-reason" style="font-size: 0.75rem; color: var(--text-main); margin-top: 0.2rem;"></p>
+              </div>
+
+              <!-- Tier 2 Box -->
+              <div class="card" id="sim-tier2-box" style="padding: 0.85rem; background: rgba(0,0,0,0.2); border: 1px solid var(--border-color); gap: 0.5rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                  <span style="font-size: 0.85rem; font-weight: 700;">👁️ Tier 2: System-2 (Fallback)</span>
+                  <span id="sim-tier2-badge" class="chip" style="font-weight: 700; font-size: 0.65rem; padding: 0.2rem 0.5rem;">Bypassed</span>
+                </div>
+                <div style="font-size: 0.7rem; color: var(--text-muted);" id="sim-tier2-model">Model: gemma4:12b</div>
+                <div id="sim-tier2-metrics">
+                  <div style="display: flex; justify-content: space-between; font-size: 0.75rem; margin-bottom: 0.2rem;">
+                    <span id="sim-tier2-cat">Category: None</span>
+                    <span id="sim-tier2-conf">Confidence: 0%</span>
+                  </div>
+                  <div class="progress-bar-container" style="height: 6px;">
+                    <div class="progress-fill" id="sim-tier2-bar" style="width: 0%; background: #a855f7;"></div>
+                  </div>
+                </div>
+                <p id="sim-tier2-reason" style="font-size: 0.75rem; color: var(--text-main); margin-top: 0.2rem;"></p>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -622,7 +677,24 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         document.getElementById("kpi-matched").innerText = data.stats.interactions_matched.toLocaleString();
         document.getElementById("kpi-bypassed").innerText = (data.stats.gate_bypassed_followed + data.stats.gate_bypassed_self).toLocaleString();
         document.getElementById("kpi-dedup").innerText = data.stats.dedup_cache_hits.toLocaleString();
-        document.getElementById("kpi-evals").innerText = data.stats.model_evaluations.toLocaleString();
+        
+        const tier1Count = data.stats.tier1_evaluations !== undefined ? data.stats.tier1_evaluations : data.stats.model_evaluations;
+        const tier2Count = data.stats.tier2_evaluations || 0;
+        const tier2Img = data.stats.tier2_image_escalations || 0;
+        const tier2Uncert = data.stats.tier2_uncertainty_escalations || 0;
+
+        const t1El = document.getElementById("kpi-tier1-evals");
+        if (t1El) t1El.innerText = tier1Count.toLocaleString();
+
+        const t2El = document.getElementById("kpi-tier2-evals");
+        if (t2El) t2El.innerText = tier2Count.toLocaleString();
+
+        const t2Sub = document.getElementById("kpi-tier2-sub");
+        if (t2Sub) t2Sub.innerText = `${tier2Img.toLocaleString()} Image • ${tier2Uncert.toLocaleString()} Uncertainty`;
+
+        const evalsLegacy = document.getElementById("kpi-evals");
+        if (evalsLegacy) evalsLegacy.innerText = data.stats.model_evaluations.toLocaleString();
+
         document.getElementById("kpi-bounces").innerText = data.stats.bounces_executed.toLocaleString();
 
         if (data.monitored_users_count !== undefined && data.monitored_users_count !== null) {
@@ -884,6 +956,97 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
 
         document.getElementById("sim-reason").innerText = data.reason;
+
+        if (data.tier1 && data.tier2) {
+          const tiersCont = document.getElementById("sim-tiers-container");
+          if (tiersCont) tiersCont.style.display = "block";
+
+          // Tier 1 Box
+          const t1 = data.tier1;
+          const t1Model = document.getElementById("sim-tier1-model");
+          if (t1Model) t1Model.innerText = `Model: ${t1.model || 'nimble'}`;
+          const t1Cat = document.getElementById("sim-tier1-cat");
+          if (t1Cat) t1Cat.innerText = `Category: ${t1.category || 'None'}`;
+          const t1Pct = Math.round(t1.confidence * 100);
+          const t1Conf = document.getElementById("sim-tier1-conf");
+          if (t1Conf) t1Conf.innerText = `Confidence: ${t1Pct}%`;
+          const t1Bar = document.getElementById("sim-tier1-bar");
+          if (t1Bar) t1Bar.style.width = `${t1Pct}%`;
+          const t1Reason = document.getElementById("sim-tier1-reason");
+          if (t1Reason) t1Reason.innerText = t1.reason;
+
+          const t1Badge = document.getElementById("sim-tier1-badge");
+          const t1Box = document.getElementById("sim-tier1-box");
+          if (t1Badge && t1Box) {
+            if (t1.status === "escalated") {
+              t1Badge.innerText = "🤔 Escalated to Tier 2";
+              t1Badge.style.color = "#f59e0b";
+              t1Badge.style.borderColor = "rgba(245, 158, 11, 0.4)";
+              t1Badge.style.background = "rgba(245, 158, 11, 0.15)";
+              t1Box.style.borderColor = "rgba(245, 158, 11, 0.4)";
+            } else if (t1.status === "bypassed") {
+              t1Badge.innerText = "⚡ Bypassed";
+              t1Badge.style.color = "var(--text-muted)";
+              t1Badge.style.borderColor = "var(--border-color)";
+              t1Badge.style.background = "transparent";
+              t1Box.style.borderColor = "var(--border-color)";
+            } else {
+              t1Badge.innerText = t1.violates ? "🚫 Violation (Resolved)" : "✅ Permitted (Resolved)";
+              t1Badge.style.color = t1.violates ? "var(--danger)" : "var(--success)";
+              t1Badge.style.borderColor = t1.violates ? "rgba(239, 68, 68, 0.4)" : "rgba(16, 185, 129, 0.4)";
+              t1Badge.style.background = t1.violates ? "var(--danger-bg)" : "var(--success-bg)";
+              t1Box.style.borderColor = t1.violates ? "rgba(239, 68, 68, 0.4)" : "rgba(16, 185, 129, 0.4)";
+            }
+          }
+
+          // Tier 2 Box
+          const t2 = data.tier2;
+          const t2Model = document.getElementById("sim-tier2-model");
+          if (t2Model) t2Model.innerText = `Model: ${t2.model || 'gemma4:12b'}`;
+          const t2Metrics = document.getElementById("sim-tier2-metrics");
+          const t2Badge = document.getElementById("sim-tier2-badge");
+          const t2Box = document.getElementById("sim-tier2-box");
+          const t2Reason = document.getElementById("sim-tier2-reason");
+
+          if (t2.status === "resolved") {
+            if (t2Metrics) t2Metrics.style.display = "block";
+            const t2Cat = document.getElementById("sim-tier2-cat");
+            if (t2Cat) t2Cat.innerText = `Category: ${t2.category || 'None'}`;
+            const t2Pct = Math.round(t2.confidence * 100);
+            const t2Conf = document.getElementById("sim-tier2-conf");
+            if (t2Conf) t2Conf.innerText = `Confidence: ${t2Pct}%`;
+            const t2Bar = document.getElementById("sim-tier2-bar");
+            if (t2Bar) t2Bar.style.width = `${t2Pct}%`;
+            if (t2Reason) t2Reason.innerText = t2.reason;
+
+            if (t2Badge) {
+              t2Badge.innerText = t2.violates ? "🚫 Final: Violation" : "✅ Final: Permitted";
+              t2Badge.style.color = t2.violates ? "var(--danger)" : "var(--success)";
+              t2Badge.style.borderColor = t2.violates ? "rgba(239, 68, 68, 0.4)" : "rgba(16, 185, 129, 0.4)";
+              t2Badge.style.background = t2.violates ? "var(--danger-bg)" : "var(--success-bg)";
+            }
+            if (t2Box) {
+              t2Box.style.borderColor = "#a855f7";
+              t2Box.style.opacity = "1";
+            }
+          } else {
+            if (t2Metrics) t2Metrics.style.display = "none";
+            if (t2Reason) t2Reason.innerText = t2.reason;
+            if (t2Badge) {
+              t2Badge.innerText = "⚡ Bypassed (0ms)";
+              t2Badge.style.color = "var(--text-muted)";
+              t2Badge.style.borderColor = "var(--border-color)";
+              t2Badge.style.background = "transparent";
+            }
+            if (t2Box) {
+              t2Box.style.borderColor = "var(--border-color)";
+              t2Box.style.opacity = "0.7";
+            }
+          }
+        } else {
+          const tiersCont = document.getElementById("sim-tiers-container");
+          if (tiersCont) tiersCont.style.display = "none";
+        }
       } catch (e) {
         console.error("Simulation failed", e);
       }
