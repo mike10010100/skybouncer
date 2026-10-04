@@ -607,3 +607,141 @@ async fn test_live_web_server_lifecycle_and_graceful_shutdown() {
     let inner_res = exit_result.unwrap().unwrap();
     assert!(inner_res.is_ok(), "Server returned clean Ok(())");
 }
+
+// =============================================================================
+// Auth Session & Admin Fleet Endpoints Integration Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_api_session_and_admin_endpoints() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:admin123").await;
+
+    let test_tenant =
+        skybouncer::tenant::Tenant::new("did:plc:tenant456").with_handle("tenant.bsky.social");
+    engine
+        .tenant_registry()
+        .register_or_update(&test_tenant)
+        .expect("enroll tenant");
+
+    // 1. Unauthenticated /api/me
+    let req = Request::builder()
+        .uri("/api/me")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let me: skybouncer::web::UserSessionResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(!me.authenticated);
+    assert_eq!(me.did, None);
+    assert!(!me.is_admin);
+
+    // 2. Authenticated via query ?did= for enrolled tenant
+    let req = Request::builder()
+        .uri("/api/me?did=did:plc:tenant456")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let me: skybouncer::web::UserSessionResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(me.authenticated);
+    assert_eq!(me.did.as_deref(), Some("did:plc:tenant456"));
+    assert_eq!(me.handle.as_deref(), Some("tenant.bsky.social"));
+    assert!(!me.is_admin);
+    assert!(me.is_active);
+
+    // 3. Authenticated via header for admin DID
+    let req = Request::builder()
+        .uri("/api/me")
+        .header("x-skybouncer-did", "did:plc:admin123")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let me: skybouncer::web::UserSessionResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(me.authenticated);
+    assert_eq!(me.did.as_deref(), Some("did:plc:admin123"));
+    assert!(me.is_admin);
+    assert!(me.is_active);
+
+    // 4. Non-admin accessing /api/admin/tenants -> 403 Forbidden
+    let req = Request::builder()
+        .uri("/api/admin/tenants?did=did:plc:tenant456")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // 5. Admin accessing /api/admin/tenants -> 200 OK
+    let req = Request::builder()
+        .uri("/api/admin/tenants?did=did:plc:admin123")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let fleet: skybouncer::web::AdminTenantsResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(fleet.total, 1);
+    assert_eq!(fleet.active_count, 1);
+    assert_eq!(fleet.paused_count, 0);
+    assert_eq!(fleet.tenants[0].did, "did:plc:tenant456");
+
+    // 6. Admin toggling tenant defense pause
+    let toggle_req = Request::builder()
+        .method("POST")
+        .uri("/api/tenant/toggle?did=did:plc:admin123")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "did": "did:plc:tenant456",
+                "is_active": false
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(toggle_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let toggle: skybouncer::web::ToggleTenantResponse =
+        serde_json::from_slice(&body_bytes).unwrap();
+    assert!(toggle.success);
+    assert!(!toggle.is_active);
+
+    // 7. Verify /api/me for tenant now shows is_active == false
+    let req = Request::builder()
+        .uri("/api/me?did=did:plc:tenant456")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let me: skybouncer::web::UserSessionResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(!me.is_active);
+
+    // 8. Logout endpoint
+    let logout_req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/logout")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(logout_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie_hdr = resp.headers().get("set-cookie");
+    assert!(cookie_hdr.is_some());
+    let cookie_str = cookie_hdr.unwrap().to_str().unwrap();
+    assert!(cookie_str.contains("skybouncer_did="));
+    assert!(cookie_str.contains("Max-Age=0"));
+}

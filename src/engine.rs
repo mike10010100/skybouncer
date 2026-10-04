@@ -1750,6 +1750,21 @@ impl SkybouncerEngine {
         self.tenant_registry.is_enrolled(did).unwrap_or(false)
     }
 
+    /// Checks whether the given DID has administrator privileges.
+    #[must_use]
+    pub fn is_admin(&self, did: &str) -> bool {
+        let clean = did.trim();
+        if self.config.protected_dids.contains(clean) {
+            return true;
+        }
+        if let Ok(admin_did) = std::env::var("ADMIN_DID") {
+            if admin_did.trim().eq_ignore_ascii_case(clean) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Checks whether a tenant is paused (or the entire engine is paused).
     #[must_use]
     pub fn is_tenant_paused(&self, did: &str) -> bool {

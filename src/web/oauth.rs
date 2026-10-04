@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::{Redirect, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
@@ -103,7 +103,7 @@ pub async fn oauth_login(
 pub async fn oauth_callback(
     State(state): State<OAuthState>,
     query: OAuthCallbackQuery,
-) -> Result<Redirect, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, String)> {
     if query.code.is_none() && query.error.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -125,7 +125,8 @@ pub async fn oauth_callback(
             return Ok(Redirect::to(&format!(
                 "/?auth=error&error={}",
                 urlencoding_simple(&e.to_string())
-            )));
+            ))
+            .into_response());
         }
     };
 
@@ -149,17 +150,25 @@ pub async fn oauth_callback(
                 }
             }
 
-            Ok(Redirect::to(&format!(
-                "/?auth=success&did={}",
-                urlencoding_simple(&did)
-            )))
+            let redirect_target = format!("/?auth=success&did={}", urlencoding_simple(&did));
+            let mut response = Redirect::to(&redirect_target).into_response();
+            let cookie_header =
+                format!("skybouncer_did={did}; Path=/; Max-Age=2592000; SameSite=Lax");
+            if let Ok(cookie_val) = axum::http::HeaderValue::from_str(&cookie_header) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::SET_COOKIE, cookie_val);
+            }
+
+            Ok(response)
         }
         Err(e) => {
             error!(error = %e, "Failed to exchange OAuth authorization code for session");
             Ok(Redirect::to(&format!(
                 "/?auth=error&error={}",
                 urlencoding_simple(&e.to_string())
-            )))
+            ))
+            .into_response())
         }
     }
 }

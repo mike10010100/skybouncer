@@ -10,7 +10,7 @@
 use axum::response::Html;
 
 /// HTML payload for the single-page application dashboard.
-pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
+pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -360,11 +360,36 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div class="status-badge" id="queue-badge" style="background: rgba(99, 102, 241, 0.12); color: var(--accent); border: 1px solid rgba(99, 102, 241, 0.25);">
         <span id="queue-badge-text">Queue: Idle (1 worker)</span>
       </div>
-      <button class="btn btn-secondary" onclick="showLoginModal()">Bluesky SSO</button>
+      <div id="auth-header-container" style="display: flex; align-items: center; gap: 0.75rem;">
+        <button class="btn btn-secondary" onclick="showLoginModal()">Sign In with Bluesky</button>
+      </div>
     </div>
   </header>
 
   <main>
+    <!-- Tenant Session & Defense Banner (shown when authenticated) -->
+    <section id="tenant-banner-card" class="card" style="display: none; padding: 1.25rem 1.5rem; border-color: var(--accent); background: linear-gradient(135deg, rgba(30, 41, 59, 0.85), rgba(99, 102, 241, 0.12));">
+      <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem;">
+        <div style="display: flex; align-items: center; gap: 1rem;">
+          <div style="font-size: 2.2rem; line-height: 1;" id="tenant-banner-icon">🛡️</div>
+          <div>
+            <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
+              <span style="font-size: 1.2rem; font-weight: 700;" id="tenant-banner-name">@handle</span>
+              <span id="tenant-role-badge" class="status-badge" style="background: rgba(99, 102, 241, 0.2); color: var(--accent);">Protected Tenant</span>
+              <span id="tenant-status-badge" class="status-badge" style="background: var(--success-bg); color: var(--success);">🟢 Defenses Active</span>
+            </div>
+            <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.35rem; display: flex; align-items: center; gap: 0.85rem; flex-wrap: wrap;">
+              <span id="tenant-did-display" style="font-family: monospace; background: rgba(0,0,0,0.25); padding: 0.15rem 0.4rem; border-radius: 4px;">did:plc:...</span>
+              <span id="tenant-modlist-link-container"></span>
+            </div>
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 0.75rem;">
+          <button id="tenant-toggle-btn" class="btn btn-secondary" onclick="toggleCurrentTenantDefense()">⏸️ Pause Defenses</button>
+        </div>
+      </div>
+    </section>
+
     <!-- Live Telemetry KPI Cards -->
     <section class="kpi-grid">
       <div class="kpi-card">
@@ -521,6 +546,38 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           <tbody id="bounces-table">
             <tr>
               <td colspan="5" style="text-align: center; color: var(--text-muted); padding: 2rem;">Loading recent bounces...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Multi-Tenant Fleet Administration (Admin Only) -->
+    <section class="card" id="admin-fleet-card" style="display: none;">
+      <div class="card-header">
+        <div>
+          <div class="card-title">👑 Multi-Tenant Fleet Administration</div>
+          <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.2rem;">
+            Fleet oversight: <strong id="admin-total-tenants">0</strong> enrolled (<span id="admin-active-tenants" style="color: var(--success); font-weight: 600;">0</span> active, <span id="admin-paused-tenants" style="color: var(--warning); font-weight: 600;">0</span> paused)
+          </div>
+        </div>
+        <button class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="loadAdminTenants()">🔄 Refresh Fleet</button>
+      </div>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Tenant Handle / DID</th>
+              <th>Status</th>
+              <th>OAuth Session</th>
+              <th>Enrolled</th>
+              <th>Sovereign Mod List</th>
+              <th>Fleet Action</th>
+            </tr>
+          </thead>
+          <tbody id="admin-tenants-table">
+            <tr>
+              <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 2rem;">Loading tenant fleet...</td>
             </tr>
           </tbody>
         </table>
@@ -817,15 +874,296 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       return (str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     }
 
+    let currentUser = null;
+
+    async function checkUserSession() {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("auth") === "success") {
+        showToast("✅ Successfully authenticated with Bluesky!");
+        if (params.get("did")) {
+          localStorage.setItem("skybouncer_did", params.get("did"));
+        }
+        window.history.replaceState({}, document.title, window.location.pathname);
+      } else if (params.get("auth") === "error") {
+        const err = params.get("error") || "Authentication failed";
+        showToast(`❌ Auth error: ${err}`);
+        window.history.replaceState({}, document.title, window.location.pathname);
+      }
+
+      const storedDid = localStorage.getItem("skybouncer_did");
+      const url = "/api/me" + (storedDid ? `?did=${encodeURIComponent(storedDid)}` : "");
+
+      try {
+        const res = await fetch(url);
+        if (!res.ok) {
+          renderUnauthenticated();
+          return;
+        }
+        const data = await res.json();
+        if (data.authenticated) {
+          currentUser = data;
+          if (data.did) {
+            localStorage.setItem("skybouncer_did", data.did);
+          }
+          renderAuthenticated(data);
+          if (data.is_admin) {
+            const adminCard = document.getElementById("admin-fleet-card");
+            if (adminCard) adminCard.style.display = "block";
+            loadAdminTenants();
+          } else {
+            const adminCard = document.getElementById("admin-fleet-card");
+            if (adminCard) adminCard.style.display = "none";
+          }
+        } else {
+          currentUser = null;
+          renderUnauthenticated();
+        }
+      } catch (e) {
+        console.error("Session check failed", e);
+        renderUnauthenticated();
+      }
+    }
+
+    function renderAuthenticated(user) {
+      const container = document.getElementById("auth-header-container");
+      if (!container) return;
+      const displayName = user.handle ? `@${user.handle}` : (user.did ? user.did.substring(0, 16) + '...' : 'Authenticated');
+      const roleBadgeHtml = user.is_admin
+        ? '<span class="status-badge" style="background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3);">👑 Admin</span>'
+        : '<span class="status-badge" style="background: rgba(99, 102, 241, 0.15); color: var(--accent); border: 1px solid rgba(99, 102, 241, 0.3);">🛡️ Tenant</span>';
+
+      container.innerHTML = `
+        <div style="display: flex; align-items: center; gap: 0.5rem; background: rgba(0, 0, 0, 0.2); padding: 0.25rem 0.6rem; border-radius: 9999px; border: 1px solid var(--border-color);">
+          <span style="font-size: 0.85rem; font-weight: 600;">${escapeHtml(displayName)}</span>
+          ${roleBadgeHtml}
+        </div>
+        <button class="btn btn-secondary" style="padding: 0.35rem 0.75rem; font-size: 0.8rem;" onclick="signOut()">Sign Out</button>
+      `;
+
+      const banner = document.getElementById("tenant-banner-card");
+      if (banner) banner.style.display = "block";
+
+      const bannerName = document.getElementById("tenant-banner-name");
+      if (bannerName) bannerName.innerText = user.handle ? `@${user.handle}` : (user.did || "Sovereign Account");
+
+      const roleBadge = document.getElementById("tenant-role-badge");
+      if (roleBadge) {
+        if (user.is_admin) {
+          roleBadge.innerText = "👑 Fleet Administrator";
+          roleBadge.style.background = "rgba(245, 158, 11, 0.15)";
+          roleBadge.style.color = "var(--warning)";
+        } else {
+          roleBadge.innerText = "🛡️ Protected Tenant";
+          roleBadge.style.background = "rgba(99, 102, 241, 0.2)";
+          roleBadge.style.color = "var(--accent)";
+        }
+      }
+
+      const statusBadge = document.getElementById("tenant-status-badge");
+      const toggleBtn = document.getElementById("tenant-toggle-btn");
+      if (statusBadge && toggleBtn) {
+        if (user.is_active) {
+          statusBadge.innerText = "🟢 Defenses Active";
+          statusBadge.style.background = "var(--success-bg)";
+          statusBadge.style.color = "var(--success)";
+          toggleBtn.innerText = "⏸️ Pause Defenses";
+          toggleBtn.className = "btn btn-secondary";
+        } else {
+          statusBadge.innerText = "⏸️ Defenses Paused";
+          statusBadge.style.background = "rgba(245, 158, 11, 0.15)";
+          statusBadge.style.color = "var(--warning)";
+          toggleBtn.innerText = "▶️ Resume Defenses";
+          toggleBtn.className = "btn";
+        }
+      }
+
+      const didDisplay = document.getElementById("tenant-did-display");
+      if (didDisplay) didDisplay.innerText = user.did || "";
+
+      const modContainer = document.getElementById("tenant-modlist-link-container");
+      if (modContainer) {
+        if (user.mod_list_uri) {
+          const webUrl = formatModListUrl(user.mod_list_uri);
+          modContainer.innerHTML = `<a href="${escapeHtml(webUrl)}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); font-weight: 600; text-decoration: none;">📋 Mod List &nearr;</a>`;
+        } else {
+          modContainer.innerHTML = `<span style="color: var(--text-muted);">📋 Mod list auto-provisions on first bounce</span>`;
+        }
+      }
+    }
+
+    function renderUnauthenticated() {
+      const container = document.getElementById("auth-header-container");
+      if (container) {
+        container.innerHTML = `<button class="btn btn-secondary" onclick="showLoginModal()">Sign In with Bluesky</button>`;
+      }
+      const banner = document.getElementById("tenant-banner-card");
+      if (banner) banner.style.display = "none";
+      const adminCard = document.getElementById("admin-fleet-card");
+      if (adminCard) adminCard.style.display = "none";
+    }
+
+    async function signOut() {
+      try {
+        await fetch("/api/auth/logout", { method: "POST" });
+      } catch (e) {
+        console.error("Logout request error", e);
+      }
+      localStorage.removeItem("skybouncer_did");
+      currentUser = null;
+      renderUnauthenticated();
+      showToast("👋 Signed out successfully");
+    }
+
+    async function toggleCurrentTenantDefense() {
+      if (!currentUser) return;
+      const targetActive = !currentUser.is_active;
+      const storedDid = localStorage.getItem("skybouncer_did") || currentUser.did;
+      const url = "/api/tenant/toggle" + (storedDid ? `?did=${encodeURIComponent(storedDid)}` : "");
+
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ is_active: targetActive })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          showToast(data.is_active ? "🟢 Defenses resumed" : "⏸️ Defenses paused");
+          currentUser.is_active = data.is_active;
+          renderAuthenticated(currentUser);
+          if (currentUser.is_admin) {
+            loadAdminTenants();
+          }
+        } else {
+          const err = await res.text();
+          showToast(`❌ Error: ${err}`);
+        }
+      } catch (e) {
+        showToast("❌ Network error toggling defense");
+      }
+    }
+
+    async function loadAdminTenants() {
+      const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
+      const url = "/api/admin/tenants" + (storedDid ? `?did=${encodeURIComponent(storedDid)}` : "");
+
+      try {
+        const res = await fetch(url);
+        if (!res.ok) {
+          if (res.status === 403) {
+            const adminCard = document.getElementById("admin-fleet-card");
+            if (adminCard) adminCard.style.display = "none";
+          }
+          return;
+        }
+        const data = await res.json();
+        const totalEl = document.getElementById("admin-total-tenants");
+        if (totalEl) totalEl.innerText = data.total;
+        const activeEl = document.getElementById("admin-active-tenants");
+        if (activeEl) activeEl.innerText = data.active_count;
+        const pausedEl = document.getElementById("admin-paused-tenants");
+        if (pausedEl) pausedEl.innerText = data.paused_count;
+
+        const tbody = document.getElementById("admin-tenants-table");
+        if (!tbody) return;
+
+        if (data.tenants.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 2rem;">No tenants enrolled in fleet yet.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = data.tenants.map(t => {
+          const handleDisplay = t.handle ? `@${escapeHtml(t.handle)}` : '<span style="color: var(--text-muted);">Unresolved</span>';
+          const statusBadge = t.is_active
+            ? '<span class="status-badge" style="background: var(--success-bg); color: var(--success); font-size: 0.75rem;">Active</span>'
+            : '<span class="status-badge" style="background: rgba(245, 158, 11, 0.15); color: var(--warning); font-size: 0.75rem;">Paused</span>';
+          const sessionBadge = t.has_session
+            ? '<span style="color: var(--success); font-weight: 600; font-size: 0.8rem;">● OAuth Connected</span>'
+            : '<span style="color: var(--text-muted); font-size: 0.8rem;">○ Service Token</span>';
+          const modLink = t.mod_list_uri
+            ? `<a href="${escapeHtml(formatModListUrl(t.mod_list_uri))}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); text-decoration: none; font-size: 0.8rem; font-weight: 600;">📋 List &nearr;</a>`
+            : '<span style="color: var(--text-muted); font-size: 0.8rem;">Pending</span>';
+          const toggleAction = t.is_active
+            ? `<button class="btn btn-secondary" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" onclick="toggleAdminTenant('${escapeHtml(t.did)}', false)">Pause</button>`
+            : `<button class="btn" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" onclick="toggleAdminTenant('${escapeHtml(t.did)}', true)">Resume</button>`;
+
+          return `
+            <tr>
+              <td>
+                <div style="font-weight: 600;">${handleDisplay}</div>
+                <code style="font-size: 0.75rem; color: var(--text-muted);">${escapeHtml(t.did)}</code>
+              </td>
+              <td>${statusBadge}</td>
+              <td>${sessionBadge}</td>
+              <td style="font-size: 0.8rem; color: var(--text-muted);">${formatDate(t.created_at)}</td>
+              <td>${modLink}</td>
+              <td>${toggleAction}</td>
+            </tr>
+          `;
+        }).join("");
+      } catch (e) {
+        console.error("Admin fleet load failed", e);
+      }
+    }
+
+    async function toggleAdminTenant(did, newActive) {
+      const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
+      const url = "/api/tenant/toggle" + (storedDid ? `?did=${encodeURIComponent(storedDid)}` : "");
+
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ did, is_active: newActive })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          showToast(data.is_active ? `🟢 Defenses resumed for ${did}` : `⏸️ Defenses paused for ${did}`);
+          loadAdminTenants();
+          if (currentUser && currentUser.did === did) {
+            currentUser.is_active = data.is_active;
+            renderAuthenticated(currentUser);
+          }
+        } else {
+          const err = await res.text();
+          showToast(`❌ Error: ${err}`);
+        }
+      } catch (e) {
+        showToast("❌ Network error toggling tenant");
+      }
+    }
+
+    function formatModListUrl(uri) {
+      if (!uri) return "#";
+      if (uri.startsWith("at://")) {
+        const parts = uri.replace("at://", "").split("/");
+        if (parts.length >= 3 && parts[1] === "app.bsky.graph.list") {
+          return `https://bsky.app/profile/${parts[0]}/lists/${parts[2]}`;
+        }
+      }
+      return uri;
+    }
+
+    function formatDate(isoStr) {
+      if (!isoStr) return "-";
+      try {
+        const d = new Date(isoStr);
+        return d.toLocaleDateString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+      } catch (e) {
+        return isoStr;
+      }
+    }
+
     // Initial load
     fetchStatus();
     loadRules();
     loadBounces();
+    checkUserSession();
     setInterval(fetchStatus, 3000);
   </script>
 </body>
 </html>
-"#;
+"##;
 
 /// Handler for `GET /`: serves the Single-Page Application dashboard HTML.
 pub async fn serve_dashboard() -> Html<&'static str> {

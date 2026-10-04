@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -446,4 +447,318 @@ pub async fn simulate_interaction(
             format!("Classification failed: {e}"),
         )),
     }
+}
+
+/// Query parameter for session-aware endpoints.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SessionQuery {
+    /// Optional DID passed as query parameter.
+    pub did: Option<String>,
+}
+
+/// Details of the currently authenticated user session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserSessionResponse {
+    /// Whether a valid user session is active.
+    pub authenticated: bool,
+    /// Authenticated decentralized identifier (DID), if signed in.
+    pub did: Option<String>,
+    /// Bluesky handle if known.
+    pub handle: Option<String>,
+    /// Whether the user has system administrator privileges.
+    pub is_admin: bool,
+    /// Whether automated defense is active for this tenant.
+    pub is_active: bool,
+    /// AT-URI of the sovereign moderation list on PDS, if provisioned.
+    pub mod_list_uri: Option<String>,
+    /// Active moderation rubric for this user.
+    pub rubric: Option<RulesResponse>,
+}
+
+/// Summary of an enrolled tenant for administrative fleet oversight.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantSummary {
+    /// Decentralized identifier (DID) of the tenant.
+    pub did: String,
+    /// Bluesky handle if known.
+    pub handle: Option<String>,
+    /// Whether automated moderation is active.
+    pub is_active: bool,
+    /// Whether an active OAuth session exists.
+    pub has_session: bool,
+    /// AT-URI of the sovereign moderation list on PDS.
+    pub mod_list_uri: Option<String>,
+    /// Unix timestamp in microseconds when enrolled.
+    pub created_at: u64,
+    /// Unix timestamp in microseconds when last updated.
+    pub updated_at: u64,
+}
+
+/// Response payload for administrative multi-tenant fleet overview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminTenantsResponse {
+    /// Total enrolled tenants count.
+    pub total: usize,
+    /// Count of actively defended tenants.
+    pub active_count: usize,
+    /// Count of paused tenants.
+    pub paused_count: usize,
+    /// List of tenant summaries.
+    pub tenants: Vec<TenantSummary>,
+}
+
+/// Request payload to toggle defense activation for a tenant.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToggleTenantRequest {
+    /// Target DID to toggle (defaults to caller's DID).
+    pub did: Option<String>,
+    /// Explicit target active state (`true` for active, `false` for paused).
+    pub is_active: Option<bool>,
+}
+
+/// Response payload after toggling tenant activation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToggleTenantResponse {
+    /// Whether the operation succeeded.
+    pub success: bool,
+    /// Target DID.
+    pub did: String,
+    /// Resulting active status (`true` if active, `false` if paused).
+    pub is_active: bool,
+    /// Status message.
+    pub message: String,
+}
+
+/// Extracts caller DID from query string, custom headers, or cookie.
+fn extract_did_from_headers(headers: &HeaderMap, query_did: Option<&str>) -> Option<String> {
+    if let Some(d) = query_did {
+        let trimmed = d.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(h) = headers.get("x-skybouncer-did") {
+        if let Ok(s) = h.to_str() {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Some(cookie_header) = headers.get(header::COOKIE) {
+        if let Ok(s) = cookie_header.to_str() {
+            for part in s.split(';') {
+                let part = part.trim();
+                if let Some(val) = part.strip_prefix("skybouncer_did=") {
+                    let val = val.trim();
+                    if !val.is_empty() {
+                        return Some(val.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Handler for `GET /api/me`: returns authenticated session info and permissions.
+pub async fn get_current_user(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionQuery>,
+) -> Json<UserSessionResponse> {
+    let did_opt = extract_did_from_headers(&headers, query.did.as_deref());
+
+    if let Some(did) = did_opt {
+        let is_admin = state.engine.is_admin(&did);
+        let mod_list_uri = state
+            .engine
+            .cache()
+            .get_mod_list(&did)
+            .ok()
+            .flatten()
+            .map(|c| c.list_uri);
+
+        if let Ok(Some(tenant)) = state.engine.tenant_registry().get(&did) {
+            let rubric = tenant.rubric.unwrap_or_else(|| state.engine.rubric());
+            return Json(UserSessionResponse {
+                authenticated: true,
+                did: Some(tenant.did),
+                handle: tenant.handle,
+                is_admin,
+                is_active: tenant.is_active,
+                mod_list_uri,
+                rubric: Some(RulesResponse {
+                    prompt: rubric.prompt,
+                    sensitivity: rubric.sensitivity,
+                    threshold: rubric.sensitivity.threshold(),
+                }),
+            });
+        }
+
+        if state.engine.is_protected(&did) || is_admin {
+            let rubric = state.engine.rubric();
+            return Json(UserSessionResponse {
+                authenticated: true,
+                did: Some(did.clone()),
+                handle: None,
+                is_admin: true,
+                is_active: !state.engine.is_tenant_paused(&did),
+                mod_list_uri,
+                rubric: Some(RulesResponse {
+                    prompt: rubric.prompt,
+                    sensitivity: rubric.sensitivity,
+                    threshold: rubric.sensitivity.threshold(),
+                }),
+            });
+        }
+    }
+
+    Json(UserSessionResponse {
+        authenticated: false,
+        did: None,
+        handle: None,
+        is_admin: false,
+        is_active: false,
+        mod_list_uri: None,
+        rubric: None,
+    })
+}
+
+/// Handler for `GET /api/admin/tenants`: returns multi-tenant fleet overview (admin only).
+pub async fn get_admin_tenants(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionQuery>,
+) -> Result<Json<AdminTenantsResponse>, (StatusCode, String)> {
+    let did_opt = extract_did_from_headers(&headers, query.did.as_deref());
+    let caller_did = did_opt.unwrap_or_default();
+
+    if !state.engine.is_admin(&caller_did) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Administrator privileges required to access tenant fleet".to_string(),
+        ));
+    }
+
+    let all_tenants = state
+        .engine
+        .tenant_registry()
+        .list_all()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut active_count = 0;
+    let mut paused_count = 0;
+    let mut summaries = Vec::with_capacity(all_tenants.len());
+
+    for t in all_tenants {
+        if t.is_active {
+            active_count += 1;
+        } else {
+            paused_count += 1;
+        }
+
+        let mod_list_uri = state
+            .engine
+            .cache()
+            .get_mod_list(&t.did)
+            .ok()
+            .flatten()
+            .map(|c| c.list_uri);
+
+        summaries.push(TenantSummary {
+            did: t.did,
+            handle: t.handle,
+            is_active: t.is_active,
+            has_session: t.session.is_some(),
+            mod_list_uri,
+            created_at: t.created_at,
+            updated_at: t.updated_at,
+        });
+    }
+
+    Ok(Json(AdminTenantsResponse {
+        total: summaries.len(),
+        active_count,
+        paused_count,
+        tenants: summaries,
+    }))
+}
+
+/// Handler for `POST /api/tenant/toggle`: toggles defense active/paused state for a tenant.
+pub async fn toggle_tenant(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<SessionQuery>,
+    Json(payload): Json<ToggleTenantRequest>,
+) -> Result<Json<ToggleTenantResponse>, (StatusCode, String)> {
+    let caller_did = extract_did_from_headers(&headers, query.did.as_deref()).unwrap_or_default();
+    let is_admin = state.engine.is_admin(&caller_did);
+
+    let target_did = payload
+        .did
+        .or_else(|| {
+            if !caller_did.is_empty() {
+                Some(caller_did.clone())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing target DID".to_string()))?;
+
+    if !is_admin && caller_did != target_did {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Cannot modify other tenant status without admin privileges".to_string(),
+        ));
+    }
+
+    let current_tenant = state
+        .engine
+        .tenant_registry()
+        .get(&target_did)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let new_active = match payload.is_active {
+        Some(explicit) => explicit,
+        None => match current_tenant {
+            Some(ref t) => !t.is_active,
+            None => false,
+        },
+    };
+
+    let _ = state
+        .engine
+        .tenant_registry()
+        .set_active(&target_did, new_active);
+
+    if state.engine.protected_dids().contains(&target_did) && is_admin {
+        if new_active {
+            state.engine.resume();
+        } else {
+            state.engine.pause();
+        }
+    }
+
+    let status_str = if new_active { "resumed" } else { "paused" };
+    Ok(Json(ToggleTenantResponse {
+        success: true,
+        did: target_did.clone(),
+        is_active: new_active,
+        message: format!("Automated defense {status_str} for {target_did}"),
+    }))
+}
+
+/// Handler for `POST /api/auth/logout`: clears session cookie and returns unauthenticated state.
+pub async fn logout() -> Response {
+    let mut resp = Json(serde_json::json!({ "logged_out": true })).into_response();
+    if let Ok(cookie_val) =
+        HeaderValue::from_str("skybouncer_did=; Path=/; Max-Age=0; SameSite=Lax")
+    {
+        resp.headers_mut().insert(header::SET_COOKIE, cookie_val);
+    }
+    resp
 }
