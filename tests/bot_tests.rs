@@ -1343,3 +1343,89 @@ async fn test_run_bounce_alert_dispatcher() {
     assert!(sent_text.contains("Violation: **crypto_spam**"));
     assert!(sent_text.contains("pardon did:plc:bad_actor"));
 }
+
+#[tokio::test]
+async fn test_bot_handler_allowlist_and_pardon_immunization() {
+    let (engine, cache, pds) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
+
+    // 1. Initial allowlist is empty
+    let res = handler
+        .handle_command("did:plc:protected1", "allowlist")
+        .await
+        .expect("handle");
+    assert!(res.contains("Your moderation allowlist is empty"));
+
+    // 2. Allow a friend
+    let res = handler
+        .handle_command("did:plc:protected1", "allow did:plc:friend1")
+        .await
+        .expect("handle");
+    assert!(res.contains("Account `did:plc:friend1` has been added to your moderation allowlist"));
+    assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:friend1"));
+
+    // 3. Allowlist now shows friend
+    let res = handler
+        .handle_command("did:plc:protected1", "allowlist")
+        .await
+        .expect("handle");
+    assert!(res.contains("Your Moderation Allowlist (1 account):"));
+    assert!(res.contains("did:plc:friend1"));
+
+    // 4. Unallow friend
+    let res = handler
+        .handle_command("did:plc:protected1", "unallow did:plc:friend1")
+        .await
+        .expect("handle");
+    assert!(
+        res.contains("Account `did:plc:friend1` has been removed from your moderation allowlist")
+    );
+    assert!(!engine.is_allowlisted("did:plc:protected1", "did:plc:friend1"));
+
+    // 5. Unallow again -> not found
+    let res = handler
+        .handle_command("did:plc:protected1", "unallow did:plc:friend1")
+        .await
+        .expect("handle");
+    assert!(res.contains("was not found on your moderation allowlist"));
+
+    // 6. Record a bounced violator in cache
+    cache
+        .record_bounce(&BouncedUser {
+            subject_did: "did:plc:violator_to_immunize".to_string(),
+            protected_did: "did:plc:protected1".to_string(),
+            listitem_uri: "at://did:plc:protected1/app.bsky.graph.listitem/item123".to_string(),
+            listitem_rkey: "item123".to_string(),
+            listitem_cid: "bafyitem123".to_string(),
+            category: "crypto_spam".to_string(),
+            confidence: 0.99,
+            reason: "airdrop spam".to_string(),
+            post_uri: "at://did:plc:violator_to_immunize/app.bsky.feed.post/123".to_string(),
+            post_text: "spam".to_string(),
+            bounced_at: 1_700_000_000,
+        })
+        .expect("record bounce");
+    assert!(cache
+        .is_bounced_for("did:plc:protected1", "did:plc:violator_to_immunize")
+        .expect("is_bounced"));
+
+    // 7. Pardon and allow!
+    let res = handler
+        .handle_command(
+            "did:plc:protected1",
+            "pardon and allow did:plc:violator_to_immunize",
+        )
+        .await
+        .expect("handle");
+    assert!(res.contains("has been pardoned and added to your allowlist"));
+    assert!(res.contains("permanently immunized against future automatic bounces"));
+
+    // Verify removed from PDS deleted_records
+    assert_eq!(pds.deleted_records.lock().len(), 1);
+    // Verify cleared from bounced cache
+    assert!(!cache
+        .is_bounced_for("did:plc:protected1", "did:plc:violator_to_immunize")
+        .expect("is_bounced"));
+    // Verify added to allowlist in both memory and db
+    assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:violator_to_immunize"));
+}

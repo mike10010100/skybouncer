@@ -376,6 +376,8 @@ async fn run_cli_pardon(args: &[String]) -> Result<(), SkybouncerError> {
     let req_payload = skybouncer::web::api::PardonRequest {
         subject_did: subject_did.clone(),
         protected_did,
+        allowlist: false,
+        reason: None,
     };
 
     let resp = match client.post(&pardon_url).json(&req_payload).send().await {

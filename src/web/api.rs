@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -77,6 +77,12 @@ pub struct PardonRequest {
     /// Optional protected DID whose list the violator should be removed from.
     #[serde(default)]
     pub protected_did: Option<String>,
+    /// Whether to permanently immunize the user against future moderation by adding them to the allowlist.
+    #[serde(default)]
+    pub allowlist: bool,
+    /// Optional explanatory reason for allowlisting.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Response payload following a pardon execution.
@@ -84,7 +90,50 @@ pub struct PardonRequest {
 pub struct PardonResponse {
     /// Whether an existing bounced record was found and deleted.
     pub pardoned: bool,
+    /// Whether the user was immunized on the allowlist.
+    #[serde(default)]
+    pub allowlisted: bool,
     /// The subject DID that was processed.
+    pub subject_did: String,
+    /// Status description message.
+    pub message: String,
+}
+
+/// Query parameters for listing allowlisted accounts.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AllowlistQuery {
+    /// Optional protected DID to filter allowlist for a specific user.
+    pub user_did: Option<String>,
+}
+
+/// Request payload to add an account to the moderation allowlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddAllowlistRequest {
+    /// Decentralized identifier (DID) or @handle of the account to allowlist.
+    pub subject: String,
+    /// Optional protected DID whose allowlist should be updated.
+    #[serde(default)]
+    pub protected_did: Option<String>,
+    /// Optional reason or justification for allowlisting.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Response payload following allowlist addition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddAllowlistResponse {
+    /// The allowlisted subject DID.
+    pub subject_did: String,
+    /// Status description message.
+    pub message: String,
+}
+
+/// Response payload following allowlist removal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveAllowlistResponse {
+    /// Whether the entry was found and removed.
+    pub removed: bool,
+    /// The removed subject DID.
     pub subject_did: String,
     /// Status description message.
     pub message: String,
@@ -499,22 +548,207 @@ pub async fn pardon_user(
         caller_did.clone()
     };
 
-    match state.engine.pardon_user(&protected_did, &subject_did).await {
-        Ok(true) => Ok(Json(PardonResponse {
-            pardoned: true,
+    if payload.allowlist {
+        match state
+            .engine
+            .pardon_and_allowlist(
+                &protected_did,
+                &subject_did,
+                payload
+                    .reason
+                    .as_deref()
+                    .or(Some("Immunized via web API pardon")),
+            )
+            .await
+        {
+            Ok(pardoned) => Ok(Json(PardonResponse {
+                pardoned,
+                allowlisted: true,
+                subject_did: subject_did.clone(),
+                message: format!(
+                    "Account {subject_did} was pardoned and immunized on the allowlist."
+                ),
+            })),
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to pardon and allowlist: {e}"),
+            )),
+        }
+    } else {
+        match state.engine.pardon_user(&protected_did, &subject_did).await {
+            Ok(true) => Ok(Json(PardonResponse {
+                pardoned: true,
+                allowlisted: false,
+                subject_did: subject_did.clone(),
+                message: format!(
+                    "Account {subject_did} was pardoned and removed from moderation list."
+                ),
+            })),
+            Ok(false) => Ok(Json(PardonResponse {
+                pardoned: false,
+                allowlisted: false,
+                subject_did: subject_did.clone(),
+                message: format!("Account {subject_did} was not found in the bounced cache."),
+            })),
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to pardon: {e}"),
+            )),
+        }
+    }
+}
+
+/// Handler for `GET /api/allowlist`: lists allowlisted accounts for the authenticated user or target user (admin).
+pub async fn get_allowlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<AllowlistQuery>,
+) -> Result<Json<Vec<crate::modlist::AllowlistEntry>>, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to view allowlist. Please sign in with Bluesky.".to_string(),
+        )
+    })?;
+
+    let is_admin = state.engine.is_admin(&caller_did);
+    let target_did = if let Some(ref ud) = query.user_did {
+        let requested = ud.trim();
+        if requested != caller_did && !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Access denied: you may only view your own allowlist.".to_string(),
+            ));
+        }
+        requested
+    } else {
+        &caller_did
+    };
+
+    match state.engine.list_allowlist(target_did) {
+        Ok(entries) => Ok(Json(entries)),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list allowlist: {e}"),
+        )),
+    }
+}
+
+/// Handler for `POST /api/allowlist`: adds an account to the moderation allowlist.
+pub async fn add_to_allowlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<AddAllowlistRequest>,
+) -> Result<Json<AddAllowlistResponse>, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to update allowlist. Please sign in with Bluesky.".to_string(),
+        )
+    })?;
+
+    let is_admin = state.engine.is_admin(&caller_did);
+    let protected_did = if let Some(ref pd) = payload.protected_did {
+        let requested = pd.trim();
+        if requested != caller_did && !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Access denied: you may only update your own allowlist.".to_string(),
+            ));
+        }
+        requested.to_string()
+    } else {
+        caller_did.clone()
+    };
+
+    let raw_subject = payload.subject.trim();
+    if raw_subject.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "subject cannot be empty".to_string(),
+        ));
+    }
+
+    let clean = raw_subject.trim_start_matches('@');
+    let subject_did = if clean.starts_with("did:") {
+        clean.to_string()
+    } else {
+        match state.engine.resolve_handle(clean).await {
+            Some(did) => did,
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Could not resolve handle `@{clean}` to a DID."),
+                ));
+            }
+        }
+    };
+
+    match state.engine.add_to_allowlist(
+        &protected_did,
+        &subject_did,
+        payload.reason.as_deref().or(Some("Added via web API")),
+    ) {
+        Ok(()) => Ok(Json(AddAllowlistResponse {
             subject_did: subject_did.clone(),
-            message: format!(
-                "Account {subject_did} was pardoned and removed from moderation list."
-            ),
-        })),
-        Ok(false) => Ok(Json(PardonResponse {
-            pardoned: false,
-            subject_did: subject_did.clone(),
-            message: format!("Account {subject_did} was not found in the bounced cache."),
+            message: format!("Account {subject_did} was added to the allowlist."),
         })),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to pardon: {e}"),
+            format!("Failed to add to allowlist: {e}"),
+        )),
+    }
+}
+
+/// Handler for `DELETE /api/allowlist/:did`: removes an account from the moderation allowlist.
+pub async fn remove_from_allowlist(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(subject_did): Path<String>,
+    Query(query): Query<AllowlistQuery>,
+) -> Result<Json<RemoveAllowlistResponse>, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to update allowlist. Please sign in with Bluesky.".to_string(),
+        )
+    })?;
+
+    let is_admin = state.engine.is_admin(&caller_did);
+    let protected_did = if let Some(ref ud) = query.user_did {
+        let requested = ud.trim();
+        if requested != caller_did && !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Access denied: you may only update your own allowlist.".to_string(),
+            ));
+        }
+        requested
+    } else {
+        &caller_did
+    };
+
+    let clean_did = subject_did.trim();
+    if clean_did.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "DID path parameter cannot be empty".to_string(),
+        ));
+    }
+
+    match state.engine.remove_from_allowlist(protected_did, clean_did) {
+        Ok(removed) => Ok(Json(RemoveAllowlistResponse {
+            removed,
+            subject_did: clean_did.to_string(),
+            message: if removed {
+                format!("Account {clean_did} was removed from the allowlist.")
+            } else {
+                format!("Account {clean_did} was not found on the allowlist.")
+            },
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to remove from allowlist: {e}"),
         )),
     }
 }
@@ -894,11 +1128,7 @@ pub async fn simulate_interaction(
         .unwrap_or_default();
 
     let final_violates = detailed.final_verdict.is_violation();
-    #[allow(clippy::cast_possible_truncation)]
-    let final_confidence_f32 = detailed
-        .final_verdict
-        .confidence()
-        .map_or(1.0, |c| c as f32);
+    let final_confidence = detailed.final_verdict.confidence().unwrap_or(1.0);
 
     let sim_outcome_str = match &detailed.final_verdict {
         Verdict::Violation {
@@ -915,14 +1145,12 @@ pub async fn simulate_interaction(
         Verdict::Permitted { .. } => "Simulated: Permitted",
     };
 
-    #[allow(clippy::cast_possible_truncation)]
-    let fallback_confidence_f32 = detailed
+    let fallback_confidence = detailed
         .fallback_verdict
         .as_ref()
-        .and_then(|v| v.confidence().map(|c| c as f32));
+        .and_then(|v| v.confidence());
 
-    #[allow(clippy::cast_possible_truncation)]
-    let primary_conf_f32 = tier1_conf as f32;
+    let primary_conf = tier1_conf;
 
     if let Err(e) = state
         .engine
@@ -943,7 +1171,7 @@ pub async fn simulate_interaction(
             } else {
                 "allow".to_string()
             },
-            primary_confidence: primary_conf_f32,
+            primary_confidence: primary_conf,
             primary_category: tier1_cat.clone().unwrap_or_default(),
             primary_reason: tier1_reason.clone(),
             escalated: detailed.escalated,
@@ -956,7 +1184,7 @@ pub async fn simulate_interaction(
                     "allow".to_string()
                 }
             }),
-            fallback_confidence: fallback_confidence_f32,
+            fallback_confidence,
             fallback_category: detailed
                 .fallback_verdict
                 .as_ref()
@@ -970,7 +1198,7 @@ pub async fn simulate_interaction(
             } else {
                 "allow".to_string()
             },
-            final_confidence: final_confidence_f32,
+            final_confidence,
             outcome: sim_outcome_str.to_string(),
         })
     {

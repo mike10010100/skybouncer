@@ -146,16 +146,69 @@ impl BotCommandHandler {
             return self.cmd_recent(sender_did);
         }
 
+        if trimmed.eq_ignore_ascii_case("allowlist") || trimmed.eq_ignore_ascii_case("allow list") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_allowlist(sender_did);
+        }
+
+        if trimmed.eq_ignore_ascii_case("allow") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
+            return Ok(
+                "Usage: `allow <did|@handle>` (e.g. `allow @alice.bsky.social`)".to_string(),
+            );
+        }
+
+        if let Some(target) = strip_prefix_ci(trimmed, "allow ") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_allow(sender_did, target.trim()).await;
+        }
+
+        if trimmed.eq_ignore_ascii_case("unallow") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
+            return Ok(
+                "Usage: `unallow <did|@handle>` (e.g. `unallow @alice.bsky.social`)".to_string(),
+            );
+        }
+
+        if let Some(target) = strip_prefix_ci(trimmed, "unallow ") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_unallow(sender_did, target.trim()).await;
+        }
+
         if trimmed.eq_ignore_ascii_case("pardon") {
             if !self.is_authorized_sender(sender_did) {
                 return Ok(self.unauthorized_response());
             }
-            return Ok("Usage: `pardon <did|@handle>` (e.g. `pardon did:plc:...` or `pardon @alice.bsky.social`)".to_string());
+            return Ok(
+                "Usage: `pardon <did|@handle>` or `pardon and allow <did|@handle>`".to_string(),
+            );
+        }
+
+        if let Some(target) = strip_prefix_ci(trimmed, "pardon and allow ") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_pardon_and_allow(sender_did, target.trim()).await;
         }
 
         if let Some(target) = strip_prefix_ci(trimmed, "pardon ") {
             if !self.is_authorized_sender(sender_did) {
                 return Ok(self.unauthorized_response());
+            }
+            if let Some(immunized_target) = strip_prefix_ci(target.trim(), "and allow ") {
+                return self
+                    .cmd_pardon_and_allow(sender_did, immunized_target.trim())
+                    .await;
             }
             return self.cmd_pardon(sender_did, target.trim()).await;
         }
@@ -200,6 +253,10 @@ impl BotCommandHandler {
              • `resume` — Reactivate automated moderation\n\
              • `recent` — List the 5 most recently bounced accounts\n\
              • `pardon <did|@handle>` — Remove an account from your moderation list\n\
+             • `pardon and allow <did|@handle>` — Pardon and permanently immunize\n\
+             • `allow <did|@handle>` — Add trusted account to your allowlist\n\
+             • `unallow <did|@handle>` — Remove account from your allowlist\n\
+             • `allowlist` — View your allowlisted accounts\n\
              • `status` — View engine telemetry & total bounces\n\
              • `test <text>` — Dry-run evaluation on sample text\n\
              • `start` / `auth` — 1-click link to activate Skybouncer ({})\n\
@@ -417,13 +474,186 @@ impl BotCommandHandler {
 
         match self.engine.pardon_user(&protected_did, &resolved_did).await {
             Ok(true) => Ok(format!(
-                "{handle_prefix}✅ Account `{resolved_did}` has been pardoned and removed from your moderation list."
+                "{handle_prefix}✅ Account `{resolved_did}` has been pardoned and removed from your moderation list.\n\n\
+                 💡 Tip: To permanently immunize this account against future bounces, use `pardon and allow {clean}` or `allow {clean}`."
             )),
             Ok(false) => Ok(format!(
                 "{handle_prefix}ℹ️ Account `{resolved_did}` was not found in your bounced list."
             )),
             Err(e) => Ok(format!("{handle_prefix}❌ Failed to pardon account: {e}")),
         }
+    }
+
+    async fn cmd_pardon_and_allow(
+        &self,
+        sender_did: &str,
+        raw_target: &str,
+    ) -> Result<String, SkybouncerError> {
+        let raw_target = raw_target.trim();
+        if raw_target.is_empty() {
+            return Ok("Usage: `pardon and allow <did|@handle>`".to_string());
+        }
+
+        let clean = raw_target.trim_start_matches('@');
+        let (resolved_did, was_handle) = if clean.starts_with("did:") {
+            (clean.to_string(), false)
+        } else {
+            match self.engine.resolve_handle(clean).await {
+                Some(did) => (did, true),
+                None => {
+                    return Ok(format!(
+                        "❌ Could not resolve handle `@{clean}` to a DID. Please verify the handle or provide the account's DID directly."
+                    ));
+                }
+            }
+        };
+
+        let protected_did = if self.engine.is_protected(sender_did)
+            || self.engine.is_enrolled(sender_did)
+            || self.engine.is_admin(sender_did)
+        {
+            sender_did.to_string()
+        } else {
+            return Ok(
+                "❌ You do not have permission to pardon users on this moderation list."
+                    .to_string(),
+            );
+        };
+
+        let handle_prefix = if was_handle {
+            format!("Resolved `@{clean}` to `{resolved_did}`.\n")
+        } else {
+            String::new()
+        };
+
+        match self
+            .engine
+            .pardon_and_allowlist(
+                &protected_did,
+                &resolved_did,
+                Some("Immunized via bot pardon-and-allow"),
+            )
+            .await
+        {
+            Ok(true) => Ok(format!(
+                "{handle_prefix}✅ Account `{resolved_did}` has been pardoned and added to your allowlist!\n\
+                 They are now permanently immunized against future automatic bounces."
+            )),
+            Ok(false) => Ok(format!(
+                "{handle_prefix}ℹ️ Account `{resolved_did}` was not on your list, but has been added to your allowlist for future immunization."
+            )),
+            Err(e) => Ok(format!("{handle_prefix}❌ Failed to pardon and allowlist account: {e}")),
+        }
+    }
+
+    async fn cmd_allow(
+        &self,
+        sender_did: &str,
+        raw_target: &str,
+    ) -> Result<String, SkybouncerError> {
+        let raw_target = raw_target.trim();
+        if raw_target.is_empty() {
+            return Ok(
+                "Usage: `allow <did|@handle>` (e.g. `allow @alice.bsky.social`)".to_string(),
+            );
+        }
+
+        let clean = raw_target.trim_start_matches('@');
+        let (resolved_did, was_handle) = if clean.starts_with("did:") {
+            (clean.to_string(), false)
+        } else {
+            match self.engine.resolve_handle(clean).await {
+                Some(did) => (did, true),
+                None => {
+                    return Ok(format!(
+                        "❌ Could not resolve handle `@{clean}` to a DID. Please verify the handle or provide the account's DID directly."
+                    ));
+                }
+            }
+        };
+
+        let handle_prefix = if was_handle {
+            format!("Resolved `@{clean}` to `{resolved_did}`.\n")
+        } else {
+            String::new()
+        };
+
+        match self
+            .engine
+            .add_to_allowlist(sender_did, &resolved_did, Some("Added via DM bot"))
+        {
+            Ok(()) => Ok(format!(
+                "{handle_prefix}✅ Account `{resolved_did}` has been added to your moderation allowlist.\n\
+                 Their interactions will now bypass all moderation checks at zero cost."
+            )),
+            Err(e) => Ok(format!("{handle_prefix}❌ Failed to allowlist account: {e}")),
+        }
+    }
+
+    async fn cmd_unallow(
+        &self,
+        sender_did: &str,
+        raw_target: &str,
+    ) -> Result<String, SkybouncerError> {
+        let raw_target = raw_target.trim();
+        if raw_target.is_empty() {
+            return Ok(
+                "Usage: `unallow <did|@handle>` (e.g. `unallow @alice.bsky.social`)".to_string(),
+            );
+        }
+
+        let clean = raw_target.trim_start_matches('@');
+        let (resolved_did, was_handle) = if clean.starts_with("did:") {
+            (clean.to_string(), false)
+        } else {
+            match self.engine.resolve_handle(clean).await {
+                Some(did) => (did, true),
+                None => {
+                    return Ok(format!(
+                        "❌ Could not resolve handle `@{clean}` to a DID. Please verify the handle or provide the account's DID directly."
+                    ));
+                }
+            }
+        };
+
+        let handle_prefix = if was_handle {
+            format!("Resolved `@{clean}` to `{resolved_did}`.\n")
+        } else {
+            String::new()
+        };
+
+        match self.engine.remove_from_allowlist(sender_did, &resolved_did) {
+            Ok(true) => Ok(format!(
+                "{handle_prefix}✅ Account `{resolved_did}` has been removed from your moderation allowlist."
+            )),
+            Ok(false) => Ok(format!(
+                "{handle_prefix}ℹ️ Account `{resolved_did}` was not found on your moderation allowlist."
+            )),
+            Err(e) => Ok(format!("{handle_prefix}❌ Failed to remove account from allowlist: {e}")),
+        }
+    }
+
+    fn cmd_allowlist(&self, sender_did: &str) -> Result<String, SkybouncerError> {
+        let entries = self.engine.list_allowlist(sender_did)?;
+        if entries.is_empty() {
+            return Ok("ℹ️ Your moderation allowlist is empty.\n\nUse `allow <did|@handle>` to exempt trusted accounts from moderation.".to_string());
+        }
+
+        let mut out = format!(
+            "🛡️ Your Moderation Allowlist ({} account{}):\n\n",
+            entries.len(),
+            if entries.len() == 1 { "" } else { "s" }
+        );
+        for (idx, entry) in entries.iter().enumerate() {
+            let num = idx.saturating_add(1);
+            let reason_str = entry.reason.as_deref().unwrap_or("No reason provided");
+            out.push_str(&format!(
+                "{num}. `{}`\n   Reason: {} | Added: {}\n",
+                entry.subject_did, reason_str, entry.created_at
+            ));
+        }
+
+        Ok(out)
     }
 
     fn cmd_status(&self, sender_did: &str) -> String {
@@ -443,6 +673,7 @@ impl BotCommandHandler {
                  • Interactions Matched: {}\n\
                  • Bypassed (Followed Author): {}\n\
                  • Bypassed (Self-Interaction): {}\n\
+                 • Bypassed (Allowlisted): {}\n\
                  • Dedup Cache Hits: {}\n\
                  • Heuristic Pre-Filter Flags: {}\n\
                  • Model Evaluations: {}\n\
@@ -457,6 +688,7 @@ impl BotCommandHandler {
                 stats.interactions_matched,
                 stats.gate_bypassed_followed,
                 stats.gate_bypassed_self,
+                stats.gate_bypassed_allowlist,
                 stats.dedup_cache_hits,
                 stats.heuristic_violations,
                 stats.model_evaluations,
@@ -477,17 +709,24 @@ impl BotCommandHandler {
                 .list_recent_bounces_for(Some(sender_did), 100)
                 .map(|b| b.len())
                 .unwrap_or(0);
+            let allowlist_count = self
+                .engine
+                .list_allowlist(sender_did)
+                .map(|l| l.len())
+                .unwrap_or(0);
             format!(
                 "📊 Skybouncer Status for Your Account:\n\n\
                  • Defense State: {}\n\
                  • Sensitivity: {}\n\
                  • Active Prompt: \"{}\"\n\
                  • Accounts Bounced from Your Posts: {}\n\
+                 • Allowlisted (Immunized) Accounts: {}\n\
                  • Protection Mode: {}",
                 state_label,
                 rubric.sensitivity,
                 rubric.prompt,
                 my_bounces,
+                allowlist_count,
                 if self.engine.is_dry_run() {
                     "Dry-Run (simulated)"
                 } else {

@@ -8,6 +8,7 @@
 //! Enforces zero lock holding across `.await` points by wrapping connections in
 //! synchronous locks that are acquired and released exclusively inside method calls.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +62,20 @@ pub struct BouncedUser {
     pub bounced_at: u64,
 }
 
+/// An account immunized on a protected user's moderation allowlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowlistEntry {
+    /// Decentralized identifier (DID) of the protected user owning this allowlist.
+    pub protected_did: String,
+    /// Decentralized identifier (DID) of the allowed/immunized subject.
+    pub subject_did: String,
+    /// Optional rationale explaining why the account was allowlisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Microsecond Unix timestamp when the entry was created.
+    pub created_at: u64,
+}
+
 /// Comprehensive audit record of an AI evaluation (Tier 1 & Tier 2 breakdown) persisted in SQLite.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvaluationLogEntry {
@@ -89,7 +104,7 @@ pub struct EvaluationLogEntry {
     /// Action emitted by Tier 1 ("allow" or "violation").
     pub primary_action: String,
     /// Confidence score from Tier 1 (0.0 to 1.0).
-    pub primary_confidence: f32,
+    pub primary_confidence: f64,
     /// Moderation category from Tier 1, if any.
     pub primary_category: String,
     /// Rationale emitted by Tier 1.
@@ -103,7 +118,7 @@ pub struct EvaluationLogEntry {
     /// Action emitted by Tier 2 ("allow" or "violation"), if escalated.
     pub fallback_action: Option<String>,
     /// Confidence score from Tier 2 (0.0 to 1.0), if escalated.
-    pub fallback_confidence: Option<f32>,
+    pub fallback_confidence: Option<f64>,
     /// Moderation category from Tier 2, if escalated.
     pub fallback_category: Option<String>,
     /// Rationale emitted by Tier 2, if escalated.
@@ -111,7 +126,7 @@ pub struct EvaluationLogEntry {
     /// Final verdict action adopted by the engine ("allow" or "violation").
     pub final_action: String,
     /// Final confidence score adopted by the engine.
-    pub final_confidence: f32,
+    pub final_confidence: f64,
     /// Final operational outcome (e.g. "Bounced", "Permitted", "Below Rubric Threshold", "Rate Limited", etc.).
     pub outcome: String,
 }
@@ -142,7 +157,7 @@ pub struct NewEvaluationLog {
     /// Action emitted by Tier 1 ("allow" or "violation").
     pub primary_action: String,
     /// Confidence score from Tier 1 (0.0 to 1.0).
-    pub primary_confidence: f32,
+    pub primary_confidence: f64,
     /// Moderation category from Tier 1, if any.
     pub primary_category: String,
     /// Rationale emitted by Tier 1.
@@ -156,7 +171,7 @@ pub struct NewEvaluationLog {
     /// Action emitted by Tier 2 ("allow" or "violation"), if escalated.
     pub fallback_action: Option<String>,
     /// Confidence score from Tier 2 (0.0 to 1.0), if escalated.
-    pub fallback_confidence: Option<f32>,
+    pub fallback_confidence: Option<f64>,
     /// Moderation category from Tier 2, if escalated.
     pub fallback_category: Option<String>,
     /// Rationale emitted by Tier 2, if escalated.
@@ -164,7 +179,7 @@ pub struct NewEvaluationLog {
     /// Final verdict action adopted by the engine.
     pub final_action: String,
     /// Final confidence score adopted by the engine.
-    pub final_confidence: f32,
+    pub final_confidence: f64,
     /// Final operational outcome.
     pub outcome: String,
 }
@@ -328,6 +343,14 @@ impl DeduplicationCache {
                 final_confidence REAL NOT NULL,
                 outcome TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS allowlist (
+                protected_did TEXT NOT NULL,
+                subject_did TEXT NOT NULL,
+                reason TEXT,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (protected_did, subject_did)
+            );
             ",
         )
         .map_err(|e| {
@@ -488,6 +511,9 @@ impl DeduplicationCache {
 
             CREATE INDEX IF NOT EXISTS idx_evaluation_log_source
                 ON evaluation_log(source);
+
+            CREATE INDEX IF NOT EXISTS idx_allowlist_protected
+                ON allowlist(protected_did);
             ",
         )
         .map_err(|e| {
@@ -1250,9 +1276,9 @@ impl DeduplicationCache {
         let timestamp_i64 = i64::try_from(entry.timestamp_us).unwrap_or(i64::MAX);
         let has_images_i64 = if entry.has_images { 1 } else { 0 };
         let escalated_i64 = if entry.escalated { 1 } else { 0 };
-        let primary_conf_f64 = f64::from(entry.primary_confidence);
-        let fallback_conf_f64 = entry.fallback_confidence.map(f64::from);
-        let final_conf_f64 = f64::from(entry.final_confidence);
+        let primary_conf_f64 = entry.primary_confidence;
+        let fallback_conf_f64 = entry.fallback_confidence;
+        let final_conf_f64 = entry.final_confidence;
 
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
@@ -1357,21 +1383,18 @@ impl DeduplicationCache {
             let has_images: bool = row.get::<_, i64>(9)? != 0;
             let primary_model: String = row.get(10)?;
             let primary_action: String = row.get(11)?;
-            #[allow(clippy::cast_possible_truncation)]
-            let primary_confidence = row.get::<_, f64>(12)? as f32;
+            let primary_confidence: f64 = row.get(12)?;
             let primary_category: String = row.get(13)?;
             let primary_reason: String = row.get(14)?;
             let escalated: bool = row.get::<_, i64>(15)? != 0;
             let escalation_reason: Option<String> = row.get(16)?;
             let fallback_model: Option<String> = row.get(17)?;
             let fallback_action: Option<String> = row.get(18)?;
-            #[allow(clippy::cast_possible_truncation)]
-            let fallback_confidence: Option<f32> = row.get::<_, Option<f64>>(19)?.map(|c| c as f32);
+            let fallback_confidence: Option<f64> = row.get(19)?;
             let fallback_category: Option<String> = row.get(20)?;
             let fallback_reason: Option<String> = row.get(21)?;
             let final_action: String = row.get(22)?;
-            #[allow(clippy::cast_possible_truncation)]
-            let final_confidence = row.get::<_, f64>(23)? as f32;
+            let final_confidence: f64 = row.get(23)?;
             let outcome: String = row.get(24)?;
 
             Ok(EvaluationLogEntry {
@@ -1454,6 +1477,126 @@ impl DeduplicationCache {
         )?;
         let deleted = stmt.execute(params![max_i64])?;
         Ok(deleted)
+    }
+
+    /// Adds an account to the protected user's moderation allowlist.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite persistence fails.
+    pub fn add_to_allowlist(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+        reason: Option<&str>,
+    ) -> Result<(), SkybouncerError> {
+        let conn = self.conn.lock();
+        let now_us = current_time_us();
+        let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
+
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO allowlist (protected_did, subject_did, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(protected_did, subject_did) DO UPDATE SET
+                 reason = excluded.reason,
+                 created_at = excluded.created_at;",
+        )?;
+
+        stmt.execute(params![protected_did, subject_did, reason, now_i64])?;
+        Ok(())
+    }
+
+    /// Removes an account from the protected user's moderation allowlist.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite delete fails.
+    pub fn remove_from_allowlist(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<bool, SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "DELETE FROM allowlist WHERE protected_did = ?1 AND subject_did = ?2;",
+        )?;
+        let affected = stmt.execute(params![protected_did, subject_did])?;
+        Ok(affected > 0)
+    }
+
+    /// Checks whether an account is currently on the protected user's moderation allowlist in SQLite.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn is_allowlisted(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<bool, SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT 1 FROM allowlist WHERE protected_did = ?1 AND subject_did = ?2 LIMIT 1;",
+        )?;
+        let exists = stmt
+            .query_row(params![protected_did, subject_did], |_| Ok(()))
+            .optional()?
+            .is_some();
+        Ok(exists)
+    }
+
+    /// Lists all accounts on the protected user's moderation allowlist.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn list_allowlist(
+        &self,
+        protected_did: &str,
+    ) -> Result<Vec<AllowlistEntry>, SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT protected_did, subject_did, reason, created_at
+             FROM allowlist
+             WHERE protected_did = ?1
+             ORDER BY created_at DESC;",
+        )?;
+        let rows = stmt.query_map(params![protected_did], |row| {
+            let p_did: String = row.get(0)?;
+            let s_did: String = row.get(1)?;
+            let reason: Option<String> = row.get(2)?;
+            let created_at_i64: i64 = row.get(3)?;
+            let created_at = u64::try_from(created_at_i64.max(0)).unwrap_or_default();
+            Ok(AllowlistEntry {
+                protected_did: p_did,
+                subject_did: s_did,
+                reason,
+                created_at,
+            })
+        })?;
+
+        let mut entries = Vec::new();
+        for r in rows {
+            entries.push(r?);
+        }
+        Ok(entries)
+    }
+
+    /// Loads all allowlist records across all protected users into a nested HashMap.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn load_all_allowlists(&self) -> Result<HashMap<String, HashSet<String>>, SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached("SELECT protected_did, subject_did FROM allowlist;")?;
+        let rows = stmt.query_map([], |row| {
+            let p_did: String = row.get(0)?;
+            let s_did: String = row.get(1)?;
+            Ok((p_did, s_did))
+        })?;
+
+        let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+        for r in rows {
+            let (p, s) = r?;
+            map.entry(p).or_default().insert(s);
+        }
+        Ok(map)
     }
 }
 
@@ -1863,5 +2006,61 @@ mod tests {
             .unwrap();
         assert_eq!(list_b_after.len(), 1);
         assert_eq!(list_b_after[0].listitem_rkey, "item_b");
+    }
+
+    #[test]
+    fn test_allowlist_crud_and_loading() {
+        let cache = DeduplicationCache::open_in_memory().unwrap();
+
+        assert!(!cache
+            .is_allowlisted("did:plc:alice", "did:plc:friend")
+            .unwrap());
+
+        cache
+            .add_to_allowlist("did:plc:alice", "did:plc:friend", Some("Friend of mine"))
+            .unwrap();
+        cache
+            .add_to_allowlist("did:plc:alice", "did:plc:colleague", None)
+            .unwrap();
+        cache
+            .add_to_allowlist("did:plc:bob", "did:plc:partner", Some("Work partner"))
+            .unwrap();
+
+        assert!(cache
+            .is_allowlisted("did:plc:alice", "did:plc:friend")
+            .unwrap());
+        assert!(cache
+            .is_allowlisted("did:plc:alice", "did:plc:colleague")
+            .unwrap());
+        assert!(!cache
+            .is_allowlisted("did:plc:alice", "did:plc:partner")
+            .unwrap());
+        assert!(cache
+            .is_allowlisted("did:plc:bob", "did:plc:partner")
+            .unwrap());
+
+        let alice_list = cache.list_allowlist("did:plc:alice").unwrap();
+        assert_eq!(alice_list.len(), 2);
+        assert!(alice_list
+            .iter()
+            .any(|e| e.subject_did == "did:plc:friend"
+                && e.reason.as_deref() == Some("Friend of mine")));
+
+        let all_map = cache.load_all_allowlists().unwrap();
+        assert_eq!(all_map.get("did:plc:alice").unwrap().len(), 2);
+        assert_eq!(all_map.get("did:plc:bob").unwrap().len(), 1);
+
+        let removed = cache
+            .remove_from_allowlist("did:plc:alice", "did:plc:friend")
+            .unwrap();
+        assert!(removed);
+        assert!(!cache
+            .is_allowlisted("did:plc:alice", "did:plc:friend")
+            .unwrap());
+
+        let removed_again = cache
+            .remove_from_allowlist("did:plc:alice", "did:plc:friend")
+            .unwrap();
+        assert!(!removed_again);
     }
 }

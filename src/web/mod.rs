@@ -22,10 +22,11 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 pub use api::{
-    health_check, AdminEvaluationsQuery, AdminEvaluationsResponse, AdminTenantsResponse, ApiState,
-    BouncesQuery, HealthResponse, PardonRequest, PardonResponse, RulesResponse, SimulateRequest,
-    SimulateResponse, StatusResponse, TenantSummary, ToggleTenantRequest, ToggleTenantResponse,
-    UpdateRulesRequest, UserSessionResponse,
+    health_check, AddAllowlistRequest, AddAllowlistResponse, AdminEvaluationsQuery,
+    AdminEvaluationsResponse, AdminTenantsResponse, AllowlistQuery, ApiState, BouncesQuery,
+    HealthResponse, PardonRequest, PardonResponse, RemoveAllowlistResponse, RulesResponse,
+    SimulateRequest, SimulateResponse, StatusResponse, TenantSummary, ToggleTenantRequest,
+    ToggleTenantResponse, UpdateRulesRequest, UserSessionResponse,
 };
 pub use oauth::{LoginQuery, OAuthState};
 pub use ui::serve_dashboard;
@@ -175,6 +176,14 @@ pub fn create_web_router(
         .route("/rules", get(api::get_rules).post(api::update_rules))
         .route("/bounces", get(api::get_bounces))
         .route("/pardon", post(api::pardon_user))
+        .route(
+            "/allowlist",
+            get(api::get_allowlist).post(api::add_to_allowlist),
+        )
+        .route(
+            "/allowlist/:did",
+            axum::routing::delete(api::remove_from_allowlist),
+        )
         .route("/simulate", post(api::simulate_interaction))
         .route("/me", get(api::get_current_user))
         .route("/admin/tenants", get(api::get_admin_tenants))
@@ -190,7 +199,7 @@ pub fn create_web_router(
         .with_state(oauth_state.clone());
 
     let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT]);
 
     Router::new()

@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.11] - 2026-10-04
+
+### Added & Enhanced
+
+- **Persistent Moderation Allowlist & Pardon Immunization (PRD §7.1)**:
+  - Added dedicated SQLite persistence (`allowlist` table) and in-memory multi-tenant lookup in `NonFollowedGate` with `<1µs` SLA (~218ns average).
+  - Added `BypassReason::AllowlistedAuthor` bypassing non-followed interactions without classifier inference or PDS writes.
+  - Implemented `SkybouncerEngine::pardon_and_allowlist` to permanently immunize pardoned authors from future re-bouncing ("pardon loop").
+  - Added ATProto DM bot commands: `allow <did|@handle>`, `unallow <did|@handle>`, `allowlist`, and `pardon and allow <did|@handle>`.
+  - Added Web REST API endpoints: `GET /api/allowlist`, `POST /api/allowlist`, `DELETE /api/allowlist/:did`, and `allowlist: bool` parameter on `POST /api/bounces/pardon`.
+- **Confidence Floating-Point Precision (`f64`)**:
+  - Upgraded `primary_confidence`, `fallback_confidence`, and `final_confidence` from `f32` to native `f64` across `EvaluationLogEntry`, `NewEvaluationLog`, SQLite storage, and web telemetry.
+- **Symmetrical Interaction Outcome Tracking**:
+  - Refined `InteractionOutcome::AlreadyBounced` to carry both `author_did` and `target_did` symmetrically, ensuring `target_did()` returns `Some` on all interaction variants.
+
 ## [0.1.10] - 2026-10-04
 
 ### Added & Fixed

@@ -29,10 +29,10 @@ use skyauth::client::OAuthClientMetadata;
 use skybouncer::classifier::{RuleRubric, Sensitivity, Verdict};
 use skybouncer::engine::{SkybouncerConfig, SkybouncerEngine};
 use skybouncer::matcher::{FollowGraph, NonFollowedGate};
-use skybouncer::modlist::{BouncedUser, DeduplicationCache, ModListManager};
+use skybouncer::modlist::{AllowlistEntry, BouncedUser, DeduplicationCache, ModListManager};
 use skybouncer::web::{
-    create_web_router, run_web_server, PardonResponse, RulesResponse, SimulateResponse,
-    StatusResponse, WebServerConfig,
+    create_web_router, run_web_server, AddAllowlistResponse, PardonResponse,
+    RemoveAllowlistResponse, RulesResponse, SimulateResponse, StatusResponse, WebServerConfig,
 };
 
 // =============================================================================
@@ -1338,4 +1338,139 @@ async fn test_simulate_ssrf_prevention() {
             "Error response should describe restriction for {malicious_url}: {body_str}"
         );
     }
+}
+
+#[tokio::test]
+async fn test_web_allowlist_endpoints_and_pardon_immunization() {
+    let protected_did = "did:plc:protected-owner";
+    let (engine, cache, pds, app) = setup_test_web_environment(protected_did).await;
+    let owner_token = create_test_session(&engine, protected_did);
+
+    // 1. Initial allowlist is empty
+    let list_req = Request::builder()
+        .uri("/api/allowlist")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = app.clone().oneshot(list_req).await.unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let entries: Vec<AllowlistEntry> = serde_json::from_slice(&bytes).unwrap();
+    assert!(entries.is_empty());
+
+    // 2. Add an account to the allowlist via POST /api/allowlist
+    let add_payload = json!({
+        "subject": "did:plc:friend1",
+        "reason": "Personal friend"
+    });
+    let add_req = Request::builder()
+        .method("POST")
+        .uri("/api/allowlist")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&add_payload).unwrap()))
+        .unwrap();
+    let add_resp = app.clone().oneshot(add_req).await.unwrap();
+    assert_eq!(add_resp.status(), StatusCode::OK);
+    let add_bytes = axum::body::to_bytes(add_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let add_res: AddAllowlistResponse = serde_json::from_slice(&add_bytes).unwrap();
+    assert_eq!(add_res.subject_did, "did:plc:friend1");
+    assert!(engine.is_allowlisted(protected_did, "did:plc:friend1"));
+
+    // 3. GET /api/allowlist now returns the added entry
+    let list_req2 = Request::builder()
+        .uri("/api/allowlist")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let list_resp2 = app.clone().oneshot(list_req2).await.unwrap();
+    assert_eq!(list_resp2.status(), StatusCode::OK);
+    let bytes2 = axum::body::to_bytes(list_resp2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let entries2: Vec<AllowlistEntry> = serde_json::from_slice(&bytes2).unwrap();
+    assert_eq!(entries2.len(), 1);
+    assert_eq!(entries2[0].subject_did, "did:plc:friend1");
+    assert_eq!(entries2[0].reason.as_deref(), Some("Personal friend"));
+
+    // 4. Cross-tenant check: Mallory cannot mutate protected-owner's allowlist
+    let mallory_token = create_test_session(&engine, "did:plc:mallory");
+    let cross_del_req = Request::builder()
+        .method("DELETE")
+        .uri(format!(
+            "/api/allowlist/did:plc:friend1?user_did={protected_did}"
+        ))
+        .header("cookie", format!("skybouncer_session={mallory_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let cross_del_resp = app.clone().oneshot(cross_del_req).await.unwrap();
+    assert_eq!(cross_del_resp.status(), StatusCode::FORBIDDEN);
+
+    // 5. DELETE /api/allowlist/:did successfully removes entry
+    let del_req = Request::builder()
+        .method("DELETE")
+        .uri("/api/allowlist/did:plc:friend1")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let del_resp = app.clone().oneshot(del_req).await.unwrap();
+    assert_eq!(del_resp.status(), StatusCode::OK);
+    let del_bytes = axum::body::to_bytes(del_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let del_res: RemoveAllowlistResponse = serde_json::from_slice(&del_bytes).unwrap();
+    assert!(del_res.removed);
+    assert!(!engine.is_allowlisted(protected_did, "did:plc:friend1"));
+
+    // 6. Record a bounced violator in cache
+    let violator_did = "did:plc:repeat_offender";
+    cache
+        .record_bounce(&BouncedUser {
+            subject_did: violator_did.to_string(),
+            protected_did: protected_did.to_string(),
+            listitem_uri: format!("at://{protected_did}/app.bsky.graph.listitem/item999"),
+            listitem_rkey: "item999".to_string(),
+            listitem_cid: "bafyitem999".to_string(),
+            category: "harassment".to_string(),
+            confidence: 0.95,
+            reason: "Targeted insult".to_string(),
+            post_uri: format!("at://{violator_did}/app.bsky.feed.post/post999"),
+            post_text: "Insulting text".to_string(),
+            bounced_at: 1_700_000_000,
+        })
+        .unwrap();
+
+    // 7. POST /api/pardon with allowlist: true immunizes violator
+    let pardon_payload = json!({
+        "subject_did": violator_did,
+        "allowlist": true,
+        "reason": "Pardoned and granted immunity"
+    });
+    let pardon_req = Request::builder()
+        .method("POST")
+        .uri("/api/pardon")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&pardon_payload).unwrap()))
+        .unwrap();
+    let pardon_resp = app.clone().oneshot(pardon_req).await.unwrap();
+    assert_eq!(pardon_resp.status(), StatusCode::OK);
+    let p_bytes = axum::body::to_bytes(pardon_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let p_res: PardonResponse = serde_json::from_slice(&p_bytes).unwrap();
+    assert!(p_res.pardoned);
+    assert!(p_res.allowlisted);
+    assert!(p_res.message.contains("immunized on the allowlist"));
+
+    // Verify PDS deleteRecord was executed
+    assert_eq!(pds.deleted_records.lock().len(), 1);
+    // Verify removed from bounce cache
+    assert!(!cache.is_bounced_for(protected_did, violator_did).unwrap());
+    // Verify present on allowlist
+    assert!(engine.is_allowlisted(protected_did, violator_did));
 }
