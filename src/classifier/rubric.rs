@@ -82,8 +82,7 @@ impl FromStr for Sensitivity {
 }
 
 /// Configurable duration for moderation list entries (permanent vs temporary timeout).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BounceDuration {
     /// Permanent moderation list entry (no expiration).
     #[default]
@@ -98,7 +97,121 @@ pub enum BounceDuration {
     Custom(u64),
 }
 
+impl Serialize for BounceDuration {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Permanent => serializer.serialize_str("permanent"),
+            Self::Cooldown24h => serializer.serialize_str("cooldown24h"),
+            Self::Timeout7d => serializer.serialize_str("timeout7d"),
+            Self::Timeout30d => serializer.serialize_str("timeout30d"),
+            Self::Custom(secs) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("custom", secs)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BounceDuration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BounceDurationVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BounceDurationVisitor {
+            type Value = BounceDuration;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(
+                    "a bounce duration string (e.g. 'permanent', '24h', '7d', '30d') or numeric seconds",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<BounceDuration, E>
+            where
+                E: serde::de::Error,
+            {
+                value
+                    .parse::<BounceDuration>()
+                    .map_err(serde::de::Error::custom)
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<BounceDuration, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    0 => Ok(BounceDuration::Permanent),
+                    86_400 => Ok(BounceDuration::Cooldown24h),
+                    604_800 => Ok(BounceDuration::Timeout7d),
+                    2_592_000 => Ok(BounceDuration::Timeout30d),
+                    secs => Ok(BounceDuration::Custom(secs)),
+                }
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<BounceDuration, E>
+            where
+                E: serde::de::Error,
+            {
+                if value <= 0 {
+                    Ok(BounceDuration::Permanent)
+                } else {
+                    let u = u64::try_from(value).map_err(serde::de::Error::custom)?;
+                    self.visit_u64(u)
+                }
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<BounceDuration, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                if let Some(key) = map.next_key::<String>()? {
+                    if key.eq_ignore_ascii_case("custom") {
+                        let val = map.next_value::<u64>()?;
+                        return Ok(BounceDuration::Custom(val));
+                    }
+                }
+                Err(serde::de::Error::custom(
+                    "expected object with 'custom' field",
+                ))
+            }
+        }
+
+        deserializer.deserialize_any(BounceDurationVisitor)
+    }
+}
+
 impl BounceDuration {
+    /// Returns the canonical machine-readable string representation.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Permanent => "permanent",
+            Self::Cooldown24h => "cooldown24h",
+            Self::Timeout7d => "timeout7d",
+            Self::Timeout30d => "timeout30d",
+            Self::Custom(_) => "custom",
+        }
+    }
+
+    /// Formats the duration as a string suitable for database storage.
+    #[must_use]
+    pub fn to_db_string(&self) -> String {
+        match self {
+            Self::Permanent => "permanent".to_string(),
+            Self::Cooldown24h => "cooldown24h".to_string(),
+            Self::Timeout7d => "timeout7d".to_string(),
+            Self::Timeout30d => "timeout30d".to_string(),
+            Self::Custom(secs) => secs.to_string(),
+        }
+    }
+
     /// Returns the timeout duration as a [`Duration`], or `None` if permanent.
     #[must_use]
     pub fn to_duration(&self) -> Option<Duration> {
@@ -138,13 +251,25 @@ impl FromStr for BounceDuration {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let normalized = s.trim().to_lowercase();
         match normalized.as_str() {
-            "permanent" | "perm" | "none" | "forever" => Ok(Self::Permanent),
-            "cooldown24h" | "24h" | "24-hour" | "24_hours" | "1d" | "day" => Ok(Self::Cooldown24h),
-            "timeout7d" | "7d" | "7-day" | "7_days" | "1w" | "week" => Ok(Self::Timeout7d),
-            "timeout30d" | "30d" | "30-day" | "30_days" | "1m" | "month" => Ok(Self::Timeout30d),
+            "permanent" | "perm" | "none" | "forever" | "0" => Ok(Self::Permanent),
+            "cooldown24h" | "cooldown_24h" | "24h" | "24-hour" | "24_hours" | "1d" | "day" => {
+                Ok(Self::Cooldown24h)
+            }
+            "timeout7d" | "timeout_7d" | "7d" | "7-day" | "7_days" | "1w" | "week" => {
+                Ok(Self::Timeout7d)
+            }
+            "timeout30d" | "timeout_30d" | "30d" | "30-day" | "30_days" | "1m" | "month" => {
+                Ok(Self::Timeout30d)
+            }
             _ => {
                 if let Ok(secs) = normalized.parse::<u64>() {
-                    Ok(Self::Custom(secs))
+                    match secs {
+                        0 => Ok(Self::Permanent),
+                        86_400 => Ok(Self::Cooldown24h),
+                        604_800 => Ok(Self::Timeout7d),
+                        2_592_000 => Ok(Self::Timeout30d),
+                        _ => Ok(Self::Custom(secs)),
+                    }
                 } else {
                     Err(SkybouncerError::Config(format!(
                         "Unknown bounce duration: `{s}`. Valid values: permanent, 24h, 7d, 30d, or seconds."
@@ -298,6 +423,33 @@ impl RuleRubric {
             } else if let Some(rest) = directive.strip_prefix("timeout =") {
                 let dur_str = rest.trim().trim_matches('"');
                 bounce_duration = dur_str.parse::<BounceDuration>()?;
+            } else if let Some(idx) = line_trimmed.rfind('[') {
+                if let Some(rest) = line_trimmed[idx..].strip_suffix(']') {
+                    let inline_dir = &rest[1..];
+                    if let Some(dur_str) = inline_dir.strip_prefix("duration:") {
+                        bounce_duration = dur_str.trim().parse::<BounceDuration>()?;
+                        let rem = line_trimmed[..idx].trim();
+                        if !rem.is_empty() {
+                            prompt_lines.push(rem);
+                        }
+                    } else if let Some(dur_str) = inline_dir.strip_prefix("timeout:") {
+                        bounce_duration = dur_str.trim().parse::<BounceDuration>()?;
+                        let rem = line_trimmed[..idx].trim();
+                        if !rem.is_empty() {
+                            prompt_lines.push(rem);
+                        }
+                    } else if let Some(sens_str) = inline_dir.strip_prefix("sensitivity:") {
+                        sensitivity = sens_str.trim().parse::<Sensitivity>()?;
+                        let rem = line_trimmed[..idx].trim();
+                        if !rem.is_empty() {
+                            prompt_lines.push(rem);
+                        }
+                    } else {
+                        prompt_lines.push(line);
+                    }
+                } else {
+                    prompt_lines.push(line);
+                }
             } else {
                 prompt_lines.push(line);
             }
@@ -334,5 +486,70 @@ impl FromStr for RuleRubric {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse(s)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bounce_duration_serde_flexibility() {
+        // Test parsing various strings
+        let d1: BounceDuration = serde_json::from_str("\"24h\"").unwrap();
+        assert_eq!(d1, BounceDuration::Cooldown24h);
+
+        let d2: BounceDuration = serde_json::from_str("\"cooldown24h\"").unwrap();
+        assert_eq!(d2, BounceDuration::Cooldown24h);
+
+        let d3: BounceDuration = serde_json::from_str("\"7d\"").unwrap();
+        assert_eq!(d3, BounceDuration::Timeout7d);
+
+        let d4: BounceDuration = serde_json::from_str("\"timeout7d\"").unwrap();
+        assert_eq!(d4, BounceDuration::Timeout7d);
+
+        let d5: BounceDuration = serde_json::from_str("\"30d\"").unwrap();
+        assert_eq!(d5, BounceDuration::Timeout30d);
+
+        let d6: BounceDuration = serde_json::from_str("\"timeout30d\"").unwrap();
+        assert_eq!(d6, BounceDuration::Timeout30d);
+
+        let d7: BounceDuration = serde_json::from_str("\"permanent\"").unwrap();
+        assert_eq!(d7, BounceDuration::Permanent);
+
+        let d8: BounceDuration = serde_json::from_str("\"perm\"").unwrap();
+        assert_eq!(d8, BounceDuration::Permanent);
+
+        // Test numbers
+        let d9: BounceDuration = serde_json::from_str("86400").unwrap();
+        assert_eq!(d9, BounceDuration::Cooldown24h);
+
+        let d10: BounceDuration = serde_json::from_str("0").unwrap();
+        assert_eq!(d10, BounceDuration::Permanent);
+
+        let d11: BounceDuration = serde_json::from_str("3600").unwrap();
+        assert_eq!(d11, BounceDuration::Custom(3600));
+
+        // Test object format
+        let d12: BounceDuration = serde_json::from_str("{\"custom\": 7200}").unwrap();
+        assert_eq!(d12, BounceDuration::Custom(7200));
+
+        // Test serialization round-trip
+        let serialized = serde_json::to_string(&BounceDuration::Cooldown24h).unwrap();
+        assert_eq!(serialized, "\"cooldown24h\"");
+        let round_trip: BounceDuration = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(round_trip, BounceDuration::Cooldown24h);
+    }
+
+    #[test]
+    fn test_rubric_parse_directives() {
+        let rubric = RuleRubric::parse("Block crypto spam [duration: 24h]").unwrap();
+        assert_eq!(rubric.prompt, "Block crypto spam");
+        assert_eq!(rubric.bounce_duration, BounceDuration::Cooldown24h);
+
+        let rubric7d = RuleRubric::parse("No harassment\ntimeout: 7d").unwrap();
+        assert_eq!(rubric7d.prompt, "No harassment");
+        assert_eq!(rubric7d.bounce_duration, BounceDuration::Timeout7d);
     }
 }

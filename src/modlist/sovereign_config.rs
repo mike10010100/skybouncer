@@ -27,6 +27,9 @@ pub struct SovereignConfigRecord {
     pub rules: String,
     /// Sensitivity string (`"low"`, `"medium"`, `"high"`).
     pub sensitivity: String,
+    /// Optional bounce duration string (`"permanent"`, `"cooldown24h"`, `"timeout7d"`, `"timeout30d"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounce_duration: Option<String>,
     /// Timestamp of last modification in ISO 8601 format.
     pub updated_at: String,
 }
@@ -39,6 +42,7 @@ impl SovereignConfigRecord {
             record_type: SOVEREIGN_CONFIG_COLLECTION.to_string(),
             rules: rubric.prompt.clone(),
             sensitivity: rubric.sensitivity.as_str().to_string(),
+            bounce_duration: Some(rubric.bounce_duration.to_db_string()),
             updated_at: crate::types::now_iso8601(),
         }
     }
@@ -51,7 +55,16 @@ impl SovereignConfigRecord {
             "high" => Sensitivity::High,
             _ => Sensitivity::Medium,
         };
-        RuleRubric::new(&self.rules, sensitivity)
+        let bounce_duration = self
+            .bounce_duration
+            .as_deref()
+            .and_then(|s| s.parse::<crate::classifier::BounceDuration>().ok())
+            .unwrap_or_default();
+        RuleRubric {
+            prompt: self.rules.clone(),
+            sensitivity,
+            bounce_duration,
+        }
     }
 }
 
@@ -59,6 +72,8 @@ impl SovereignConfigRecord {
 struct ListMetadata {
     rules: String,
     sensitivity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bounce_duration: Option<String>,
 }
 
 /// Encodes rubric parameters into moderation list description metadata.
@@ -75,6 +90,7 @@ pub fn format_list_description_with_rubric(base_description: &str, rubric: &Rule
     let meta = ListMetadata {
         rules: rubric.prompt.clone(),
         sensitivity: rubric.sensitivity.as_str().to_string(),
+        bounce_duration: Some(rubric.bounce_duration.to_db_string()),
     };
 
     let json_str = serde_json::to_string(&meta).unwrap_or_default();
@@ -101,8 +117,17 @@ pub fn extract_rubric_from_list_description(description: &str) -> Option<RuleRub
         "high" => Sensitivity::High,
         _ => Sensitivity::Medium,
     };
+    let bounce_duration = meta
+        .bounce_duration
+        .as_deref()
+        .and_then(|s| s.parse::<crate::classifier::BounceDuration>().ok())
+        .unwrap_or_default();
 
-    Some(RuleRubric::new(&meta.rules, sensitivity))
+    Some(RuleRubric {
+        prompt: meta.rules,
+        sensitivity,
+        bounce_duration,
+    })
 }
 
 /// Client helper fetching sovereign configuration from a user's PDS repository.

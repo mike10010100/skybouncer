@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.12] - 2026-10-04
+
+### Fixed & Enhanced
+
+- **Flexible Bounce Duration Deserialization & Normalization**:
+  - Implemented visitor-based deserializer for `BounceDuration` accepting string formats (`"24h"`, `"7d"`, `"30d"`, `"cooldown24h"`, `"timeout7d"`, `"timeout30d"`, `"permanent"`), numeric seconds (`86400`, `604800`, `2592000`, `0`), and `{ "custom": seconds }` objects.
+  - Resolved UI form submission deserialization error when selecting non-permanent cooldown options in the web dashboard.
+  - Normalized duration selection values in the frontend dashboard to ensure seamless round-trip synchronization between buttons, state, and API payload.
+- **Tenant Registry & Sovereign Repository Bounce Duration Persistence**:
+  - Added `bounce_duration` column to `tenants` SQLite schema with automatic idempotent migration.
+  - Enrolled tenants now persist custom bounce durations across server restarts, registry reloads, and web session reconnects.
+  - Added `bounce_duration` to `SovereignConfigRecord` and moderation list metadata tags (`[skybouncer:...]`) in sovereign PDS repositories.
+- **Bot Handler Duration Commands**:
+  - Added `duration <permanent|24h|7d|30d>` and `set duration <val>` bot command for adjusting tenant timeout lifecycles via ATProto DMs.
+  - Updated `rules` and `set rules` responses to display active bounce duration.
+
 ## [0.1.11] - 2026-10-04
 
 ### Added & Enhanced

@@ -30,7 +30,7 @@ pub use api::{
     UserSessionResponse,
 };
 pub use oauth::{LoginQuery, OAuthState};
-pub use ui::serve_dashboard;
+pub use ui::{serve_dashboard, DASHBOARD_HTML};
 
 use crate::engine::SkybouncerEngine;
 use crate::error::SkybouncerError;
