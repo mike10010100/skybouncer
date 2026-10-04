@@ -60,6 +60,17 @@ pub struct BouncedUser {
     pub post_text: String,
     /// Microsecond Unix timestamp when the bounce was recorded.
     pub bounced_at: u64,
+    /// Optional microsecond Unix timestamp when the temporary bounce expires (or `None` for permanent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+}
+
+impl BouncedUser {
+    /// Returns true if this bounce has an expiration timestamp and it has expired relative to `now_us`.
+    #[must_use]
+    pub fn is_expired(&self, now_us: u64) -> bool {
+        self.expires_at.is_some_and(|exp| exp <= now_us)
+    }
 }
 
 /// An account immunized on a protected user's moderation allowlist.
@@ -290,6 +301,7 @@ impl DeduplicationCache {
                 bounced_at INTEGER NOT NULL,
                 protected_did TEXT NOT NULL DEFAULT '',
                 post_text TEXT NOT NULL DEFAULT '',
+                expires_at INTEGER,
                 PRIMARY KEY (protected_did, subject_did)
             );
 
@@ -374,6 +386,10 @@ impl DeduplicationCache {
             "ALTER TABLE evaluation_log ADD COLUMN source TEXT NOT NULL DEFAULT 'live';",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE bounced_users ADD COLUMN expires_at INTEGER;",
+            [],
+        );
 
         // 3. Migrate legacy bounced_users table from single-column PK (subject_did) to composite PK (protected_did, subject_did)
         let needs_pk_migration: bool = {
@@ -409,12 +425,13 @@ impl DeduplicationCache {
                     bounced_at INTEGER NOT NULL,
                     protected_did TEXT NOT NULL DEFAULT '',
                     post_text TEXT NOT NULL DEFAULT '',
+                    expires_at INTEGER,
                     PRIMARY KEY (protected_did, subject_did)
                 );
                 INSERT OR IGNORE INTO bounced_users_v2
                     SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
                            category, confidence, reason, post_uri, bounced_at,
-                           COALESCE(protected_did, ''), COALESCE(post_text, '')
+                           COALESCE(protected_did, ''), COALESCE(post_text, ''), expires_at
                     FROM bounced_users;
                 DROP TABLE bounced_users;
                 ALTER TABLE bounced_users_v2 RENAME TO bounced_users;
@@ -473,6 +490,9 @@ impl DeduplicationCache {
 
             CREATE INDEX IF NOT EXISTS idx_bounced_users_protected
                 ON bounced_users(protected_did);
+
+            CREATE INDEX IF NOT EXISTS idx_bounced_users_expires
+                ON bounced_users(expires_at) WHERE expires_at IS NOT NULL;
 
             CREATE INDEX IF NOT EXISTS idx_bounced_user_rkeys_subject
                 ON bounced_user_rkeys(subject_did);
@@ -677,7 +697,7 @@ impl DeduplicationCache {
         let mut stmt = conn.prepare_cached(
             "SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
                         category, confidence, reason, post_uri, bounced_at,
-                        protected_did, post_text
+                        protected_did, post_text, expires_at
                  FROM bounced_users
                  WHERE subject_did = ?1
                  LIMIT 1;",
@@ -687,6 +707,9 @@ impl DeduplicationCache {
             .query_row(params![subject_did], |row| {
                 let bounced_at_i64: i64 = row.get(8)?;
                 let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
+                let expires_at = row
+                    .get::<_, Option<i64>>(11)?
+                    .map(|v| u64::try_from(v.max(0)).unwrap_or_default());
                 Ok(BouncedUser {
                     subject_did: row.get(0)?,
                     listitem_uri: row.get(1)?,
@@ -699,6 +722,7 @@ impl DeduplicationCache {
                     bounced_at,
                     protected_did: row.get(9)?,
                     post_text: row.get(10)?,
+                    expires_at,
                 })
             })
             .optional()?;
@@ -719,7 +743,7 @@ impl DeduplicationCache {
         let mut stmt = conn.prepare_cached(
             "SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
                         category, confidence, reason, post_uri, bounced_at,
-                        protected_did, post_text
+                        protected_did, post_text, expires_at
                  FROM bounced_users
                  WHERE subject_did = ?1 AND protected_did = ?2;",
         )?;
@@ -728,6 +752,9 @@ impl DeduplicationCache {
             .query_row(params![subject_did, protected_did], |row| {
                 let bounced_at_i64: i64 = row.get(8)?;
                 let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
+                let expires_at = row
+                    .get::<_, Option<i64>>(11)?
+                    .map(|v| u64::try_from(v.max(0)).unwrap_or_default());
                 Ok(BouncedUser {
                     subject_did: row.get(0)?,
                     listitem_uri: row.get(1)?,
@@ -740,6 +767,7 @@ impl DeduplicationCache {
                     bounced_at,
                     protected_did: row.get(9)?,
                     post_text: row.get(10)?,
+                    expires_at,
                 })
             })
             .optional()?;
@@ -758,6 +786,9 @@ impl DeduplicationCache {
     /// Returns [`SkybouncerError::Database`] if the insert fails.
     pub fn record_bounce(&self, entry: &BouncedUser) -> Result<(), SkybouncerError> {
         let bounced_at_i64 = i64::try_from(entry.bounced_at).unwrap_or(i64::MAX);
+        let expires_at_i64 = entry
+            .expires_at
+            .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
 
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(|e| {
@@ -772,8 +803,8 @@ impl DeduplicationCache {
                 "INSERT INTO bounced_users (
                         subject_did, listitem_uri, listitem_rkey, listitem_cid,
                         category, confidence, reason, post_uri, bounced_at,
-                        protected_did, post_text
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                        protected_did, post_text, expires_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                      ON CONFLICT(protected_did, subject_did) DO UPDATE SET
                          listitem_uri = excluded.listitem_uri,
                          listitem_rkey = excluded.listitem_rkey,
@@ -783,7 +814,8 @@ impl DeduplicationCache {
                          reason = excluded.reason,
                          post_uri = excluded.post_uri,
                          bounced_at = excluded.bounced_at,
-                         post_text = excluded.post_text;",
+                         post_text = excluded.post_text,
+                         expires_at = excluded.expires_at;",
             )?;
 
             user_stmt.execute(params![
@@ -798,6 +830,7 @@ impl DeduplicationCache {
                 bounced_at_i64,
                 entry.protected_did,
                 entry.post_text,
+                expires_at_i64,
             ])?;
         }
 
@@ -946,7 +979,7 @@ impl DeduplicationCache {
             let mut stmt = conn.prepare_cached(
                 "SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
                         category, confidence, reason, post_uri, bounced_at,
-                        protected_did, post_text
+                        protected_did, post_text, expires_at
                  FROM bounced_users
                  WHERE protected_did = ?1
                  ORDER BY bounced_at DESC
@@ -956,6 +989,9 @@ impl DeduplicationCache {
             let rows = stmt.query_map(params![target, limit_i64], |row| {
                 let bounced_at_i64: i64 = row.get(8)?;
                 let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
+                let expires_at = row
+                    .get::<_, Option<i64>>(11)?
+                    .map(|v| u64::try_from(v.max(0)).unwrap_or_default());
                 Ok(BouncedUser {
                     subject_did: row.get(0)?,
                     listitem_uri: row.get(1)?,
@@ -968,6 +1004,7 @@ impl DeduplicationCache {
                     bounced_at,
                     protected_did: row.get(9)?,
                     post_text: row.get(10)?,
+                    expires_at,
                 })
             })?;
 
@@ -978,7 +1015,7 @@ impl DeduplicationCache {
             let mut stmt = conn.prepare_cached(
                 "SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
                         category, confidence, reason, post_uri, bounced_at,
-                        protected_did, post_text
+                        protected_did, post_text, expires_at
                  FROM bounced_users
                  ORDER BY bounced_at DESC
                  LIMIT ?1;",
@@ -987,6 +1024,9 @@ impl DeduplicationCache {
             let rows = stmt.query_map(params![limit_i64], |row| {
                 let bounced_at_i64: i64 = row.get(8)?;
                 let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
+                let expires_at = row
+                    .get::<_, Option<i64>>(11)?
+                    .map(|v| u64::try_from(v.max(0)).unwrap_or_default());
                 Ok(BouncedUser {
                     subject_did: row.get(0)?,
                     listitem_uri: row.get(1)?,
@@ -999,6 +1039,7 @@ impl DeduplicationCache {
                     bounced_at,
                     protected_did: row.get(9)?,
                     post_text: row.get(10)?,
+                    expires_at,
                 })
             })?;
 
@@ -1007,6 +1048,51 @@ impl DeduplicationCache {
             }
         }
 
+        Ok(list)
+    }
+
+    /// Lists all temporary bounces that have expired relative to `now_us`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    pub fn list_expired_bounces(&self, now_us: u64) -> Result<Vec<BouncedUser>, SkybouncerError> {
+        let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
+                    category, confidence, reason, post_uri, bounced_at,
+                    protected_did, post_text, expires_at
+             FROM bounced_users
+             WHERE expires_at IS NOT NULL AND expires_at <= ?1
+             ORDER BY expires_at ASC;",
+        )?;
+
+        let rows = stmt.query_map(params![now_i64], |row| {
+            let bounced_at_i64: i64 = row.get(8)?;
+            let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
+            let expires_at = row
+                .get::<_, Option<i64>>(11)?
+                .map(|v| u64::try_from(v.max(0)).unwrap_or_default());
+            Ok(BouncedUser {
+                subject_did: row.get(0)?,
+                listitem_uri: row.get(1)?,
+                listitem_rkey: row.get(2)?,
+                listitem_cid: row.get(3)?,
+                category: row.get(4)?,
+                confidence: row.get(5)?,
+                reason: row.get(6)?,
+                post_uri: row.get(7)?,
+                bounced_at,
+                protected_did: row.get(9)?,
+                post_text: row.get(10)?,
+                expires_at,
+            })
+        })?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
         Ok(list)
     }
 
@@ -1655,6 +1741,7 @@ mod tests {
             post_uri: "at://did:plc:badactor/app.bsky.feed.post/post1".to_string(),
             post_text: "Free airdrop at scam link".to_string(),
             bounced_at: 1_700_000_100,
+            expires_at: None,
         };
 
         assert!(!cache.is_bounced("did:plc:badactor").unwrap());
@@ -1768,6 +1855,7 @@ mod tests {
             post_uri: "at://did:plc:migrated_user/app.bsky.feed.post/1".to_string(),
             post_text: "Migrated text".to_string(),
             bounced_at: 1_700_000_000,
+            expires_at: None,
         };
         cache.record_bounce(&bounce).unwrap();
         let fetched = cache
@@ -1938,6 +2026,7 @@ mod tests {
             post_uri: "at://did:plc:spammer/app.bsky.feed.post/1".to_string(),
             post_text: "Spam text".to_string(),
             bounced_at: 1_700_000_000,
+            expires_at: None,
         };
 
         let bounce_b = BouncedUser {
@@ -1952,6 +2041,7 @@ mod tests {
             post_uri: "at://did:plc:spammer/app.bsky.feed.post/2".to_string(),
             post_text: "Harassment text".to_string(),
             bounced_at: 1_700_000_100,
+            expires_at: None,
         };
 
         // Record bounces for both tenants

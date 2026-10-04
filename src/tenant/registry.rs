@@ -426,12 +426,14 @@ impl TenantRegistry {
                         Some(RuleRubric {
                             prompt,
                             sensitivity: sens,
+                            bounce_duration: crate::classifier::BounceDuration::default(),
                         })
                     }
                     (Some(prompt), None) => {
                         Some(RuleRubric::parse(&prompt).unwrap_or(RuleRubric {
                             prompt,
                             sensitivity: crate::classifier::Sensitivity::Medium,
+                            bounce_duration: crate::classifier::BounceDuration::default(),
                         }))
                     }
                     _ => None,

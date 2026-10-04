@@ -9,7 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added & Enhanced
 
-- **Persistent Moderation Allowlist & Pardon Immunization (PRD §7.1)**:
+- **Temporary "Time-Out" / Cooldown Bounces (TTL Bouncing with Background PDS Pruning, PRD §7.1 Item 2)**:
+  - Added `BounceDuration` enum (`Permanent`, `Cooldown24h`, `Timeout7d`, `Timeout30d`, `Custom(u64)`) to `RuleRubric` with directive parsing (`duration: 24h`, `timeout: 7d`).
+  - Added `expires_at` column and partial index `idx_bounced_users_expires` to SQLite cache `bounced_users` with seamless migration support across legacy schema versions.
+  - Added `expires_at` calculation in `ModListManager::bounce_user_with_text` and `SkybouncerEngine::process_commit`.
+  - Implemented `SkybouncerEngine::prune_expired_bounces()` in periodic maintenance loop to automatically unbounce and delete expired listitem records from sovereign PDS repositories and purge SQLite cache entries.
+  - Added `Violation Duration` segmented control to web dashboard House Rules card and `⏳ TTL` expiration indicators to Recently Bounced table.
+- **Prometheus `/metrics` Observability Endpoint (PRD §7.3 Item 6)**:
+  - Mounted `GET /metrics` and `GET /api/metrics` serving standard Prometheus 0.0.4 text exposition format (`Content-Type: text/plain; version=0.0.4; charset=utf-8`).
+  - Exports telemetry counters: `skybouncer_commits_received_total`, `skybouncer_follow_sync_events_total`, `skybouncer_interactions_matched_total`, `skybouncer_gate_bypassed_total{reason=...}`, `skybouncer_candidates_evaluated_total`, `skybouncer_dedup_cache_hits_total`, `skybouncer_eval_cache_hits_total`, `skybouncer_heuristic_violations_total`, `skybouncer_model_evaluations_total`, `skybouncer_bounces_total`, `skybouncer_permitted_total`, `skybouncer_eval_queue_overflows_total`, and gauges for evaluation queue depth, protected users, enrolled tenants, and build info.
+- **Tenant-Scoped Evaluation Audit Log (PRD §7.1 Item 3)**:
+  - Added `GET /api/evaluations` with strict tenant isolation: non-admin tenants view evaluations on interactions targeting their own posts, while administrators retain fleet-wide visibility.
+  - Enabled dynamic `#admin-eval-card` for all authenticated tenants to inspect evaluation decisions and confidence scores in real time.
+- **Dashboard Rubric Presets & Bounced Search Filtering (PRD §7.3 Item 5)**:
+  - Added one-click rubric preset buttons (*Balanced Defense*, *Zero Crypto*, *Anti-Hostility*, and *Anti-Ragebait*).
+  - Added real-time client-side search filtering input on the Recently Bounced table.
+  - Added "Pardon & Allow" one-click button on bounce entries.
+  - Added dedicated Allowlist Management card for viewing, searching, adding, and removing allowlisted users.
+- **Persistent Moderation Allowlist & Pardon Immunization (PRD §7.1 Item 1)**:
   - Added dedicated SQLite persistence (`allowlist` table) and in-memory multi-tenant lookup in `NonFollowedGate` with `<1µs` SLA (~218ns average).
   - Added `BypassReason::AllowlistedAuthor` bypassing non-followed interactions without classifier inference or PDS writes.
   - Implemented `SkybouncerEngine::pardon_and_allowlist` to permanently immunize pardoned authors from future re-bouncing ("pardon loop").

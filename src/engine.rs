@@ -39,6 +39,7 @@ use crate::matcher::{
     BypassReason, FollowGraph, FollowSyncEvent, GateDecision, Interaction, NonFollowedGate,
     TargetMatcher,
 };
+use crate::modlist::cache::current_time_us;
 use crate::modlist::{BouncedUser, DeduplicationCache, ModListManager, DEFAULT_MOD_LIST_NAME};
 use crate::tenant::{Tenant, TenantRegistry};
 
@@ -54,8 +55,8 @@ pub const DEFAULT_EVALUATION_CONCURRENCY: usize = 1;
 /// Default evaluation verdict cache TTL (24 hours).
 pub const DEFAULT_EVALUATION_CACHE_TTL: Duration = Duration::from_secs(86400);
 
-/// Default periodic cache maintenance interval (1 hour).
-pub const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
+/// Default periodic cache maintenance interval (60 seconds).
+pub const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default graceful shutdown timeout (5 seconds).
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1715,6 +1716,7 @@ impl SkybouncerEngine {
                 }
 
                 // Actionable violation: bounce on sovereign PDS
+                let expires_at = rubric.bounce_duration.expires_at_us(current_time_us());
                 let pds_client = self.resolve_pds_client_for(&target_did).await?;
                 let bounce_result = self
                     .modlist_manager
@@ -1727,6 +1729,7 @@ impl SkybouncerEngine {
                         &reason,
                         &post_uri,
                         &post_text,
+                        expires_at,
                     )
                     .await
                     .inspect_err(|_e| {
@@ -2541,6 +2544,52 @@ impl SkybouncerEngine {
         self.run(rx, cancel).await
     }
 
+    /// Prunes expired temporary bounces from both sovereign PDS moderation lists and the SQLite cache.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if querying expired bounces fails.
+    pub async fn prune_expired_bounces(&self) -> Result<usize, SkybouncerError> {
+        let now_us = current_time_us();
+        let expired = self.cache.list_expired_bounces(now_us)?;
+        if expired.is_empty() {
+            return Ok(0);
+        }
+
+        let mut pruned_count = 0;
+        for record in expired {
+            match self
+                .pardon_user(&record.protected_did, &record.subject_did)
+                .await
+            {
+                Ok(true) => {
+                    pruned_count += 1;
+                    info!(
+                        subject_did = %record.subject_did,
+                        protected_did = %record.protected_did,
+                        "Pruned expired temporary bounce from PDS and cache"
+                    );
+                }
+                Ok(false) => {
+                    debug!(
+                        subject_did = %record.subject_did,
+                        protected_did = %record.protected_did,
+                        "Expired bounce record was already removed"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        subject_did = %record.subject_did,
+                        protected_did = %record.protected_did,
+                        error = %e,
+                        "Failed to pardon expired bounce on PDS"
+                    );
+                }
+            }
+        }
+
+        Ok(pruned_count)
+    }
+
     /// Runs the periodic background maintenance loop to prune expired evaluation cache entries.
     ///
     /// # Errors
@@ -2579,6 +2628,16 @@ impl SkybouncerEngine {
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to prune expired web sessions in maintenance task");
+                        }
+                    }
+                    match self.prune_expired_bounces().await {
+                        Ok(count) => {
+                            if count > 0 {
+                                info!(count, "Pruned expired temporary bounces from PDS and cache");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to prune expired bounces in maintenance task");
                         }
                     }
                 }

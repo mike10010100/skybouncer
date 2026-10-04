@@ -53,16 +53,16 @@ pub use limiter::{
 };
 pub use stream::{run_jetstream_streamer, StreamConfig, DEFAULT_JETSTREAM_ENDPOINT};
 pub use web::{
-    create_web_router, run_web_server, AddAllowlistRequest, AddAllowlistResponse, AllowlistQuery,
-    ApiState, BouncesQuery, EvaluationsQuery, EvaluationsResponse, LoginQuery, OAuthState,
-    PardonRequest, PardonResponse, RemoveAllowlistResponse, RulesResponse, SimulateRequest,
-    SimulateResponse, StatusResponse, UpdateRulesRequest, WebServerConfig, DEFAULT_WEB_HOST,
-    DEFAULT_WEB_PORT,
+    create_web_router, get_prometheus_metrics, run_web_server, AddAllowlistRequest,
+    AddAllowlistResponse, AllowlistQuery, ApiState, BouncesQuery, EvaluationsQuery,
+    EvaluationsResponse, LoginQuery, OAuthState, PardonRequest, PardonResponse,
+    RemoveAllowlistResponse, RulesResponse, SimulateRequest, SimulateResponse, StatusResponse,
+    UpdateRulesRequest, WebServerConfig, DEFAULT_WEB_HOST, DEFAULT_WEB_PORT,
 };
 
 pub use classifier::{
-    Classifier, HeuristicClassifier, HeuristicRule, JevClassifier, JevConfig, MockClassifier,
-    RuleRubric, Sensitivity, Verdict, ViolationCategory,
+    BounceDuration, Classifier, HeuristicClassifier, HeuristicRule, JevClassifier, JevConfig,
+    MockClassifier, RuleRubric, Sensitivity, Verdict, ViolationCategory,
 };
 pub use engine::{
     BounceNotification, EngineStats, EngineStatsSnapshot, InteractionOutcome, ProcessCommitResult,

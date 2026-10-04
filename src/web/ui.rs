@@ -590,6 +590,17 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </div>
           </div>
           <div style="margin-bottom: 1rem;">
+            <label style="font-size: 0.75rem; text-transform: uppercase; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">
+              Violation Duration (Time-Out / Cooldown)
+            </label>
+            <div class="segmented-control">
+              <button class="segmented-btn active" id="dur-perm" onclick="setBounceDuration('permanent')">Permanent</button>
+              <button class="segmented-btn" id="dur-24h" onclick="setBounceDuration('24h')">24h Cooldown</button>
+              <button class="segmented-btn" id="dur-7d" onclick="setBounceDuration('7d')">7d Timeout</button>
+              <button class="segmented-btn" id="dur-30d" onclick="setBounceDuration('30d')">30d Timeout</button>
+            </div>
+          </div>
+          <div style="margin-bottom: 1rem;">
             <div style="display: flex; gap: 0.35rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.35rem;">
               <label style="font-size: 0.75rem; text-transform: uppercase; font-weight: 600; color: var(--text-muted); margin-right: 0.25rem;">
                 Moderation Prompt
@@ -871,6 +882,27 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
     }
 
+    let activeBounceDuration = "permanent";
+
+    function setBounceDuration(val) {
+      activeBounceDuration = val || "permanent";
+      const norm = (activeBounceDuration || "").toLowerCase();
+      const is24h = norm === "cooldown24h" || norm === "24h" || norm === "1d";
+      const is7d = norm === "timeout7d" || norm === "7d" || norm === "1w";
+      const is30d = norm === "timeout30d" || norm === "30d" || norm === "1m";
+      const isPerm = !is24h && !is7d && !is30d;
+
+      const permBtn = document.getElementById("dur-perm");
+      const b24hBtn = document.getElementById("dur-24h");
+      const b7dBtn = document.getElementById("dur-7d");
+      const b30dBtn = document.getElementById("dur-30d");
+
+      if (permBtn) permBtn.classList.toggle("active", isPerm);
+      if (b24hBtn) b24hBtn.classList.toggle("active", is24h);
+      if (b7dBtn) b7dBtn.classList.toggle("active", is7d);
+      if (b30dBtn) b30dBtn.classList.toggle("active", is30d);
+    }
+
     function renderRulesAuthenticated(rubric) {
       const unauthBox = document.getElementById("rules-unauth-container");
       const authBox = document.getElementById("rules-auth-container");
@@ -879,6 +911,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       if (rubric) {
         document.getElementById("rules-prompt").value = rubric.prompt || "";
         setSensitivity(rubric.sensitivity || "medium");
+        setBounceDuration(rubric.bounce_duration || "permanent");
       }
     }
 
@@ -933,7 +966,11 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             "Content-Type": "application/json"
           },
           credentials: "same-origin",
-          body: JSON.stringify({ prompt, sensitivity: activeSensitivity })
+          body: JSON.stringify({
+            prompt,
+            sensitivity: activeSensitivity,
+            bounce_duration: activeBounceDuration
+          })
         });
         if (res.ok) {
           const data = await res.json();
@@ -1289,6 +1326,9 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       tbody.innerHTML = bounces.map(b => {
         const profileUrl = bskyProfileUrl(b.subject_did);
         const postLinkHtml = formatPostLink(b.post_uri, b.post_text);
+        const ttlBadge = b.expires_at ?
+          `<span class="status-badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; font-size: 0.7rem; margin-left: 0.35rem;" title="Expires at ${new Date(b.expires_at / 1000).toLocaleString()}">⏳ TTL</span>` :
+          `<span class="status-badge" style="background: rgba(148, 163, 184, 0.15); color: var(--text-muted); font-size: 0.7rem; margin-left: 0.35rem;">Permanent</span>`;
         return `
         <tr>
           <td>
@@ -1297,7 +1337,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </a>
           </td>
           <td>${postLinkHtml}</td>
-          <td><span class="status-badge" style="background: var(--danger-bg); color: var(--danger); font-size: 0.75rem;">${escapeHtml(b.category)}</span></td>
+          <td><span class="status-badge" style="background: var(--danger-bg); color: var(--danger); font-size: 0.75rem;">${escapeHtml(b.category)}</span>${ttlBadge}</td>
           <td><strong>${Math.round(b.confidence * 100)}%</strong></td>
           <td><span style="font-size: 0.82rem;" title="${escapeHtml(b.reason)}">${escapeHtml(b.reason)}</span></td>
           <td style="white-space: nowrap;">

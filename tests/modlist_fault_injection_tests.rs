@@ -283,6 +283,7 @@ async fn test_adversarial_pds_socket_drop_on_delete_record() {
         post_uri: "at://did:plc:socket_drop_pardon/app.bsky.feed.post/1".to_string(),
         post_text: "spam message".to_string(),
         bounced_at: 1_700_000_000,
+        expires_at: None,
     };
     manager.cache().record_bounce(&bounce).unwrap();
     assert!(manager.is_bounced("did:plc:socket_drop_pardon").unwrap());

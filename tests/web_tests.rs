@@ -380,6 +380,7 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
         post_uri: "at://did:plc:toxic-violator-999/app.bsky.feed.post/post123".to_string(),
         post_text: "You are terrible".to_string(),
         bounced_at: 1_720_000_000_000_000,
+        expires_at: None,
     };
     cache.record_bounce(&bounce_entry).unwrap();
     let owner_token = create_test_session(&engine, "did:plc:protected-owner");
@@ -1447,6 +1448,7 @@ async fn test_web_allowlist_endpoints_and_pardon_immunization() {
             post_uri: format!("at://{violator_did}/app.bsky.feed.post/post999"),
             post_text: "Insulting text".to_string(),
             bounced_at: 1_700_000_000,
+            expires_at: None,
         })
         .unwrap();
 
@@ -1643,4 +1645,78 @@ async fn test_tenant_scoped_evaluations_api() {
     let eval_res_sim: EvaluationsResponse = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(eval_res_sim.total, 1);
     assert_eq!(eval_res_sim.evaluations[0].source, "simulation");
+}
+
+#[tokio::test]
+async fn test_prometheus_metrics_endpoint() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+
+    // Simulate some engine stats activity
+    engine
+        .stats()
+        .commits_received
+        .fetch_add(42, std::sync::atomic::Ordering::Relaxed);
+    engine
+        .stats()
+        .bounces_executed
+        .fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+    engine
+        .stats()
+        .gate_bypassed_self
+        .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+
+    // 1. Test GET /metrics (standard root endpoint)
+    let req = Request::builder()
+        .uri("/metrics")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8")
+    );
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+    assert!(body.contains("# HELP skybouncer_commits_received_total"));
+    assert!(body.contains("# TYPE skybouncer_commits_received_total counter"));
+    assert!(body.contains("skybouncer_commits_received_total 42"));
+
+    assert!(body.contains("# HELP skybouncer_bounces_total"));
+    assert!(body.contains("skybouncer_bounces_total 3"));
+
+    assert!(body.contains("skybouncer_gate_bypassed_total{reason=\"self\"} 5"));
+    assert!(body.contains("skybouncer_gate_bypassed_total{reason=\"followed\"} 0"));
+    assert!(body.contains("skybouncer_gate_bypassed_total{reason=\"allowlist\"} 0"));
+
+    assert!(body.contains("# TYPE skybouncer_protected_users gauge"));
+    assert!(body.contains("skybouncer_protected_users"));
+    assert!(body.contains("skybouncer_eval_queue_depth 0"));
+    assert!(body.contains("skybouncer_enrolled_tenants"));
+    assert!(body.contains("skybouncer_build_info{version="));
+
+    // 2. Test GET /api/metrics (nested API route)
+    let req_api = Request::builder()
+        .uri("/api/metrics")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp_api = app.oneshot(req_api).await.unwrap();
+    assert_eq!(resp_api.status(), StatusCode::OK);
+    assert_eq!(
+        resp_api
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain; version=0.0.4; charset=utf-8")
+    );
 }

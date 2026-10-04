@@ -472,6 +472,7 @@ impl ModListManager {
             reason,
             post_uri,
             "",
+            None,
         )
         .await
     }
@@ -497,6 +498,7 @@ impl ModListManager {
         reason: &str,
         post_uri: &str,
         post_text: &str,
+        expires_at: Option<u64>,
     ) -> Result<Option<String>, SkybouncerError> {
         // 1. Check rubric threshold if rubric is configured
         if let Some(ref rubric) = *self.rubric.read() {
@@ -586,6 +588,12 @@ impl ModListManager {
         };
 
         // 8. Persist to SQLite cache with compensating deletion on failure
+        let effective_expires_at = expires_at.or_else(|| {
+            self.rubric
+                .read()
+                .as_ref()
+                .and_then(|r| r.bounce_duration.expires_at_us(now_us))
+        });
         let bounce_record = BouncedUser {
             subject_did: candidate_did.to_string(),
             protected_did: protected_did.to_string(),
@@ -598,6 +606,7 @@ impl ModListManager {
             post_uri: post_uri.to_string(),
             post_text: post_text.to_string(),
             bounced_at: now_us,
+            expires_at: effective_expires_at,
         };
         if let Err(cache_err) = self.cache.record_bounce(&bounce_record) {
             error!(

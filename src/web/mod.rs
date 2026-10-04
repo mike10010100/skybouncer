@@ -22,11 +22,11 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 pub use api::{
-    health_check, AddAllowlistRequest, AddAllowlistResponse, AdminEvaluationsQuery,
-    AdminEvaluationsResponse, AdminTenantsResponse, AllowlistQuery, ApiState, BouncesQuery,
-    EvaluationsQuery, EvaluationsResponse, HealthResponse, PardonRequest, PardonResponse,
-    RemoveAllowlistResponse, RulesResponse, SimulateRequest, SimulateResponse, StatusResponse,
-    TenantSummary, ToggleTenantRequest, ToggleTenantResponse, UpdateRulesRequest,
+    get_prometheus_metrics, health_check, AddAllowlistRequest, AddAllowlistResponse,
+    AdminEvaluationsQuery, AdminEvaluationsResponse, AdminTenantsResponse, AllowlistQuery,
+    ApiState, BouncesQuery, EvaluationsQuery, EvaluationsResponse, HealthResponse, PardonRequest,
+    PardonResponse, RemoveAllowlistResponse, RulesResponse, SimulateRequest, SimulateResponse,
+    StatusResponse, TenantSummary, ToggleTenantRequest, ToggleTenantResponse, UpdateRulesRequest,
     UserSessionResponse,
 };
 pub use oauth::{LoginQuery, OAuthState};
@@ -173,6 +173,7 @@ pub fn create_web_router(
 
     let api_router = Router::new()
         .route("/health", get(api::health_check))
+        .route("/metrics", get(api::get_prometheus_metrics))
         .route("/status", get(api::get_status))
         .route("/rules", get(api::get_rules).post(api::update_rules))
         .route("/bounces", get(api::get_bounces))
@@ -192,7 +193,7 @@ pub fn create_web_router(
         .route("/evaluations", get(api::get_evaluations))
         .route("/tenant/toggle", post(api::toggle_tenant))
         .route("/auth/logout", post(api::logout))
-        .with_state(api_state);
+        .with_state(api_state.clone());
 
     let oauth_router = Router::new()
         .route("/client-metadata.json", get(oauth::get_client_metadata))
@@ -208,6 +209,10 @@ pub fn create_web_router(
         .route("/", get(ui::serve_dashboard))
         .route("/auth", get(oauth::auth_redirect))
         .route("/healthz", get(api::health_check))
+        .route(
+            "/metrics",
+            get(api::get_prometheus_metrics).with_state(api_state),
+        )
         .route(
             "/client-metadata.json",
             get(oauth::get_client_metadata).with_state(oauth_state),

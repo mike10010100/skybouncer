@@ -639,6 +639,7 @@ async fn test_command_handler_recent_and_pardon() {
             post_uri: "at://did:plc:spammer1/app.bsky.feed.post/post1".to_string(),
             post_text: "Scam post".to_string(),
             bounced_at: 1_700_000_000,
+            expires_at: None,
         })
         .expect("record bounce");
 
@@ -1194,6 +1195,7 @@ async fn test_command_handler_pardon_with_handle_resolution() {
             post_uri: "at://did:plc:alice123/post/1".to_string(),
             post_text: "Spam content".to_string(),
             bounced_at: 1_700_000_000,
+            expires_at: None,
         })
         .expect("record");
 
@@ -1403,6 +1405,7 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
             post_uri: "at://did:plc:violator_to_immunize/app.bsky.feed.post/123".to_string(),
             post_text: "spam".to_string(),
             bounced_at: 1_700_000_000,
+            expires_at: None,
         })
         .expect("record bounce");
     assert!(cache
