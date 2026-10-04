@@ -5,4 +5,4 @@
 
 pub mod registry;
 
-pub use registry::{Tenant, TenantRegistry};
+pub use registry::{Tenant, TenantRegistry, DEFAULT_HANDLE_TTL};

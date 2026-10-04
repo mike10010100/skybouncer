@@ -823,6 +823,7 @@ impl BotCommandHandler {
     }
 
     async fn cmd_test(&self, sender_did: &str, text: &str) -> Result<String, SkybouncerError> {
+        let sender_rubric = self.engine.rubric_for(sender_did);
         let synthetic_interaction = Interaction {
             author_did: "did:plc:test-author-sample".to_string(),
             target_did: sender_did.to_string(),
@@ -836,6 +837,7 @@ impl BotCommandHandler {
             image_cids: Vec::new(),
             image_alts: Vec::new(),
             enriched_context: None,
+            rubric: Some(sender_rubric),
         };
 
         // Evaluate using heuristic first, then model

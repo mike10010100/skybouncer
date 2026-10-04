@@ -22,6 +22,9 @@ use crate::classifier::RuleRubric;
 use crate::crypto::SessionCipher;
 use crate::error::SkybouncerError;
 
+/// Default time-to-live for handle resolution caching (1 hour).
+pub const DEFAULT_HANDLE_TTL: Duration = Duration::from_secs(3600);
+
 /// Multi-tenant record representing an enrolled Bluesky user.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tenant {
@@ -90,7 +93,8 @@ impl Tenant {
 #[derive(Clone)]
 pub struct TenantRegistry {
     conn: Arc<Mutex<Connection>>,
-    pds_clients: Arc<RwLock<HashMap<String, Arc<PdsRepoClient>>>>,
+    /// In-memory cache of authenticated [`PdsRepoClient`] instances indexed by tenant DID.
+    pub pds_clients: Arc<RwLock<HashMap<String, Arc<PdsRepoClient>>>>,
     oauth_client: Arc<RwLock<Option<Arc<AtprotoOAuthClient>>>>,
     cipher: SessionCipher,
     refresh_locks: Arc<crate::modlist::manager::StripedAsyncLocks>,
@@ -479,25 +483,66 @@ impl TenantRegistry {
         }
     }
 
-    /// Retrieves an enrolled tenant by Bluesky handle.
+    /// Retrieves an enrolled tenant by Bluesky handle enforcing a maximum TTL age.
+    ///
+    /// The tenant's handle mapping must have been updated within `max_age` of the current time.
+    /// If the handle mapping has expired or does not match, returns `Ok(None)`.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if SQLite lookup fails.
-    pub fn get_by_handle(&self, handle: &str) -> Result<Option<Tenant>, SkybouncerError> {
+    pub fn get_by_handle_with_ttl(
+        &self,
+        handle: &str,
+        max_age: Duration,
+    ) -> Result<Option<Tenant>, SkybouncerError> {
         let clean = handle.trim().trim_start_matches('@');
+        let max_age_us = u64::try_from(max_age.as_micros()).unwrap_or(u64::MAX);
+        let cutoff_us = current_time_us().saturating_sub(max_age_us);
+        let cutoff_i64 = i64::try_from(cutoff_us).unwrap_or(i64::MAX);
+
         let did_opt: Option<String> = {
             let conn = self.conn.lock();
             let mut stmt = conn.prepare_cached(
-                "SELECT did FROM tenants WHERE LOWER(handle) = LOWER(?1) OR LOWER(handle) = LOWER(?2) LIMIT 1;",
+                "SELECT did FROM tenants WHERE (LOWER(handle) = LOWER(?1) OR LOWER(handle) = LOWER(?2)) AND updated_at >= ?3 LIMIT 1;",
             )?;
-            stmt.query_row(params![clean, format!("@{clean}")], |row| row.get(0))
-                .optional()?
+            stmt.query_row(params![clean, format!("@{clean}"), cutoff_i64], |row| {
+                row.get(0)
+            })
+            .optional()?
         };
 
         match did_opt {
             Some(did) => self.get(&did),
             None => Ok(None),
         }
+    }
+
+    /// Retrieves an enrolled tenant by Bluesky handle using the default TTL ([`DEFAULT_HANDLE_TTL`]).
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite lookup fails.
+    pub fn get_by_handle(&self, handle: &str) -> Result<Option<Tenant>, SkybouncerError> {
+        self.get_by_handle_with_ttl(handle, DEFAULT_HANDLE_TTL)
+    }
+
+    /// Invalidates a handle mapping in the registry by setting `handle = NULL`
+    /// for any matching tenants.
+    ///
+    /// Returns `true` if any tenant's handle was invalidated.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite update query fails.
+    pub fn invalidate_handle(&self, handle: &str) -> Result<bool, SkybouncerError> {
+        let clean = handle.trim().trim_start_matches('@');
+        let now_us = current_time_us();
+        let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
+
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "UPDATE tenants SET handle = NULL, updated_at = ?1 WHERE LOWER(handle) = LOWER(?2) OR LOWER(handle) = LOWER(?3);",
+        )?;
+        let count = stmt.execute(params![now_i64, clean, format!("@{clean}")])?;
+        Ok(count > 0)
     }
 
     /// Checks whether the given DID is registered and enrolled in the tenant registry.
@@ -609,6 +654,18 @@ impl TenantRegistry {
             did
         ])?;
         Ok(count > 0)
+    }
+
+    /// Resets the moderation rule rubric for an enrolled tenant back to the default rubric.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if update query fails.
+    pub fn reset_rubric(
+        &self,
+        did: &str,
+        default_rubric: &RuleRubric,
+    ) -> Result<bool, SkybouncerError> {
+        self.update_rubric(did, default_rubric)
     }
 
     /// Updates the handle for an enrolled tenant.
@@ -877,41 +934,60 @@ impl TenantRegistry {
 
         // 4. If session is expired or close to expiring, auto-refresh via OAuth
         if session.is_expired_with_leeway(Duration::from_secs(60)) {
-            if let Some(ref oc) = resolved_oauth_client {
-                if session.refresh_token().is_some() {
+            let oc = match resolved_oauth_client.as_ref() {
+                Some(oc) => oc,
+                None => {
+                    self.pds_clients.write().remove(did);
+                    return Err(SkybouncerError::Auth(format!(
+                        "OAuth session for tenant {did} is expired and no OAuth client is configured"
+                    )));
+                }
+            };
+
+            if session.refresh_token().is_none() {
+                self.pds_clients.write().remove(did);
+                return Err(SkybouncerError::Auth(format!(
+                    "OAuth session for tenant {did} is expired and has no refresh token"
+                )));
+            }
+
+            tracing::info!(
+                did = %did,
+                "Refreshing expired ATProto OAuth session for tenant PDS client"
+            );
+            match oc.refresh_session(&mut session).await {
+                Ok(()) => {
                     tracing::info!(
                         did = %did,
-                        "Refreshing expired ATProto OAuth session for tenant PDS client"
+                        "Successfully refreshed ATProto OAuth session for tenant"
                     );
-                    match oc.refresh_session(&mut session).await {
-                        Ok(()) => {
-                            tracing::info!(
-                                did = %did,
-                                "Successfully refreshed ATProto OAuth session for tenant"
-                            );
-                            if let Err(e) = self.update_session(did, &session) {
-                                tracing::warn!(
-                                    did = %did,
-                                    error = %e,
-                                    "Failed to persist refreshed session to SQLite database"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                did = %did,
-                                error = %e,
-                                "Failed to refresh ATProto OAuth session using refresh token"
-                            );
-                        }
+                    if let Err(e) = self.update_session(did, &session) {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "Failed to persist refreshed session to SQLite database"
+                        );
                     }
-                } else {
+                }
+                Err(e) => {
                     tracing::warn!(
                         did = %did,
-                        "Tenant session is expired but has no refresh token to refresh with"
+                        error = %e,
+                        "Failed to refresh ATProto OAuth session using refresh token"
                     );
+                    self.pds_clients.write().remove(did);
+                    return Err(SkybouncerError::Auth(format!(
+                        "Failed to refresh expired OAuth session for tenant {did}: {e}"
+                    )));
                 }
             }
+        }
+
+        if session.is_expired() {
+            self.pds_clients.write().remove(did);
+            return Err(SkybouncerError::Auth(format!(
+                "OAuth session for tenant {did} remains expired"
+            )));
         }
 
         // 5. Construct PdsRepoClient
@@ -1360,5 +1436,71 @@ mod tests {
         // Attempting to retrieve tenant fails authentication tag check
         let fetch_result = registry_b.get("did:plc:protected-key-test");
         assert!(fetch_result.is_err());
+    }
+
+    #[test]
+    fn test_tenant_handle_ttl_and_invalidation() {
+        let registry = TenantRegistry::open_in_memory().unwrap();
+        let tenant = Tenant::new("did:plc:alice").with_handle("alice.bsky.social");
+        registry.register_or_update(&tenant).unwrap();
+
+        // Standard retrieval with default TTL
+        let fetched = registry.get_by_handle("alice.bsky.social").unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().did, "did:plc:alice");
+
+        // Prefix '@' works
+        let with_at = registry.get_by_handle("@alice.bsky.social").unwrap();
+        assert!(with_at.is_some());
+
+        // Zero TTL treats it as expired
+        let expired = registry
+            .get_by_handle_with_ttl("alice.bsky.social", Duration::ZERO)
+            .unwrap();
+        assert!(expired.is_none());
+
+        // Invalidation clears handle
+        let invalidated = registry.invalidate_handle("alice.bsky.social").unwrap();
+        assert!(invalidated);
+
+        // After invalidation, lookup returns None
+        let after = registry.get_by_handle("alice.bsky.social").unwrap();
+        assert!(after.is_none());
+
+        // Re-invalidating non-existent handle returns false
+        let second_inv = registry.invalidate_handle("alice.bsky.social").unwrap();
+        assert!(!second_inv);
+    }
+
+    #[tokio::test]
+    async fn test_expired_session_without_oauth_client_or_refresh_token_errors() {
+        let registry = TenantRegistry::open_in_memory().unwrap();
+        let dpop_key = DPoPKey::generate();
+
+        // Expired session without refresh token
+        let session_no_rt = OAuthSession::new(
+            "did:plc:no-rt",
+            "at_expired",
+            None,
+            "DPoP",
+            None,
+            Some(0),
+            dpop_key,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let tenant = Tenant::new("did:plc:no-rt").with_session(session_no_rt);
+        registry.register_or_update(&tenant).unwrap();
+
+        // Calling get_pds_client without OAuth client errors
+        let res_no_oc = registry.get_pds_client("did:plc:no-rt", None).await;
+        assert!(res_no_oc.is_err());
+        assert!(
+            matches!(res_no_oc, Err(SkybouncerError::Auth(msg)) if msg.contains("no OAuth client"))
+        );
+        assert!(registry.pds_clients.read().get("did:plc:no-rt").is_none());
     }
 }

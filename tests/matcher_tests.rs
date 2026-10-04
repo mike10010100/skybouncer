@@ -207,6 +207,127 @@ fn test_follow_graph_hydrate_batch_and_dids() {
     assert_eq!(graph.follow_count("did:plc:alice"), 0);
 }
 
+#[test]
+fn test_follow_graph_remove_synthetic_follow_fallback() {
+    let graph = FollowGraph::new();
+
+    // No follows yet -> returns None
+    assert_eq!(
+        graph.remove_synthetic_follow_fallback("did:plc:alice"),
+        None
+    );
+
+    // Add only a real TID rkey -> returns None because no synthetic keys exist
+    graph.add_follow("did:plc:alice", "3la7real_tid", "did:plc:bob");
+    assert_eq!(
+        graph.remove_synthetic_follow_fallback("did:plc:alice"),
+        None
+    );
+    assert!(graph.is_following("did:plc:alice", "did:plc:bob"));
+
+    // Add synthetic hydrate_0 -> should remove it
+    graph.add_follow("did:plc:alice", "hydrate_0", "did:plc:charlie");
+    assert!(graph.is_following("did:plc:alice", "did:plc:charlie"));
+
+    let removed = graph.remove_synthetic_follow_fallback("did:plc:alice");
+    assert_eq!(removed, Some("did:plc:charlie".to_string()));
+    assert!(!graph.is_following("did:plc:alice", "did:plc:charlie"));
+
+    // Real TID follow remains intact
+    assert!(graph.is_following("did:plc:alice", "did:plc:bob"));
+
+    // Add synthetic seed_did -> should remove it
+    graph.hydrate_dids("did:plc:alice", vec!["did:plc:david"]);
+    assert!(graph.is_following("did:plc:alice", "did:plc:david"));
+
+    let removed_seed = graph.remove_synthetic_follow_fallback("did:plc:alice");
+    assert_eq!(removed_seed, Some("did:plc:david".to_string()));
+    assert!(!graph.is_following("did:plc:alice", "did:plc:david"));
+}
+
+#[test]
+fn test_follow_graph_handle_commit_delete_synthetic_fallback() {
+    let graph = FollowGraph::new();
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+
+    // Hydrated with synthetic rkey hydrate_0
+    graph.add_follow("did:plc:alice", "hydrate_0", "did:plc:bob");
+    assert!(graph.is_following("did:plc:alice", "did:plc:bob"));
+
+    // Delete commit arrives with real ATProto TID (untracked in reverse index)
+    let commit = make_follow_delete_commit("did:plc:alice", "3l5u4vh2k6s2y");
+    let event = graph.handle_commit(&commit, &protected_dids);
+
+    assert_eq!(
+        event,
+        FollowSyncEvent::FollowRemoved {
+            protected_did: "did:plc:alice".to_string(),
+            rkey: "3l5u4vh2k6s2y".to_string(),
+            followed_did: "did:plc:bob".to_string(),
+        }
+    );
+    assert!(!graph.is_following("did:plc:alice", "did:plc:bob"));
+}
+
+#[test]
+fn test_follow_graph_handle_commit_delete_payload_subject_fallback() {
+    let graph = FollowGraph::new();
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+
+    // Follow added
+    graph.add_follow("did:plc:alice", "custom_rkey", "did:plc:bob");
+    assert!(graph.is_following("did:plc:alice", "did:plc:bob"));
+
+    // Delete commit has a different rkey but provides subject in record payload
+    let commit = JetstreamCommit {
+        did: "did:plc:alice".to_string(),
+        time_us: 1_700_000_000_000_000,
+        collection: "app.bsky.graph.follow".to_string(),
+        rkey: "untracked_rkey".to_string(),
+        operation: CommitOperation::Delete,
+        cid: None,
+        record: Some(serde_json::json!({ "subject": "did:plc:bob" })),
+    };
+
+    let event = graph.handle_commit(&commit, &protected_dids);
+    assert_eq!(
+        event,
+        FollowSyncEvent::FollowRemoved {
+            protected_did: "did:plc:alice".to_string(),
+            rkey: "untracked_rkey".to_string(),
+            followed_did: "did:plc:bob".to_string(),
+        }
+    );
+    assert!(!graph.is_following("did:plc:alice", "did:plc:bob"));
+}
+
+#[test]
+fn test_follow_graph_handle_commit_delete_rkey_as_did_fallback() {
+    let graph = FollowGraph::new();
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+
+    // Follow added
+    graph.add_follow("did:plc:alice", "some_rkey", "did:plc:bob");
+    assert!(graph.is_following("did:plc:alice", "did:plc:bob"));
+
+    // Delete commit specifies the DID as the rkey
+    let commit = make_follow_delete_commit("did:plc:alice", "did:plc:bob");
+    let event = graph.handle_commit(&commit, &protected_dids);
+
+    assert_eq!(
+        event,
+        FollowSyncEvent::FollowRemoved {
+            protected_did: "did:plc:alice".to_string(),
+            rkey: "did:plc:bob".to_string(),
+            followed_did: "did:plc:bob".to_string(),
+        }
+    );
+    assert!(!graph.is_following("did:plc:alice", "did:plc:bob"));
+}
+
 // ============================================================================
 // 2. NonFollowedGate Unit Tests
 // ============================================================================

@@ -913,6 +913,7 @@ async fn test_engine_builder_with_tiered_classifier() {
         image_cids: Vec::new(),
         image_alts: Vec::new(),
         enriched_context: None,
+        rubric: None,
     };
 
     let verdict = engine

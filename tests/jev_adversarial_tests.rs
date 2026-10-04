@@ -37,6 +37,7 @@ fn sample_interaction(text: &str) -> Interaction {
         image_cids: Vec::new(),
         image_alts: Vec::new(),
         enriched_context: None,
+        rubric: None,
     }
 }
 

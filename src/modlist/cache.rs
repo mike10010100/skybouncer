@@ -1753,6 +1753,22 @@ impl DeduplicationCache {
         Ok(())
     }
 
+    /// Removes the cached DID-to-handle mapping for a given handle.
+    ///
+    /// Used to invalidate a rotated or stale handle so subsequent lookups
+    /// re-resolve it from the authoritative source.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite execution fails.
+    pub fn remove_handle_for_handle(&self, handle: &str) -> Result<usize, SkybouncerError> {
+        let clean = handle.trim().trim_start_matches('@');
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare_cached("DELETE FROM did_handles WHERE handle = ?1 COLLATE NOCASE;")?;
+        let deleted = stmt.execute(params![clean])?;
+        Ok(deleted)
+    }
+
     /// Prunes stale DID-to-handle cache entries and bounds the table size.
     ///
     /// First deletes mappings whose `updated_at` is strictly older than `older_than_us`,

@@ -1257,6 +1257,9 @@ pub async fn simulate_interaction(
         None
     };
 
+    let rubric = state.engine.rubric_for(&target_did);
+    let threshold = rubric.sensitivity.threshold();
+
     let synthetic_interaction = Interaction {
         post_uri: "at://did:plc:sample/app.bsky.feed.post/sample123".to_string(),
         post_cid: Some("bafysample123".to_string()),
@@ -1270,10 +1273,8 @@ pub async fn simulate_interaction(
         image_cids,
         image_alts: Vec::new(),
         enriched_context,
+        rubric: Some(rubric.clone()),
     };
-
-    let rubric = state.engine.rubric();
-    let threshold = rubric.sensitivity.threshold();
 
     // 1. Check zero-cost heuristic pre-filter
     let heuristic_verdict = state
