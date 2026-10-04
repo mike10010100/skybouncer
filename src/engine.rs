@@ -2042,6 +2042,9 @@ impl SkybouncerEngine {
         if clean.starts_with("did:") {
             return Some(clean.to_string());
         }
+        if let Ok(Some(tenant)) = self.tenant_registry.get_by_handle(clean) {
+            return Some(tenant.did);
+        }
         self.enricher.resolve_handle(clean).await
     }
 

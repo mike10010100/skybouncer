@@ -34,6 +34,7 @@ use skybouncer::modlist::{AllowlistEntry, BouncedUser, DeduplicationCache, ModLi
 use skybouncer::web::{
     create_web_router, run_web_server, AddAllowlistResponse, EvaluationsResponse, PardonResponse,
     RemoveAllowlistResponse, RulesResponse, SimulateResponse, StatusResponse, WebServerConfig,
+    DASHBOARD_HTML,
 };
 
 // =============================================================================
@@ -1856,4 +1857,278 @@ async fn test_prometheus_metrics_endpoint() {
             .and_then(|v| v.to_str().ok()),
         Some("text/plain; version=0.0.4; charset=utf-8")
     );
+}
+
+// =============================================================================
+// DOM Contract & Matrix Integration Tests
+// =============================================================================
+
+#[test]
+fn test_ui_dom_and_javascript_contract_validation() {
+    let html = DASHBOARD_HTML;
+
+    // 1. Verify all document.getElementById calls in JavaScript reference valid DOM IDs
+    let mut get_elem_idx = 0;
+    while let Some(start) = html[get_elem_idx..].find("document.getElementById(\"") {
+        let abs_start = get_elem_idx + start + "document.getElementById(\"".len();
+        let end = html[abs_start..]
+            .find('"')
+            .expect("valid closing quote for getElementById");
+        let id = &html[abs_start..abs_start + end];
+        let id_needle = format!("id=\"{id}\"");
+        assert!(
+            html.contains(&id_needle),
+            "DOM contract failure: document.getElementById('{id}') in JS but no {id_needle} in HTML!"
+        );
+        get_elem_idx = abs_start + end;
+    }
+
+    // 2. Verify all setSensitivity calls pass valid Sensitivity enum strings
+    let mut sens_idx = 0;
+    while let Some(start) = html[sens_idx..].find("setSensitivity('") {
+        let abs_start = sens_idx + start + "setSensitivity('".len();
+        let end = html[abs_start..]
+            .find('\'')
+            .expect("closing quote for setSensitivity");
+        let sens_str = &html[abs_start..abs_start + end];
+        let parsed = sens_str.parse::<Sensitivity>();
+        assert!(
+            parsed.is_ok(),
+            "DOM contract failure: setSensitivity('{sens_str}') is not a valid Sensitivity variant!"
+        );
+        sens_idx = abs_start + end;
+    }
+
+    // 3. Verify all setBounceDuration calls pass valid BounceDuration enum strings
+    let mut dur_idx = 0;
+    while let Some(start) = html[dur_idx..].find("setBounceDuration('") {
+        let abs_start = dur_idx + start + "setBounceDuration('".len();
+        let end = html[abs_start..]
+            .find('\'')
+            .expect("closing quote for setBounceDuration");
+        let dur_str = &html[abs_start..abs_start + end];
+        let parsed = dur_str.parse::<BounceDuration>();
+        assert!(
+            parsed.is_ok(),
+            "DOM contract failure: setBounceDuration('{dur_str}') cannot be parsed as BounceDuration!"
+        );
+        let serde_deser: Result<BounceDuration, _> =
+            serde_json::from_str(&format!("\"{dur_str}\""));
+        assert!(
+            serde_deser.is_ok(),
+            "DOM contract failure: setBounceDuration('{dur_str}') cannot be deserialized by serde into BounceDuration!"
+        );
+        dur_idx = abs_start + end;
+    }
+
+    // 4. Verify all preset buttons invoke defined RUBRIC_PRESETS
+    let presets_marker = "const RUBRIC_PRESETS = {";
+    let presets_start = html
+        .find(presets_marker)
+        .expect("RUBRIC_PRESETS defined in UI");
+    let presets_block = &html[presets_start..presets_start + 1000];
+
+    let mut preset_idx = 0;
+    while let Some(start) = html[preset_idx..].find("applyRubricPreset('") {
+        let abs_start = preset_idx + start + "applyRubricPreset('".len();
+        let end = html[abs_start..]
+            .find('\'')
+            .expect("closing quote for applyRubricPreset");
+        let preset_key = &html[abs_start..abs_start + end];
+        let key_needle = format!("{preset_key}: {{");
+        assert!(
+            presets_block.contains(&key_needle),
+            "DOM contract failure: applyRubricPreset('{preset_key}') referenced in button but '{key_needle}' not found in RUBRIC_PRESETS!"
+        );
+        preset_idx = abs_start + end;
+    }
+}
+
+#[tokio::test]
+async fn test_api_all_rubric_presets_submission_matrix() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let alice_token = create_test_session(&engine, "did:plc:alice");
+
+    // All presets defined in UI
+    let presets = [
+        (
+            "Filter blatant spam, automated bot promotions, crypto/NFT shilling, unwanted commercial links, and direct harassment or personal attacks. Allow constructive critique, benign banter, and standard disagreements.",
+            "medium",
+        ),
+        (
+            "Aggressively filter all cryptocurrency, token, airdrop, memecoin, pump-and-dump, web3 wallet, NFT promotions, unsolicited WhatsApp/Telegram investment invitations, and high-frequency automated bot links.",
+            "high",
+        ),
+        (
+            "Strictly filter hostile language, targeted harassment, abusive insults, slurs, doxxing threats, demeaning personal attacks, and aggressive intimidation directed at users.",
+            "high",
+        ),
+        (
+            "Filter bad-faith sealioning, deceptive ragebait, troll provocations intended to incite conflict, and bad-faith harassment campaigns.",
+            "medium",
+        ),
+    ];
+
+    // All duration strings that UI buttons or API can produce
+    let duration_variants = [
+        "permanent",
+        "cooldown24h",
+        "timeout7d",
+        "timeout30d",
+        "24h",
+        "7d",
+        "30d",
+    ];
+
+    for (prompt, sens) in &presets {
+        for dur in &duration_variants {
+            let payload = json!({
+                "prompt": prompt,
+                "sensitivity": sens,
+                "bounce_duration": dur
+            });
+
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/rules")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap();
+
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "Failed to update rules with preset sens='{sens}', dur='{dur}'"
+            );
+
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let rules: RulesResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(rules.prompt, *prompt);
+            assert_eq!(rules.sensitivity, sens.parse::<Sensitivity>().unwrap());
+            assert_eq!(
+                rules.bounce_duration,
+                dur.parse::<BounceDuration>().unwrap()
+            );
+
+            // Check GET /api/rules matches
+            let get_req = Request::builder()
+                .uri("/api/rules")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .body(Body::empty())
+                .unwrap();
+            let get_resp = app.clone().oneshot(get_req).await.unwrap();
+            assert_eq!(get_resp.status(), StatusCode::OK);
+            let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let get_rules: RulesResponse = serde_json::from_slice(&get_bytes).unwrap();
+            assert_eq!(
+                get_rules.bounce_duration,
+                dur.parse::<BounceDuration>().unwrap()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_api_allowlist_full_lifecycle_matrix() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let alice_token = create_test_session(&engine, "did:plc:alice");
+
+    // Enroll a partner tenant so handle resolution succeeds locally without live network
+    let partner =
+        skybouncer::tenant::Tenant::new("did:plc:partner").with_handle("partner.bsky.social");
+    engine
+        .tenant_registry()
+        .register_or_update(&partner)
+        .expect("enroll partner tenant");
+
+    // 1. Initial allowlist is empty
+    let req = Request::builder()
+        .uri("/api/allowlist")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let entries: Vec<AllowlistEntry> = serde_json::from_slice(&bytes).unwrap();
+    assert!(entries.is_empty());
+
+    // 2. Add via DID
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/allowlist")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "subject": "did:plc:charlie",
+                "reason": "Trusted colleague"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 3. Add via Handle with @
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/allowlist")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "subject": "@partner.bsky.social"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 4. Verify 2 entries present
+    let req = Request::builder()
+        .uri("/api/allowlist")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let entries: Vec<AllowlistEntry> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(entries.len(), 2);
+
+    // 5. Remove entry by DID
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/allowlist/did:plc:charlie")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 6. Verify 1 entry left
+    let req = Request::builder()
+        .uri("/api/allowlist")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let entries: Vec<AllowlistEntry> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(entries.len(), 1);
 }
