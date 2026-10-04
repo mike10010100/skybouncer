@@ -19,6 +19,7 @@ use skyauth::session::OAuthSession;
 use skybase::repo::PdsRepoClient;
 
 use crate::classifier::RuleRubric;
+use crate::crypto::SessionCipher;
 use crate::error::SkybouncerError;
 
 /// Multi-tenant record representing an enrolled Bluesky user.
@@ -91,6 +92,7 @@ pub struct TenantRegistry {
     conn: Arc<Mutex<Connection>>,
     pds_clients: Arc<RwLock<HashMap<String, Arc<PdsRepoClient>>>>,
     oauth_client: Arc<RwLock<Option<Arc<AtprotoOAuthClient>>>>,
+    cipher: SessionCipher,
 }
 
 impl TenantRegistry {
@@ -121,6 +123,7 @@ impl TenantRegistry {
             conn: Arc::new(Mutex::new(conn)),
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
+            cipher: SessionCipher::from_env(),
         })
     }
 
@@ -140,6 +143,7 @@ impl TenantRegistry {
             conn: Arc::new(Mutex::new(conn)),
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
+            cipher: SessionCipher::from_env(),
         })
     }
 
@@ -172,6 +176,7 @@ impl TenantRegistry {
             conn: Arc::new(Mutex::new(conn)),
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
+            cipher: SessionCipher::from_env(),
         }
     }
 
@@ -189,7 +194,21 @@ impl TenantRegistry {
             conn,
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
+            cipher: SessionCipher::from_env(),
         })
+    }
+
+    /// Configures a custom [`SessionCipher`] for encrypting and decrypting OAuth session tokens at rest.
+    #[must_use]
+    pub fn with_cipher(mut self, cipher: SessionCipher) -> Self {
+        self.cipher = cipher;
+        self
+    }
+
+    /// Returns a reference to the active [`SessionCipher`].
+    #[must_use]
+    pub fn cipher(&self) -> &SessionCipher {
+        &self.cipher
     }
 
     fn apply_pragmas(conn: &Connection) -> Result<(), SkybouncerError> {
@@ -259,9 +278,12 @@ impl TenantRegistry {
     /// Returns [`SkybouncerError`] if database persistence or JSON serialization fails.
     pub fn register_or_update(&self, tenant: &Tenant) -> Result<(), SkybouncerError> {
         let session_json = match tenant.session {
-            Some(ref s) => Some(serde_json::to_string(s).map_err(|e| {
-                SkybouncerError::Config(format!("Failed to serialize tenant session: {e}"))
-            })?),
+            Some(ref s) => {
+                let json = serde_json::to_string(s).map_err(|e| {
+                    SkybouncerError::Config(format!("Failed to serialize tenant session: {e}"))
+                })?;
+                Some(self.cipher.encrypt(json.as_bytes())?)
+            }
             None => None,
         };
 
@@ -352,14 +374,24 @@ impl TenantRegistry {
                 updated_at_i64,
             )) => {
                 let session: Option<OAuthSession> = match session_json {
-                    Some(ref json) if !json.trim().is_empty() => serde_json::from_str(json)
-                        .map_err(|e| {
+                    Some(ref raw) if !raw.trim().is_empty() => {
+                        let decrypted = self.cipher.decrypt_or_passthrough(raw).map_err(|e| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 2,
                                 rusqlite::types::Type::Text,
                                 Box::new(e),
                             )
-                        })?,
+                        })?;
+                        let session: OAuthSession =
+                            serde_json::from_str(&decrypted).map_err(|e| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(e),
+                                )
+                            })?;
+                        Some(session)
+                    }
                     _ => None,
                 };
 
@@ -600,12 +632,13 @@ impl TenantRegistry {
         let serialized = serde_json::to_string(session).map_err(|e| {
             SkybouncerError::Database(format!("Failed to serialize OAuthSession for {did}: {e}"))
         })?;
+        let encrypted = self.cipher.encrypt(serialized.as_bytes())?;
         let now_us = current_time_us();
         let conn = self.conn.lock();
         let rows = conn
             .execute(
                 "UPDATE tenants SET session_json = ?1, updated_at = ?2 WHERE did = ?3",
-                params![serialized, now_us, did],
+                params![encrypted, now_us, did],
             )
             .map_err(|e| {
                 SkybouncerError::Database(format!("Failed to update session for {did}: {e}"))
@@ -1093,5 +1126,158 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(10));
         assert_eq!(registry.validate_web_session(&expired_token).unwrap(), None);
+    }
+
+    #[test]
+    fn test_tenant_session_encrypted_at_rest_in_sqlite() {
+        use crate::crypto::ENCRYPTION_V1_PREFIX;
+
+        let registry = TenantRegistry::open_in_memory().unwrap();
+        let dpop_key = DPoPKey::generate();
+        let session = OAuthSession::new(
+            "did:plc:encrypted-user",
+            "super_secret_access_token_xyz",
+            Some("super_secret_refresh_token_abc".to_string()),
+            "DPoP",
+            Some("atproto".to_string()),
+            Some(3600),
+            dpop_key,
+            Some("https://pds.encrypted.example.com".to_string()),
+            Some("https://auth.example.com".to_string()),
+            Some("https://auth.example.com/oauth/token".to_string()),
+        )
+        .unwrap();
+
+        let tenant = Tenant::new("did:plc:encrypted-user").with_session(session);
+        registry.register_or_update(&tenant).unwrap();
+
+        // 1. Raw SQLite inspection: Must NOT contain plaintext secrets and must have enc:v1: prefix
+        let raw_json: String = {
+            let conn = registry.conn.lock();
+            conn.query_row(
+                "SELECT session_json FROM tenants WHERE did = 'did:plc:encrypted-user';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert!(raw_json.starts_with(ENCRYPTION_V1_PREFIX));
+        assert!(!raw_json.contains("super_secret_access_token_xyz"));
+        assert!(!raw_json.contains("super_secret_refresh_token_abc"));
+
+        // 2. Normal registry retrieval transparently decrypts
+        let fetched = registry
+            .get("did:plc:encrypted-user")
+            .unwrap()
+            .expect("tenant should exist");
+        let fetched_session = fetched.session.expect("session must be decrypted");
+        assert_eq!(
+            fetched_session.access_token(),
+            "super_secret_access_token_xyz"
+        );
+        assert_eq!(
+            fetched_session.refresh_token(),
+            Some("super_secret_refresh_token_abc")
+        );
+    }
+
+    #[test]
+    fn test_tenant_session_legacy_unencrypted_passthrough_and_migration() {
+        use crate::crypto::ENCRYPTION_V1_PREFIX;
+
+        let registry = TenantRegistry::open_in_memory().unwrap();
+        let dpop_key = DPoPKey::generate();
+        let session = OAuthSession::new(
+            "did:plc:legacy-user",
+            "legacy_plain_access_token",
+            Some("legacy_plain_refresh_token".to_string()),
+            "DPoP",
+            Some("atproto".to_string()),
+            Some(3600),
+            dpop_key,
+            Some("https://pds.legacy.example.com".to_string()),
+            Some("https://auth.example.com".to_string()),
+            Some("https://auth.example.com/oauth/token".to_string()),
+        )
+        .unwrap();
+
+        let legacy_json = serde_json::to_string(&session).unwrap();
+
+        // Manually inject raw unencrypted JSON into SQLite as if created by an older version
+        {
+            let conn = registry.conn.lock();
+            conn.execute(
+                "INSERT INTO tenants (did, handle, session_json, is_active, created_at, updated_at)
+                 VALUES ('did:plc:legacy-user', 'legacy.bsky.social', ?1, 1, 1000, 1000);",
+                params![legacy_json],
+            )
+            .unwrap();
+        }
+
+        // 1. Transparent backward compatibility: get() loads and parses plain JSON seamlessly
+        let fetched = registry
+            .get("did:plc:legacy-user")
+            .unwrap()
+            .expect("legacy tenant exists");
+        let loaded_session = fetched.session.expect("legacy session parsed");
+        assert_eq!(loaded_session.access_token(), "legacy_plain_access_token");
+
+        // 2. On update_session (e.g. token refresh or update), session is encrypted
+        let updated = registry
+            .update_session("did:plc:legacy-user", &loaded_session)
+            .unwrap();
+        assert!(updated);
+
+        // 3. Raw SQLite inspection now verifies encryption
+        let raw_json_after_update: String = {
+            let conn = registry.conn.lock();
+            conn.query_row(
+                "SELECT session_json FROM tenants WHERE did = 'did:plc:legacy-user';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert!(raw_json_after_update.starts_with(ENCRYPTION_V1_PREFIX));
+        assert!(!raw_json_after_update.contains("legacy_plain_access_token"));
+    }
+
+    #[test]
+    fn test_tenant_session_wrong_key_fails_cleanly() {
+        let cipher_a = SessionCipher::from_secret_passphrase("correct-encryption-key-123");
+        let cipher_b = SessionCipher::from_secret_passphrase("wrong-encryption-key-999");
+
+        let registry_a = TenantRegistry::open_in_memory()
+            .unwrap()
+            .with_cipher(cipher_a);
+
+        let dpop_key = DPoPKey::generate();
+        let session = OAuthSession::new(
+            "did:plc:protected-key-test",
+            "classified_token_data",
+            None,
+            "DPoP",
+            None,
+            None,
+            dpop_key,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let tenant = Tenant::new("did:plc:protected-key-test").with_session(session);
+        registry_a.register_or_update(&tenant).unwrap();
+
+        // registry_b connects to same SQLite DB but with wrong key
+        let registry_b = TenantRegistry::from_connection(Arc::clone(&registry_a.conn))
+            .unwrap()
+            .with_cipher(cipher_b);
+
+        // Attempting to retrieve tenant fails authentication tag check
+        let fetch_result = registry_b.get("did:plc:protected-key-test");
+        assert!(fetch_result.is_err());
     }
 }

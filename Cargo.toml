@@ -1,6 +1,6 @@
 [package]
 name = "skybouncer"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Michael Paulauski <mike10010100@gmail.com>"]
@@ -59,6 +59,9 @@ url = { version = "2.5", features = ["serde"] }
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+
+# Cryptography & Encryption at Rest
+ring = "0.17"
 
 # WebSocket Stream Ingestion for Live Daemon
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }

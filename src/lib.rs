@@ -21,6 +21,7 @@
 
 pub mod bot;
 pub mod classifier;
+pub mod crypto;
 pub mod engine;
 pub mod enricher;
 pub mod error;
@@ -32,6 +33,7 @@ pub mod tenant;
 pub mod types;
 pub mod web;
 
+pub use crypto::SessionCipher;
 pub use tenant::{Tenant, TenantRegistry};
 
 pub use bot::{

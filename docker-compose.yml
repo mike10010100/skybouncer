@@ -27,6 +27,7 @@ services:
       - PUBLIC_URL=${PUBLIC_URL:-https://skybouncer.example.com}
       - SERVICE_DID=${SERVICE_DID:-did:web:skybouncer.example.com}
       - SKYBOUNCER_DATABASE_PATH=/data/skybouncer.db
+      - SKYBOUNCER_SESSION_ENCRYPTION_KEY=${SKYBOUNCER_SESSION_ENCRYPTION_KEY:-}
       - ADMIN_DID=${ADMIN_DID:-}
       - RUST_LOG=${RUST_LOG:-info,skybouncer=info,skybase=info}
     stop_grace_period: 30s
