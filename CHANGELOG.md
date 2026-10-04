@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-10-04
+
+### Security & Correctness Hardening (AI Review Remediation)
+
+- **DM Bot Authorization Gate (C1)**:
+  - Enforced sender authorization across all DM commands via `is_authorized_sender`.
+  - Restricted fleet-wide commands (`cmd_pause`, `cmd_resume`, global rubric/sensitivity adjustments) to fleet administrator or single-tenant deployments.
+  - Eliminated arbitrary protected DID fallback in `cmd_pardon`, ensuring pardons can only operate on the sender's own moderation list.
+  - Handled sovereign config commit sync errors with explicit warnings.
+- **Session Encryption Key & AAD Binding (C2 & AI 2 #4)**:
+  - Added explicit warning log when fallback deterministic key is used for session encryption.
+  - Bound tenant DID as Additional Authenticated Data (`encrypt_with_aad` / `decrypt_or_passthrough_with_aad`), cryptographically preventing token swapping between tenants.
+  - Stored SHA-256 hashes of web session tokens at rest (`hash_session_token`).
+- **Simulate Endpoint Authentication & DNS-Pinning (H1, M9)**:
+  - Added session authentication check to `/api/simulate`, preventing wallet-drain DoS and audit log pollution by anonymous callers.
+  - Hardened image fetch against DNS rebinding TOCTOU by pinning resolved IP directly in `reqwest::ClientBuilder::resolve()` and capping payloads to 2MB.
+- **Firehose Cursor Tracking & Jittered Backoff (H2, L5)**:
+  - Stream consumer continuously records cursor timestamps from observed firehose events.
+  - On reconnection, rewinds cursor by 5 seconds (5,000,000 µs) to prevent dropped moderation events during network blips.
+  - Added randomized jittered exponential backoff that only resets after receiving at least 5 successful frames.
+- **Strict Classifier Confidence Handling (H3)**:
+  - Removed fabricated 0.95 confidence default on missing model scores, returning explicit errors instead to prevent erroneous moderation actions.
+  - Capped interaction prompt text to 4000 characters and isolated candidate content within `<candidate_content>` tags.
+- **PDS Client Resolution & Single-Flight Token Refresh (H4, H5)**:
+  - Replaced open fallback with `resolve_pds_client_for`, returning `Err` if a tenant's credentials cannot be resolved and preventing unintended writes using administrator credentials.
+  - Introduced per-DID striped async mutexes (`refresh_locks`) to serialize concurrent OAuth token refreshes and eliminate token revocation races.
+- **Multi-Tenant Modlist & Dedup Isolation (M1, M2, M3, M4 / AI 2 #5)**:
+  - Migrated `bounced_users` table to composite primary key `(protected_did, subject_did)` with schema migration, ensuring violator bans for tenant A do not suppress bans for tenant B.
+  - Added secondary index `idx_bounced_users_subject` maintaining sub-microsecond lookup latency SLA.
+  - Added compensating PDS record deletion if cache persistence fails after remote PDS write.
+  - Added separate `listblock_provision_locks` to prevent deadlock and TOCTOU races in listblock provisioning.
+  - Propagated remote discovery errors with `?` in `ensure_mod_list` to prevent duplicate modlist creation during transient PDS 500s.
+- **Engine Invariants & Performance (M5, M6, M7, M8, M10, M12, M14, M15, L2, L3, L4, L8, L11)**:
+  - `is_tenant_paused` fails closed on database errors.
+  - Moved rate-limit token consumption from enqueue to dequeue in `evaluate_candidate`.
+  - Scoped tenant toggles to prevent affecting global pause state in multi-tenant mode.
+  - Redacted protected DIDs and telemetry in `/api/status` for unauthenticated callers.
+  - Logged warnings on failed audit trail writes rather than dropping silently.
+  - Poller processes all unread DMs in chronological order with bounded deduplication cache (2048 entries).
+  - Replaced per-commit `HashSet` clones in firehose hot path with zero-allocation reference checks.
+  - Enforced minimum queue capacity of 100 in `SkybouncerConfig`.
+  - Added `; Secure` flag to logout session clearing cookie.
+  - Hardened HTML hrefs in UI with HTML entity escaping and DID/rkey regex sanitization.
+  - Strengthened Content-Security-Policy with `object-src 'none'; base-uri 'self';`.
+  - Paginated follow graph hydration up to 10,000 accounts and added XRPC `listRecords` hydration for real follow rkeys.
+  - Removed `std::process::abort()` from fallback registry.
+
 ## [0.1.8] - 2026-10-04
 
 ### Fixed

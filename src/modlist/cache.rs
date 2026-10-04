@@ -264,7 +264,7 @@ impl DeduplicationCache {
             );
 
             CREATE TABLE IF NOT EXISTS bounced_users (
-                subject_did TEXT PRIMARY KEY,
+                subject_did TEXT NOT NULL,
                 listitem_uri TEXT NOT NULL,
                 listitem_rkey TEXT NOT NULL,
                 listitem_cid TEXT NOT NULL,
@@ -274,47 +274,18 @@ impl DeduplicationCache {
                 post_uri TEXT NOT NULL,
                 bounced_at INTEGER NOT NULL,
                 protected_did TEXT NOT NULL DEFAULT '',
-                post_text TEXT NOT NULL DEFAULT ''
+                post_text TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (protected_did, subject_did)
             );
-            ",
-        )
-        .map_err(|e| {
-            SkybouncerError::Database(format!("Failed to initialize base cache schema: {e}"))
-        })?;
-
-        // 2. Ensure columns exist on legacy tables BEFORE creating indexes on them
-        let _ = conn.execute(
-            "ALTER TABLE bounced_users ADD COLUMN protected_did TEXT NOT NULL DEFAULT '';",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE bounced_users ADD COLUMN post_text TEXT NOT NULL DEFAULT '';",
-            [],
-        );
-
-        // 3. Dependent tables and indexes
-        conn.execute_batch(
-            "
-            CREATE INDEX IF NOT EXISTS idx_bounced_users_bounced_at
-                ON bounced_users(bounced_at);
-
-            CREATE INDEX IF NOT EXISTS idx_bounced_users_protected
-                ON bounced_users(protected_did);
 
             CREATE TABLE IF NOT EXISTS bounced_user_rkeys (
+                protected_did TEXT NOT NULL DEFAULT '',
                 subject_did TEXT NOT NULL,
                 listitem_rkey TEXT NOT NULL PRIMARY KEY,
                 listitem_uri TEXT NOT NULL,
                 listitem_cid TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                FOREIGN KEY(subject_did) REFERENCES bounced_users(subject_did) ON DELETE CASCADE
+                created_at INTEGER NOT NULL
             );
-
-            CREATE INDEX IF NOT EXISTS idx_bounced_user_rkeys_subject
-                ON bounced_user_rkeys(subject_did);
-
-            INSERT OR IGNORE INTO bounced_user_rkeys (subject_did, listitem_rkey, listitem_uri, listitem_cid, created_at)
-                SELECT subject_did, listitem_rkey, listitem_uri, listitem_cid, bounced_at FROM bounced_users;
 
             CREATE TABLE IF NOT EXISTS evaluation_cache (
                 cache_key TEXT PRIMARY KEY,
@@ -323,12 +294,6 @@ impl DeduplicationCache {
                 evaluated_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL
             );
-
-            CREATE INDEX IF NOT EXISTS idx_evaluation_cache_expires_at
-                ON evaluation_cache(expires_at);
-
-            CREATE INDEX IF NOT EXISTS idx_evaluation_cache_author
-                ON evaluation_cache(author_did);
 
             CREATE TABLE IF NOT EXISTS listblock_cache (
                 user_did TEXT PRIMARY KEY,
@@ -363,6 +328,120 @@ impl DeduplicationCache {
                 final_confidence REAL NOT NULL,
                 outcome TEXT NOT NULL
             );
+            ",
+        )
+        .map_err(|e| {
+            SkybouncerError::Database(format!("Failed to initialize base cache schema: {e}"))
+        })?;
+
+        // 2. Ensure backward-compatible columns exist on legacy tables BEFORE creating indexes on them
+        let _ = conn.execute(
+            "ALTER TABLE bounced_users ADD COLUMN protected_did TEXT NOT NULL DEFAULT '';",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE bounced_users ADD COLUMN post_text TEXT NOT NULL DEFAULT '';",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE bounced_user_rkeys ADD COLUMN protected_did TEXT NOT NULL DEFAULT '';",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE evaluation_log ADD COLUMN source TEXT NOT NULL DEFAULT 'live';",
+            [],
+        );
+
+        // 3. Migrate legacy bounced_users table from single-column PK (subject_did) to composite PK (protected_did, subject_did)
+        let needs_pk_migration: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info(bounced_users);")?;
+            let mut pk_count = 0;
+            let mut subject_is_pk = false;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                let pk: i64 = row.get(5)?;
+                if pk > 0 {
+                    pk_count += 1;
+                    if name == "subject_did" {
+                        subject_is_pk = true;
+                    }
+                }
+            }
+            pk_count == 1 && subject_is_pk
+        };
+
+        if needs_pk_migration {
+            conn.execute_batch(
+                "
+                CREATE TABLE bounced_users_v2 (
+                    subject_did TEXT NOT NULL,
+                    listitem_uri TEXT NOT NULL,
+                    listitem_rkey TEXT NOT NULL,
+                    listitem_cid TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    post_uri TEXT NOT NULL,
+                    bounced_at INTEGER NOT NULL,
+                    protected_did TEXT NOT NULL DEFAULT '',
+                    post_text TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (protected_did, subject_did)
+                );
+                INSERT OR IGNORE INTO bounced_users_v2
+                    SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
+                           category, confidence, reason, post_uri, bounced_at,
+                           COALESCE(protected_did, ''), COALESCE(post_text, '')
+                    FROM bounced_users;
+                DROP TABLE bounced_users;
+                ALTER TABLE bounced_users_v2 RENAME TO bounced_users;
+                ",
+            )
+            .map_err(|e| {
+                SkybouncerError::Database(format!("Failed to migrate bounced_users PK: {e}"))
+            })?;
+        }
+
+        // 4. Dependent indexes
+        conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_bounced_users_bounced_at
+                ON bounced_users(bounced_at);
+
+            CREATE INDEX IF NOT EXISTS idx_bounced_users_subject
+                ON bounced_users(subject_did);
+
+            CREATE INDEX IF NOT EXISTS idx_bounced_users_protected
+                ON bounced_users(protected_did);
+
+            CREATE INDEX IF NOT EXISTS idx_bounced_user_rkeys_subject
+                ON bounced_user_rkeys(subject_did);
+
+            CREATE INDEX IF NOT EXISTS idx_bounced_user_rkeys_protected
+                ON bounced_user_rkeys(protected_did, subject_did);
+
+            INSERT OR IGNORE INTO bounced_user_rkeys (protected_did, subject_did, listitem_rkey, listitem_uri, listitem_cid, created_at)
+                SELECT protected_did, subject_did, listitem_rkey, listitem_uri, listitem_cid, bounced_at FROM bounced_users;
+
+            CREATE TABLE IF NOT EXISTS evaluation_cache (
+                cache_key TEXT PRIMARY KEY,
+                author_did TEXT NOT NULL,
+                verdict_json TEXT NOT NULL,
+                evaluated_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_evaluation_cache_expires_at
+                ON evaluation_cache(expires_at);
+
+            CREATE INDEX IF NOT EXISTS idx_evaluation_cache_author
+                ON evaluation_cache(author_did);
+
+            CREATE TABLE IF NOT EXISTS listblock_cache (
+                user_did TEXT PRIMARY KEY,
+                list_uri TEXT NOT NULL,
+                blocked_at INTEGER NOT NULL
+            );
 
             CREATE INDEX IF NOT EXISTS idx_evaluation_log_timestamp
                 ON evaluation_log(timestamp_us DESC, id DESC);
@@ -377,12 +456,6 @@ impl DeduplicationCache {
         .map_err(|e| {
             SkybouncerError::Database(format!("Failed to initialize cache schema indexes: {e}"))
         })?;
-
-        // 4. Ensure backward-compatible columns exist on evaluation_log if migrated
-        let _ = conn.execute(
-            "ALTER TABLE evaluation_log ADD COLUMN source TEXT NOT NULL DEFAULT 'live';",
-            [],
-        );
 
         Ok(())
     }
@@ -513,7 +586,7 @@ impl DeduplicationCache {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT 1 FROM bounced_users
-             WHERE subject_did = ?1 AND (protected_did = ?2 OR protected_did = '') LIMIT 1;",
+             WHERE subject_did = ?1 AND protected_did = ?2 LIMIT 1;",
         )?;
 
         let exists = stmt
@@ -538,11 +611,53 @@ impl DeduplicationCache {
                         category, confidence, reason, post_uri, bounced_at,
                         protected_did, post_text
                  FROM bounced_users
-                 WHERE subject_did = ?1;",
+                 WHERE subject_did = ?1
+                 LIMIT 1;",
         )?;
 
         let res = stmt
             .query_row(params![subject_did], |row| {
+                let bounced_at_i64: i64 = row.get(8)?;
+                let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
+                Ok(BouncedUser {
+                    subject_did: row.get(0)?,
+                    listitem_uri: row.get(1)?,
+                    listitem_rkey: row.get(2)?,
+                    listitem_cid: row.get(3)?,
+                    category: row.get(4)?,
+                    confidence: row.get(5)?,
+                    reason: row.get(6)?,
+                    post_uri: row.get(7)?,
+                    bounced_at,
+                    protected_did: row.get(9)?,
+                    post_text: row.get(10)?,
+                })
+            })
+            .optional()?;
+
+        Ok(res)
+    }
+
+    /// Retrieves detailed record of a bounced violator for a specific protected user.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    pub fn get_bounced_user_for(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<Option<BouncedUser>, SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
+                        category, confidence, reason, post_uri, bounced_at,
+                        protected_did, post_text
+                 FROM bounced_users
+                 WHERE subject_did = ?1 AND protected_did = ?2;",
+        )?;
+
+        let res = stmt
+            .query_row(params![subject_did, protected_did], |row| {
                 let bounced_at_i64: i64 = row.get(8)?;
                 let bounced_at = u64::try_from(bounced_at_i64.max(0)).unwrap_or_default();
                 Ok(BouncedUser {
@@ -569,105 +684,159 @@ impl DeduplicationCache {
     /// Preserves all historical and concurrent `listitem_rkey` values in `bounced_user_rkeys`
     /// while maintaining the canonical latest bounce state in `bounced_users`.
     ///
+    /// Uses a single SQLite transaction to guarantee atomicity.
+    ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if the insert fails.
     pub fn record_bounce(&self, entry: &BouncedUser) -> Result<(), SkybouncerError> {
         let bounced_at_i64 = i64::try_from(entry.bounced_at).unwrap_or(i64::MAX);
 
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(|e| {
+            SkybouncerError::Database(format!(
+                "Failed to start transaction for bounce record: {e}"
+            ))
+        })?;
 
         // 1. Insert or update the canonical bounced_users record
-        let mut user_stmt = conn.prepare_cached(
-            "INSERT INTO bounced_users (
-                    subject_did, listitem_uri, listitem_rkey, listitem_cid,
-                    category, confidence, reason, post_uri, bounced_at,
-                    protected_did, post_text
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                 ON CONFLICT(subject_did) DO UPDATE SET
-                     listitem_uri = excluded.listitem_uri,
-                     listitem_rkey = excluded.listitem_rkey,
-                     listitem_cid = excluded.listitem_cid,
-                     category = excluded.category,
-                     confidence = excluded.confidence,
-                     reason = excluded.reason,
-                     post_uri = excluded.post_uri,
-                     bounced_at = excluded.bounced_at,
-                     protected_did = excluded.protected_did,
-                     post_text = excluded.post_text;",
-        )?;
+        {
+            let mut user_stmt = tx.prepare_cached(
+                "INSERT INTO bounced_users (
+                        subject_did, listitem_uri, listitem_rkey, listitem_cid,
+                        category, confidence, reason, post_uri, bounced_at,
+                        protected_did, post_text
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(protected_did, subject_did) DO UPDATE SET
+                         listitem_uri = excluded.listitem_uri,
+                         listitem_rkey = excluded.listitem_rkey,
+                         listitem_cid = excluded.listitem_cid,
+                         category = excluded.category,
+                         confidence = excluded.confidence,
+                         reason = excluded.reason,
+                         post_uri = excluded.post_uri,
+                         bounced_at = excluded.bounced_at,
+                         post_text = excluded.post_text;",
+            )?;
 
-        user_stmt.execute(params![
-            entry.subject_did,
-            entry.listitem_uri,
-            entry.listitem_rkey,
-            entry.listitem_cid,
-            entry.category,
-            entry.confidence,
-            entry.reason,
-            entry.post_uri,
-            bounced_at_i64,
-            entry.protected_did,
-            entry.post_text,
-        ])?;
+            user_stmt.execute(params![
+                entry.subject_did,
+                entry.listitem_uri,
+                entry.listitem_rkey,
+                entry.listitem_cid,
+                entry.category,
+                entry.confidence,
+                entry.reason,
+                entry.post_uri,
+                bounced_at_i64,
+                entry.protected_did,
+                entry.post_text,
+            ])?;
+        }
 
         // 2. Record in historical rkeys table (never overwrites or erases existing rkeys)
-        let mut rkey_stmt = conn.prepare_cached(
-            "INSERT INTO bounced_user_rkeys (
-                subject_did, listitem_rkey, listitem_uri, listitem_cid, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(listitem_rkey) DO NOTHING;",
-        )?;
+        {
+            let mut rkey_stmt = tx.prepare_cached(
+                "INSERT INTO bounced_user_rkeys (
+                    protected_did, subject_did, listitem_rkey, listitem_uri, listitem_cid, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(listitem_rkey) DO NOTHING;",
+            )?;
 
-        rkey_stmt.execute(params![
-            entry.subject_did,
-            entry.listitem_rkey,
-            entry.listitem_uri,
-            entry.listitem_cid,
-            bounced_at_i64,
-        ])?;
+            rkey_stmt.execute(params![
+                entry.protected_did,
+                entry.subject_did,
+                entry.listitem_rkey,
+                entry.listitem_uri,
+                entry.listitem_cid,
+                bounced_at_i64,
+            ])?;
+        }
+
+        tx.commit().map_err(|e| {
+            SkybouncerError::Database(format!("Failed to commit bounce record transaction: {e}"))
+        })?;
 
         Ok(())
     }
 
-    /// Retrieves all known listitem `rkey` values associated with the given subject DID.
-    ///
-    /// Returns both the primary rkey and any historical or concurrent duplicate rkeys recorded.
+    /// Retrieves all known listitem `rkey` values associated with the given subject DID for a protected user.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
-    pub fn get_all_bounced_rkeys(&self, subject_did: &str) -> Result<Vec<String>, SkybouncerError> {
+    pub fn get_all_bounced_rkeys_for(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<Vec<String>, SkybouncerError> {
         let conn = self.conn.lock();
-
-        let mut stmt = conn.prepare_cached(
-            "SELECT listitem_rkey FROM bounced_user_rkeys
-             WHERE subject_did = ?1
-             ORDER BY created_at ASC;",
-        )?;
-
-        let rows = stmt.query_map(params![subject_did], |row| row.get::<_, String>(0))?;
         let mut rkeys = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for r in rows {
-            let rk = r?;
-            if seen.insert(rk.clone()) {
-                rkeys.push(rk);
-            }
-        }
 
-        // Defensive fallback: if bounced_user_rkeys had no entries, check bounced_users
-        if rkeys.is_empty() {
-            let mut fallback_stmt = conn.prepare_cached(
-                "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1;",
+        if protected_did.is_empty() {
+            let mut stmt = conn.prepare_cached(
+                "SELECT listitem_rkey FROM bounced_user_rkeys
+                 WHERE subject_did = ?1
+                 ORDER BY created_at ASC;",
             )?;
-            let fallback_rkey: Option<String> = fallback_stmt
-                .query_row(params![subject_did], |row| row.get(0))
-                .optional()?;
-            if let Some(rk) = fallback_rkey {
-                rkeys.push(rk);
+
+            let rows = stmt.query_map(params![subject_did], |row| row.get::<_, String>(0))?;
+            for r in rows {
+                let rk = r?;
+                if seen.insert(rk.clone()) {
+                    rkeys.push(rk);
+                }
+            }
+
+            if rkeys.is_empty() {
+                let mut fallback_stmt = conn.prepare_cached(
+                    "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1;",
+                )?;
+                let fallback_rkey: Option<String> = fallback_stmt
+                    .query_row(params![subject_did], |row| row.get(0))
+                    .optional()?;
+                if let Some(rk) = fallback_rkey {
+                    rkeys.push(rk);
+                }
+            }
+        } else {
+            let mut stmt = conn.prepare_cached(
+                "SELECT listitem_rkey FROM bounced_user_rkeys
+                 WHERE subject_did = ?1 AND protected_did = ?2
+                 ORDER BY created_at ASC;",
+            )?;
+
+            let rows = stmt.query_map(params![subject_did, protected_did], |row| {
+                row.get::<_, String>(0)
+            })?;
+            for r in rows {
+                let rk = r?;
+                if seen.insert(rk.clone()) {
+                    rkeys.push(rk);
+                }
+            }
+
+            if rkeys.is_empty() {
+                let mut fallback_stmt = conn.prepare_cached(
+                    "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1 AND protected_did = ?2;",
+                )?;
+                let fallback_rkey: Option<String> = fallback_stmt
+                    .query_row(params![subject_did, protected_did], |row| row.get(0))
+                    .optional()?;
+                if let Some(rk) = fallback_rkey {
+                    rkeys.push(rk);
+                }
             }
         }
 
         Ok(rkeys)
+    }
+
+    /// Retrieves all known listitem `rkey` values associated with the given subject DID across all lists.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    pub fn get_all_bounced_rkeys(&self, subject_did: &str) -> Result<Vec<String>, SkybouncerError> {
+        self.get_all_bounced_rkeys_for("", subject_did)
     }
 
     /// Retrieves all known listitem `rkey` values associated with the given subject DID.
@@ -691,6 +860,9 @@ impl DeduplicationCache {
     /// Lists recently bounced users filtered by an optional protected user DID,
     /// ordered by most recent bounce timestamp descending.
     ///
+    /// Strictly isolates tenant moderation data: when `protected_did` is provided,
+    /// only bounces for that exact tenant are returned.
+    ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
     pub fn list_recent_bounces_for(
@@ -708,7 +880,7 @@ impl DeduplicationCache {
                         category, confidence, reason, post_uri, bounced_at,
                         protected_did, post_text
                  FROM bounced_users
-                 WHERE protected_did = ?1 OR protected_did = ''
+                 WHERE protected_did = ?1
                  ORDER BY bounced_at DESC
                  LIMIT ?2;",
             )?;
@@ -770,53 +942,134 @@ impl DeduplicationCache {
         Ok(list)
     }
 
-    /// Removes a bounced user from the cache, returning the primary listitem `rkey`.
+    /// Removes a bounced user from the cache for a specific protected user, returning the listitem `rkey`.
+    ///
+    /// Cleans up both `bounced_users` and all associated entries in `bounced_user_rkeys`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the query or deletion fails.
+    pub fn remove_bounce_for(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<Option<String>, SkybouncerError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(|e| {
+            SkybouncerError::Database(format!(
+                "Failed to start transaction for remove_bounce: {e}"
+            ))
+        })?;
+
+        let rkey: Option<String> = {
+            if protected_did.is_empty() {
+                let mut select_stmt = tx.prepare_cached(
+                    "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1 LIMIT 1;",
+                )?;
+                select_stmt
+                    .query_row(params![subject_did], |row| row.get(0))
+                    .optional()?
+            } else {
+                let mut select_stmt = tx.prepare_cached(
+                    "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1 AND protected_did = ?2 LIMIT 1;",
+                )?;
+                select_stmt
+                    .query_row(params![subject_did, protected_did], |row| row.get(0))
+                    .optional()?
+            }
+        };
+
+        if rkey.is_some() {
+            if protected_did.is_empty() {
+                let mut delete_rkeys =
+                    tx.prepare_cached("DELETE FROM bounced_user_rkeys WHERE subject_did = ?1;")?;
+                let _ = delete_rkeys.execute(params![subject_did]);
+
+                let mut delete_stmt =
+                    tx.prepare_cached("DELETE FROM bounced_users WHERE subject_did = ?1;")?;
+                delete_stmt.execute(params![subject_did])?;
+            } else {
+                let mut delete_rkeys = tx.prepare_cached(
+                    "DELETE FROM bounced_user_rkeys WHERE subject_did = ?1 AND protected_did = ?2;",
+                )?;
+                let _ = delete_rkeys.execute(params![subject_did, protected_did]);
+
+                let mut delete_stmt = tx.prepare_cached(
+                    "DELETE FROM bounced_users WHERE subject_did = ?1 AND protected_did = ?2;",
+                )?;
+                delete_stmt.execute(params![subject_did, protected_did])?;
+            }
+        }
+
+        tx.commit().map_err(|e| {
+            SkybouncerError::Database(format!("Failed to commit remove_bounce transaction: {e}"))
+        })?;
+
+        Ok(rkey)
+    }
+
+    /// Removes a bounced user from the cache across all lists, returning the primary listitem `rkey`.
     ///
     /// Cleans up both `bounced_users` and all associated entries in `bounced_user_rkeys`.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if the query or deletion fails.
     pub fn remove_bounce(&self, subject_did: &str) -> Result<Option<String>, SkybouncerError> {
-        let conn = self.conn.lock();
-
-        let mut select_stmt =
-            conn.prepare_cached("SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1;")?;
-
-        let rkey: Option<String> = select_stmt
-            .query_row(params![subject_did], |row| row.get(0))
-            .optional()?;
-
-        if rkey.is_some() {
-            let mut delete_rkeys =
-                conn.prepare_cached("DELETE FROM bounced_user_rkeys WHERE subject_did = ?1;")?;
-            let _ = delete_rkeys.execute(params![subject_did]);
-
-            let mut delete_stmt =
-                conn.prepare_cached("DELETE FROM bounced_users WHERE subject_did = ?1;")?;
-
-            delete_stmt.execute(params![subject_did])?;
-        }
-
-        Ok(rkey)
+        self.remove_bounce_for("", subject_did)
     }
 
-    /// Removes a bounced user from the cache, returning all known listitem `rkey` values.
+    /// Removes a bounced user from the cache for a specific protected user, returning all known listitem `rkey` values.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the query or deletion fails.
+    pub fn remove_all_bounces_for(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<Vec<String>, SkybouncerError> {
+        let rkeys = self.get_all_bounced_rkeys_for(protected_did, subject_did)?;
+        if !rkeys.is_empty() {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(|e| {
+                SkybouncerError::Database(format!(
+                    "Failed to start transaction for remove_all_bounces: {e}"
+                ))
+            })?;
+
+            if protected_did.is_empty() {
+                let mut delete_rkeys =
+                    tx.prepare_cached("DELETE FROM bounced_user_rkeys WHERE subject_did = ?1;")?;
+                let _ = delete_rkeys.execute(params![subject_did]);
+
+                let mut delete_stmt =
+                    tx.prepare_cached("DELETE FROM bounced_users WHERE subject_did = ?1;")?;
+                delete_stmt.execute(params![subject_did])?;
+            } else {
+                let mut delete_rkeys = tx.prepare_cached(
+                    "DELETE FROM bounced_user_rkeys WHERE subject_did = ?1 AND protected_did = ?2;",
+                )?;
+                let _ = delete_rkeys.execute(params![subject_did, protected_did]);
+
+                let mut delete_stmt = tx.prepare_cached(
+                    "DELETE FROM bounced_users WHERE subject_did = ?1 AND protected_did = ?2;",
+                )?;
+                delete_stmt.execute(params![subject_did, protected_did])?;
+            }
+
+            tx.commit().map_err(|e| {
+                SkybouncerError::Database(format!(
+                    "Failed to commit remove_all_bounces transaction: {e}"
+                ))
+            })?;
+        }
+        Ok(rkeys)
+    }
+
+    /// Removes a bounced user from the cache across all lists, returning all known listitem `rkey` values.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if the query or deletion fails.
     pub fn remove_all_bounces(&self, subject_did: &str) -> Result<Vec<String>, SkybouncerError> {
-        let rkeys = self.get_all_bounced_rkeys(subject_did)?;
-        if !rkeys.is_empty() {
-            let conn = self.conn.lock();
-            let mut delete_rkeys =
-                conn.prepare_cached("DELETE FROM bounced_user_rkeys WHERE subject_did = ?1;")?;
-            let _ = delete_rkeys.execute(params![subject_did]);
-
-            let mut delete_stmt =
-                conn.prepare_cached("DELETE FROM bounced_users WHERE subject_did = ?1;")?;
-            delete_stmt.execute(params![subject_did])?;
-        }
-        Ok(rkeys)
+        self.remove_all_bounces_for("", subject_did)
     }
 
     /// Counts the total number of bounced users recorded in the cache.
@@ -1482,5 +1735,91 @@ mod tests {
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].id, id3);
         assert_eq!(remaining[1].id, id2);
+    }
+
+    #[test]
+    fn test_multitenant_bounce_isolation() {
+        let cache = DeduplicationCache::open_in_memory().unwrap();
+
+        let bounce_a = BouncedUser {
+            subject_did: "did:plc:spammer".to_string(),
+            protected_did: "did:plc:tenant_a".to_string(),
+            listitem_uri: "at://did:plc:tenant_a/app.bsky.graph.listitem/item_a".to_string(),
+            listitem_rkey: "item_a".to_string(),
+            listitem_cid: "bafyitema".to_string(),
+            category: "spam".to_string(),
+            confidence: 0.99,
+            reason: "Spam for A".to_string(),
+            post_uri: "at://did:plc:spammer/app.bsky.feed.post/1".to_string(),
+            post_text: "Spam text".to_string(),
+            bounced_at: 1_700_000_000,
+        };
+
+        let bounce_b = BouncedUser {
+            subject_did: "did:plc:spammer".to_string(),
+            protected_did: "did:plc:tenant_b".to_string(),
+            listitem_uri: "at://did:plc:tenant_b/app.bsky.graph.listitem/item_b".to_string(),
+            listitem_rkey: "item_b".to_string(),
+            listitem_cid: "bafyitemb".to_string(),
+            category: "harassment".to_string(),
+            confidence: 0.95,
+            reason: "Harassment for B".to_string(),
+            post_uri: "at://did:plc:spammer/app.bsky.feed.post/2".to_string(),
+            post_text: "Harassment text".to_string(),
+            bounced_at: 1_700_000_100,
+        };
+
+        // Record bounces for both tenants
+        cache.record_bounce(&bounce_a).unwrap();
+        cache.record_bounce(&bounce_b).unwrap();
+
+        // Both are bounced in their respective tenant contexts
+        assert!(cache
+            .is_bounced_for("did:plc:tenant_a", "did:plc:spammer")
+            .unwrap());
+        assert!(cache
+            .is_bounced_for("did:plc:tenant_b", "did:plc:spammer")
+            .unwrap());
+        assert!(!cache
+            .is_bounced_for("did:plc:tenant_c", "did:plc:spammer")
+            .unwrap());
+
+        // Recent bounces list isolates records
+        let list_a = cache
+            .list_recent_bounces_for(Some("did:plc:tenant_a"), 10)
+            .unwrap();
+        assert_eq!(list_a.len(), 1);
+        assert_eq!(list_a[0].listitem_rkey, "item_a");
+
+        let list_b = cache
+            .list_recent_bounces_for(Some("did:plc:tenant_b"), 10)
+            .unwrap();
+        assert_eq!(list_b.len(), 1);
+        assert_eq!(list_b[0].listitem_rkey, "item_b");
+
+        let list_c = cache
+            .list_recent_bounces_for(Some("did:plc:tenant_c"), 10)
+            .unwrap();
+        assert_eq!(list_c.len(), 0);
+
+        // Tenant A pardons spammer
+        let removed = cache
+            .remove_bounce_for("did:plc:tenant_a", "did:plc:spammer")
+            .unwrap();
+        assert_eq!(removed.as_deref(), Some("item_a"));
+
+        // Tenant A no longer has spammer bounced, but Tenant B STILL DOES!
+        assert!(!cache
+            .is_bounced_for("did:plc:tenant_a", "did:plc:spammer")
+            .unwrap());
+        assert!(cache
+            .is_bounced_for("did:plc:tenant_b", "did:plc:spammer")
+            .unwrap());
+
+        let list_b_after = cache
+            .list_recent_bounces_for(Some("did:plc:tenant_b"), 10)
+            .unwrap();
+        assert_eq!(list_b_after.len(), 1);
+        assert_eq!(list_b_after[0].listitem_rkey, "item_b");
     }
 }

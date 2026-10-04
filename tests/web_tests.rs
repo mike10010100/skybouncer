@@ -192,10 +192,33 @@ async fn test_api_status_endpoint() {
     stats.interactions_matched.fetch_add(1, Ordering::Relaxed);
     stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
 
+    // Unauthenticated status call redacts protected_dids and stats (privacy hardening M8)
+    let unauth_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth_resp.status(), StatusCode::OK);
+    let unauth_bytes = axum::body::to_bytes(unauth_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let unauth_status: StatusResponse = serde_json::from_slice(&unauth_bytes).unwrap();
+    assert!(unauth_status.protected_dids.is_empty());
+    assert_eq!(unauth_status.stats.commits_received, 0);
+
+    let alice_token = create_test_session(&engine, "did:plc:alice");
+
+    // Authenticated status call returns full protected_dids and stats
     let response = app
         .oneshot(
             Request::builder()
                 .uri("/api/status")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -466,8 +489,29 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
 // =============================================================================
 
 #[tokio::test]
-async fn test_api_simulate_heuristic_match() {
+async fn test_api_simulate_unauthenticated_rejected() {
     let (_engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+
+    let payload = json!({
+        "text": "FREE AIRDROP LIVE NOW!",
+        "author_did": "did:plc:spammer123"
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/simulate")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_api_simulate_heuristic_match() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let alice_token = create_test_session(&engine, "did:plc:alice");
 
     let payload = json!({
         "text": "FREE AIRDROP LIVE NOW! Connect wallet to claim free tokens immediately!",
@@ -477,6 +521,7 @@ async fn test_api_simulate_heuristic_match() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/simulate")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
@@ -529,6 +574,7 @@ async fn test_api_simulate_heuristic_disabled_by_default() {
     )
     .with_client_name("Skybouncer Test Dashboard");
     let app = create_web_router(Arc::clone(&engine), None, metadata);
+    let alice_token = create_test_session(&engine, "did:plc:alice");
 
     let payload = json!({
         "text": "FREE AIRDROP LIVE NOW! Connect wallet to claim free tokens immediately!",
@@ -538,6 +584,7 @@ async fn test_api_simulate_heuristic_disabled_by_default() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/simulate")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
@@ -556,7 +603,8 @@ async fn test_api_simulate_heuristic_disabled_by_default() {
 
 #[tokio::test]
 async fn test_api_simulate_benign_text() {
-    let (_engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let alice_token = create_test_session(&engine, "did:plc:alice");
 
     let payload = json!({
         "text": "Hello! Really enjoyed reading your recent technical architecture notes.",
@@ -566,6 +614,7 @@ async fn test_api_simulate_benign_text() {
     let req = Request::builder()
         .method("POST")
         .uri("/api/simulate")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
@@ -584,12 +633,14 @@ async fn test_api_simulate_benign_text() {
 
 #[tokio::test]
 async fn test_api_simulate_validation_error() {
-    let (_engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let alice_token = create_test_session(&engine, "did:plc:alice");
 
     let payload = json!({ "text": "   " });
     let req = Request::builder()
         .method("POST")
         .uri("/api/simulate")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
@@ -647,10 +698,12 @@ async fn test_api_simulate_tiered_inspection_escalation() {
         "text": "Can you explain why you said that earlier? Seems contradictory.",
         "author_did": "did:plc:questioner"
     });
+    let alice_token = create_test_session(&engine, "did:plc:alice");
 
     let req = Request::builder()
         .method("POST")
         .uri("/api/simulate")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
@@ -777,10 +830,19 @@ async fn test_live_web_server_lifecycle_and_graceful_shutdown() {
     // Wait briefly for server to bind
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    let token = engine
+        .tenant_registry()
+        .create_web_session("did:plc:live-test", Duration::from_secs(3600))
+        .unwrap();
+
     // Issue real HTTP request to the running server
     let client = reqwest::Client::new();
     let status_url = format!("http://127.0.0.1:{ephemeral_port}/api/status");
-    let resp = client.get(&status_url).send().await;
+    let resp = client
+        .get(&status_url)
+        .header("cookie", format!("skybouncer_session={token}"))
+        .send()
+        .await;
     assert!(resp.is_ok(), "Live HTTP request to web server succeeded");
     let resp = resp.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -950,6 +1012,7 @@ async fn test_api_session_and_admin_endpoints() {
     let sim_req = Request::builder()
         .method("POST")
         .uri("/api/simulate")
+        .header("cookie", format!("skybouncer_session={admin_token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&sim_payload).unwrap()))
         .unwrap();
@@ -1230,7 +1293,8 @@ async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
 
 #[tokio::test]
 async fn test_simulate_ssrf_prevention() {
-    let (_engine, _cache, _pds, app) = setup_test_web_environment("did:plc:admin").await;
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:admin").await;
+    let admin_token = create_test_session(&engine, "did:plc:admin");
 
     let malicious_urls = vec![
         "http://169.254.169.254/latest/meta-data/",
@@ -1251,6 +1315,7 @@ async fn test_simulate_ssrf_prevention() {
         let req = Request::builder()
             .method("POST")
             .uri("/api/simulate")
+            .header("cookie", format!("skybouncer_session={admin_token}"))
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&payload).unwrap()))
             .unwrap();

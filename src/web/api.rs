@@ -177,15 +177,30 @@ pub struct StatusResponse {
 
 /// Handler for `GET /api/status`: returns engine operational telemetry.
 pub async fn get_status(State(state): State<ApiState>, headers: HeaderMap) -> Json<StatusResponse> {
-    let stats = state.engine.stats().snapshot();
-    let mut protected_dids: Vec<String> = state.engine.protected_dids().into_iter().collect();
-    protected_dids.sort();
-
-    // Redact private prompt for unauthenticated callers
     let caller_did = extract_authenticated_caller(&headers, &state.engine);
     let is_admin = caller_did
         .as_deref()
         .is_some_and(|did| state.engine.is_admin(did));
+
+    let stats = if caller_did.is_some() || is_admin {
+        state.engine.stats().snapshot()
+    } else {
+        EngineStatsSnapshot::default()
+    };
+
+    let protected_dids = if is_admin {
+        let mut dids: Vec<String> = state.engine.protected_dids().into_iter().collect();
+        dids.sort();
+        dids
+    } else if let Some(ref did) = caller_did {
+        if state.engine.is_protected(did) {
+            vec![did.clone()]
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
 
     let rubric = if let Some(ref did) = caller_did {
         state.engine.rubric_for(did)
@@ -373,10 +388,17 @@ pub async fn update_rules(
         .is_enrolled(&target_did)
         .unwrap_or(false);
     if is_enrolled {
-        let _ = state
+        state
             .engine
             .tenant_registry()
-            .update_rubric(&target_did, &rubric);
+            .update_rubric(&target_did, &rubric)
+            .map_err(|e| {
+                tracing::error!(did = %target_did, error = %e, "Failed to persist updated rubric");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to persist rubric: {e}"),
+                )
+            })?;
     } else if state.engine.is_protected(&target_did) {
         // Only non-enrolled protected accounts update the default engine rubric
         state.engine.set_rubric(rubric.clone());
@@ -386,7 +408,9 @@ pub async fn update_rules(
     let eng = state.engine.clone();
     let publish_did = target_did.clone();
     tokio::spawn(async move {
-        let _ = eng.publish_sovereign_config(&publish_did).await;
+        if let Err(e) = eng.publish_sovereign_config(&publish_did).await {
+            tracing::warn!(did = %publish_did, error = %e, "Failed to publish sovereign config to PDS in background task");
+        }
     });
 
     Ok(Json(RulesResponse {
@@ -532,16 +556,18 @@ async fn fetch_simulation_image(url_str: &str) -> Result<Vec<u8>, (StatusCode, S
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
 
     let host_port = format!("{host}:{port}");
-    let addrs = tokio::net::lookup_host(&host_port).await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Failed to resolve image URL host: {e}"),
-        )
-    })?;
+    let addrs: Vec<_> = tokio::net::lookup_host(&host_port)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to resolve image URL host: {e}"),
+            )
+        })?
+        .collect();
 
-    let mut resolved_any = false;
-    for addr in addrs {
-        resolved_any = true;
+    let mut target_addr = None;
+    for addr in &addrs {
         let ip = addr.ip();
         if skyauth::ssrf::is_restricted_ip(ip) {
             return Err((
@@ -549,17 +575,21 @@ async fn fetch_simulation_image(url_str: &str) -> Result<Vec<u8>, (StatusCode, S
                 format!("SSRF protection: image URL resolves to restricted IP ({ip})"),
             ));
         }
+        if target_addr.is_none() {
+            target_addr = Some(*addr);
+        }
     }
 
-    if !resolved_any {
-        return Err((
+    let pinned_addr = target_addr.ok_or_else(|| {
+        (
             StatusCode::BAD_REQUEST,
             "Could not resolve any IP address for host".to_string(),
-        ));
-    }
+        )
+    })?;
 
-    // Fetch with redirect::Policy::none() to prevent open-redirect SSRF
+    // Fetch with redirect::Policy::none() and pinned IP address to eliminate DNS-rebinding TOCTOU (M9)
     let client = reqwest::Client::builder()
+        .resolve(host, pinned_addr)
         .timeout(Duration::from_millis(5000))
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!(
@@ -592,28 +622,43 @@ async fn fetch_simulation_image(url_str: &str) -> Result<Vec<u8>, (StatusCode, S
         ));
     }
 
-    let bytes = resp.bytes().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("Failed to read image bytes: {e}"),
-        )
-    })?;
-
-    if bytes.len() > 4 * 1024 * 1024 {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Simulation image exceeds 4MB limit".to_string(),
-        ));
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to read image stream: {e}"),
+            )
+        })?;
+        if bytes.len().saturating_add(chunk.len()) > 2 * 1024 * 1024 {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Simulation image exceeds 2MB limit".to_string(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
     }
 
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 /// Handler for `POST /api/simulate`: runs a dry-run evaluation on sample text and optional images.
 pub async fn simulate_interaction(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(payload): Json<SimulateRequest>,
 ) -> Result<Json<SimulateResponse>, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to run evaluation simulation".to_string(),
+        )
+    })?;
+
+    let is_admin = state.engine.is_admin(&caller_did);
+
     let text = payload.text.trim();
     if text.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Text cannot be empty".to_string()));
@@ -622,14 +667,11 @@ pub async fn simulate_interaction(
     let author_did = payload
         .author_did
         .unwrap_or_else(|| "did:plc:sample-author".to_string());
-    let target_did = payload.target_did.unwrap_or_else(|| {
-        state
-            .engine
-            .protected_dids()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| "did:plc:protected-sample".to_string())
-    });
+    let target_did = if is_admin {
+        payload.target_did.unwrap_or_else(|| caller_did.clone())
+    } else {
+        caller_did.clone()
+    };
 
     let mut image_cids = Vec::new();
     let mut images_base64 = Vec::new();
@@ -713,7 +755,7 @@ pub async fn simulate_interaction(
                 .and_then(|t| t.handle)
                 .unwrap_or_default();
 
-            let _ = state
+            if let Err(e) = state
                 .engine
                 .cache()
                 .record_evaluation_log(&NewEvaluationLog {
@@ -741,7 +783,10 @@ pub async fn simulate_interaction(
                     final_action: "violation".to_string(),
                     final_confidence: 1.0,
                     outcome: "Simulated: Would Bounce (Regex Pre-filter)".to_string(),
-                });
+                })
+            {
+                tracing::warn!(error = %e, "Failed to record simulated evaluation log");
+            }
 
             return Ok(Json(SimulateResponse {
                 violates: true,
@@ -879,7 +924,7 @@ pub async fn simulate_interaction(
     #[allow(clippy::cast_possible_truncation)]
     let primary_conf_f32 = tier1_conf as f32;
 
-    let _ = state
+    if let Err(e) = state
         .engine
         .cache()
         .record_evaluation_log(&NewEvaluationLog {
@@ -927,7 +972,10 @@ pub async fn simulate_interaction(
             },
             final_confidence: final_confidence_f32,
             outcome: sim_outcome_str.to_string(),
-        });
+        })
+    {
+        tracing::warn!(error = %e, "Failed to record simulated evaluation log");
+    }
 
     match detailed.final_verdict {
         Verdict::Violation {
@@ -1329,12 +1377,20 @@ pub async fn toggle_tenant(
         },
     };
 
-    let _ = state
+    state
         .engine
         .tenant_registry()
-        .set_active(&target_did, new_active);
+        .set_active(&target_did, new_active)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to update tenant status: {e}"),
+            )
+        })?;
 
-    if state.engine.protected_dids().contains(&target_did) && is_admin {
+    if (state.engine.is_admin(&target_did) || state.engine.is_single_tenant())
+        && state.engine.is_protected(&target_did)
+    {
         if new_active {
             state.engine.resume();
         } else {
@@ -1368,9 +1424,9 @@ pub async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Respon
     }
 
     let mut resp = Json(serde_json::json!({ "logged_out": true })).into_response();
-    if let Ok(cookie_val) =
-        HeaderValue::from_str("skybouncer_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
-    {
+    if let Ok(cookie_val) = HeaderValue::from_str(
+        "skybouncer_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure",
+    ) {
         resp.headers_mut().insert(header::SET_COOKIE, cookie_val);
     }
     resp

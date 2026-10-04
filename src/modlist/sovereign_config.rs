@@ -39,7 +39,7 @@ impl SovereignConfigRecord {
             record_type: SOVEREIGN_CONFIG_COLLECTION.to_string(),
             rules: rubric.prompt.clone(),
             sensitivity: rubric.sensitivity.as_str().to_string(),
-            updated_at: chrono_timestamp(),
+            updated_at: crate::types::now_iso8601(),
         }
     }
 
@@ -53,16 +53,6 @@ impl SovereignConfigRecord {
         };
         RuleRubric::new(&self.rules, sensitivity)
     }
-}
-
-/// Generates a simple UTC ISO 8601 timestamp string without external dependencies.
-fn chrono_timestamp() -> String {
-    // Standard Unix epoch elapsed seconds
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{secs}")
 }
 
 #[derive(Debug, Serialize, Deserialize)]

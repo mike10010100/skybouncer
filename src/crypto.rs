@@ -70,11 +70,19 @@ impl SessionCipher {
                 if let Some(key_bytes) = parse_hex_32(trimmed) {
                     return Self::new(key_bytes);
                 }
+                tracing::warn!(
+                    "SKYBOUNCER_SESSION_ENCRYPTION_KEY is not a 64-character hex string; deriving key via passphrase KDF"
+                );
                 return Self::from_secret_passphrase(trimmed);
             }
         }
 
         // Fallback: derive a stable default machine key based on hostname/hostname salt
+        tracing::warn!(
+            "SECURITY WARNING: SKYBOUNCER_SESSION_ENCRYPTION_KEY is not set! \
+             Session OAuth tokens at rest are being protected by a host-derived fallback key. \
+             Please configure SKYBOUNCER_SESSION_ENCRYPTION_KEY with a 64-char hex key in production."
+        );
         let host = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("SERVICE_DID"))
             .unwrap_or_else(|_| "skybouncer-default-storage-key".to_string());
@@ -86,6 +94,18 @@ impl SessionCipher {
     /// # Errors
     /// Returns [`SkybouncerError::Auth`] if CSPRNG nonce generation or AES-256-GCM sealing fails.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<String, SkybouncerError> {
+        self.encrypt_with_aad(plaintext, &[])
+    }
+
+    /// Encrypts plaintext bytes with additional authenticated data (AAD) into a versioned Base64 envelope (`enc:v1:<base64>`).
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Auth`] if CSPRNG nonce generation or AES-256-GCM sealing fails.
+    pub fn encrypt_with_aad(
+        &self,
+        plaintext: &[u8],
+        aad_bytes: &[u8],
+    ) -> Result<String, SkybouncerError> {
         let rng = SystemRandom::new();
         let mut nonce_bytes = [0u8; 12];
         rng.fill(&mut nonce_bytes)
@@ -98,7 +118,7 @@ impl SessionCipher {
 
         let mut in_out = plaintext.to_vec();
         sealing_key
-            .seal_in_place_append_tag(Aad::empty(), &mut in_out)
+            .seal_in_place_append_tag(Aad::from(aad_bytes), &mut in_out)
             .map_err(|_| SkybouncerError::Auth("Failed to encrypt session payload".to_string()))?;
 
         // Format payload: 12-byte nonce followed by ciphertext + 16-byte tag
@@ -116,6 +136,18 @@ impl SessionCipher {
     /// # Errors
     /// Returns [`SkybouncerError::Auth`] if Base64 decoding, nonce extraction, or AES-256-GCM tag verification fails.
     pub fn decrypt_or_passthrough(&self, raw: &str) -> Result<String, SkybouncerError> {
+        self.decrypt_or_passthrough_with_aad(raw, &[])
+    }
+
+    /// Decrypts a versioned Base64 envelope with additional authenticated data (AAD) or passes through legacy unencrypted plaintext.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Auth`] if Base64 decoding, nonce extraction, or AES-256-GCM tag verification fails.
+    pub fn decrypt_or_passthrough_with_aad(
+        &self,
+        raw: &str,
+        aad_bytes: &[u8],
+    ) -> Result<String, SkybouncerError> {
         let raw = raw.trim();
         if !raw.starts_with(ENCRYPTION_V1_PREFIX) {
             // Legacy unencrypted JSON payload; pass through directly
@@ -147,14 +179,38 @@ impl SessionCipher {
         let mut opening_key = OpeningKey::new(unbound_key, SingleNonce(Some(nonce_arr)));
 
         let mut in_out = ciphertext_and_tag.to_vec();
-        let plaintext_slice = opening_key
-            .open_in_place(Aad::empty(), &mut in_out)
-            .map_err(|_| {
-                SkybouncerError::Auth(
+        // Try opening with specified AAD; if non-empty and fails, try empty AAD for backwards-compatibility
+        let plaintext_slice = match opening_key.open_in_place(Aad::from(aad_bytes), &mut in_out) {
+            Ok(slice) => slice,
+            Err(_) if !aad_bytes.is_empty() => {
+                let unbound_key_retry = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
+                    .map_err(|_| SkybouncerError::Auth("Invalid AES-256-GCM key".to_string()))?;
+                let mut retry_key =
+                    OpeningKey::new(unbound_key_retry, SingleNonce(Some(nonce_arr)));
+                let mut retry_buf = ciphertext_and_tag.to_vec();
+                retry_key
+                    .open_in_place(Aad::empty(), &mut retry_buf)
+                    .map_err(|_| {
+                        SkybouncerError::Auth(
+                            "Failed to decrypt session: authentication tag mismatch or invalid key"
+                                .to_string(),
+                        )
+                    })?;
+                return String::from_utf8(retry_buf[..retry_buf.len() - 16].to_vec()).map_err(
+                    |e| {
+                        SkybouncerError::Auth(format!(
+                            "Decrypted session payload is not valid UTF-8: {e}"
+                        ))
+                    },
+                );
+            }
+            Err(_) => {
+                return Err(SkybouncerError::Auth(
                     "Failed to decrypt session: authentication tag mismatch or invalid key"
                         .to_string(),
-                )
-            })?;
+                ));
+            }
+        };
 
         String::from_utf8(plaintext_slice.to_vec()).map_err(|e| {
             SkybouncerError::Auth(format!("Decrypted session payload is not valid UTF-8: {e}"))

@@ -299,7 +299,7 @@ async fn test_adversarial_pds_socket_drop_on_delete_record() {
 }
 
 #[tokio::test]
-async fn test_adversarial_pds_list_records_500_falls_through_to_provisioning() {
+async fn test_adversarial_pds_list_records_500_fails_without_duplicate_provisioning() {
     let server = MockServer::start().await;
 
     // listRecords returns 500 Internal Server Error
@@ -312,7 +312,7 @@ async fn test_adversarial_pds_list_records_500_falls_through_to_provisioning() {
         .mount(&server)
         .await;
 
-    // createRecord succeeds
+    // createRecord succeeds (should never be called)
     Mock::given(method("POST"))
         .and(path("/xrpc/com.atproto.repo.createRecord"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -327,15 +327,14 @@ async fn test_adversarial_pds_list_records_500_falls_through_to_provisioning() {
             .unwrap();
     let manager = ModListManager::open_in_memory().unwrap();
 
-    let uri = manager
-        .ensure_mod_list(&client, "did:plc:alice")
-        .await
-        .unwrap();
-    assert_eq!(uri, "at://did:plc:alice/app.bsky.graph.list/fallback_rkey");
+    let res = manager.ensure_mod_list(&client, "did:plc:alice").await;
+    assert!(
+        res.is_err(),
+        "Transient listRecords 500 must fail instead of creating duplicate mod list"
+    );
 
-    // Cached locally
-    let cached = manager.get_mod_list("did:plc:alice").unwrap().unwrap();
-    assert_eq!(cached.list_uri, uri);
+    // Must not be cached locally
+    assert!(manager.get_mod_list("did:plc:alice").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -353,7 +352,7 @@ async fn test_adversarial_pds_list_records_malformed_json() {
         .mount(&server)
         .await;
 
-    // createRecord succeeds
+    // createRecord succeeds (should never be called)
     Mock::given(method("POST"))
         .and(path("/xrpc/com.atproto.repo.createRecord"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -368,18 +367,14 @@ async fn test_adversarial_pds_list_records_malformed_json() {
             .unwrap();
     let manager = ModListManager::open_in_memory().unwrap();
 
-    // Malformed JSON is swallowed safely by `if let Ok(resp)` and falls through to provisioning
-    let uri = manager
-        .ensure_mod_list(&client, "did:plc:alice")
-        .await
-        .unwrap();
-    assert_eq!(
-        uri,
-        "at://did:plc:alice/app.bsky.graph.list/malformed_fallback_rkey"
+    // Malformed JSON is not swallowed to avoid provisioning duplicates
+    let res = manager.ensure_mod_list(&client, "did:plc:alice").await;
+    assert!(
+        res.is_err(),
+        "Malformed JSON on listRecords must fail instead of creating duplicate mod list"
     );
 
-    let cached = manager.get_mod_list("did:plc:alice").unwrap().unwrap();
-    assert_eq!(cached.list_uri, uri);
+    assert!(manager.get_mod_list("did:plc:alice").unwrap().is_none());
 }
 
 #[tokio::test]
