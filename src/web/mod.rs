@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::{header, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use tokio_util::sync::CancellationToken;
@@ -188,6 +189,10 @@ pub fn create_web_router(
         .route("/callback", get(oauth::oauth_callback))
         .with_state(oauth_state.clone());
 
+    let cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT]);
+
     Router::new()
         .route("/", get(ui::serve_dashboard))
         .route("/auth", get(oauth::auth_redirect))
@@ -198,8 +203,36 @@ pub fn create_web_router(
         )
         .nest("/api", api_router)
         .nest("/oauth", oauth_router)
-        .layer(CorsLayer::permissive())
+        .layer(cors)
+        .layer(axum::middleware::from_fn(security_headers_middleware))
         .layer(TraceLayer::new_for_http())
+}
+
+async fn security_headers_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        header::HeaderName::from_static("content-security-policy"),
+        axum::http::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; frame-ancestors 'none';",
+        ),
+    );
+    resp
 }
 
 /// Constructs the [`AtprotoOAuthClient`] and [`OAuthClientMetadata`] from server configuration.

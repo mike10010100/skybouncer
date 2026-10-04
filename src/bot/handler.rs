@@ -119,7 +119,7 @@ impl BotCommandHandler {
         }
 
         if trimmed.eq_ignore_ascii_case("recent") {
-            return self.cmd_recent();
+            return self.cmd_recent(sender_did);
         }
 
         if trimmed.eq_ignore_ascii_case("pardon") {
@@ -276,13 +276,13 @@ impl BotCommandHandler {
         ))
     }
 
-    fn cmd_recent(&self) -> Result<String, SkybouncerError> {
-        let bounces = self.engine.list_recent_bounces(5)?;
+    fn cmd_recent(&self, sender_did: &str) -> Result<String, SkybouncerError> {
+        let bounces = self.engine.list_recent_bounces_for(Some(sender_did), 5)?;
         if bounces.is_empty() {
-            return Ok("ℹ️ No accounts have been bounced yet.".to_string());
+            return Ok("ℹ️ No accounts have been bounced from your replies yet.".to_string());
         }
 
-        let mut out = String::from("🚫 Recently Bounced Accounts (last 5):\n\n");
+        let mut out = String::from("🚫 Recently Bounced Accounts from Your Replies (last 5):\n\n");
         for (idx, b) in bounces.iter().enumerate() {
             let num = idx.saturating_add(1);
             out.push_str(&format!(
@@ -356,33 +356,68 @@ impl BotCommandHandler {
         } else {
             "▶️ ACTIVE"
         };
-        format!(
-            "📊 Skybouncer Engine Status:\n\n\
-             • State: {}\n\
-             • Commits Received: {}\n\
-             • Follows Synced: {}\n\
-             • Interactions Matched: {}\n\
-             • Bypassed (Followed Author): {}\n\
-             • Bypassed (Self-Interaction): {}\n\
-             • Dedup Cache Hits: {}\n\
-             • Heuristic Pre-Filter Flags: {}\n\
-             • Model Evaluations: {}\n\
-             • Violations Detected: {}\n\
-             • Bounces Executed on PDS: {}\n\
-             • Permitted Interactions: {}",
-            state_label,
-            stats.commits_received,
-            stats.follows_synced,
-            stats.interactions_matched,
-            stats.gate_bypassed_followed,
-            stats.gate_bypassed_self,
-            stats.dedup_cache_hits,
-            stats.heuristic_violations,
-            stats.model_evaluations,
-            stats.violations_detected,
-            stats.bounces_executed,
-            stats.permitted,
-        )
+
+        if self.engine.is_admin(sender_did) {
+            format!(
+                "📊 Skybouncer Engine Status (Admin Fleet View):\n\n\
+                 • State: {}\n\
+                 • Commits Received: {}\n\
+                 • Follows Synced: {}\n\
+                 • Interactions Matched: {}\n\
+                 • Bypassed (Followed Author): {}\n\
+                 • Bypassed (Self-Interaction): {}\n\
+                 • Dedup Cache Hits: {}\n\
+                 • Heuristic Pre-Filter Flags: {}\n\
+                 • Model Evaluations: {}\n\
+                 • Violations Detected: {}\n\
+                 • Bounces Executed on PDS: {}\n\
+                 • Permitted Interactions: {}\n\
+                 • Enrolled Tenants: {}\n\
+                 • Dry-Run Mode: {}",
+                state_label,
+                stats.commits_received,
+                stats.follows_synced,
+                stats.interactions_matched,
+                stats.gate_bypassed_followed,
+                stats.gate_bypassed_self,
+                stats.dedup_cache_hits,
+                stats.heuristic_violations,
+                stats.model_evaluations,
+                stats.violations_detected,
+                stats.bounces_executed,
+                stats.permitted,
+                self.engine.tenant_registry().count().unwrap_or(0),
+                if self.engine.is_dry_run() {
+                    "Yes (shadow)"
+                } else {
+                    "No (live)"
+                }
+            )
+        } else {
+            let rubric = self.engine.rubric_for(sender_did);
+            let my_bounces = self
+                .engine
+                .list_recent_bounces_for(Some(sender_did), 100)
+                .map(|b| b.len())
+                .unwrap_or(0);
+            format!(
+                "📊 Skybouncer Status for Your Account:\n\n\
+                 • Defense State: {}\n\
+                 • Sensitivity: {}\n\
+                 • Active Prompt: \"{}\"\n\
+                 • Accounts Bounced from Your Posts: {}\n\
+                 • Protection Mode: {}",
+                state_label,
+                rubric.sensitivity,
+                rubric.prompt,
+                my_bounces,
+                if self.engine.is_dry_run() {
+                    "Dry-Run (simulated)"
+                } else {
+                    "Active Sovereign Bouncer"
+                }
+            )
+        }
     }
 
     fn cmd_onboarding(&self, sender_did: &str) -> String {

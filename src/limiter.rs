@@ -135,9 +135,26 @@ impl EvaluationRateLimiter {
         if let Some(timestamps) = shard.get_mut(target_did) {
             let window = self.config.window_duration;
             timestamps.retain(|&ts| now.saturating_duration_since(ts) < window);
-            self.config.max_evaluations.saturating_sub(timestamps.len())
+            let rem = self.config.max_evaluations.saturating_sub(timestamps.len());
+            if timestamps.is_empty() {
+                shard.remove(target_did);
+            }
+            rem
         } else {
             self.config.max_evaluations
+        }
+    }
+
+    /// Prunes stale entries across all shards whose recorded timestamps have all expired.
+    pub fn prune_stale(&self) {
+        let now = Instant::now();
+        let window = self.config.window_duration;
+        for shard in &self.shards {
+            let mut map = shard.lock();
+            map.retain(|_, timestamps| {
+                timestamps.retain(|&ts| now.saturating_duration_since(ts) < window);
+                !timestamps.is_empty()
+            });
         }
     }
 

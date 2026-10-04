@@ -89,6 +89,13 @@ async fn setup_test_web_environment(
     (engine, cache, pds, router)
 }
 
+fn create_test_session(engine: &SkybouncerEngine, did: &str) -> String {
+    engine
+        .tenant_registry()
+        .create_web_session(did, Duration::from_secs(3600))
+        .expect("create test session")
+}
+
 // =============================================================================
 // Dashboard UI Delivery Tests
 // =============================================================================
@@ -214,6 +221,7 @@ async fn test_api_status_endpoint() {
 #[tokio::test]
 async fn test_api_get_and_update_rules() {
     let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let alice_token = create_test_session(&engine, "did:plc:alice");
 
     // 0. Unauthenticated GET /api/rules returns 401 Unauthorized
     let unauth_req = Request::builder()
@@ -223,10 +231,19 @@ async fn test_api_get_and_update_rules() {
     let unauth_resp = app.clone().oneshot(unauth_req).await.unwrap();
     assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
 
+    // 0b. Spoofed x-skybouncer-did without valid session returns 401 Unauthorized
+    let spoof_req = Request::builder()
+        .uri("/api/rules")
+        .header("x-skybouncer-did", "did:plc:alice")
+        .body(Body::empty())
+        .unwrap();
+    let spoof_resp = app.clone().oneshot(spoof_req).await.unwrap();
+    assert_eq!(spoof_resp.status(), StatusCode::UNAUTHORIZED);
+
     // 1. Authenticated GET /api/rules returns initial rubric
     let get_req = Request::builder()
         .uri("/api/rules")
-        .header("x-skybouncer-did", "did:plc:alice")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
         .body(Body::empty())
         .unwrap();
     let get_resp = app.clone().oneshot(get_req).await.unwrap();
@@ -261,7 +278,7 @@ async fn test_api_get_and_update_rules() {
     let post_req = Request::builder()
         .method("POST")
         .uri("/api/rules")
-        .header("x-skybouncer-did", "did:plc:alice")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&update_payload).unwrap()))
         .unwrap();
@@ -294,7 +311,7 @@ async fn test_api_get_and_update_rules() {
     let bad_req = Request::builder()
         .method("POST")
         .uri("/api/rules")
-        .header("x-skybouncer-did", "did:plc:alice")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&invalid_payload).unwrap()))
         .unwrap();
@@ -333,10 +350,50 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
         bounced_at: 1_720_000_000_000_000,
     };
     cache.record_bounce(&bounce_entry).unwrap();
+    let owner_token = create_test_session(&engine, "did:plc:protected-owner");
+
+    // 0. Unauthenticated GET /api/bounces returns 401 Unauthorized
+    let unauth_bounces_req = Request::builder()
+        .uri("/api/bounces")
+        .body(Body::empty())
+        .unwrap();
+    let unauth_bounces_resp = app.clone().oneshot(unauth_bounces_req).await.unwrap();
+    assert_eq!(unauth_bounces_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 0b. Unauthenticated POST /api/pardon returns 401 Unauthorized
+    let unauth_pardon_req = Request::builder()
+        .method("POST")
+        .uri("/api/pardon")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "subject_did": violator_did })).unwrap(),
+        ))
+        .unwrap();
+    let unauth_pardon_resp = app.clone().oneshot(unauth_pardon_req).await.unwrap();
+    assert_eq!(unauth_pardon_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 0c. Cross-tenant pardon attempt: Mallory cannot pardon user from protected-owner's list
+    let mallory_token = create_test_session(&engine, "did:plc:mallory");
+    let mallory_pardon_req = Request::builder()
+        .method("POST")
+        .uri("/api/pardon")
+        .header("cookie", format!("skybouncer_session={mallory_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "subject_did": violator_did,
+                "protected_did": "did:plc:protected-owner"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let mallory_pardon_resp = app.clone().oneshot(mallory_pardon_req).await.unwrap();
+    assert_eq!(mallory_pardon_resp.status(), StatusCode::FORBIDDEN);
 
     // 1. GET /api/bounces returns the recorded bounce
     let bounces_req = Request::builder()
         .uri("/api/bounces?limit=10")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
         .body(Body::empty())
         .unwrap();
     let bounces_resp = app.clone().oneshot(bounces_req).await.unwrap();
@@ -354,6 +411,7 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
     let pardon_req = Request::builder()
         .method("POST")
         .uri("/api/pardon")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&pardon_payload).unwrap()))
         .unwrap();
@@ -374,6 +432,7 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
     let re_pardon_req = Request::builder()
         .method("POST")
         .uri("/api/pardon")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&pardon_payload).unwrap()))
         .unwrap();
@@ -388,6 +447,7 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
     // 4. GET /api/bounces is now empty
     let empty_req = Request::builder()
         .uri("/api/bounces")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
         .body(Body::empty())
         .unwrap();
     let empty_resp = app.oneshot(empty_req).await.unwrap();
@@ -750,6 +810,9 @@ async fn test_api_session_and_admin_endpoints() {
         .register_or_update(&test_tenant)
         .expect("enroll tenant");
 
+    let tenant_token = create_test_session(&engine, "did:plc:tenant456");
+    let admin_token = create_test_session(&engine, "did:plc:admin123");
+
     // 1. Unauthenticated /api/me
     let req = Request::builder()
         .uri("/api/me")
@@ -765,9 +828,24 @@ async fn test_api_session_and_admin_endpoints() {
     assert_eq!(me.did, None);
     assert!(!me.is_admin);
 
-    // 2. Authenticated via query ?did= for enrolled tenant
+    // 1b. Spoofed ?did= query param or x-skybouncer-did header without session is ignored
     let req = Request::builder()
         .uri("/api/me?did=did:plc:tenant456")
+        .header("x-skybouncer-did", "did:plc:tenant456")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let me: skybouncer::web::UserSessionResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(!me.authenticated);
+
+    // 2. Authenticated via session cookie for enrolled tenant
+    let req = Request::builder()
+        .uri("/api/me")
+        .header("cookie", format!("skybouncer_session={tenant_token}"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -783,10 +861,10 @@ async fn test_api_session_and_admin_endpoints() {
     assert!(me.is_active);
     assert_eq!(me.monitored_users_count, None);
 
-    // 3. Authenticated via header for admin DID
+    // 3. Authenticated via session Bearer header for admin DID
     let req = Request::builder()
         .uri("/api/me")
-        .header("x-skybouncer-did", "did:plc:admin123")
+        .header("authorization", format!("Bearer {admin_token}"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -803,15 +881,25 @@ async fn test_api_session_and_admin_endpoints() {
 
     // 4. Non-admin accessing /api/admin/tenants -> 403 Forbidden
     let req = Request::builder()
-        .uri("/api/admin/tenants?did=did:plc:tenant456")
+        .uri("/api/admin/tenants")
+        .header("cookie", format!("skybouncer_session={tenant_token}"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
+    // 4b. Anonymous accessing /api/admin/tenants -> 401 Unauthorized
+    let req = Request::builder()
+        .uri("/api/admin/tenants")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
     // 5. Admin accessing /api/admin/tenants -> 200 OK
     let req = Request::builder()
-        .uri("/api/admin/tenants?did=did:plc:admin123")
+        .uri("/api/admin/tenants")
+        .header("cookie", format!("skybouncer_session={admin_token}"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -828,7 +916,8 @@ async fn test_api_session_and_admin_endpoints() {
 
     // 5c. Non-admin accessing /api/admin/evaluations -> 403 Forbidden
     let req_non_admin_evals = Request::builder()
-        .uri("/api/admin/evaluations?did=did:plc:tenant456")
+        .uri("/api/admin/evaluations")
+        .header("cookie", format!("skybouncer_session={tenant_token}"))
         .body(Body::empty())
         .unwrap();
     let resp_non_admin_evals = app.clone().oneshot(req_non_admin_evals).await.unwrap();
@@ -836,7 +925,8 @@ async fn test_api_session_and_admin_endpoints() {
 
     // 5d. Admin accessing /api/admin/evaluations -> 200 OK
     let req_admin_evals = Request::builder()
-        .uri("/api/admin/evaluations?did=did:plc:admin123")
+        .uri("/api/admin/evaluations")
+        .header("cookie", format!("skybouncer_session={admin_token}"))
         .body(Body::empty())
         .unwrap();
     let resp_admin_evals = app.clone().oneshot(req_admin_evals).await.unwrap();
@@ -864,7 +954,8 @@ async fn test_api_session_and_admin_endpoints() {
     assert_eq!(sim_resp.status(), StatusCode::OK);
 
     let req_admin_evals_after = Request::builder()
-        .uri("/api/admin/evaluations?did=did:plc:admin123")
+        .uri("/api/admin/evaluations")
+        .header("cookie", format!("skybouncer_session={admin_token}"))
         .body(Body::empty())
         .unwrap();
     let resp_admin_evals_after = app.clone().oneshot(req_admin_evals_after).await.unwrap();
@@ -882,7 +973,7 @@ async fn test_api_session_and_admin_endpoints() {
     // 5f. Verify /api/status telemetry reports monitored_users_count for admin, but hides it for unauthenticated
     let status_req_admin = Request::builder()
         .uri("/api/status")
-        .header("x-skybouncer-did", "did:plc:admin123")
+        .header("cookie", format!("skybouncer_session={admin_token}"))
         .body(Body::empty())
         .unwrap();
     let status_resp_admin = app.clone().oneshot(status_req_admin).await.unwrap();
@@ -910,7 +1001,8 @@ async fn test_api_session_and_admin_endpoints() {
     // 6. Admin toggling tenant defense pause
     let toggle_req = Request::builder()
         .method("POST")
-        .uri("/api/tenant/toggle?did=did:plc:admin123")
+        .uri("/api/tenant/toggle")
+        .header("cookie", format!("skybouncer_session={admin_token}"))
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -932,7 +1024,8 @@ async fn test_api_session_and_admin_endpoints() {
 
     // 7. Verify /api/me for tenant now shows is_active == false
     let req = Request::builder()
-        .uri("/api/me?did=did:plc:tenant456")
+        .uri("/api/me")
+        .header("cookie", format!("skybouncer_session={tenant_token}"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -942,10 +1035,11 @@ async fn test_api_session_and_admin_endpoints() {
     let me: skybouncer::web::UserSessionResponse = serde_json::from_slice(&body_bytes).unwrap();
     assert!(!me.is_active);
 
-    // 8. Logout endpoint
+    // 8. Logout endpoint clears skybouncer_session
     let logout_req = Request::builder()
         .method("POST")
         .uri("/api/auth/logout")
+        .header("cookie", format!("skybouncer_session={tenant_token}"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(logout_req).await.unwrap();
@@ -953,8 +1047,16 @@ async fn test_api_session_and_admin_endpoints() {
     let cookie_hdr = resp.headers().get("set-cookie");
     assert!(cookie_hdr.is_some());
     let cookie_str = cookie_hdr.unwrap().to_str().unwrap();
-    assert!(cookie_str.contains("skybouncer_did="));
+    assert!(cookie_str.contains("skybouncer_session="));
     assert!(cookie_str.contains("Max-Age=0"));
+    assert!(cookie_str.contains("HttpOnly"));
+
+    // Verify session token is deleted from SQLite
+    assert!(engine
+        .tenant_registry()
+        .validate_web_session(&tenant_token)
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -1001,9 +1103,13 @@ async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
         .register_or_update(&tenant)
         .unwrap();
 
-    // 2. Call /api/me?did=did:plc:tenant-dynamic -> handle should resolve dynamically to alice.custom.domain!
+    let dynamic_token = create_test_session(&engine, "did:plc:tenant-dynamic");
+    let admin_token = create_test_session(&engine, "did:plc:admin");
+
+    // 2. Call /api/me with session cookie -> handle should resolve dynamically to alice.custom.domain!
     let req = Request::builder()
-        .uri("/api/me?did=did:plc:tenant-dynamic")
+        .uri("/api/me")
+        .header("cookie", format!("skybouncer_session={dynamic_token}"))
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1031,7 +1137,7 @@ async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
     let post_req = Request::builder()
         .method("POST")
         .uri("/api/rules")
-        .header("x-skybouncer-did", "did:plc:tenant-dynamic")
+        .header("cookie", format!("skybouncer_session={dynamic_token}"))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&custom_payload).unwrap()))
         .unwrap();
@@ -1058,9 +1164,10 @@ async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
     // 5b. Authenticated user Bob attempting to view Alice's rules returns 403 Forbidden
     let bob = skybouncer::tenant::Tenant::new("did:plc:bob");
     engine.tenant_registry().register_or_update(&bob).unwrap();
+    let bob_token = create_test_session(&engine, "did:plc:bob");
     let snoop_req = Request::builder()
         .uri("/api/rules?did=did:plc:tenant-dynamic")
-        .header("x-skybouncer-did", "did:plc:bob")
+        .header("cookie", format!("skybouncer_session={bob_token}"))
         .body(Body::empty())
         .unwrap();
     let snoop_resp = app.clone().oneshot(snoop_req).await.unwrap();
@@ -1069,7 +1176,7 @@ async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
     // 6. Tenant GET /api/rules returns their own custom rubric
     let tenant_req = Request::builder()
         .uri("/api/rules")
-        .header("x-skybouncer-did", "did:plc:tenant-dynamic")
+        .header("cookie", format!("skybouncer_session={dynamic_token}"))
         .body(Body::empty())
         .unwrap();
     let tenant_resp = app.clone().oneshot(tenant_req).await.unwrap();
@@ -1087,15 +1194,16 @@ async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
     // 6b. Admin inspecting tenant's rubric via query param returns 200 OK
     let admin_req = Request::builder()
         .uri("/api/rules?did=did:plc:tenant-dynamic")
-        .header("x-skybouncer-did", "did:plc:admin")
+        .header("cookie", format!("skybouncer_session={admin_token}"))
         .body(Body::empty())
         .unwrap();
     let admin_resp = app.clone().oneshot(admin_req).await.unwrap();
     assert_eq!(admin_resp.status(), StatusCode::OK);
 
-    // 7. GET /api/me?did=did:plc:tenant-dynamic propagates custom rubric in session response
+    // 7. GET /api/me propagates custom rubric in session response
     let me_req = Request::builder()
-        .uri("/api/me?did=did:plc:tenant-dynamic")
+        .uri("/api/me")
+        .header("cookie", format!("skybouncer_session={dynamic_token}"))
         .body(Body::empty())
         .unwrap();
     let me_resp = app.oneshot(me_req).await.unwrap();
@@ -1111,4 +1219,55 @@ async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
         me_final.rubric.as_ref().map(|r| r.sensitivity),
         Some(Sensitivity::Low)
     );
+}
+
+// =============================================================================
+// SSRF Prevention Integration Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_simulate_ssrf_prevention() {
+    let (_engine, _cache, _pds, app) = setup_test_web_environment("did:plc:admin").await;
+
+    let malicious_urls = vec![
+        "http://169.254.169.254/latest/meta-data/",
+        "http://127.0.0.1:8080/internal",
+        "http://localhost:3000/admin",
+        "http://10.0.0.1/secrets",
+        "http://192.168.1.1/router",
+        "file:///etc/passwd",
+        "ftp://127.0.0.1/test",
+    ];
+
+    for malicious_url in malicious_urls {
+        let payload = json!({
+            "text": "Check this image",
+            "author_did": "did:plc:attacker",
+            "image_url": malicious_url
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/simulate")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "SSRF URL '{malicious_url}' must be rejected with 400 Bad Request"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&bytes);
+        assert!(
+            body_str.contains("restricted")
+                || body_str.contains("scheme")
+                || body_str.contains("Invalid image URL")
+                || body_str.contains("host"),
+            "Error response should describe restriction for {malicious_url}: {body_str}"
+        );
+    }
 }

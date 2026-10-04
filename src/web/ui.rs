@@ -710,9 +710,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
     async function fetchStatus() {
       try {
-        const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
-        const headers = storedDid ? { "x-skybouncer-did": storedDid } : {};
-        const res = await fetch("/api/status", { headers });
+        const res = await fetch("/api/status", { credentials: "same-origin" });
         if (!res.ok) return;
         const data = await res.json();
         document.getElementById("kpi-commits").innerText = data.stats.commits_received.toLocaleString();
@@ -816,14 +814,13 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     async function loadRules() {
-      const authDid = (currentUser && currentUser.did) || localStorage.getItem("skybouncer_did");
-      if (!authDid) {
+      if (!currentUser || !currentUser.did) {
         renderRulesUnauthenticated();
         return;
       }
       try {
         const res = await fetch("/api/rules", {
-          headers: { "x-skybouncer-did": authDid }
+          credentials: "same-origin"
         });
         if (!res.ok) {
           if (res.status === 401 || res.status === 403) {
@@ -846,8 +843,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     async function saveRules() {
-      const authDid = (currentUser && currentUser.did) || localStorage.getItem("skybouncer_did");
-      if (!authDid) {
+      if (!currentUser || !currentUser.did) {
         showToast("⚠️ Please sign in to save your moderation rubric");
         return;
       }
@@ -856,9 +852,9 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         const res = await fetch("/api/rules", {
           method: "POST",
           headers: {
-            "Content-Type": "application/json",
-            "x-skybouncer-did": authDid
+            "Content-Type": "application/json"
           },
+          credentials: "same-origin",
           body: JSON.stringify({ prompt, sensitivity: activeSensitivity })
         });
         if (res.ok) {
@@ -1133,9 +1129,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
     async function loadBounces() {
       try {
-        const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
-        const url = "/api/bounces?limit=50" + (storedDid ? `&user_did=${encodeURIComponent(storedDid)}` : "");
-        const res = await fetch(url);
+        const res = await fetch("/api/bounces?limit=50", { credentials: "same-origin" });
         if (!res.ok) return;
         const bounces = await res.json();
         const tbody = document.getElementById("bounces-table");
@@ -1160,11 +1154,22 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             <td><strong>${Math.round(b.confidence * 100)}%</strong></td>
             <td><span style="font-size: 0.82rem;" title="${escapeHtml(b.reason)}">${escapeHtml(b.reason)}</span></td>
             <td>
-              <button class="btn btn-danger" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" onclick="pardonUser('${escapeHtml(b.subject_did)}')">Pardon</button>
+              <button class="btn btn-danger btn-pardon" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" data-did="${escapeHtml(b.subject_did)}">Pardon</button>
             </td>
           </tr>
         `;
         }).join("");
+
+        const tbody = document.getElementById("bounces-tbody");
+        if (tbody && !tbody.hasAttribute("data-pardon-attached")) {
+          tbody.setAttribute("data-pardon-attached", "true");
+          tbody.addEventListener("click", (e) => {
+            const btn = e.target.closest(".btn-pardon");
+            if (btn && btn.dataset.did) {
+              pardonUser(btn.dataset.did);
+            }
+          });
+        }
       } catch (e) {
         console.error("Bounces fetch failed", e);
       }
@@ -1173,14 +1178,13 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     async function pardonUser(did) {
       if (!confirm(`Are you sure you want to pardon ${did} and remove them from your moderation list?`)) return;
 
-      const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
       try {
         const res = await fetch("/api/pardon", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
           body: JSON.stringify({
-            subject_did: did,
-            protected_did: storedDid || undefined
+            subject_did: did
           })
         });
         if (res.ok) {
@@ -1210,7 +1214,12 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     function escapeHtml(str) {
-      return (str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      return (str || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
 
     let currentUser = null;
@@ -1219,9 +1228,6 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       const params = new URLSearchParams(window.location.search);
       if (params.get("auth") === "success") {
         showToast("✅ Successfully authenticated with Bluesky!");
-        if (params.get("did")) {
-          localStorage.setItem("skybouncer_did", params.get("did"));
-        }
         window.history.replaceState({}, document.title, window.location.pathname);
       } else if (params.get("auth") === "error") {
         const err = params.get("error") || "Authentication failed";
@@ -1229,11 +1235,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         window.history.replaceState({}, document.title, window.location.pathname);
       }
 
-      const storedDid = localStorage.getItem("skybouncer_did");
-      const url = "/api/me" + (storedDid ? `?did=${encodeURIComponent(storedDid)}` : "");
-
       try {
-        const res = await fetch(url);
+        const res = await fetch("/api/me", { credentials: "same-origin" });
         if (!res.ok) {
           renderUnauthenticated();
           return;
@@ -1241,9 +1244,6 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         const data = await res.json();
         if (data.authenticated) {
           currentUser = data;
-          if (data.did) {
-            localStorage.setItem("skybouncer_did", data.did);
-          }
           renderAuthenticated(data);
           renderRulesAuthenticated(data.rubric);
           if (data.is_admin) {
@@ -1379,7 +1379,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
     async function signOut() {
       try {
-        await fetch("/api/auth/logout", { method: "POST" });
+        await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
       } catch (e) {
         console.error("Logout request error", e);
       }
@@ -1393,13 +1393,12 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     async function toggleCurrentTenantDefense() {
       if (!currentUser) return;
       const targetActive = !currentUser.is_active;
-      const storedDid = localStorage.getItem("skybouncer_did") || currentUser.did;
-      const url = "/api/tenant/toggle" + (storedDid ? `?did=${encodeURIComponent(storedDid)}` : "");
 
       try {
-        const res = await fetch(url, {
+        const res = await fetch("/api/tenant/toggle", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
           body: JSON.stringify({ is_active: targetActive })
         });
         if (res.ok) {
@@ -1420,13 +1419,10 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     async function loadAdminTenants() {
-      const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
-      const url = "/api/admin/tenants" + (storedDid ? `?did=${encodeURIComponent(storedDid)}` : "");
-
       try {
-        const res = await fetch(url);
+        const res = await fetch("/api/admin/tenants", { credentials: "same-origin" });
         if (!res.ok) {
-          if (res.status === 403) {
+          if (res.status === 403 || res.status === 401) {
             const adminCard = document.getElementById("admin-fleet-card");
             if (adminCard) adminCard.style.display = "none";
           }
@@ -1464,8 +1460,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             ? `<a href="${escapeHtml(formatModListUrl(t.mod_list_uri))}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); text-decoration: none; font-size: 0.8rem; font-weight: 600;">📋 List &nearr;</a>`
             : '<span style="color: var(--text-muted); font-size: 0.8rem;">Pending</span>';
           const toggleAction = t.is_active
-            ? `<button class="btn btn-secondary" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" onclick="toggleAdminTenant('${escapeHtml(t.did)}', false)">Pause</button>`
-            : `<button class="btn" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" onclick="toggleAdminTenant('${escapeHtml(t.did)}', true)">Resume</button>`;
+            ? `<button class="btn btn-secondary btn-tenant-toggle" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" data-did="${escapeHtml(t.did)}" data-active="false">Pause</button>`
+            : `<button class="btn btn-tenant-toggle" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" data-did="${escapeHtml(t.did)}" data-active="true">Resume</button>`;
 
           return `
             <tr>
@@ -1481,19 +1477,27 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </tr>
           `;
         }).join("");
+
+        if (!tbody.hasAttribute("data-toggle-attached")) {
+          tbody.setAttribute("data-toggle-attached", "true");
+          tbody.addEventListener("click", (e) => {
+            const btn = e.target.closest(".btn-tenant-toggle");
+            if (btn && btn.dataset.did) {
+              toggleAdminTenant(btn.dataset.did, btn.dataset.active === "true");
+            }
+          });
+        }
       } catch (e) {
         console.error("Admin fleet load failed", e);
       }
     }
 
     async function toggleAdminTenant(did, newActive) {
-      const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
-      const url = "/api/tenant/toggle" + (storedDid ? `?did=${encodeURIComponent(storedDid)}` : "");
-
       try {
-        const res = await fetch(url, {
+        const res = await fetch("/api/tenant/toggle", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
           body: JSON.stringify({ did, is_active: newActive })
         });
         if (res.ok) {
@@ -1525,17 +1529,13 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     async function loadAdminEvaluations() {
-      const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
       const sourceFilter = document.getElementById("admin-eval-source-filter")?.value || "all";
-      let url = "/api/admin/evaluations?limit=50&source=" + encodeURIComponent(sourceFilter);
-      if (storedDid) {
-        url += "&did=" + encodeURIComponent(storedDid);
-      }
+      const url = "/api/admin/evaluations?limit=50&source=" + encodeURIComponent(sourceFilter);
 
       try {
-        const res = await fetch(url);
+        const res = await fetch(url, { credentials: "same-origin" });
         if (!res.ok) {
-          if (res.status === 403) {
+          if (res.status === 403 || res.status === 401) {
             const evalCard = document.getElementById("admin-eval-card");
             if (evalCard) evalCard.style.display = "none";
           }

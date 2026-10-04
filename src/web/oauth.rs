@@ -6,6 +6,7 @@
 //! - `GET /oauth/callback`: Handles the redirect callback, verifies PKCE + DPoP, and exchanges code for session.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -151,10 +152,31 @@ pub async fn oauth_callback(
                 }
             }
 
-            let redirect_target = format!("/?auth=success&did={}", urlencoding_simple(&did));
-            let mut response = Redirect::to(&redirect_target).into_response();
-            let cookie_header =
-                format!("skybouncer_did={did}; Path=/; Max-Age=2592000; SameSite=Lax");
+            let session_token = if let Some(ref engine) = state.engine {
+                match engine
+                    .tenant_registry()
+                    .create_web_session(&did, Duration::from_secs(30 * 86400))
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(error = %e, did = %did, "Failed to create web session in SQLite");
+                        String::new()
+                    }
+                }
+            } else {
+                String::new()
+            };
+
+            let redirect_target = "/?auth=success";
+            let mut response = Redirect::to(redirect_target).into_response();
+
+            // Detect if running on HTTPS
+            let is_https = state.metadata.redirect_uri.starts_with("https://");
+            let secure_attr = if is_https { "; Secure" } else { "" };
+
+            let cookie_header = format!(
+                "skybouncer_session={session_token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax{secure_attr}"
+            );
             if let Ok(cookie_val) = axum::http::HeaderValue::from_str(&cookie_header) {
                 response
                     .headers_mut()
