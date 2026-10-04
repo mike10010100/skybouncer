@@ -784,6 +784,15 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
         warn!("No JEV_API_BASE_URL configured; primary classifier fallback disabled");
     }
 
+    if let Some(ref fb) = config.fallback_jev_config {
+        info!(
+            endpoint = %fb.base_url,
+            model = %fb.model,
+            timeout_ms = fb.timeout.as_millis(),
+            "Multimodal System-2 fallback classifier configured (escalating on images/uncertainty)"
+        );
+    }
+
     if config.enable_heuristic_prefilter {
         info!(
             "⚡ Zero-cost heuristic regex pre-filter: ENABLED (short-circuiting common patterns)"
