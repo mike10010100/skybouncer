@@ -864,14 +864,16 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         document.getElementById("sim-category").innerText = `Category: ${data.category || 'None'}`;
 
         const evalStr = (data.evaluator || "").toLowerCase();
-        if (evalStr.includes("fallback") || evalStr.includes("vision")) {
+        if (evalStr.includes("uncertainty")) {
+          document.getElementById("sim-evaluator").innerText = "🤔 Uncertainty Escalation (Tier 2 Fallback)";
+        } else if (evalStr.includes("fallback") || evalStr.includes("vision")) {
           document.getElementById("sim-evaluator").innerText = "👁️ Vision Fallback (Tier 2 Multimodal)";
         } else if (evalStr.includes("heuristic")) {
           document.getElementById("sim-evaluator").innerText = "⚡ Heuristic Pre-Filter";
         } else if (data.images_evaluated > 0 || evalStr.includes("multimodal")) {
           document.getElementById("sim-evaluator").innerText = "🧠 Primary Model (Multimodal)";
         } else {
-          document.getElementById("sim-evaluator").innerText = "🧠 Jev Model (Text)";
+          document.getElementById("sim-evaluator").innerText = "🧠 System-1 Primary (Text)";
         }
 
         if (data.images_evaluated > 0) {

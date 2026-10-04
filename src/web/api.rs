@@ -533,7 +533,9 @@ pub async fn simulate_interaction(
             reason,
         }) => {
             let meets_threshold = rubric.meets_threshold(&category, confidence);
-            let evaluator = if reason.contains("Fallback") || reason.contains("Tiered") {
+            let evaluator = if reason.contains("uncertainty escalation") {
+                "fallback_uncertainty_classifier".to_string()
+            } else if reason.contains("Fallback") || reason.contains("Tiered") {
                 "fallback_vision_classifier".to_string()
             } else if images_evaluated > 0 {
                 "primary_classifier (multimodal)".to_string()
@@ -552,7 +554,9 @@ pub async fn simulate_interaction(
             }))
         }
         Ok(Verdict::Permitted { reason, confidence }) => {
-            let evaluator = if reason.contains("Fallback") || reason.contains("Tiered") {
+            let evaluator = if reason.contains("uncertainty escalation") {
+                "fallback_uncertainty_classifier".to_string()
+            } else if reason.contains("Fallback") || reason.contains("Tiered") {
                 "fallback_vision_classifier".to_string()
             } else if images_evaluated > 0 {
                 "primary_classifier (multimodal)".to_string()

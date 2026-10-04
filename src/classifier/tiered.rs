@@ -234,8 +234,32 @@ impl Classifier for TieredClassifier {
                 );
             }
 
+            let escalation_prefix = if has_images {
+                "[Tiered Fallback: visual image]"
+            } else {
+                "[Tiered Fallback: uncertainty escalation]"
+            };
+
             // 3. Evaluate candidate with the heavier System-2 fallback model
-            self.fallback.classify(interaction).await
+            match self.fallback.classify(interaction).await? {
+                Verdict::Violation {
+                    category,
+                    confidence,
+                    reason,
+                } => Ok(Verdict::violation(
+                    category,
+                    confidence,
+                    format!("{escalation_prefix} {reason}"),
+                )),
+                Verdict::Permitted { reason, confidence } => {
+                    let formatted = format!("{escalation_prefix} {reason}");
+                    if let Some(c) = confidence {
+                        Ok(Verdict::permitted_with_confidence(formatted, c))
+                    } else {
+                        Ok(Verdict::permitted(formatted))
+                    }
+                }
+            }
         } else {
             // Decisive result: resolved directly by primary classifier
             self.stats.primary_resolved.fetch_add(1, Ordering::Relaxed);
@@ -307,7 +331,9 @@ mod tests {
 
         let verdict = tiered.classify(&interaction).await.unwrap();
         assert!(verdict.is_permitted());
-        assert_eq!(verdict.reason(), "Fallback verified: benign banter");
+        assert!(verdict
+            .reason()
+            .contains("Fallback verified: benign banter"));
 
         assert_eq!(primary.call_count(), 1);
         assert_eq!(fallback.call_count(), 1);
