@@ -485,7 +485,7 @@ impl ChatClient {
         Ok(result)
     }
 
-    /// Sends a text message to the specified conversation.
+    /// Sends a text message to the specified conversation, automatically extracting and attaching link facets.
     ///
     /// # Errors
     /// Returns [`SkybouncerError`] if the HTTP request or JSON deserialization fails.
@@ -494,12 +494,23 @@ impl ChatClient {
         convo_id: &str,
         text: &str,
     ) -> Result<MessageView, SkybouncerError> {
+        let payload = SendMessagePayload::new(text);
+        self.send_message_payload(convo_id, payload).await
+    }
+
+    /// Sends a structured message payload via `chat.bsky.convo.sendMessage`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if the HTTP request or JSON deserialization fails.
+    pub async fn send_message_payload(
+        &self,
+        convo_id: &str,
+        payload: SendMessagePayload,
+    ) -> Result<MessageView, SkybouncerError> {
         let url = format!("{}/xrpc/chat.bsky.convo.sendMessage", self.base_url);
         let req = SendMessageRequest {
             convo_id: convo_id.to_string(),
-            message: SendMessagePayload {
-                text: text.to_string(),
-            },
+            message: payload,
         };
         let body = serde_json::to_value(&req)?;
 

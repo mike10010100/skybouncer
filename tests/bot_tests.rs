@@ -244,6 +244,343 @@ async fn test_chat_client_send_message_failure() {
 }
 
 #[tokio::test]
+async fn test_chat_client_send_message_extracts_link_facet_with_exact_byte_offsets() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            assert_eq!(body["convoId"], "convo_facet_1");
+            let text = body["message"]["text"].as_str().unwrap_or_default();
+            let facets = body["message"]["facets"].as_array().expect("facets array");
+            assert_eq!(facets.len(), 1);
+
+            let facet = &facets[0];
+            let byte_start = facet["index"]["byteStart"].as_u64().expect("byteStart") as usize;
+            let byte_end = facet["index"]["byteEnd"].as_u64().expect("byteEnd") as usize;
+
+            let sliced_str = &text[byte_start..byte_end];
+            assert_eq!(sliced_str, "https://skybouncer.mike10010100.com/auth");
+
+            let feature = &facet["features"][0];
+            assert_eq!(feature["$type"], "app.bsky.richtext.facet#link");
+            assert_eq!(feature["uri"], "https://skybouncer.mike10010100.com/auth");
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_facet_1",
+                "rev": "rev_facet_1",
+                "text": text,
+                "sender": { "did": "did:plc:bot" },
+                "sentAt": "2026-10-04T12:00:00Z"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "token").expect("client creation");
+    let text = "Please authorize here: https://skybouncer.mike10010100.com/auth to continue.";
+    let msg = client
+        .send_message("convo_facet_1", text)
+        .await
+        .expect("send_message");
+
+    assert_eq!(msg.id, "msg_facet_1");
+}
+
+#[tokio::test]
+async fn test_chat_client_send_message_multibyte_emoji_facet_offsets() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let text = body["message"]["text"].as_str().unwrap_or_default();
+            let facets = body["message"]["facets"].as_array().expect("facets array");
+            assert_eq!(facets.len(), 1);
+
+            let facet = &facets[0];
+            let byte_start = facet["index"]["byteStart"].as_u64().expect("byteStart") as usize;
+            let byte_end = facet["index"]["byteEnd"].as_u64().expect("byteEnd") as usize;
+
+            // Slicing by byte offsets must strictly yield the URL
+            let sliced_str = &text[byte_start..byte_end];
+            assert_eq!(sliced_str, "https://skybouncer.mike10010100.com/auth");
+
+            // Ensure preceding UTF-8 multi-byte emoji offset is accurately represented (4 bytes per emoji)
+            let char_index_before = text.find("https://").unwrap();
+            assert_eq!(byte_start, char_index_before);
+
+            let feature = &facet["features"][0];
+            assert_eq!(feature["$type"], "app.bsky.richtext.facet#link");
+            assert_eq!(feature["uri"], "https://skybouncer.mike10010100.com/auth");
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_emoji_1",
+                "rev": "rev_emoji_1",
+                "text": text,
+                "sender": { "did": "did:plc:bot" },
+                "sentAt": "2026-10-04T12:00:00Z"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "token").expect("client creation");
+    let text =
+        "👋 Welcome to Skybouncer! 🛡️ Auth: https://skybouncer.mike10010100.com/auth ✨ Enjoy!";
+    let msg = client
+        .send_message("convo_emoji_target", text)
+        .await
+        .expect("send_message");
+
+    assert_eq!(msg.id, "msg_emoji_1");
+}
+
+#[tokio::test]
+async fn test_chat_client_send_message_multiple_links_and_trailing_punctuation() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let text = body["message"]["text"].as_str().unwrap_or_default();
+            let facets = body["message"]["facets"].as_array().expect("facets array");
+            assert_eq!(facets.len(), 2);
+
+            // First facet: parenthesized with trailing dot "(https://alpha.example.com/login)."
+            let f0_start = facets[0]["index"]["byteStart"].as_u64().unwrap() as usize;
+            let f0_end = facets[0]["index"]["byteEnd"].as_u64().unwrap() as usize;
+            let s0 = &text[f0_start..f0_end];
+            assert_eq!(s0, "https://alpha.example.com/login");
+            assert_eq!(
+                facets[0]["features"][0]["uri"],
+                "https://alpha.example.com/login"
+            );
+
+            // Second facet: with exclamation "https://beta.example.com/docs!"
+            let f1_start = facets[1]["index"]["byteStart"].as_u64().unwrap() as usize;
+            let f1_end = facets[1]["index"]["byteEnd"].as_u64().unwrap() as usize;
+            let s1 = &text[f1_start..f1_end];
+            assert_eq!(s1, "https://beta.example.com/docs");
+            assert_eq!(
+                facets[1]["features"][0]["uri"],
+                "https://beta.example.com/docs"
+            );
+
+            // Strictly ascending order
+            assert!(f0_end <= f1_start);
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_multi_1",
+                "rev": "rev_multi_1",
+                "text": text,
+                "sender": { "did": "did:plc:bot" },
+                "sentAt": "2026-10-04T12:00:00Z"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "token").expect("client creation");
+    let text = "Visit (https://alpha.example.com/login). Also see https://beta.example.com/docs!";
+    let msg = client
+        .send_message("convo_multi_target", text)
+        .await
+        .expect("send_message");
+
+    assert_eq!(msg.id, "msg_multi_1");
+}
+
+#[tokio::test]
+async fn test_chat_client_send_message_exotic_unicode_and_markdown_link_facets() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let text = body["message"]["text"].as_str().unwrap_or_default();
+            let facets = body["message"]["facets"].as_array().expect("facets array");
+            assert_eq!(facets.len(), 6);
+
+            let expected_urls = [
+                "https://skybouncer.mike10010100.com/bold",
+                "https://skybouncer.mike10010100.com/quotes",
+                "https://skybouncer.mike10010100.com/cjk",
+                "https://skybouncer.mike10010100.com/adjacent",
+                "https://skybouncer.mike10010100.com/cjk-continuous",
+                "HTTPS://skybouncer.mike10010100.com/uppercase-trailing",
+            ];
+
+            for (i, expected_url) in expected_urls.iter().enumerate() {
+                let facet = &facets[i];
+                let byte_start = facet["index"]["byteStart"].as_u64().unwrap() as usize;
+                let byte_end = facet["index"]["byteEnd"].as_u64().unwrap() as usize;
+                let sliced = &text[byte_start..byte_end];
+                assert_eq!(sliced, *expected_url, "mismatch at facet index {i}");
+                assert_eq!(
+                    facet["features"][0]["$type"],
+                    "app.bsky.richtext.facet#link"
+                );
+                assert_eq!(facet["features"][0]["uri"], *expected_url);
+            }
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_exotic_1",
+                "rev": "rev_exotic_1",
+                "text": text,
+                "sender": { "did": "did:plc:bot" },
+                "sentAt": "2026-10-04T12:00:00Z"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "token").expect("client creation");
+    let text = "Bold: **https://skybouncer.mike10010100.com/bold**, quotes: “https://skybouncer.mike10010100.com/quotes”, CJK: https://skybouncer.mike10010100.com/cjk。, and adjacent emoji: 🔗https://skybouncer.mike10010100.com/adjacent! Also: 请访问https://skybouncer.mike10010100.com/cjk-continuous进行授权 and 🚀HTTPS://skybouncer.mike10010100.com/uppercase-trailing🚀.";
+    let msg = client
+        .send_message("convo_exotic_target", text)
+        .await
+        .expect("send_message");
+
+    assert_eq!(msg.id, "msg_exotic_1");
+}
+
+#[tokio::test]
+async fn test_chat_client_send_message_ipv4_ipv6_and_heavy_unicode_facets() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let text = body["message"]["text"].as_str().unwrap_or_default();
+            let facets = body["message"]["facets"].as_array().expect("facets array");
+            assert_eq!(facets.len(), 3);
+
+            let expected_urls = [
+                "http://127.0.0.1:8080/auth",
+                "http://[::1]:9090/v1/auth?step=2",
+                "https://example.com/family",
+            ];
+
+            for (i, expected_url) in expected_urls.iter().enumerate() {
+                let facet = &facets[i];
+                let byte_start = facet["index"]["byteStart"].as_u64().unwrap() as usize;
+                let byte_end = facet["index"]["byteEnd"].as_u64().unwrap() as usize;
+                let sliced = &text[byte_start..byte_end];
+                assert_eq!(sliced, *expected_url, "mismatch at facet index {i}");
+                assert_eq!(
+                    facet["features"][0]["$type"],
+                    "app.bsky.richtext.facet#link"
+                );
+                assert_eq!(facet["features"][0]["uri"], *expected_url);
+            }
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_heavy_1",
+                "rev": "rev_heavy_1",
+                "text": text,
+                "sender": { "did": "did:plc:bot" },
+                "sentAt": "2026-10-04T12:00:00Z"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "token").expect("client creation");
+    let text = "IPv4: http://127.0.0.1:8080/auth, IPv6: http://[::1]:9090/v1/auth?step=2, and Family 👨‍👩‍👧‍👦: https://example.com/family!";
+    let msg = client
+        .send_message("convo_heavy_target", text)
+        .await
+        .expect("send_message");
+
+    assert_eq!(msg.id, "msg_heavy_1");
+}
+
+#[tokio::test]
+async fn test_onboarding_intro_formatting_and_facet_delivery() {
+    let server = MockServer::start().await;
+    let (engine, _, _) = setup_test_engine("did:plc:protected_onboard").await;
+    let handler =
+        BotCommandHandler::new(engine, "did:plc:skybouncer-bot").with_public_url(server.uri());
+
+    let user_did = "did:plc:new-user-12345";
+    let onboarding_text = handler
+        .handle_command(user_did, "start")
+        .await
+        .expect("handle start");
+
+    // R1 Verification: authorization URL is on its own dedicated line without adjacent emojis, brackets, or punctuation
+    let lines: Vec<&str> = onboarding_text.lines().collect();
+    let auth_url = handler.auth_url();
+    let matching_lines: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| l.contains(&auth_url))
+        .collect();
+    assert_eq!(
+        matching_lines.len(),
+        1,
+        "auth URL must appear exactly once in onboarding DM"
+    );
+    assert_eq!(
+        matching_lines[0], auth_url,
+        "auth URL must occupy its own dedicated line without leading or trailing characters"
+    );
+    assert!(
+        !matching_lines[0].contains("🔗"),
+        "must not have emoji glued to URL"
+    );
+    assert!(
+        !matching_lines[0].contains('(') && !matching_lines[0].contains(')'),
+        "must not have brackets glued"
+    );
+
+    // WireMock Verification: sendMessage automatically extracts and attaches the link facet
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let text = body["message"]["text"].as_str().unwrap_or_default();
+            let facets = body["message"]["facets"].as_array().expect("facets array");
+            assert_eq!(facets.len(), 1, "exactly one facet for auth url");
+
+            let facet = &facets[0];
+            let byte_start = facet["index"]["byteStart"].as_u64().unwrap() as usize;
+            let byte_end = facet["index"]["byteEnd"].as_u64().unwrap() as usize;
+
+            let sliced_url = &text[byte_start..byte_end];
+            assert!(sliced_url.ends_with("/auth"));
+
+            let feature = &facet["features"][0];
+            assert_eq!(feature["$type"], "app.bsky.richtext.facet#link");
+            assert_eq!(feature["uri"], sliced_url);
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_onboard_out",
+                "rev": "rev_onboard_out",
+                "text": text,
+                "sender": { "did": "did:plc:skybouncer-bot" },
+                "sentAt": "2026-10-04T12:00:00Z"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "token").expect("client creation");
+    let sent = client
+        .send_message("convo_onboard_conv", &onboarding_text)
+        .await
+        .expect("send_message");
+
+    assert_eq!(sent.id, "msg_onboard_out");
+}
+
+#[tokio::test]
 async fn test_chat_client_update_read_success() {
     let server = MockServer::start().await;
 
@@ -534,6 +871,49 @@ async fn test_command_handler_help_and_empty() {
         .await
         .expect("handle");
     assert_eq!(reply_q, reply_help);
+}
+
+#[tokio::test]
+async fn test_command_handler_onboarding_clean_url_formatting() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot")
+        .with_public_url("https://skybouncer.mike10010100.com");
+
+    let cmds = ["start", "onboard", "auth", "activate", "hi", "hello"];
+    for cmd in cmds {
+        let reply = handler
+            .handle_command("did:plc:new-user", cmd)
+            .await
+            .expect("handle onboarding command");
+
+        assert!(reply.contains("Welcome to **Skybouncer**"));
+        assert!(reply.contains("did:plc:new-user"));
+
+        // R1: Verify authorization URL is formatted on its own dedicated line without emojis or punctuation glued
+        let lines: Vec<&str> = reply.lines().collect();
+        let auth_url = handler.auth_url();
+        let matching_lines: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains(&auth_url))
+            .collect();
+        assert_eq!(
+            matching_lines.len(),
+            1,
+            "URL must appear once for command '{cmd}'"
+        );
+        assert_eq!(
+            matching_lines[0], auth_url,
+            "URL must be strictly isolated on its own line without adjacent emojis, brackets, or punctuation"
+        );
+
+        // Verify link facets can be cleanly extracted with exact byte offset matching
+        let facets = skybouncer::bot::extract_link_facets(&reply);
+        assert_eq!(facets.len(), 1);
+        let f = &facets[0];
+        let slice = &reply[f.index.byte_start..f.index.byte_end];
+        assert_eq!(slice, auth_url);
+    }
 }
 
 #[tokio::test]
@@ -830,14 +1210,14 @@ async fn test_run_bot_poller_processes_dm_and_replies() {
                             "rev": "rev_1",
                             "unreadCount": 1,
                             "members": [
-                                { "did": "did:plc:user_asker" },
+                                { "did": "did:plc:protected1" },
                                 { "did": "did:plc:skybouncer-bot" }
                             ],
                             "lastMessage": {
                                 "id": "msg_cmd_1",
                                 "rev": "rev_1",
                                 "text": "rules",
-                                "sender": { "did": "did:plc:user_asker" },
+                                "sender": { "did": "did:plc:protected1" },
                                 "sentAt": "2026-10-02T03:00:00Z"
                             }
                         }
@@ -853,7 +1233,7 @@ async fn test_run_bot_poller_processes_dm_and_replies() {
                             "rev": "rev_2",
                             "unreadCount": 0,
                             "members": [
-                                { "did": "did:plc:user_asker" },
+                                { "did": "did:plc:protected1" },
                                 { "did": "did:plc:skybouncer-bot" }
                             ],
                             "lastMessage": None::<serde_json::Value>

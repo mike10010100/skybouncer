@@ -37,11 +37,11 @@ pub use crypto::SessionCipher;
 pub use tenant::{Tenant, TenantRegistry};
 
 pub use bot::{
-    format_bounce_alert, run_bot_poller, run_bounce_alert_dispatcher, AcceptConvoRequest,
-    AcceptConvoResponse, BotCommandHandler, ChatClient, ConvoMember, ConvoView,
-    GetMessagesResponse, ListConvoRequestsResponse, ListConvosResponse, MessageSender, MessageView,
-    SendMessagePayload, SendMessageRequest, UpdateReadRequest, DEFAULT_BOT_POLL_INTERVAL,
-    DEFAULT_CHAT_ENDPOINT,
+    extract_link_facets, format_bounce_alert, run_bot_poller, run_bounce_alert_dispatcher,
+    AcceptConvoRequest, AcceptConvoResponse, BotCommandHandler, ChatClient, ConvoMember, ConvoView,
+    FacetIndex, GetMessagesResponse, ListConvoRequestsResponse, ListConvosResponse, MessageSender,
+    MessageView, SendMessagePayload, SendMessageRequest, UpdateReadRequest,
+    DEFAULT_BOT_POLL_INTERVAL, DEFAULT_CHAT_ENDPOINT,
 };
 pub use enricher::{
     AppViewContextEnricher, AuthorContext, ContextEnricher, EnrichedContext, MockContextEnricher,
