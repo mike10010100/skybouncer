@@ -393,6 +393,12 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
     <!-- Live Telemetry KPI Cards -->
     <section class="kpi-grid">
+      <!-- Admin Only KPI Card: Users Monitored -->
+      <div class="kpi-card" id="kpi-monitored-card" style="display: none; border-color: rgba(99, 102, 241, 0.45); background: linear-gradient(135deg, rgba(30, 41, 59, 0.9), rgba(99, 102, 241, 0.15));">
+        <div class="kpi-label">Users Monitored 👑</div>
+        <div class="kpi-val" id="kpi-monitored-val" style="color: var(--accent);">0</div>
+        <div class="kpi-sub" id="kpi-monitored-sub">Protected Accounts Defended</div>
+      </div>
       <div class="kpi-card">
         <div class="kpi-label">Commits Ingested</div>
         <div class="kpi-val" id="kpi-commits">0</div>
@@ -607,7 +613,9 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
     async function fetchStatus() {
       try {
-        const res = await fetch("/api/status");
+        const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
+        const headers = storedDid ? { "x-skybouncer-did": storedDid } : {};
+        const res = await fetch("/api/status", { headers });
         if (!res.ok) return;
         const data = await res.json();
         document.getElementById("kpi-commits").innerText = data.stats.commits_received.toLocaleString();
@@ -616,6 +624,16 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         document.getElementById("kpi-dedup").innerText = data.stats.dedup_cache_hits.toLocaleString();
         document.getElementById("kpi-evals").innerText = data.stats.model_evaluations.toLocaleString();
         document.getElementById("kpi-bounces").innerText = data.stats.bounces_executed.toLocaleString();
+
+        if (data.monitored_users_count !== undefined && data.monitored_users_count !== null) {
+          const monCard = document.getElementById("kpi-monitored-card");
+          if (monCard) monCard.style.display = "flex";
+          const monVal = document.getElementById("kpi-monitored-val");
+          if (monVal) monVal.innerText = data.monitored_users_count.toLocaleString();
+        } else if (!currentUser || !currentUser.is_admin) {
+          const monCard = document.getElementById("kpi-monitored-card");
+          if (monCard) monCard.style.display = "none";
+        }
 
         const enqueued = data.stats.eval_queue_enqueued || 0;
         const processed = data.stats.eval_queue_processed || 0;
@@ -1022,6 +1040,18 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
       }
 
+      if (user.is_admin) {
+        const monCard = document.getElementById("kpi-monitored-card");
+        if (monCard) monCard.style.display = "flex";
+        if (user.monitored_users_count !== undefined) {
+          const monVal = document.getElementById("kpi-monitored-val");
+          if (monVal) monVal.innerText = user.monitored_users_count.toLocaleString();
+        }
+      } else {
+        const monCard = document.getElementById("kpi-monitored-card");
+        if (monCard) monCard.style.display = "none";
+      }
+
       const statusBadge = document.getElementById("tenant-status-badge");
       const toggleBtn = document.getElementById("tenant-toggle-btn");
       if (statusBadge && toggleBtn) {
@@ -1076,6 +1106,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       if (banner) banner.style.display = "none";
       const adminCard = document.getElementById("admin-fleet-card");
       if (adminCard) adminCard.style.display = "none";
+      const monCard = document.getElementById("kpi-monitored-card");
+      if (monCard) monCard.style.display = "none";
       renderRulesUnauthenticated();
     }
 
@@ -1141,6 +1173,10 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         if (activeEl) activeEl.innerText = data.active_count;
         const pausedEl = document.getElementById("admin-paused-tenants");
         if (pausedEl) pausedEl.innerText = data.paused_count;
+        const kpiMonVal = document.getElementById("kpi-monitored-val");
+        if (kpiMonVal && data.monitored_count !== undefined) {
+          kpiMonVal.innerText = data.monitored_count.toLocaleString();
+        }
 
         const tbody = document.getElementById("admin-tenants-table");
         if (!tbody) return;

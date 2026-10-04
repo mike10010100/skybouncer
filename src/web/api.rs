@@ -141,6 +141,9 @@ pub struct StatusResponse {
     pub dry_run: bool,
     /// Skybouncer package version string.
     pub version: String,
+    /// Number of actively monitored accounts across the fleet (only visible to authenticated administrators).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitored_users_count: Option<usize>,
 }
 
 /// Handler for `GET /api/status`: returns engine operational telemetry.
@@ -151,6 +154,10 @@ pub async fn get_status(State(state): State<ApiState>, headers: HeaderMap) -> Js
 
     // Redact private prompt for unauthenticated callers
     let caller_did = extract_authenticated_caller(&headers);
+    let is_admin = caller_did
+        .as_deref()
+        .is_some_and(|did| state.engine.is_admin(did));
+
     let rubric = if let Some(ref did) = caller_did {
         state.engine.rubric_for(did)
     } else {
@@ -158,6 +165,12 @@ pub async fn get_status(State(state): State<ApiState>, headers: HeaderMap) -> Js
             prompt: "[Protected sovereign rubric - sign in to view]".to_string(),
             sensitivity: state.engine.rubric().sensitivity,
         }
+    };
+
+    let monitored_users_count = if is_admin {
+        Some(state.engine.protected_dids().len())
+    } else {
+        None
     };
 
     Json(StatusResponse {
@@ -170,6 +183,7 @@ pub async fn get_status(State(state): State<ApiState>, headers: HeaderMap) -> Js
         },
         dry_run: state.engine.is_dry_run(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        monitored_users_count,
     })
 }
 
@@ -590,6 +604,9 @@ pub struct UserSessionResponse {
     /// Whether auto-blocking is actively established on the user's sovereign PDS via app.bsky.graph.listblock.
     #[serde(default)]
     pub is_list_blocked: bool,
+    /// Number of actively monitored accounts across the fleet (only visible to administrators).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitored_users_count: Option<usize>,
 }
 
 /// Summary of an enrolled tenant for administrative fleet oversight.
@@ -620,6 +637,9 @@ pub struct AdminTenantsResponse {
     pub active_count: usize,
     /// Count of paused tenants.
     pub paused_count: usize,
+    /// Total count of users actively monitored by the moderation engine.
+    #[serde(default)]
+    pub monitored_count: usize,
     /// List of tenant summaries.
     pub tenants: Vec<TenantSummary>,
 }
@@ -703,6 +723,12 @@ pub async fn get_current_user(
         // Dynamically resolve handle if missing or empty
         let resolved_handle = state.engine.resolve_did_to_handle(&did).await;
 
+        let monitored_users_count = if is_admin {
+            Some(state.engine.protected_dids().len())
+        } else {
+            None
+        };
+
         if let Ok(Some(tenant)) = state.engine.tenant_registry().get(&did) {
             let rubric = tenant.rubric.unwrap_or_else(|| state.engine.rubric());
             let handle = tenant.handle.or(resolved_handle);
@@ -719,6 +745,7 @@ pub async fn get_current_user(
                     threshold: rubric.sensitivity.threshold(),
                 }),
                 is_list_blocked,
+                monitored_users_count,
             });
         }
 
@@ -737,6 +764,7 @@ pub async fn get_current_user(
                     threshold: rubric.sensitivity.threshold(),
                 }),
                 is_list_blocked,
+                monitored_users_count,
             });
         }
     }
@@ -750,6 +778,7 @@ pub async fn get_current_user(
         mod_list_uri: None,
         rubric: None,
         is_list_blocked: false,
+        monitored_users_count: None,
     })
 }
 
@@ -811,10 +840,13 @@ pub async fn get_admin_tenants(
         });
     }
 
+    let monitored_count = state.engine.protected_dids().len();
+
     Ok(Json(AdminTenantsResponse {
         total: summaries.len(),
         active_count,
         paused_count,
+        monitored_count,
         tenants: summaries,
     }))
 }

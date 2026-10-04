@@ -121,6 +121,8 @@ async fn test_serve_dashboard_html() {
     assert!(body_str.contains("Recently Bounced"));
     assert!(body_str.contains("Evaluation Queue"));
     assert!(body_str.contains("Queue Overflows"));
+    assert!(body_str.contains("Users Monitored"));
+    assert!(body_str.contains("kpi-monitored-card"));
 }
 
 #[tokio::test]
@@ -681,6 +683,7 @@ async fn test_api_session_and_admin_endpoints() {
     assert_eq!(me.handle.as_deref(), Some("tenant.bsky.social"));
     assert!(!me.is_admin);
     assert!(me.is_active);
+    assert_eq!(me.monitored_users_count, None);
 
     // 3. Authenticated via header for admin DID
     let req = Request::builder()
@@ -698,6 +701,7 @@ async fn test_api_session_and_admin_endpoints() {
     assert_eq!(me.did.as_deref(), Some("did:plc:admin123"));
     assert!(me.is_admin);
     assert!(me.is_active);
+    assert_eq!(me.monitored_users_count, Some(1));
 
     // 4. Non-admin accessing /api/admin/tenants -> 403 Forbidden
     let req = Request::builder()
@@ -721,7 +725,36 @@ async fn test_api_session_and_admin_endpoints() {
     assert_eq!(fleet.total, 1);
     assert_eq!(fleet.active_count, 1);
     assert_eq!(fleet.paused_count, 0);
+    assert_eq!(fleet.monitored_count, 1);
     assert_eq!(fleet.tenants[0].did, "did:plc:tenant456");
+
+    // 5b. Verify /api/status telemetry reports monitored_users_count for admin, but hides it for unauthenticated
+    let status_req_admin = Request::builder()
+        .uri("/api/status")
+        .header("x-skybouncer-did", "did:plc:admin123")
+        .body(Body::empty())
+        .unwrap();
+    let status_resp_admin = app.clone().oneshot(status_req_admin).await.unwrap();
+    assert_eq!(status_resp_admin.status(), StatusCode::OK);
+    let status_admin_bytes = axum::body::to_bytes(status_resp_admin.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status_admin: skybouncer::web::StatusResponse =
+        serde_json::from_slice(&status_admin_bytes).unwrap();
+    assert_eq!(status_admin.monitored_users_count, Some(1));
+
+    let status_req_unauth = Request::builder()
+        .uri("/api/status")
+        .body(Body::empty())
+        .unwrap();
+    let status_resp_unauth = app.clone().oneshot(status_req_unauth).await.unwrap();
+    assert_eq!(status_resp_unauth.status(), StatusCode::OK);
+    let status_unauth_bytes = axum::body::to_bytes(status_resp_unauth.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status_unauth: skybouncer::web::StatusResponse =
+        serde_json::from_slice(&status_unauth_bytes).unwrap();
+    assert_eq!(status_unauth.monitored_users_count, None);
 
     // 6. Admin toggling tenant defense pause
     let toggle_req = Request::builder()
