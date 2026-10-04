@@ -242,6 +242,8 @@ Adhering to [`AGENTS.md`](AGENTS.md) and [`rust-best-practices`](https://github.
 | **M8: Persistent OAuth Token Auto-Refresh** | Background PDS operation token refresh with single-flight deduplication, SQLite token persistence across restarts, and early dashboard activation. | ✅ **Completed & Published (`v0.1.4` / `v0.1.5`)** |
 | **M9: Tier 1 & Tier 2 Evaluation Audit Log** | Persistent SQLite evaluation audit logging, granular telemetry breakdown, retention management, and admin oversight view. | ✅ **Completed & Published (`v0.1.5`)** |
 | **M10: Web & Auth Layer Security Hardening** | 256-bit CSPRNG web session tokens, admin privilege verification, SSRF blocking, DOM XSS prevention, security headers, scoped DM bot privacy, and rate limiter memory eviction. | ✅ **Completed & Published (`v0.1.6`)** |
+| **M11: AES-256-GCM Session Encryption at Rest** | Authenticated AES-256-GCM encryption with CSPRNG nonces for OAuth tokens/DPoP keys at rest, `enc:v1:` versioning, zero-downtime legacy passthrough, and key management via `SKYBOUNCER_SESSION_ENCRYPTION_KEY`. | ✅ **Completed & Published (`v0.1.7`)** |
+
 
 ---
 

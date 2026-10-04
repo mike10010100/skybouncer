@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-10-04
+
+### Security & Hardening
+
+- **AES-256-GCM Session Encryption at Rest (Issue #9)**:
+  - Implemented `SessionCipher` in `src/crypto.rs` using `ring::aead::AES_256_GCM` with random 96-bit nonces generated via CSPRNG (`ring::rand::SystemRandom`) and 128-bit authentication tags.
+  - Transparent envelope format `enc:v1:<base64(12B nonce + ciphertext + 16B tag)>` stored in the `session_json` column of the `tenants` SQLite table.
+  - Zero-downtime, transparent backward compatibility: legacy unencrypted JSON rows are automatically recognized and parsed seamlessly without data loss or schema migration downtime, and re-encrypted on next write/refresh.
+  - Key management via `SKYBOUNCER_SESSION_ENCRYPTION_KEY` supporting 64-character hex keys, high-entropy secret passphrases, or machine-stable fallback derivation based on `HOSTNAME`/`SERVICE_DID`.
+  - Integrated into `TenantRegistry` methods `register_or_update`, `update_session`, and `get`.
+  - Added unit and integration tests verifying ciphertext structure, absence of plaintext tokens in raw SQLite data, legacy migration, and tampering/key mismatch rejection.
+
 ## [0.1.6] - 2026-10-04
 
 ### Security & Hardening

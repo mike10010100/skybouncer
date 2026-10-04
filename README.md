@@ -2,7 +2,7 @@
 
 > **Sovereign, Rule-Driven Auto-Moderation & Bouncer Service for AT Protocol and Bluesky**
 
-[![Crates.io](https://img.shields.io/badge/crates.io-v0.1.6-blue.svg)](https://crates.io/crates/skybouncer)
+[![Crates.io](https://img.shields.io/badge/crates.io-v0.1.7-blue.svg)](https://crates.io/crates/skybouncer)
 [![Rust Safe](https://img.shields.io/badge/Rust-Safe_2021-brightgreen.svg)](#)
 [![Forbid Unsafe](https://img.shields.io/badge/%23!%5Bforbid(unsafe_code)%5D-enforced-blue.svg)](#)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#)
