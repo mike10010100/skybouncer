@@ -266,6 +266,240 @@ async fn test_chat_client_update_read_success() {
         .expect("update_read");
 }
 
+#[tokio::test]
+async fn test_chat_client_list_convo_requests() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvoRequests"))
+        .respond_with(|req: &wiremock::Request| {
+            let auth = req
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert_eq!(auth, "Bearer test_req_token");
+
+            let query = req.url.query().unwrap_or_default();
+            assert!(query.contains("limit=20"));
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "requests": [
+                    {
+                        "id": "convo_req_1",
+                        "rev": "rev_req_1",
+                        "status": "request",
+                        "unreadCount": 1,
+                        "members": [
+                            { "did": "did:plc:stranger" },
+                            { "did": "did:plc:bot" }
+                        ],
+                        "lastMessage": {
+                            "id": "msg_stranger_1",
+                            "rev": "rev_stranger_1",
+                            "text": "Start",
+                            "sender": { "did": "did:plc:stranger" },
+                            "sentAt": "2026-10-04T00:00:00Z"
+                        }
+                    }
+                ],
+                "cursor": "req_cursor_123"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "test_req_token").expect("client creation");
+    let resp = client
+        .list_convo_requests(Some(20), None)
+        .await
+        .expect("list_convo_requests");
+
+    assert_eq!(resp.requests.len(), 1);
+    assert_eq!(resp.requests[0].id, "convo_req_1");
+    assert_eq!(resp.requests[0].status.as_deref(), Some("request"));
+    assert_eq!(resp.cursor, Some("req_cursor_123".to_string()));
+}
+
+#[tokio::test]
+async fn test_chat_client_accept_convo() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.acceptConvo"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            assert_eq!(body["convoId"], "convo_to_accept");
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "rev": "accepted_rev_999"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "test_token").expect("client");
+    let resp = client
+        .accept_convo("convo_to_accept")
+        .await
+        .expect("accept_convo");
+
+    assert_eq!(resp.rev, Some("accepted_rev_999".to_string()));
+}
+
+#[tokio::test]
+async fn test_chat_client_auto_token_refresh_via_refresh_session() {
+    let server = MockServer::start().await;
+
+    // Chat endpoint returns 400 ExpiredToken on initial expired access token,
+    // and returns 200 OK once the token has been refreshed.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .respond_with(|req: &wiremock::Request| {
+            let auth = req
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+
+            if auth == "Bearer expired_access_jwt" {
+                ResponseTemplate::new(400).set_body_json(json!({
+                    "error": "ExpiredToken",
+                    "message": "Token has expired"
+                }))
+            } else if auth == "Bearer fresh_refreshed_access_jwt" {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "convos": [],
+                    "cursor": null
+                }))
+            } else {
+                ResponseTemplate::new(401).set_body_json(json!({
+                    "error": "AuthenticationRequired",
+                    "message": "Unexpected token"
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    // RefreshSession endpoint returns new tokens
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.server.refreshSession"))
+        .respond_with(|req: &wiremock::Request| {
+            let auth = req
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert_eq!(auth, "Bearer active_refresh_jwt");
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "accessJwt": "fresh_refreshed_access_jwt",
+                "refreshJwt": "next_refresh_jwt",
+                "handle": "bot.bsky.social",
+                "did": "did:plc:bot"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "expired_access_jwt")
+        .expect("client")
+        .with_refresh_token("active_refresh_jwt")
+        .with_credentials(server.uri(), "bot.bsky.social", "secret-app-pass");
+
+    // The call should detect ExpiredToken, invoke refreshSession, update token, and retry successfully!
+    let resp = client
+        .list_convos(None, None)
+        .await
+        .expect("should transparently refresh token and succeed");
+
+    assert_eq!(resp.convos.len(), 0);
+    assert_eq!(
+        client.current_access_token().await,
+        "fresh_refreshed_access_jwt"
+    );
+}
+
+#[tokio::test]
+async fn test_chat_client_auto_token_refresh_fallback_to_app_password() {
+    let server = MockServer::start().await;
+
+    // Chat endpoint returns 400 ExpiredToken on expired token
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .respond_with(|req: &wiremock::Request| {
+            let auth = req
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+
+            if auth == "Bearer expired_access_jwt" {
+                ResponseTemplate::new(400).set_body_json(json!({
+                    "error": "ExpiredToken",
+                    "message": "Token has expired"
+                }))
+            } else if auth == "Bearer app_password_logged_in_access_jwt" {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "convos": [],
+                    "cursor": null
+                }))
+            } else {
+                ResponseTemplate::new(401).set_body_json(json!({
+                    "error": "AuthenticationRequired",
+                    "message": "Unexpected token"
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    // RefreshSession fails (e.g. refresh token also expired after long downtime)
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.server.refreshSession"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "ExpiredToken",
+            "message": "Refresh token has expired"
+        })))
+        .mount(&server)
+        .await;
+
+    // createSession fallback with App Password credentials
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.server.createSession"))
+        .respond_with(|req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            assert_eq!(body["identifier"], "skybouncer.bsky.social");
+            assert_eq!(body["password"], "app-password-123");
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "accessJwt": "app_password_logged_in_access_jwt",
+                "refreshJwt": "new_refreshed_jwt",
+                "handle": "skybouncer.bsky.social",
+                "did": "did:plc:skybouncer-bot"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "expired_access_jwt")
+        .expect("client")
+        .with_refresh_token("expired_refresh_jwt")
+        .with_credentials(server.uri(), "skybouncer.bsky.social", "app-password-123");
+
+    let resp = client
+        .list_convos(None, None)
+        .await
+        .expect("should recover via createSession fallback");
+
+    assert_eq!(resp.convos.len(), 0);
+    assert_eq!(
+        client.current_access_token().await,
+        "app_password_logged_in_access_jwt"
+    );
+}
+
 // =============================================================================
 // BotCommandHandler Command Tests
 // =============================================================================
@@ -618,6 +852,153 @@ async fn test_run_bot_poller_processes_dm_and_replies() {
     assert!(res.is_ok());
     assert!(send_called.load(Ordering::SeqCst) >= 1);
     assert!(read_called.load(Ordering::SeqCst) >= 1);
+}
+
+#[tokio::test]
+async fn test_run_bot_poller_auto_accepts_and_processes_convo_requests() {
+    let server = MockServer::start().await;
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let bot_did = "did:plc:skybouncer-bot";
+    let handler = BotCommandHandler::new(engine, bot_did);
+
+    let requests_polled = Arc::new(AtomicUsize::new(0));
+    let accept_called = Arc::new(AtomicUsize::new(0));
+    let send_called = Arc::new(AtomicUsize::new(0));
+    let read_called = Arc::new(AtomicUsize::new(0));
+
+    // Incoming conversation requests endpoint
+    let rp = Arc::clone(&requests_polled);
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvoRequests"))
+        .respond_with(move |_: &wiremock::Request| {
+            let count = rp.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                // First poll returns pending request from stranger huwupy with "help"
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "requests": [
+                        {
+                            "id": "convo_huwupy_request",
+                            "rev": "rev_req_0",
+                            "status": "request",
+                            "unreadCount": 1,
+                            "members": [
+                                { "did": "did:plc:huwupy" },
+                                { "did": "did:plc:skybouncer-bot" }
+                            ],
+                            "lastMessage": {
+                                "id": "msg_huwupy_1",
+                                "rev": "rev_msg_1",
+                                "text": "help",
+                                "sender": { "did": "did:plc:huwupy" },
+                                "sentAt": "2026-10-04T12:00:00Z"
+                            }
+                        }
+                    ],
+                    "cursor": null
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "requests": [],
+                    "cursor": null
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    // acceptConvo endpoint
+    let ac = Arc::clone(&accept_called);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.acceptConvo"))
+        .respond_with(move |req: &wiremock::Request| {
+            ac.fetch_add(1, Ordering::SeqCst);
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            assert_eq!(body["convoId"], "convo_huwupy_request");
+            ResponseTemplate::new(200).set_body_json(json!({
+                "rev": "rev_accepted_1"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    // listConvos endpoint returns empty list
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "convos": [],
+            "cursor": null
+        })))
+        .mount(&server)
+        .await;
+
+    // sendMessage endpoint
+    let sc = Arc::clone(&send_called);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(move |req: &wiremock::Request| {
+            sc.fetch_add(1, Ordering::SeqCst);
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            assert_eq!(body["convoId"], "convo_huwupy_request");
+            let text = body["message"]["text"].as_str().unwrap_or_default();
+            assert!(text.contains("Skybouncer Bot Commands"));
+
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_reply_huwupy",
+                "rev": "rev_rep_1",
+                "text": text,
+                "sender": { "did": "did:plc:skybouncer-bot" },
+                "sentAt": "2026-10-04T12:00:01Z"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    // updateRead endpoint
+    let rc = Arc::clone(&read_called);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.updateRead"))
+        .respond_with(move |req: &wiremock::Request| {
+            rc.fetch_add(1, Ordering::SeqCst);
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            assert_eq!(body["convoId"], "convo_huwupy_request");
+            assert_eq!(body["messageId"], "msg_huwupy_1");
+            ResponseTemplate::new(200).set_body_json(json!({}))
+        })
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "test_token").expect("client");
+    let cancel = CancellationToken::new();
+    let cancel_poller = cancel.clone();
+
+    let poller_task = tokio::spawn(async move {
+        run_bot_poller(client, handler, Duration::from_millis(20), cancel_poller).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    cancel.cancel();
+
+    let res = tokio::time::timeout(Duration::from_millis(500), poller_task)
+        .await
+        .expect("poller shutdown within timeout")
+        .expect("join task");
+
+    assert!(res.is_ok());
+    assert_eq!(
+        accept_called.load(Ordering::SeqCst),
+        1,
+        "acceptConvo must be called exactly once"
+    );
+    assert_eq!(
+        send_called.load(Ordering::SeqCst),
+        1,
+        "sendMessage must be called for the request command"
+    );
+    assert_eq!(
+        read_called.load(Ordering::SeqCst),
+        1,
+        "updateRead must mark the request message read"
+    );
 }
 
 #[tokio::test]

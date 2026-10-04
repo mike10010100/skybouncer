@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] - 2026-10-04
+
+### Added & Fixed
+
+- **Auto-Accept Conversation Requests (`chat.bsky.convo.listConvoRequests` & `acceptConvo`)**:
+  - Implemented `list_convo_requests()` and `accept_convo()` on `ChatClient`.
+  - Added strongly-typed `ListConvoRequestsResponse`, `AcceptConvoRequest`, and `AcceptConvoResponse` structs, and added `status: Option<String>` to `ConvoView`.
+  - Enhanced `run_bot_poller` to poll conversation requests on each tick, automatically accept pending DM requests from non-followed accounts, and immediately evaluate and reply to incoming commands.
+- **Automated ATProto Session Refresh & Recovery**:
+  - Solved the 2-hour ATProto session expiration failure loop where `listConvos` errored with HTTP 400 `{"error":"ExpiredToken"}`.
+  - Implemented single-flight transparent session refresh (`refreshSession` via `refreshJwt`) with fallback to App Password re-login (`createSession`).
+  - Concurrent requests arriving during token expiration deduplicate onto a single refresh operation without burning tokens or causing races.
+- **Test Suite**:
+  - Added unit and integration tests verifying `listConvoRequests`, `acceptConvo`, automatic token refresh on `ExpiredToken`, App Password re-login fallback, and poller auto-acceptance.
+
 ## [0.1.9] - 2026-10-04
 
 ### Security & Correctness Hardening (AI Review Remediation)
