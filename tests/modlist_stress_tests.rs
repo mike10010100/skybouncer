@@ -43,6 +43,7 @@ fn test_concurrent_load_shared_cache_30_threads() {
                         let did = format!("did:plc:user_{thread_idx}_{op}");
                         let bounce = BouncedUser {
                             subject_did: did.clone(),
+                            protected_did: "did:plc:owner".to_string(),
                             listitem_uri: format!(
                                 "at://did:plc:owner/app.bsky.graph.listitem/{thread_idx}_{op}"
                             ),
@@ -52,6 +53,7 @@ fn test_concurrent_load_shared_cache_30_threads() {
                             confidence: 0.95,
                             reason: "Automated airdrop attack".to_string(),
                             post_uri: format!("at://{did}/app.bsky.feed.post/1"),
+                            post_text: "Airdrop link".to_string(),
                             bounced_at: 1_720_000_000_000_000 + (op as u64),
                         };
                         cache
@@ -177,6 +179,7 @@ fn test_concurrent_load_distinct_disk_connections_25_threads() {
                 let did = format!("did:plc:disk_actor_{thread_idx}_{op}");
                 let bounce = BouncedUser {
                     subject_did: did.clone(),
+                    protected_did: "did:plc:owner".to_string(),
                     listitem_uri: format!(
                         "at://did:plc:owner/app.bsky.graph.listitem/{thread_idx}_{op}"
                     ),
@@ -186,6 +189,7 @@ fn test_concurrent_load_distinct_disk_connections_25_threads() {
                     confidence: 0.88,
                     reason: "Mass mention abuse".to_string(),
                     post_uri: format!("at://{did}/app.bsky.feed.post/1"),
+                    post_text: "Mass mention attack".to_string(),
                     bounced_at: 1_720_000_000_000_000 + (op as u64),
                 };
 
@@ -438,6 +442,7 @@ fn test_clock_drift_and_timestamp_boundary_resilience() {
     // 3. Test ModListConfig and BouncedUser with maximum integer timestamps
     let extreme_bounce = BouncedUser {
         subject_did: "did:plc:extreme_did".to_string(),
+        protected_did: "did:plc:owner".to_string(),
         listitem_uri: "at://did:plc:owner/app.bsky.graph.listitem/extreme".to_string(),
         listitem_rkey: "extreme".to_string(),
         listitem_cid: "bafyextreme".to_string(),
@@ -445,6 +450,7 @@ fn test_clock_drift_and_timestamp_boundary_resilience() {
         confidence: 1.0,
         reason: "Timestamp boundary test".to_string(),
         post_uri: "at://did:plc:extreme_did/app.bsky.feed.post/1".to_string(),
+        post_text: "Boundary test".to_string(),
         bounced_at: u64::MAX, // Saturates to i64::MAX in SQLite
     };
 
@@ -505,6 +511,7 @@ fn test_disk_backed_recovery_across_persistence_boundaries() {
         for i in 0..num_bounces {
             let bounce = BouncedUser {
                 subject_did: format!("did:plc:violator_{i}"),
+                protected_did: "did:plc:owner".to_string(),
                 listitem_uri: format!("at://did:plc:owner/app.bsky.graph.listitem/{i}"),
                 listitem_rkey: format!("item_{i}"),
                 listitem_cid: format!("bafycid_{i}"),
@@ -512,6 +519,7 @@ fn test_disk_backed_recovery_across_persistence_boundaries() {
                 confidence: 0.90,
                 reason: format!("Spam incident {i}"),
                 post_uri: format!("at://did:plc:violator_{i}/app.bsky.feed.post/1"),
+                post_text: format!("Spam text {i}"),
                 bounced_at: 1_720_000_000_000_000 + (i as u64),
             };
             cache.record_bounce(&bounce).unwrap();
@@ -585,6 +593,7 @@ fn test_disk_backed_recovery_across_persistence_boundaries() {
         // Further mutations on reopened DB succeed
         let extra_bounce = BouncedUser {
             subject_did: "did:plc:extra_violator".to_string(),
+            protected_did: "did:plc:owner".to_string(),
             listitem_uri: "at://did:plc:owner/app.bsky.graph.listitem/extra".to_string(),
             listitem_rkey: "extra".to_string(),
             listitem_cid: "bafyextra".to_string(),
@@ -592,6 +601,7 @@ fn test_disk_backed_recovery_across_persistence_boundaries() {
             confidence: 0.99,
             reason: "Doxxing threat".to_string(),
             post_uri: "at://did:plc:extra_violator/app.bsky.feed.post/1".to_string(),
+            post_text: "Doxxing text".to_string(),
             bounced_at: 1_720_000_000_000_999,
         };
         cache2.record_bounce(&extra_bounce).unwrap();
@@ -726,6 +736,7 @@ fn test_high_volume_cache_throughput_and_sla() {
     for i in 0..population_size {
         let bounce = BouncedUser {
             subject_did: format!("did:plc:scale_actor_{i}"),
+            protected_did: "did:plc:owner".to_string(),
             listitem_uri: format!("at://did:plc:owner/app.bsky.graph.listitem/{i}"),
             listitem_rkey: format!("{i}"),
             listitem_cid: "bafycid".to_string(),
@@ -733,6 +744,7 @@ fn test_high_volume_cache_throughput_and_sla() {
             confidence: 0.90,
             reason: "Bulk population".to_string(),
             post_uri: format!("at://did:plc:scale_actor_{i}/app.bsky.feed.post/1"),
+            post_text: "Bulk spam message".to_string(),
             bounced_at: 1_720_000_000_000_000 + (i as u64),
         };
         cache.record_bounce(&bounce).unwrap();

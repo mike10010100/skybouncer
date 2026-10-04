@@ -321,6 +321,7 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
     let list_item_uri = format!("{list_uri}/item/item123");
     let bounce_entry = BouncedUser {
         subject_did: violator_did.to_string(),
+        protected_did: "did:plc:protected-owner".to_string(),
         listitem_uri: list_item_uri.clone(),
         listitem_rkey: "item123".to_string(),
         listitem_cid: "bafytestcid".to_string(),
@@ -328,6 +329,7 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
         confidence: 0.95,
         reason: "Targeted harassment".to_string(),
         post_uri: "at://did:plc:toxic-violator-999/app.bsky.feed.post/post123".to_string(),
+        post_text: "You are terrible".to_string(),
         bounced_at: 1_720_000_000_000_000,
     };
     cache.record_bounce(&bounce_entry).unwrap();

@@ -613,6 +613,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           <thead>
             <tr>
               <th>Violator DID</th>
+              <th>Offending Post</th>
               <th>Category</th>
               <th>Confidence</th>
               <th>Reason</th>
@@ -621,7 +622,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           </thead>
           <tbody id="bounces-table">
             <tr>
-              <td colspan="5" style="text-align: center; color: var(--text-muted); padding: 2rem;">Loading recent bounces...</td>
+              <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 2rem;">Loading recent bounces...</td>
             </tr>
           </tbody>
         </table>
@@ -1052,29 +1053,73 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
     }
 
+    function formatPostLink(uri, text) {
+      if (!uri || uri.trim() === "") {
+        return text && text.trim().length > 0
+          ? `<span style="font-size: 0.8rem; color: var(--text-muted);" title="${escapeHtml(text)}">${escapeHtml(text.length > 40 ? text.substring(0, 37) + "..." : text)}</span>`
+          : '<span style="color: var(--text-muted); font-size: 0.8rem;">—</span>';
+      }
+
+      let bskyUrl = null;
+      const match = uri.match(/^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/([^/]+)$/);
+      if (match) {
+        const [, actor, rkey] = match;
+        bskyUrl = `https://bsky.app/profile/${encodeURIComponent(actor)}/post/${encodeURIComponent(rkey)}`;
+      }
+
+      const hasText = text && text.trim().length > 0;
+      const displayText = hasText
+        ? (text.length > 35 ? text.substring(0, 32) + "..." : text)
+        : (match ? `Post ${match[2].substring(0, 8)}...` : "View Post");
+
+      if (bskyUrl) {
+        return `
+          <div style="display: flex; flex-direction: column; gap: 0.2rem; max-width: 220px;">
+            <a href="${bskyUrl}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); text-decoration: none; font-size: 0.82rem; font-weight: 600; display: inline-flex; align-items: center; gap: 0.3rem;" title="Open offending post on Bluesky">
+              <span>💬</span> <span style="text-decoration: underline; text-underline-offset: 2px;">${escapeHtml(displayText)}</span> ↗
+            </a>
+            ${hasText ? `<div style="font-size: 0.72rem; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(text)}">${escapeHtml(text)}</div>` : ''}
+          </div>
+        `;
+      }
+
+      return `<span style="font-size: 0.8rem; color: var(--text-muted);" title="${escapeHtml(uri)}">${escapeHtml(displayText)}</span>`;
+    }
+
     async function loadBounces() {
       try {
-        const res = await fetch("/api/bounces?limit=20");
+        const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
+        const url = "/api/bounces?limit=50" + (storedDid ? `&user_did=${encodeURIComponent(storedDid)}` : "");
+        const res = await fetch(url);
         if (!res.ok) return;
         const bounces = await res.json();
         const tbody = document.getElementById("bounces-table");
 
         if (bounces.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted); padding: 2rem;">No accounts have been bounced yet. Shield is active!</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 2rem;">No accounts have been bounced yet. Shield is active!</td></tr>';
           return;
         }
 
-        tbody.innerHTML = bounces.map(b => `
+        tbody.innerHTML = bounces.map(b => {
+          const profileUrl = `https://bsky.app/profile/${encodeURIComponent(b.subject_did)}`;
+          const postLinkHtml = formatPostLink(b.post_uri, b.post_text);
+          return `
           <tr>
-            <td><code style="font-size: 0.8rem; background: rgba(0,0,0,0.2); padding: 0.2rem 0.4rem; border-radius: 4px;">${b.subject_did}</code></td>
-            <td><span class="status-badge" style="background: var(--danger-bg); color: var(--danger); font-size: 0.75rem;">${b.category}</span></td>
-            <td><strong>${Math.round(b.confidence * 100)}%</strong></td>
-            <td>${escapeHtml(b.reason)}</td>
             <td>
-              <button class="btn btn-danger" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" onclick="pardonUser('${b.subject_did}')">Pardon</button>
+              <a href="${profileUrl}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none;" title="Open profile on Bluesky">
+                <code style="font-size: 0.8rem; background: rgba(0,0,0,0.2); padding: 0.2rem 0.4rem; border-radius: 4px; color: var(--text-main); font-family: monospace;">${escapeHtml(b.subject_did)}</code>
+              </a>
+            </td>
+            <td>${postLinkHtml}</td>
+            <td><span class="status-badge" style="background: var(--danger-bg); color: var(--danger); font-size: 0.75rem;">${escapeHtml(b.category)}</span></td>
+            <td><strong>${Math.round(b.confidence * 100)}%</strong></td>
+            <td><span style="font-size: 0.82rem;" title="${escapeHtml(b.reason)}">${escapeHtml(b.reason)}</span></td>
+            <td>
+              <button class="btn btn-danger" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" onclick="pardonUser('${escapeHtml(b.subject_did)}')">Pardon</button>
             </td>
           </tr>
-        `).join("");
+        `;
+        }).join("");
       } catch (e) {
         console.error("Bounces fetch failed", e);
       }
@@ -1083,11 +1128,15 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     async function pardonUser(did) {
       if (!confirm(`Are you sure you want to pardon ${did} and remove them from your moderation list?`)) return;
 
+      const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
       try {
         const res = await fetch("/api/pardon", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ subject_did: did })
+          body: JSON.stringify({
+            subject_did: did,
+            protected_did: storedDid || undefined
+          })
         });
         if (res.ok) {
           showToast(`✅ Pardoned ${did}`);
