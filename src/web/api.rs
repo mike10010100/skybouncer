@@ -473,6 +473,9 @@ pub struct UserSessionResponse {
     pub mod_list_uri: Option<String>,
     /// Active moderation rubric for this user.
     pub rubric: Option<RulesResponse>,
+    /// Whether auto-blocking is actively established on the user's sovereign PDS via app.bsky.graph.listblock.
+    #[serde(default)]
+    pub is_list_blocked: bool,
 }
 
 /// Summary of an enrolled tenant for administrative fleet oversight.
@@ -581,6 +584,7 @@ pub async fn get_current_user(
             .ok()
             .flatten()
             .map(|c| c.list_uri);
+        let is_list_blocked = state.engine.cache().is_list_blocked(&did).unwrap_or(false);
 
         if let Ok(Some(tenant)) = state.engine.tenant_registry().get(&did) {
             let rubric = tenant.rubric.unwrap_or_else(|| state.engine.rubric());
@@ -596,6 +600,7 @@ pub async fn get_current_user(
                     sensitivity: rubric.sensitivity,
                     threshold: rubric.sensitivity.threshold(),
                 }),
+                is_list_blocked,
             });
         }
 
@@ -613,6 +618,7 @@ pub async fn get_current_user(
                     sensitivity: rubric.sensitivity,
                     threshold: rubric.sensitivity.threshold(),
                 }),
+                is_list_blocked,
             });
         }
     }
@@ -625,6 +631,7 @@ pub async fn get_current_user(
         is_active: false,
         mod_list_uri: None,
         rubric: None,
+        is_list_blocked: false,
     })
 }
 

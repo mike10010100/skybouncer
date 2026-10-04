@@ -150,7 +150,7 @@ async fn test_ensure_mod_list_cache_hit_zero_network() {
         .await
         .unwrap();
     assert!(uri1.starts_with("at://did:plc:alice/app.bsky.graph.list/"));
-    assert_eq!(pds.created_records.lock().len(), 1);
+    assert_eq!(pds.created_records.lock().len(), 2); // 1 list + 1 listblock
 
     // Call 2: Cache hit short-circuits with 0 additional PDS requests
     let uri2 = manager
@@ -158,7 +158,7 @@ async fn test_ensure_mod_list_cache_hit_zero_network() {
         .await
         .unwrap();
     assert_eq!(uri1, uri2);
-    assert_eq!(pds.created_records.lock().len(), 1);
+    assert_eq!(pds.created_records.lock().len(), 2);
 }
 
 #[tokio::test]
@@ -174,8 +174,10 @@ async fn test_ensure_mod_list_provisions_when_not_cached() {
     assert!(uri.starts_with("at://did:plc:alice/app.bsky.graph.list/"));
 
     let records = pds.created_records.lock();
-    assert_eq!(records.len(), 1);
+    assert_eq!(records.len(), 2);
     assert_eq!(records[0]["collection"], "app.bsky.graph.list");
+    assert_eq!(records[1]["collection"], "app.bsky.graph.listblock");
+    assert_eq!(records[1]["record"]["subject"], uri);
     assert_eq!(
         records[0]["record"]["purpose"],
         "app.bsky.graph.defs#modlist"
@@ -212,8 +214,11 @@ async fn test_ensure_mod_list_discovers_existing_remote_list() {
         "at://did:plc:alice/app.bsky.graph.list/existing_modlist_rkey"
     );
 
-    // Zero createRecord requests issued
-    assert_eq!(pds.created_records.lock().len(), 0);
+    // Zero list createRecord requests issued; auto-subscribes listblock
+    let created = pds.created_records.lock();
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0]["collection"], "app.bsky.graph.listblock");
+    assert_eq!(created[0]["record"]["subject"], uri);
 
     // Existing list is now cached locally
     let cached = manager.get_mod_list("did:plc:alice").unwrap().unwrap();
@@ -248,12 +253,13 @@ async fn test_bounce_user_success_and_cache_population() {
     let listitem_uri = res.unwrap();
     assert!(listitem_uri.starts_with("at://did:plc:alice/app.bsky.graph.listitem/"));
 
-    // Verify 2 PDS creations: list + listitem
+    // Verify 3 PDS creations: list + listblock + listitem
     let records = pds.created_records.lock();
-    assert_eq!(records.len(), 2);
+    assert_eq!(records.len(), 3);
     assert_eq!(records[0]["collection"], "app.bsky.graph.list");
-    assert_eq!(records[1]["collection"], "app.bsky.graph.listitem");
-    assert_eq!(records[1]["record"]["subject"], "did:plc:violator_crypto");
+    assert_eq!(records[1]["collection"], "app.bsky.graph.listblock");
+    assert_eq!(records[2]["collection"], "app.bsky.graph.listitem");
+    assert_eq!(records[2]["record"]["subject"], "did:plc:violator_crypto");
 
     // Verify cache record
     assert!(manager.is_bounced("did:plc:violator_crypto").unwrap());
@@ -287,7 +293,7 @@ async fn test_bounce_user_deduplication_drops_redundant_writes() {
         .await
         .unwrap();
     assert!(res1.is_some());
-    assert_eq!(pds.created_records.lock().len(), 2); // 1 list + 1 listitem
+    assert_eq!(pds.created_records.lock().len(), 3); // 1 list + 1 listblock + 1 listitem
 
     // Second bounce: same candidate DID drops immediately at zero cost
     let res2 = manager
@@ -303,7 +309,7 @@ async fn test_bounce_user_deduplication_drops_redundant_writes() {
         .await
         .unwrap();
     assert!(res2.is_none());
-    assert_eq!(pds.created_records.lock().len(), 2); // No new PDS requests
+    assert_eq!(pds.created_records.lock().len(), 3); // No new PDS requests
 }
 
 #[tokio::test]

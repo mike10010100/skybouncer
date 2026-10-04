@@ -521,6 +521,31 @@ impl ListItemRecord {
     }
 }
 
+/// ATProto list block record model (`app.bsky.graph.listblock`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListBlockRecord {
+    /// Optional lexicon type discriminator.
+    #[serde(rename = "$type", default, skip_serializing_if = "Option::is_none")]
+    pub record_type: Option<String>,
+    /// Canonical AT-URI of the moderation list being blocked (`at://{did}/app.bsky.graph.list/{rkey}`).
+    pub subject: String,
+    /// ISO-8601 creation timestamp.
+    pub created_at: String,
+}
+
+impl ListBlockRecord {
+    /// Creates a new [`ListBlockRecord`] targeting a moderation list AT-URI.
+    #[must_use]
+    pub fn new(subject: impl Into<String>, created_at: impl Into<String>) -> Self {
+        Self {
+            record_type: Some("app.bsky.graph.listblock".to_string()),
+            subject: subject.into(),
+            created_at: created_at.into(),
+        }
+    }
+}
+
 /// A record item returned by `com.atproto.repo.listRecords`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepoRecordItem<T = serde_json::Value> {

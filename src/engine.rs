@@ -1611,6 +1611,21 @@ impl SkybouncerEngine {
             .await
     }
 
+    /// Ensures that an `app.bsky.graph.listblock` record exists on the sovereign PDS to auto-block list members.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if listblock creation fails.
+    pub async fn ensure_list_blocked(
+        &self,
+        protected_did: &str,
+        list_uri: &str,
+    ) -> Result<(), SkybouncerError> {
+        let pds_client = self.pds_client_for(protected_did);
+        self.modlist_manager
+            .ensure_list_blocked(&pds_client, protected_did, list_uri)
+            .await
+    }
+
     /// Returns `true` if this engine operates in shadow dry-run mode.
     #[must_use]
     pub fn is_dry_run(&self) -> bool {

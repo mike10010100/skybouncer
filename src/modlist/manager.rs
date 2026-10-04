@@ -13,7 +13,9 @@ use tracing::{debug, info, instrument};
 use crate::classifier::{RuleRubric, ViolationCategory};
 use crate::error::SkybouncerError;
 use crate::modlist::cache::{BouncedUser, DeduplicationCache, ModListConfig};
-use crate::types::{now_iso8601, ListItemRecord, ListRecordsResponse, ModListRecord};
+use crate::types::{
+    now_iso8601, ListBlockRecord, ListItemRecord, ListRecordsResponse, ModListRecord,
+};
 
 /// Default name assigned to newly provisioned moderation lists.
 pub const DEFAULT_MOD_LIST_NAME: &str = "Skybouncer Moderation List";
@@ -217,6 +219,9 @@ impl ModListManager {
                 list_uri = %config.list_uri,
                 "Found existing moderation list in SQLite cache"
             );
+            let _ = self
+                .ensure_list_blocked(pds_client, protected_did, &config.list_uri)
+                .await;
             return Ok(config.list_uri);
         }
 
@@ -230,6 +235,9 @@ impl ModListManager {
                 list_uri = %config.list_uri,
                 "Found moderation list provisioned by concurrent task in SQLite cache"
             );
+            let _ = self
+                .ensure_list_blocked(pds_client, protected_did, &config.list_uri)
+                .await;
             return Ok(config.list_uri);
         }
 
@@ -248,6 +256,9 @@ impl ModListManager {
                 list_uri = %simulated_uri,
                 "🛡️ [SHADOW MODE] Simulated moderation list on sovereign PDS"
             );
+            let _ = self
+                .ensure_list_blocked(pds_client, protected_did, &simulated_uri)
+                .await;
             return Ok(simulated_uri);
         }
 
@@ -269,6 +280,9 @@ impl ModListManager {
                         created_at: now_us,
                     };
                     self.cache.set_mod_list(&config)?;
+                    let _ = self
+                        .ensure_list_blocked(pds_client, protected_did, &item.uri)
+                        .await;
                     return Ok(item.uri);
                 }
             }
@@ -307,8 +321,90 @@ impl ModListManager {
             created_at: now_us,
         };
         self.cache.set_mod_list(&config)?;
+        let _ = self
+            .ensure_list_blocked(pds_client, protected_did, &result.uri)
+            .await;
 
         Ok(result.uri)
+    }
+
+    /// Ensures that an `app.bsky.graph.listblock` record exists on the protected user's PDS,
+    /// activating automatic blocking for all violators placed on this moderation list.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Repo`] if PDS record creation fails,
+    /// or [`SkybouncerError::Database`] if cache access fails.
+    #[instrument(skip(self, pds_client), fields(protected_did = %protected_did, list_uri = %list_uri))]
+    pub async fn ensure_list_blocked(
+        &self,
+        pds_client: &PdsRepoClient,
+        protected_did: &str,
+        list_uri: &str,
+    ) -> Result<(), SkybouncerError> {
+        // Fast path: already confirmed and cached locally
+        if self.cache.is_list_blocked(protected_did)? {
+            debug!(
+                protected_did = %protected_did,
+                list_uri = %list_uri,
+                "Listblock auto-blocking is already active in SQLite cache"
+            );
+            return Ok(());
+        }
+
+        if self.dry_run {
+            self.cache.set_list_blocked(protected_did, list_uri)?;
+            info!(
+                protected_did = %protected_did,
+                list_uri = %list_uri,
+                "🛡️ [SHADOW MODE] Simulated listblock auto-blocking subscription on sovereign PDS"
+            );
+            return Ok(());
+        }
+
+        // Check if remote PDS already has a listblock targeting this list_uri
+        if let Ok(resp) = self
+            .list_pds_records::<ListBlockRecord>(pds_client, "app.bsky.graph.listblock", 50)
+            .await
+        {
+            for item in resp.records {
+                if item.value.subject == list_uri {
+                    info!(
+                        protected_did = %protected_did,
+                        list_uri = %list_uri,
+                        "Discovered existing remote listblock on PDS; caching locally"
+                    );
+                    self.cache.set_list_blocked(protected_did, list_uri)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        info!(
+            protected_did = %protected_did,
+            list_uri = %list_uri,
+            "Auto-subscribing sovereign PDS to listblock for automated defense"
+        );
+
+        let rkey = skybase::repo::generate_tid();
+        let now_iso = now_iso8601();
+        let block_record = ListBlockRecord::new(list_uri, now_iso);
+
+        let _ = pds_client
+            .create_record("app.bsky.graph.listblock", Some(&rkey), &block_record, true)
+            .await
+            .map_err(|e| {
+                SkybouncerError::Repo(format!("Failed to auto-subscribe listblock on PDS: {e}"))
+            })?;
+
+        self.cache.set_list_blocked(protected_did, list_uri)?;
+
+        info!(
+            protected_did = %protected_did,
+            list_uri = %list_uri,
+            "Successfully activated auto-blocking listblock on sovereign PDS"
+        );
+
+        Ok(())
     }
 
     /// Bounces a violating account by adding an `app.bsky.graph.listitem` to the protected user's

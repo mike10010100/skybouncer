@@ -377,6 +377,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
               <span style="font-size: 1.2rem; font-weight: 700;" id="tenant-banner-name">@handle</span>
               <span id="tenant-role-badge" class="status-badge" style="background: rgba(99, 102, 241, 0.2); color: var(--accent);">Protected Tenant</span>
               <span id="tenant-status-badge" class="status-badge" style="background: var(--success-bg); color: var(--success);">🟢 Defenses Active</span>
+              <span id="tenant-block-badge" class="status-badge" style="background: rgba(16, 185, 129, 0.15); color: var(--success); display: none;">🛡️ Auto-Block Active</span>
             </div>
             <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.35rem; display: flex; align-items: center; gap: 0.85rem; flex-wrap: wrap;">
               <span id="tenant-did-display" style="font-family: monospace; background: rgba(0,0,0,0.25); padding: 0.15rem 0.4rem; border-radius: 4px;">did:plc:...</span>
@@ -980,11 +981,24 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       const didDisplay = document.getElementById("tenant-did-display");
       if (didDisplay) didDisplay.innerText = user.did || "";
 
+      const blockBadge = document.getElementById("tenant-block-badge");
+      if (blockBadge) {
+        if (user.is_list_blocked) {
+          blockBadge.style.display = "inline-flex";
+          blockBadge.innerText = "🛡️ Auto-Block Active";
+          blockBadge.style.background = "rgba(16, 185, 129, 0.15)";
+          blockBadge.style.color = "var(--success)";
+        } else {
+          blockBadge.style.display = "none";
+        }
+      }
+
       const modContainer = document.getElementById("tenant-modlist-link-container");
       if (modContainer) {
         if (user.mod_list_uri) {
           const webUrl = formatModListUrl(user.mod_list_uri);
-          modContainer.innerHTML = `<a href="${escapeHtml(webUrl)}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); font-weight: 600; text-decoration: none;">📋 Mod List &nearr;</a>`;
+          const blockNote = user.is_list_blocked ? " • Auto-Block Active on Bluesky" : "";
+          modContainer.innerHTML = `<a href="${escapeHtml(webUrl)}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); font-weight: 600; text-decoration: none;">📋 Mod List &nearr;</a><span style="color: var(--text-muted); font-size: 0.75rem;">${escapeHtml(blockNote)}</span>`;
         } else {
           modContainer.innerHTML = `<span style="color: var(--text-muted);">📋 Mod list auto-provisions on first bounce</span>`;
         }

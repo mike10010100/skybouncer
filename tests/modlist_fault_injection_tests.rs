@@ -512,11 +512,12 @@ async fn test_rapid_oscillating_bounce_pardon_bounce_lifecycle() {
     }
 
     // Verify total PDS mutations across 5 cycles:
-    // 1 list creation (in cycle 1) + 5 listitem creations + 5 listitem deletions
+    // 1 list creation (in cycle 1) + 1 listblock auto-subscription + 5 listitem creations + 5 listitem deletions
     let created = pds.created_records.lock();
-    assert_eq!(created.len(), 6); // 1 list + 5 listitems
+    assert_eq!(created.len(), 7); // 1 list + 1 listblock + 5 listitems
     assert_eq!(created[0]["collection"], "app.bsky.graph.list");
-    for item in &created[1..] {
+    assert_eq!(created[1]["collection"], "app.bsky.graph.listblock");
+    for item in &created[2..] {
         assert_eq!(item["collection"], "app.bsky.graph.listitem");
         assert_eq!(item["record"]["subject"], target_did);
     }

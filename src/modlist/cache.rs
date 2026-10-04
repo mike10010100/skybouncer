@@ -191,6 +191,12 @@ impl DeduplicationCache {
 
             CREATE INDEX IF NOT EXISTS idx_evaluation_cache_author
                 ON evaluation_cache(author_did);
+
+            CREATE TABLE IF NOT EXISTS listblock_cache (
+                user_did TEXT PRIMARY KEY,
+                list_uri TEXT NOT NULL,
+                blocked_at INTEGER NOT NULL
+            );
             ",
         )
         .map_err(|e| {
@@ -252,6 +258,48 @@ impl DeduplicationCache {
             created_at_i64,
         ])?;
 
+        Ok(())
+    }
+
+    /// Checks whether an automatic `app.bsky.graph.listblock` subscription is cached for the user.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    pub fn is_list_blocked(&self, user_did: &str) -> Result<bool, SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare_cached("SELECT 1 FROM listblock_cache WHERE user_did = ?1 LIMIT 1;")
+            .map_err(|e| {
+                SkybouncerError::Database(format!("Failed to prepare listblock query: {e}"))
+            })?;
+
+        let exists = stmt
+            .query_row(params![user_did], |_| Ok(()))
+            .optional()
+            .map_err(|e| {
+                SkybouncerError::Database(format!("Failed to check listblock cache: {e}"))
+            })?
+            .is_some();
+
+        Ok(exists)
+    }
+
+    /// Records an active `app.bsky.graph.listblock` subscription for the user.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the SQLite execution fails.
+    pub fn set_list_blocked(&self, user_did: &str, list_uri: &str) -> Result<(), SkybouncerError> {
+        let now_us = current_time_us();
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO listblock_cache (user_did, list_uri, blocked_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_did) DO UPDATE SET
+                 list_uri = excluded.list_uri,
+                 blocked_at = excluded.blocked_at;",
+        )?;
+
+        stmt.execute(params![user_did, list_uri, now_us])?;
         Ok(())
     }
 

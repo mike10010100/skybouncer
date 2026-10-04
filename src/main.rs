@@ -814,9 +814,18 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
         }
     }
 
-    // Ensure moderation list exists on PDS for configured protected DIDs
-    if !config.dry_run && config.pds_endpoint.is_some() && config.pds_access_token.is_some() {
-        for did in &config.protected_dids {
+    // Ensure moderation list and listblock exist on PDS for configured protected DIDs and enrolled tenants
+    if !config.dry_run {
+        let mut all_dids = config.protected_dids.clone();
+        if let Ok(tenants) = engine.tenant_registry().list_all() {
+            for t in tenants {
+                if t.session.is_some() {
+                    all_dids.insert(t.did);
+                }
+            }
+        }
+
+        for did in &all_dids {
             match engine.ensure_mod_list(did).await {
                 Ok(list_uri) => {
                     info!(
@@ -824,6 +833,13 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
                         list_uri = %list_uri,
                         "Moderation list verified on sovereign PDS"
                     );
+                    if let Err(e) = engine.ensure_list_blocked(did, &list_uri).await {
+                        warn!(
+                            did = %did,
+                            error = %e,
+                            "Could not verify auto-blocking listblock on PDS"
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!(
