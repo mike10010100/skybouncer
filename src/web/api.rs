@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::classifier::{RuleRubric, Sensitivity, Verdict};
 use crate::engine::{EngineStatsSnapshot, SkybouncerEngine};
 use crate::matcher::{Interaction, InteractionType};
+use crate::modlist::cache::{EvaluationLogEntry, NewEvaluationLog};
 use crate::modlist::BouncedUser;
 
 /// Shared application state injected into web route handlers.
@@ -507,8 +508,8 @@ pub async fn simulate_interaction(
     let synthetic_interaction = Interaction {
         post_uri: "at://did:plc:sample/app.bsky.feed.post/sample123".to_string(),
         post_cid: Some("bafysample123".to_string()),
-        author_did,
-        target_did,
+        author_did: author_did.clone(),
+        target_did: target_did.clone(),
         text: text.to_string(),
         interaction_type: InteractionType::DirectReply,
         parent_uri: None,
@@ -554,6 +555,45 @@ pub async fn simulate_interaction(
                 confidence: 0.0,
                 reason: "Bypassed: Heuristic regex pre-filter matched instantly (0ms)".to_string(),
             };
+            let target_handle = state
+                .engine
+                .tenant_registry()
+                .get(&target_did)
+                .ok()
+                .flatten()
+                .and_then(|t| t.handle)
+                .unwrap_or_default();
+
+            let _ = state
+                .engine
+                .cache()
+                .record_evaluation_log(&NewEvaluationLog {
+                    timestamp_us: crate::modlist::cache::current_time_us(),
+                    source: "simulation".to_string(),
+                    post_uri: format!("at://{author_did}/app.bsky.feed.post/simulated"),
+                    post_text: text.to_string(),
+                    author_did: author_did.clone(),
+                    author_handle: "simulated-test.bsky.social".to_string(),
+                    target_did: target_did.clone(),
+                    target_handle,
+                    has_images: images_evaluated > 0,
+                    primary_model: "heuristic_prefilter".to_string(),
+                    primary_action: "violation".to_string(),
+                    primary_confidence: 1.0,
+                    primary_category: category.to_string(),
+                    primary_reason: reason.clone(),
+                    escalated: false,
+                    escalation_reason: Some("Heuristic regex instant match".to_string()),
+                    fallback_model: None,
+                    fallback_action: None,
+                    fallback_confidence: None,
+                    fallback_category: None,
+                    fallback_reason: None,
+                    final_action: "violation".to_string(),
+                    final_confidence: 1.0,
+                    outcome: "Simulated: Would Bounce (Regex Pre-filter)".to_string(),
+                });
+
             return Ok(Json(SimulateResponse {
                 violates: true,
                 category: Some(category.to_string()),
@@ -597,12 +637,12 @@ pub async fn simulate_interaction(
 
     let tier1 = TierStageDetail {
         stage_name: "Tier 1 • System-1 Fast Text".to_string(),
-        model: detailed.primary_model,
+        model: detailed.primary_model.clone(),
         status: tier1_status,
         violates: tier1_violates,
-        category: tier1_cat,
+        category: tier1_cat.clone(),
         confidence: tier1_conf,
-        reason: tier1_reason,
+        reason: tier1_reason.clone(),
     };
 
     let tier2 = if detailed.escalated {
@@ -649,6 +689,96 @@ pub async fn simulate_interaction(
             }),
         }
     };
+
+    let target_handle = state
+        .engine
+        .tenant_registry()
+        .get(&target_did)
+        .ok()
+        .flatten()
+        .and_then(|t| t.handle)
+        .unwrap_or_default();
+
+    let final_violates = detailed.final_verdict.is_violation();
+    #[allow(clippy::cast_possible_truncation)]
+    let final_confidence_f32 = detailed
+        .final_verdict
+        .confidence()
+        .map_or(1.0, |c| c as f32);
+
+    let sim_outcome_str = match &detailed.final_verdict {
+        Verdict::Violation {
+            category,
+            confidence,
+            ..
+        } => {
+            if rubric.meets_threshold(category, *confidence) {
+                "Simulated: Would Bounce"
+            } else {
+                "Simulated: Below Rubric Threshold"
+            }
+        }
+        Verdict::Permitted { .. } => "Simulated: Permitted",
+    };
+
+    #[allow(clippy::cast_possible_truncation)]
+    let fallback_confidence_f32 = detailed
+        .fallback_verdict
+        .as_ref()
+        .and_then(|v| v.confidence().map(|c| c as f32));
+
+    #[allow(clippy::cast_possible_truncation)]
+    let primary_conf_f32 = tier1_conf as f32;
+
+    let _ = state
+        .engine
+        .cache()
+        .record_evaluation_log(&NewEvaluationLog {
+            timestamp_us: crate::modlist::cache::current_time_us(),
+            source: "simulation".to_string(),
+            post_uri: format!("at://{author_did}/app.bsky.feed.post/simulated"),
+            post_text: text.to_string(),
+            author_did: author_did.clone(),
+            author_handle: "simulated-test.bsky.social".to_string(),
+            target_did: target_did.clone(),
+            target_handle,
+            has_images: images_evaluated > 0,
+            primary_model: detailed.primary_model.clone(),
+            primary_action: if tier1_violates {
+                "violation".to_string()
+            } else {
+                "allow".to_string()
+            },
+            primary_confidence: primary_conf_f32,
+            primary_category: tier1_cat.clone().unwrap_or_default(),
+            primary_reason: tier1_reason.clone(),
+            escalated: detailed.escalated,
+            escalation_reason: detailed.escalation_reason.clone(),
+            fallback_model: detailed.fallback_model.clone(),
+            fallback_action: detailed.fallback_verdict.as_ref().map(|v| {
+                if v.is_violation() {
+                    "violation".to_string()
+                } else {
+                    "allow".to_string()
+                }
+            }),
+            fallback_confidence: fallback_confidence_f32,
+            fallback_category: detailed
+                .fallback_verdict
+                .as_ref()
+                .and_then(|v| v.category().map(|c| c.to_string())),
+            fallback_reason: detailed
+                .fallback_verdict
+                .as_ref()
+                .map(|v| v.reason().to_string()),
+            final_action: if final_violates {
+                "violation".to_string()
+            } else {
+                "allow".to_string()
+            },
+            final_confidence: final_confidence_f32,
+            outcome: sim_outcome_str.to_string(),
+        });
 
     match detailed.final_verdict {
         Verdict::Violation {
@@ -977,6 +1107,66 @@ pub async fn get_admin_tenants(
         monitored_count,
         tenants: summaries,
     }))
+}
+
+/// Query parameters for administrative evaluation log requests.
+#[derive(Debug, Deserialize, Default)]
+pub struct AdminEvaluationsQuery {
+    /// Active authenticated caller DID (or session parameter).
+    pub did: Option<String>,
+    /// Optional target DID filter.
+    pub target_did: Option<String>,
+    /// Optional source filter: "all", "live", or "simulation".
+    pub source: Option<String>,
+    /// Max entries to return (default: 50, max: 200).
+    pub limit: Option<usize>,
+    /// Pagination offset.
+    pub offset: Option<usize>,
+}
+
+/// Response payload containing evaluation logs for administrative audit.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminEvaluationsResponse {
+    /// Total count of evaluation logs matching filter.
+    pub total: usize,
+    /// List of evaluation log entries.
+    pub evaluations: Vec<EvaluationLogEntry>,
+}
+
+/// Handler for `GET /api/admin/evaluations`: returns comprehensive Tier 1 & Tier 2 evaluation log (admin only).
+pub async fn get_admin_evaluations(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminEvaluationsQuery>,
+) -> Result<Json<AdminEvaluationsResponse>, (StatusCode, String)> {
+    let did_opt = extract_did_from_headers(&headers, query.did.as_deref());
+    let caller_did = did_opt.unwrap_or_default();
+
+    if !state.engine.is_admin(&caller_did) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Administrator privileges required to access evaluation audit logs".to_string(),
+        ));
+    }
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0);
+    let target_filter = query.target_did.as_deref();
+    let source_filter = query.source.as_deref();
+
+    let total = state
+        .engine
+        .cache()
+        .count_evaluation_logs(target_filter, source_filter)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let evaluations = state
+        .engine
+        .cache()
+        .list_evaluation_logs(target_filter, source_filter, limit, offset)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(AdminEvaluationsResponse { total, evaluations }))
 }
 
 /// Handler for `POST /api/tenant/toggle`: toggles defense active/paused state for a tenant.

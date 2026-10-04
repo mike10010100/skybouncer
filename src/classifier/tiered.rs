@@ -356,6 +356,14 @@ impl Classifier for TieredClassifier {
         self.evaluate_tiered(interaction, false).await
     }
 
+    async fn classify_detailed_with_stats(
+        &self,
+        interaction: &Interaction,
+        record_stats: bool,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        self.evaluate_tiered(interaction, record_stats).await
+    }
+
     fn set_rubric(&self, rubric: RuleRubric) {
         self.primary.set_rubric(rubric.clone());
         self.fallback.set_rubric(rubric);

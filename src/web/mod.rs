@@ -21,10 +21,10 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 pub use api::{
-    health_check, AdminTenantsResponse, ApiState, BouncesQuery, HealthResponse, PardonRequest,
-    PardonResponse, RulesResponse, SimulateRequest, SimulateResponse, StatusResponse,
-    TenantSummary, ToggleTenantRequest, ToggleTenantResponse, UpdateRulesRequest,
-    UserSessionResponse,
+    health_check, AdminEvaluationsQuery, AdminEvaluationsResponse, AdminTenantsResponse, ApiState,
+    BouncesQuery, HealthResponse, PardonRequest, PardonResponse, RulesResponse, SimulateRequest,
+    SimulateResponse, StatusResponse, TenantSummary, ToggleTenantRequest, ToggleTenantResponse,
+    UpdateRulesRequest, UserSessionResponse,
 };
 pub use oauth::{LoginQuery, OAuthState};
 pub use ui::serve_dashboard;
@@ -177,6 +177,7 @@ pub fn create_web_router(
         .route("/simulate", post(api::simulate_interaction))
         .route("/me", get(api::get_current_user))
         .route("/admin/tenants", get(api::get_admin_tenants))
+        .route("/admin/evaluations", get(api::get_admin_evaluations))
         .route("/tenant/toggle", post(api::toggle_tenant))
         .route("/auth/logout", post(api::logout))
         .with_state(api_state);

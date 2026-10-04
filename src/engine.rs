@@ -1342,7 +1342,74 @@ impl SkybouncerEngine {
                     .violations_detected
                     .fetch_add(1, Ordering::Relaxed);
                 debug!("Heuristic regex pre-filter detected violation at zero cost");
-                heuristic_verdict
+
+                // Cache the verdict with configured TTL
+                let _ = self.cache.set_evaluation(
+                    &post_uri,
+                    &author_did,
+                    &heuristic_verdict,
+                    self.config.evaluation_ttl,
+                );
+
+                let outcome = self
+                    .act_on_verdict(&interaction, heuristic_verdict.clone())
+                    .await;
+
+                let outcome_str = match &outcome {
+                    Ok(InteractionOutcome::Bounced { .. }) => "Bounced (Regex Pre-filter)",
+                    Ok(InteractionOutcome::BelowThreshold { .. }) => {
+                        "Below Threshold (Regex Pre-filter)"
+                    }
+                    Ok(InteractionOutcome::AlreadyBounced { .. }) => "Already Bounced",
+                    Ok(InteractionOutcome::RateLimited { .. }) => "Rate Limited",
+                    Ok(InteractionOutcome::Paused { .. }) => "Paused",
+                    Ok(InteractionOutcome::Permitted { .. }) => "Permitted",
+                    Ok(InteractionOutcome::Bypassed { .. }) => "Bypassed",
+                    Ok(InteractionOutcome::QueuedForEvaluation { .. }) => "Queued",
+                    Ok(InteractionOutcome::QueueOverflow { .. }) => "Queue Overflow",
+                    Err(_) => "Error (Regex Pre-filter)",
+                };
+
+                let target_handle = self
+                    .tenant_registry
+                    .get(&target_did)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.handle)
+                    .unwrap_or_default();
+
+                let log_entry = crate::modlist::cache::NewEvaluationLog {
+                    timestamp_us: crate::modlist::cache::current_time_us(),
+                    source: "live".to_string(),
+                    post_uri: interaction.post_uri.clone(),
+                    post_text: interaction.text.clone(),
+                    author_did: interaction.author_did.clone(),
+                    author_handle: String::new(),
+                    target_did: interaction.target_did.clone(),
+                    target_handle,
+                    has_images: interaction.has_images(),
+                    primary_model: "heuristic_prefilter".to_string(),
+                    primary_action: "violation".to_string(),
+                    primary_confidence: 1.0,
+                    primary_category: heuristic_verdict
+                        .category()
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                    primary_reason: heuristic_verdict.reason().to_string(),
+                    escalated: false,
+                    escalation_reason: Some("Heuristic regex instant match".to_string()),
+                    fallback_model: None,
+                    fallback_action: None,
+                    fallback_confidence: None,
+                    fallback_category: None,
+                    fallback_reason: None,
+                    final_action: "violation".to_string(),
+                    final_confidence: 1.0,
+                    outcome: outcome_str.to_string(),
+                };
+                let _ = self.cache.record_evaluation_log(&log_entry);
+
+                return outcome;
             } else {
                 // Tier 4: Per-User Evaluation Rate Limiter (Anti-Denial-of-Wallet, PRD §5.2)
                 if !self.rate_limiter.check_and_record(&target_did) {
@@ -1423,9 +1490,9 @@ impl SkybouncerEngine {
         // Tier 7: Primary Model Evaluation
         self.stats.model_evaluations.fetch_add(1, Ordering::Relaxed);
         self.stats.tier1_evaluations.fetch_add(1, Ordering::Relaxed);
-        let model_verdict = self
+        let detailed_eval = self
             .classifier
-            .classify(&interaction)
+            .classify_detailed_with_stats(&interaction, true)
             .await
             .inspect_err(|_e| {
                 self.stats
@@ -1433,24 +1500,25 @@ impl SkybouncerEngine {
                     .fetch_add(1, Ordering::Relaxed);
             })?;
 
-        if model_verdict
-            .reason()
-            .contains("[Tiered Fallback: visual image]")
-        {
+        if detailed_eval.escalated {
             self.stats.tier2_evaluations.fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .tier2_image_escalations
-                .fetch_add(1, Ordering::Relaxed);
-        } else if model_verdict
-            .reason()
-            .contains("[Tiered Fallback: uncertainty escalation]")
-        {
-            self.stats.tier2_evaluations.fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .tier2_uncertainty_escalations
-                .fetch_add(1, Ordering::Relaxed);
+            if detailed_eval
+                .escalation_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("image")
+            {
+                self.stats
+                    .tier2_image_escalations
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.stats
+                    .tier2_uncertainty_escalations
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
 
+        let model_verdict = detailed_eval.final_verdict.clone();
         if model_verdict.is_violation() {
             self.stats
                 .violations_detected
@@ -1466,7 +1534,107 @@ impl SkybouncerEngine {
         );
 
         // Tier 8: Rubric Sensitivity Gate & Sovereign PDS Bounce
-        self.act_on_verdict(&interaction, model_verdict).await
+        let outcome = self
+            .act_on_verdict(&interaction, model_verdict.clone())
+            .await;
+
+        let outcome_str = match &outcome {
+            Ok(InteractionOutcome::Bounced { .. }) => "Bounced",
+            Ok(InteractionOutcome::Permitted { .. }) => "Permitted",
+            Ok(InteractionOutcome::BelowThreshold { .. }) => "Below Rubric Threshold",
+            Ok(InteractionOutcome::AlreadyBounced { .. }) => "Already Bounced",
+            Ok(InteractionOutcome::RateLimited { .. }) => "Rate Limited",
+            Ok(InteractionOutcome::Paused { .. }) => "Paused",
+            Ok(InteractionOutcome::Bypassed { .. }) => "Bypassed",
+            Ok(InteractionOutcome::QueuedForEvaluation { .. }) => "Queued",
+            Ok(InteractionOutcome::QueueOverflow { .. }) => "Queue Overflow",
+            Err(_) => "Error",
+        };
+
+        let author_handle = interaction
+            .enriched_context
+            .as_ref()
+            .and_then(|c| c.author.as_ref())
+            .and_then(|a| a.handle.clone())
+            .unwrap_or_default();
+
+        let target_handle = self
+            .tenant_registry
+            .get(&target_did)
+            .ok()
+            .flatten()
+            .and_then(|t| t.handle)
+            .unwrap_or_default();
+
+        #[allow(clippy::cast_possible_truncation)]
+        let primary_confidence = detailed_eval
+            .primary_verdict
+            .confidence()
+            .map_or(1.0, |c| c as f32);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let fallback_confidence = detailed_eval
+            .fallback_verdict
+            .as_ref()
+            .and_then(|v| v.confidence().map(|c| c as f32));
+
+        #[allow(clippy::cast_possible_truncation)]
+        let final_confidence = model_verdict.confidence().map_or(1.0, |c| c as f32);
+
+        let log_entry = crate::modlist::cache::NewEvaluationLog {
+            timestamp_us: crate::modlist::cache::current_time_us(),
+            source: "live".to_string(),
+            post_uri: interaction.post_uri.clone(),
+            post_text: interaction.text.clone(),
+            author_did: interaction.author_did.clone(),
+            author_handle,
+            target_did: interaction.target_did.clone(),
+            target_handle,
+            has_images: interaction.has_images(),
+            primary_model: detailed_eval.primary_model,
+            primary_action: if detailed_eval.primary_verdict.is_violation() {
+                "violation".to_string()
+            } else {
+                "allow".to_string()
+            },
+            primary_confidence,
+            primary_category: detailed_eval
+                .primary_verdict
+                .category()
+                .map(|c| c.to_string())
+                .unwrap_or_default(),
+            primary_reason: detailed_eval.primary_verdict.reason().to_string(),
+            escalated: detailed_eval.escalated,
+            escalation_reason: detailed_eval.escalation_reason,
+            fallback_model: detailed_eval.fallback_model,
+            fallback_action: detailed_eval.fallback_verdict.as_ref().map(|v| {
+                if v.is_violation() {
+                    "violation".to_string()
+                } else {
+                    "allow".to_string()
+                }
+            }),
+            fallback_confidence,
+            fallback_category: detailed_eval
+                .fallback_verdict
+                .as_ref()
+                .and_then(|v| v.category().map(|c| c.to_string())),
+            fallback_reason: detailed_eval
+                .fallback_verdict
+                .as_ref()
+                .map(|v| v.reason().to_string()),
+            final_action: if model_verdict.is_violation() {
+                "violation".to_string()
+            } else {
+                "allow".to_string()
+            },
+            final_confidence,
+            outcome: outcome_str.to_string(),
+        };
+
+        let _ = self.cache.record_evaluation_log(&log_entry);
+
+        outcome
     }
 
     /// Evaluates a classifier verdict against the rubric sensitivity threshold and executes PDS bounce if actionable.

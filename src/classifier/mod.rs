@@ -233,6 +233,19 @@ pub trait Classifier: Send + Sync {
         &self,
         interaction: &Interaction,
     ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        self.classify_detailed_with_stats(interaction, false).await
+    }
+
+    /// Returns detailed multi-tier inspection breakdown, optionally updating operational telemetry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkybouncerError`] if underlying model evaluation fails.
+    async fn classify_detailed_with_stats(
+        &self,
+        interaction: &Interaction,
+        _record_stats: bool,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
         let verdict = self.classify(interaction).await?;
         Ok(TieredEvaluationResult {
             primary_verdict: verdict.clone(),
@@ -266,6 +279,16 @@ impl<T: Classifier + ?Sized> Classifier for std::sync::Arc<T> {
         (**self).classify_detailed(interaction).await
     }
 
+    async fn classify_detailed_with_stats(
+        &self,
+        interaction: &Interaction,
+        record_stats: bool,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        (**self)
+            .classify_detailed_with_stats(interaction, record_stats)
+            .await
+    }
+
     fn set_rubric(&self, rubric: RuleRubric) {
         (**self).set_rubric(rubric);
     }
@@ -286,6 +309,16 @@ impl<T: Classifier + ?Sized> Classifier for Box<T> {
         interaction: &Interaction,
     ) -> Result<TieredEvaluationResult, SkybouncerError> {
         (**self).classify_detailed(interaction).await
+    }
+
+    async fn classify_detailed_with_stats(
+        &self,
+        interaction: &Interaction,
+        record_stats: bool,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        (**self)
+            .classify_detailed_with_stats(interaction, record_stats)
+            .await
     }
 
     fn set_rubric(&self, rubric: RuleRubric) {

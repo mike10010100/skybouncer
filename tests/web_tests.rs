@@ -826,7 +826,60 @@ async fn test_api_session_and_admin_endpoints() {
     assert_eq!(fleet.monitored_count, 1);
     assert_eq!(fleet.tenants[0].did, "did:plc:tenant456");
 
-    // 5b. Verify /api/status telemetry reports monitored_users_count for admin, but hides it for unauthenticated
+    // 5c. Non-admin accessing /api/admin/evaluations -> 403 Forbidden
+    let req_non_admin_evals = Request::builder()
+        .uri("/api/admin/evaluations?did=did:plc:tenant456")
+        .body(Body::empty())
+        .unwrap();
+    let resp_non_admin_evals = app.clone().oneshot(req_non_admin_evals).await.unwrap();
+    assert_eq!(resp_non_admin_evals.status(), StatusCode::FORBIDDEN);
+
+    // 5d. Admin accessing /api/admin/evaluations -> 200 OK
+    let req_admin_evals = Request::builder()
+        .uri("/api/admin/evaluations?did=did:plc:admin123")
+        .body(Body::empty())
+        .unwrap();
+    let resp_admin_evals = app.clone().oneshot(req_admin_evals).await.unwrap();
+    assert_eq!(resp_admin_evals.status(), StatusCode::OK);
+    let evals_bytes = axum::body::to_bytes(resp_admin_evals.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let evals_resp: skybouncer::web::AdminEvaluationsResponse =
+        serde_json::from_slice(&evals_bytes).unwrap();
+    assert_eq!(evals_resp.total, 0);
+
+    // 5e. Run a simulation and verify it is recorded in /api/admin/evaluations
+    let sim_payload = json!({
+        "text": "Testing simulation audit log integration",
+        "author_did": "did:plc:sim-tester",
+        "target_did": "did:plc:admin123"
+    });
+    let sim_req = Request::builder()
+        .method("POST")
+        .uri("/api/simulate")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&sim_payload).unwrap()))
+        .unwrap();
+    let sim_resp = app.clone().oneshot(sim_req).await.unwrap();
+    assert_eq!(sim_resp.status(), StatusCode::OK);
+
+    let req_admin_evals_after = Request::builder()
+        .uri("/api/admin/evaluations?did=did:plc:admin123")
+        .body(Body::empty())
+        .unwrap();
+    let resp_admin_evals_after = app.clone().oneshot(req_admin_evals_after).await.unwrap();
+    assert_eq!(resp_admin_evals_after.status(), StatusCode::OK);
+    let evals_after_bytes = axum::body::to_bytes(resp_admin_evals_after.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let evals_after: skybouncer::web::AdminEvaluationsResponse =
+        serde_json::from_slice(&evals_after_bytes).unwrap();
+    assert_eq!(evals_after.total, 1);
+    assert_eq!(evals_after.evaluations[0].source, "simulation");
+    assert_eq!(evals_after.evaluations[0].author_did, "did:plc:sim-tester");
+    assert_eq!(evals_after.evaluations[0].target_did, "did:plc:admin123");
+
+    // 5f. Verify /api/status telemetry reports monitored_users_count for admin, but hides it for unauthenticated
     let status_req_admin = Request::builder()
         .uri("/api/status")
         .header("x-skybouncer-did", "did:plc:admin123")

@@ -660,6 +660,47 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         </table>
       </div>
     </section>
+
+    <!-- Tier 1 & Tier 2 Evaluation Audit Log (Admin Only) -->
+    <section class="card" id="admin-eval-card" style="display: none; margin-top: 1.5rem;">
+      <div class="card-header" style="flex-wrap: wrap; gap: 0.75rem;">
+        <div>
+          <div class="card-title">👑 Tier 1 &amp; Tier 2 Evaluation Log</div>
+          <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.2rem;">
+            Full AI arbitration audit: <strong id="admin-total-evals">0</strong> evaluations recorded
+          </div>
+        </div>
+        <div style="display: flex; gap: 0.5rem; align-items: center;">
+          <select id="admin-eval-source-filter" class="form-input" style="width: auto; padding: 0.35rem 0.6rem; font-size: 0.8rem;" onchange="loadAdminEvaluations()">
+            <option value="all">All Sources</option>
+            <option value="live">Live Firehose</option>
+            <option value="simulation">Simulations</option>
+          </select>
+          <button class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="loadAdminEvaluations()">🔄 Refresh Logs</button>
+        </div>
+      </div>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Source</th>
+              <th>Protected User</th>
+              <th>Author</th>
+              <th>Offending Post</th>
+              <th>Tier 1 (System-1)</th>
+              <th>Tier 2 (Fallback)</th>
+              <th>Outcome</th>
+            </tr>
+          </thead>
+          <tbody id="admin-evals-table">
+            <tr>
+              <td colspan="8" style="text-align: center; color: var(--text-muted); padding: 2rem;">Loading evaluation logs...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
   </main>
 
   <div class="toast" id="toast">Changes saved</div>
@@ -1048,6 +1089,10 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           const tiersCont = document.getElementById("sim-tiers-container");
           if (tiersCont) tiersCont.style.display = "none";
         }
+
+        if (currentUser && currentUser.is_admin) {
+          loadAdminEvaluations();
+        }
       } catch (e) {
         console.error("Simulation failed", e);
       }
@@ -1204,10 +1249,15 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           if (data.is_admin) {
             const adminCard = document.getElementById("admin-fleet-card");
             if (adminCard) adminCard.style.display = "block";
+            const evalCard = document.getElementById("admin-eval-card");
+            if (evalCard) evalCard.style.display = "block";
             loadAdminTenants();
+            loadAdminEvaluations();
           } else {
             const adminCard = document.getElementById("admin-fleet-card");
             if (adminCard) adminCard.style.display = "none";
+            const evalCard = document.getElementById("admin-eval-card");
+            if (evalCard) evalCard.style.display = "none";
           }
         } else {
           currentUser = null;
@@ -1320,6 +1370,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       if (banner) banner.style.display = "none";
       const adminCard = document.getElementById("admin-fleet-card");
       if (adminCard) adminCard.style.display = "none";
+      const evalCard = document.getElementById("admin-eval-card");
+      if (evalCard) evalCard.style.display = "none";
       const monCard = document.getElementById("kpi-monitored-card");
       if (monCard) monCard.style.display = "none";
       renderRulesUnauthenticated();
@@ -1470,6 +1522,126 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
       }
       return uri;
+    }
+
+    async function loadAdminEvaluations() {
+      const storedDid = localStorage.getItem("skybouncer_did") || (currentUser && currentUser.did);
+      const sourceFilter = document.getElementById("admin-eval-source-filter")?.value || "all";
+      let url = "/api/admin/evaluations?limit=50&source=" + encodeURIComponent(sourceFilter);
+      if (storedDid) {
+        url += "&did=" + encodeURIComponent(storedDid);
+      }
+
+      try {
+        const res = await fetch(url);
+        if (!res.ok) {
+          if (res.status === 403) {
+            const evalCard = document.getElementById("admin-eval-card");
+            if (evalCard) evalCard.style.display = "none";
+          }
+          return;
+        }
+        const data = await res.json();
+        const totalEl = document.getElementById("admin-total-evals");
+        if (totalEl) totalEl.innerText = data.total.toLocaleString();
+
+        const tbody = document.getElementById("admin-evals-table");
+        if (!tbody) return;
+
+        if (!data.evaluations || data.evaluations.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: 2rem;">No evaluation logs recorded yet. Incoming interactions from Bluesky Jetstream firehose will appear here in real time.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = data.evaluations.map(renderEvaluationRow).join("");
+      } catch (e) {
+        console.error("Evaluation log load failed", e);
+      }
+    }
+
+    function renderEvaluationRow(ev) {
+      const ts = new Date(ev.timestamp_us / 1000).toLocaleString();
+      const isLive = ev.source === "live";
+      const sourceBadge = isLive
+        ? '<span class="status-badge" style="background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); font-size: 0.7rem;">📡 Live</span>'
+        : '<span class="status-badge" style="background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); font-size: 0.7rem;">🧪 Sim</span>';
+
+      const targetDisplay = ev.target_handle ? `@${escapeHtml(ev.target_handle)}` : formatDid(ev.target_did);
+      const targetLink = `https://bsky.app/profile/${encodeURIComponent(ev.target_handle || ev.target_did)}`;
+
+      const authorDisplay = ev.author_handle ? `@${escapeHtml(ev.author_handle)}` : formatDid(ev.author_did);
+      const authorLink = `https://bsky.app/profile/${encodeURIComponent(ev.author_handle || ev.author_did)}`;
+
+      const postLinkHtml = formatPostLink(ev.post_uri, ev.post_text);
+
+      const t1Violates = ev.primary_action === "violation";
+      const t1Badge = t1Violates
+        ? `<span class="status-badge badge-danger" style="font-size: 0.7rem;">Violation (${Math.round(ev.primary_confidence * 100)}%)</span>`
+        : `<span class="status-badge badge-success" style="font-size: 0.7rem;">Allow (${Math.round(ev.primary_confidence * 100)}%)</span>`;
+      const t1Category = ev.primary_category ? `<span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 500;">${escapeHtml(ev.primary_category)}</span>` : '';
+
+      let t2Html = '<span style="color: var(--text-muted); font-size: 0.8rem;">— Resolved in T1</span>';
+      if (ev.escalated) {
+        const t2Violates = ev.fallback_action === "violation";
+        const t2Badge = t2Violates
+          ? `<span class="status-badge badge-danger" style="font-size: 0.7rem;">Violation (${Math.round((ev.fallback_confidence || 0) * 100)}%)</span>`
+          : `<span class="status-badge badge-success" style="font-size: 0.7rem;">Allow (${Math.round((ev.fallback_confidence || 0) * 100)}%)</span>`;
+        const t2Category = ev.fallback_category ? `<span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 500;">${escapeHtml(ev.fallback_category)}</span>` : '';
+        const escReason = ev.escalation_reason || "Escalated";
+        t2Html = `
+          <div style="display: flex; flex-direction: column; gap: 0.2rem;">
+            <div style="display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap;">
+              <span class="status-badge" style="background: rgba(234, 179, 8, 0.15); color: #facc15; border: 1px solid rgba(234, 179, 8, 0.3); font-size: 0.7rem;" title="${escapeHtml(escReason)}">⚠️ ${escapeHtml(escReason)}</span>
+              <code style="font-size: 0.7rem;">${escapeHtml(ev.fallback_model || "")}</code>
+            </div>
+            <div style="display: flex; align-items: center; gap: 0.35rem;">${t2Badge} ${t2Category}</div>
+            <div style="font-size: 0.75rem; color: var(--text-muted); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(ev.fallback_reason || '')}">
+              ${escapeHtml(ev.fallback_reason || '')}
+            </div>
+          </div>
+        `;
+      }
+
+      let outcomeBadge = `<span class="status-badge" style="font-size: 0.75rem;">${escapeHtml(ev.outcome)}</span>`;
+      if (ev.outcome.includes("Bounced")) {
+        outcomeBadge = `<span class="status-badge badge-danger" style="font-size: 0.75rem;">🚫 ${escapeHtml(ev.outcome)}</span>`;
+      } else if (ev.outcome.includes("Below") || ev.outcome.includes("Skipped")) {
+        outcomeBadge = `<span class="status-badge badge-warning" style="font-size: 0.75rem;">🛡️ ${escapeHtml(ev.outcome)}</span>`;
+      } else if (ev.outcome.includes("Permitted") || ev.outcome.includes("Allow")) {
+        outcomeBadge = `<span class="status-badge badge-success" style="font-size: 0.75rem;">✅ ${escapeHtml(ev.outcome)}</span>`;
+      }
+
+      return `
+        <tr>
+          <td style="font-size: 0.75rem; white-space: nowrap; color: var(--text-muted);">${escapeHtml(ts)}</td>
+          <td>${sourceBadge}</td>
+          <td style="font-size: 0.8rem; white-space: nowrap;">
+            <a href="${targetLink}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); text-decoration: none;">
+              ${targetDisplay}
+            </a>
+          </td>
+          <td style="font-size: 0.8rem; white-space: nowrap;">
+            <a href="${authorLink}" target="_blank" rel="noopener noreferrer" style="color: var(--text-color); text-decoration: none;">
+              ${authorDisplay}
+            </a>
+          </td>
+          <td>${postLinkHtml}</td>
+          <td>
+            <div style="display: flex; flex-direction: column; gap: 0.2rem;">
+              <div style="display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap;">
+                <code style="font-size: 0.7rem;">${escapeHtml(ev.primary_model)}</code>
+                ${t1Badge}
+              </div>
+              <div>${t1Category}</div>
+              <div style="font-size: 0.75rem; color: var(--text-muted); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(ev.primary_reason)}">
+                ${escapeHtml(ev.primary_reason)}
+              </div>
+            </div>
+          </td>
+          <td>${t2Html}</td>
+          <td>${outcomeBadge}</td>
+        </tr>
+      `;
     }
 
     function formatDate(isoStr) {
