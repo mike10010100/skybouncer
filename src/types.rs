@@ -143,6 +143,15 @@ impl Facet {
         Self { index, features }
     }
 
+    /// Creates a new link facet spanning byte range `[byte_start, byte_end)` pointing to `uri`.
+    #[must_use]
+    pub fn link(byte_start: usize, byte_end: usize, uri: impl Into<String>) -> Self {
+        Self {
+            index: ByteSlice::new(byte_start, byte_end),
+            features: vec![FacetFeature::Link { uri: uri.into() }],
+        }
+    }
+
     /// Returns an iterator over all mentioned DIDs in this facet.
     pub fn mentioned_dids(&self) -> impl Iterator<Item = &str> {
         self.features

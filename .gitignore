@@ -13,3 +13,6 @@
 mutants.out/
 mutants.out.old/
 mutants.out.*/
+
+# Teamwork scratch artifacts
+.agents/

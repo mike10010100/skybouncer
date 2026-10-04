@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.13] - 2026-10-04
+
+### Added & Fixed
+
+- **Dedicated Line Formatting for DM Onboarding Links**:
+  - Isolated authorization URL onto its own clean line in `cmd_onboarding` without leading emoji or adjacent characters, preventing client-side autolink parsing glitches.
+- **ATProto Rich Text Link Facets (`app.bsky.richtext.facet#link`)**:
+  - Added `Facet`, `FacetIndex`, `FacetFeature`, and `LinkFacetFeature` structures conforming to the ATProto `app.bsky.richtext.facet` schema.
+  - Implemented `extract_link_facets` to detect HTTP/HTTPS URLs with exact UTF-8 byte boundary calculations (`byteStart`, `byteEnd`), correctly trimming trailing terminal punctuation, unbalanced brackets, and CJK fullwidth characters.
+  - Integrated automatic link facet generation into `ChatClient::send_message` so Bluesky mobile and web clients render links as native clickable hyperlinks.
+- **Integration Tests**:
+  - Added WireMock integration tests in `tests/bot_tests.rs` verifying wire-level facet payload transmission and multi-byte offset calculations.
+
 ## [0.1.12] - 2026-10-04
 
 ### Fixed & Enhanced

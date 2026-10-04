@@ -813,7 +813,7 @@ impl BotCommandHandler {
             "👋 Welcome to **Skybouncer** — your personal, sovereign automated bouncer for Bluesky!\n\n\
              Skybouncer monitors your incoming replies and mentions in real-time, using AI and your custom natural-language rules to catch spam bots, crypto schemes, and bad-faith harassment, placing them on your personal moderation list.\n\n\
              To activate 1-click protection for your account (`{sender_did}`), authorize Skybouncer here:\n\
-             🔗 {auth_url}\n\n\
+             {auth_url}\n\n\
              Once authorized, your personal bouncer is live! You can message me anytime right here with:\n\
              • `rules` — View or update your moderation prompt\n\
              • `pause` / `resume` — Suspend or re-enable protection\n\
