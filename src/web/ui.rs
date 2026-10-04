@@ -1336,8 +1336,9 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         const profileUrl = bskyProfileUrl(b.subject_did);
         const postLinkHtml = formatPostLink(b.post_uri, b.post_text);
         const ttlBadge = b.expires_at ?
-          `<span class="status-badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; font-size: 0.7rem; margin-left: 0.35rem;" title="Expires at ${new Date(b.expires_at / 1000).toLocaleString()}">⏳ TTL</span>` :
+          `<span class="status-badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; font-size: 0.7rem; margin-left: 0.35rem;" title="Expires at ${escapeHtml(formatFullDate(b.expires_at) || formatDate(b.expires_at))}">⏳ TTL</span>` :
           `<span class="status-badge" style="background: rgba(148, 163, 184, 0.15); color: var(--text-muted); font-size: 0.7rem; margin-left: 0.35rem;">Permanent</span>`;
+        const bouncedTitle = b.bounced_at ? ` title="Bounced: ${escapeHtml(formatFullDate(b.bounced_at))}"` : '';
         return `
         <tr>
           <td>
@@ -1346,7 +1347,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </a>
           </td>
           <td>${postLinkHtml}</td>
-          <td><span class="status-badge" style="background: var(--danger-bg); color: var(--danger); font-size: 0.75rem;">${escapeHtml(b.category)}</span>${ttlBadge}</td>
+          <td><span class="status-badge" style="background: var(--danger-bg); color: var(--danger); font-size: 0.75rem;"${bouncedTitle}>${escapeHtml(b.category)}</span>${ttlBadge}</td>
           <td><strong>${Math.round(b.confidence * 100)}%</strong></td>
           <td><span style="font-size: 0.82rem;" title="${escapeHtml(b.reason)}">${escapeHtml(b.reason)}</span></td>
           <td style="white-space: nowrap;">
@@ -1431,18 +1432,20 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
 
         tbody.innerHTML = entries.map(e => {
-          const profileUrl = bskyProfileUrl(e.allowed_did);
+          const did = e.subject_did || e.allowed_did || "";
+          const profileUrl = bskyProfileUrl(did);
+          const fullDate = formatFullDate(e.created_at);
           return `
             <tr>
               <td>
                 <a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none;" title="Open profile on Bluesky">
-                  <code style="font-size: 0.8rem; background: rgba(0,0,0,0.2); padding: 0.2rem 0.4rem; border-radius: 4px; color: var(--text-main); font-family: monospace;">${escapeHtml(e.allowed_did)}</code>
+                  <code style="font-size: 0.8rem; background: rgba(0,0,0,0.2); padding: 0.2rem 0.4rem; border-radius: 4px; color: var(--text-main); font-family: monospace;">${escapeHtml(did)}</code>
                 </a>
               </td>
               <td><span style="font-size: 0.82rem; color: var(--text-muted);">${escapeHtml(e.reason || "No reason specified")}</span></td>
-              <td style="font-size: 0.8rem; color: var(--text-muted);">${formatDate(e.created_at)}</td>
+              <td style="font-size: 0.8rem; color: var(--text-muted);" title="${escapeHtml(fullDate)}">${formatDate(e.created_at)}</td>
               <td>
-                <button class="btn btn-secondary btn-allowlist-remove" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" data-did="${escapeHtml(e.allowed_did)}">Remove</button>
+                <button class="btn btn-secondary btn-allowlist-remove" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" data-did="${escapeHtml(did)}">Remove</button>
               </td>
             </tr>
           `;
@@ -1828,7 +1831,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
               </td>
               <td>${statusBadge}</td>
               <td>${sessionBadge}</td>
-              <td style="font-size: 0.8rem; color: var(--text-muted);">${formatDate(t.created_at)}</td>
+              <td style="font-size: 0.8rem; color: var(--text-muted);" title="${escapeHtml(formatFullDate(t.created_at))}">${formatDate(t.created_at)}</td>
               <td>${modLink}</td>
               <td>${toggleAction}</td>
             </tr>
@@ -1917,7 +1920,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     function renderEvaluationRow(ev) {
-      const ts = new Date(ev.timestamp_us / 1000).toLocaleString();
+      const ts = formatDate(ev.timestamp_us);
+      const fullTs = formatFullDate(ev.timestamp_us);
       const isLive = ev.source === "live";
       const sourceBadge = isLive
         ? '<span class="status-badge" style="background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); font-size: 0.7rem;">📡 Live</span>'
@@ -1970,7 +1974,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
       return `
         <tr>
-          <td style="font-size: 0.75rem; white-space: nowrap; color: var(--text-muted);">${escapeHtml(ts)}</td>
+          <td style="font-size: 0.75rem; white-space: nowrap; color: var(--text-muted);" title="${escapeHtml(fullTs)}">${escapeHtml(ts)}</td>
           <td>${sourceBadge}</td>
           <td style="font-size: 0.8rem; white-space: nowrap;">
             <a href="${escapeHtml(targetLink)}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); text-decoration: none;">
@@ -2001,13 +2005,58 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       `;
     }
 
-    function formatDate(isoStr) {
-      if (!isoStr) return "-";
+    function parseTimestampToMs(val) {
+      if (val === null || val === undefined || val === "") return null;
+      if (typeof val === "number" || (!isNaN(val) && !isNaN(parseFloat(val)))) {
+        const num = Number(val);
+        if (num === 0) return null;
+        if (num > 1e14) {
+          // Microsecond Unix timestamp (e.g. 1791154870054265) -> convert to milliseconds
+          return Math.round(num / 1000);
+        } else if (num < 1e11) {
+          // Second Unix timestamp (e.g. 1791154870) -> convert to milliseconds
+          return Math.round(num * 1000);
+        } else {
+          // Millisecond Unix timestamp (e.g. 1791154870054)
+          return Math.round(num);
+        }
+      }
+      const parsed = Date.parse(val);
+      return isNaN(parsed) ? null : parsed;
+    }
+
+    function formatDate(val) {
+      if (val === null || val === undefined || val === "") return "—";
       try {
-        const d = new Date(isoStr);
-        return d.toLocaleDateString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+        const ms = parseTimestampToMs(val);
+        if (ms === null) return String(val);
+        const d = new Date(ms);
+        if (isNaN(d.getTime())) return String(val);
+        const nowYear = new Date().getFullYear();
+        const opts = {
+          month: "short",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit"
+        };
+        if (d.getFullYear() !== nowYear) {
+          opts.year = "numeric";
+        }
+        return d.toLocaleString(undefined, opts);
       } catch (e) {
-        return isoStr;
+        return String(val);
+      }
+    }
+
+    function formatFullDate(val) {
+      if (val === null || val === undefined || val === "") return "";
+      try {
+        const ms = parseTimestampToMs(val);
+        if (ms === null) return "";
+        const d = new Date(ms);
+        return isNaN(d.getTime()) ? "" : d.toLocaleString();
+      } catch (e) {
+        return "";
       }
     }
 

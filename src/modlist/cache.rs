@@ -79,6 +79,7 @@ pub struct AllowlistEntry {
     /// Decentralized identifier (DID) of the protected user owning this allowlist.
     pub protected_did: String,
     /// Decentralized identifier (DID) of the allowed/immunized subject.
+    #[serde(alias = "allowed_did")]
     pub subject_did: String,
     /// Optional rationale explaining why the account was allowlisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]

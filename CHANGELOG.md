@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.14] - 2026-10-04
+
+### Fixed & Enhanced
+
+- **Dashboard Date/Timestamp Formatting Normalization**:
+  - Implemented `parseTimestampToMs` in web dashboard JavaScript to automatically normalize timestamps across microsecond epoch timestamps (from SQLite cache, tenant registry, and evaluations), millisecond timestamps, second timestamps, and ISO 8601 strings.
+  - Fixed date formatting calculation bug where microsecond timestamps passed directly to JavaScript `Date` evaluated into year ~58,729, resulting in erratic calendar days in the distant past or future.
+  - Added `formatFullDate` providing full localized timestamp tooltips on hover across allowlist records, fleet admin tenants, audit evaluation logs, and bounced violator TTL/expiration badges.
+- **Moderation Allowlist Subject Display**:
+  - Resolved blank account entries in the Moderation Allowlist UI table by reading `subject_did` (with fallback to `allowed_did`), rendering valid Bluesky profile links and monospace DID code blocks.
+  - Attached correct subject DIDs to `data-did` on allowlist "Remove" action buttons, restoring allowlist removal functionality from the dashboard.
+  - Added `#[serde(alias = "allowed_did")]` to `AllowlistEntry` in Rust backend for backwards and cross-client compatibility.
+- **Contract Tests**:
+  - Added `test_allowlist_entry_alias_deserialization` and `test_ui_dom_allowlist_and_timestamp_contract_validation` to `tests/web_tests.rs`.
+
 ## [0.1.13] - 2026-10-04
 
 ### Added & Fixed

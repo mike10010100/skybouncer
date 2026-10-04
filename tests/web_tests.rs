@@ -2132,3 +2132,66 @@ async fn test_api_allowlist_full_lifecycle_matrix() {
     let entries: Vec<AllowlistEntry> = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(entries.len(), 1);
 }
+
+#[test]
+fn test_allowlist_entry_alias_deserialization() {
+    // 1. Standard subject_did
+    let json_standard = r#"{
+        "protected_did": "did:plc:owner123",
+        "subject_did": "did:plc:allowed123",
+        "reason": "Trusted colleague",
+        "created_at": 1791154870054265
+    }"#;
+    let entry_standard: AllowlistEntry = serde_json::from_str(json_standard).unwrap();
+    assert_eq!(entry_standard.protected_did, "did:plc:owner123");
+    assert_eq!(entry_standard.subject_did, "did:plc:allowed123");
+    assert_eq!(entry_standard.reason.as_deref(), Some("Trusted colleague"));
+    assert_eq!(entry_standard.created_at, 1791154870054265);
+
+    // 2. Legacy allowed_did alias
+    let json_alias = r#"{
+        "protected_did": "did:plc:owner123",
+        "allowed_did": "did:plc:allowed123",
+        "reason": "Trusted friend",
+        "created_at": 1791154870054265
+    }"#;
+    let entry_alias: AllowlistEntry = serde_json::from_str(json_alias).unwrap();
+    assert_eq!(entry_alias.protected_did, "did:plc:owner123");
+    assert_eq!(entry_alias.subject_did, "did:plc:allowed123");
+    assert_eq!(entry_alias.reason.as_deref(), Some("Trusted friend"));
+}
+
+#[test]
+fn test_ui_dom_allowlist_and_timestamp_contract_validation() {
+    let html = DASHBOARD_HTML;
+
+    // 1. Verify loadAllowlist reads subject_did (not isolated allowed_did)
+    assert!(
+        html.contains("e.subject_did || e.allowed_did"),
+        "DOM contract failure: loadAllowlist must read e.subject_did || e.allowed_did!"
+    );
+
+    // 2. Verify timestamp parsing & formatting functions exist in dashboard HTML
+    assert!(
+        html.contains("function parseTimestampToMs(val)"),
+        "DOM contract failure: parseTimestampToMs must be defined in dashboard JavaScript!"
+    );
+    assert!(
+        html.contains("function formatDate(val)"),
+        "DOM contract failure: formatDate must be defined in dashboard JavaScript!"
+    );
+    assert!(
+        html.contains("function formatFullDate(val)"),
+        "DOM contract failure: formatFullDate must be defined in dashboard JavaScript!"
+    );
+
+    // 3. Verify allowlist table renders subject DID and uses formatFullDate tooltip
+    assert!(
+        html.contains("bskyProfileUrl(did)"),
+        "DOM contract failure: allowlist profile link must use resolved did!"
+    );
+    assert!(
+        html.contains("data-did=\"${escapeHtml(did)}\""),
+        "DOM contract failure: allowlist remove button must use resolved did!"
+    );
+}
