@@ -705,6 +705,29 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
   <div class="toast" id="toast">Changes saved</div>
 
+  <!-- Bluesky OAuth Login Modal -->
+  <div id="login-modal" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(6px); z-index: 9999; align-items: center; justify-content: center;">
+    <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius); padding: 2rem; max-width: 420px; width: 90%; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
+        <h3 style="margin: 0; font-size: 1.25rem; font-weight: 700;">Sign In with Bluesky</h3>
+        <button onclick="closeLoginModal()" style="background: none; border: none; color: var(--text-muted); font-size: 1.5rem; cursor: pointer; line-height: 1;">&times;</button>
+      </div>
+      <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.25rem;">
+        Authenticate with ATProto OAuth 2.0 to unlock your sovereign moderation rules, admin oversight, and personal bounce feed.
+      </p>
+      <form id="login-form" onsubmit="handleLoginSubmit(event)">
+        <div style="margin-bottom: 1.25rem;">
+          <label style="display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.4rem; color: var(--text-muted);">Bluesky Handle</label>
+          <input type="text" id="login-handle-input" class="input" placeholder="e.g. alice.bsky.social or custom domain" style="width: 100%; box-sizing: border-box;" required autocomplete="username" />
+        </div>
+        <div style="display: flex; gap: 0.75rem; justify-content: flex-end;">
+          <button type="button" class="btn btn-secondary" onclick="closeLoginModal()">Cancel</button>
+          <button type="submit" class="btn">Continue &rarr;</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <script>
     let activeSensitivity = "medium";
 
@@ -1160,8 +1183,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         `;
         }).join("");
 
-        const tbody = document.getElementById("bounces-tbody");
-        if (tbody && !tbody.hasAttribute("data-pardon-attached")) {
+        if (!tbody.hasAttribute("data-pardon-attached")) {
           tbody.setAttribute("data-pardon-attached", "true");
           tbody.addEventListener("click", (e) => {
             const btn = e.target.closest(".btn-pardon");
@@ -1200,9 +1222,33 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     function showLoginModal() {
-      const handle = prompt("Enter your Bluesky handle to sign in via ATProto OAuth (e.g. alice.bsky.social):");
-      if (handle && handle.trim()) {
-        window.location.href = `/oauth/login?handle=${encodeURIComponent(handle.trim())}`;
+      const modal = document.getElementById("login-modal");
+      if (modal) {
+        modal.style.display = "flex";
+        const input = document.getElementById("login-handle-input");
+        if (input) {
+          input.value = "";
+          setTimeout(() => input.focus(), 50);
+        }
+      } else {
+        const handle = prompt("Enter your Bluesky handle to sign in via ATProto OAuth (e.g. alice.bsky.social):");
+        if (handle && handle.trim()) {
+          window.location.href = `/oauth/login?handle=${encodeURIComponent(handle.trim())}`;
+        }
+      }
+    }
+
+    function closeLoginModal() {
+      const modal = document.getElementById("login-modal");
+      if (modal) modal.style.display = "none";
+    }
+
+    function handleLoginSubmit(e) {
+      e.preventDefault();
+      const input = document.getElementById("login-handle-input");
+      if (input && input.value.trim()) {
+        const handle = input.value.trim().replace(/^@/, "");
+        window.location.href = `/oauth/login?handle=${encodeURIComponent(handle)}`;
       }
     }
 
