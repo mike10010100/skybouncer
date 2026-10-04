@@ -1117,6 +1117,31 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
     }
 
+    function bskyProfileUrl(actorOrDid) {
+      if (!actorOrDid) return "#";
+      const clean = String(actorOrDid).trim().replace(/^@/, "");
+      // Bluesky profile routes require literal colons for DIDs (e.g. did:plc:... or did:web:...)
+      if (clean.startsWith("did:")) {
+        return `https://bsky.app/profile/${clean}`;
+      }
+      return `https://bsky.app/profile/${encodeURIComponent(clean)}`;
+    }
+
+    function bskyPostUrl(actor, rkey) {
+      if (!actor || !rkey) return "#";
+      const profile = bskyProfileUrl(actor);
+      return `${profile}/post/${encodeURIComponent(rkey)}`;
+    }
+
+    function formatDid(did) {
+      if (!did) return "—";
+      const clean = String(did).trim();
+      if (clean.length > 20) {
+        return clean.substring(0, 16) + "...";
+      }
+      return clean;
+    }
+
     function formatPostLink(uri, text) {
       if (!uri || uri.trim() === "") {
         return text && text.trim().length > 0
@@ -1128,7 +1153,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       const match = uri.match(/^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/([^/]+)$/);
       if (match) {
         const [, actor, rkey] = match;
-        bskyUrl = `https://bsky.app/profile/${encodeURIComponent(actor)}/post/${encodeURIComponent(rkey)}`;
+        bskyUrl = bskyPostUrl(actor, rkey);
       }
 
       const hasText = text && text.trim().length > 0;
@@ -1163,7 +1188,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
 
         tbody.innerHTML = bounces.map(b => {
-          const profileUrl = `https://bsky.app/profile/${encodeURIComponent(b.subject_did)}`;
+          const profileUrl = bskyProfileUrl(b.subject_did);
           const postLinkHtml = formatPostLink(b.post_uri, b.post_text);
           return `
           <tr>
@@ -1568,7 +1593,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       if (uri.startsWith("at://")) {
         const parts = uri.replace("at://", "").split("/");
         if (parts.length >= 3 && parts[1] === "app.bsky.graph.list") {
-          return `https://bsky.app/profile/${parts[0]}/lists/${parts[2]}`;
+          return `${bskyProfileUrl(parts[0])}/lists/${encodeURIComponent(parts[2])}`;
         }
       }
       return uri;
@@ -1613,10 +1638,10 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         : '<span class="status-badge" style="background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); font-size: 0.7rem;">🧪 Sim</span>';
 
       const targetDisplay = ev.target_handle ? `@${escapeHtml(ev.target_handle)}` : formatDid(ev.target_did);
-      const targetLink = `https://bsky.app/profile/${encodeURIComponent(ev.target_handle || ev.target_did)}`;
+      const targetLink = bskyProfileUrl(ev.target_handle || ev.target_did);
 
       const authorDisplay = ev.author_handle ? `@${escapeHtml(ev.author_handle)}` : formatDid(ev.author_did);
-      const authorLink = `https://bsky.app/profile/${encodeURIComponent(ev.author_handle || ev.author_did)}`;
+      const authorLink = bskyProfileUrl(ev.author_handle || ev.author_did);
 
       const postLinkHtml = formatPostLink(ev.post_uri, ev.post_text);
 

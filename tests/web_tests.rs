@@ -131,6 +131,9 @@ async fn test_serve_dashboard_html() {
     assert!(body_str.contains("Queue Overflows"));
     assert!(body_str.contains("Users Monitored"));
     assert!(body_str.contains("kpi-monitored-card"));
+    assert!(body_str.contains("bskyProfileUrl"));
+    assert!(body_str.contains("bskyPostUrl"));
+    assert!(body_str.contains("formatDid"));
 }
 
 #[tokio::test]
