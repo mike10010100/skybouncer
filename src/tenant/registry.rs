@@ -165,9 +165,7 @@ impl TenantRegistry {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "CRITICAL: Could not open any SQLite connection");
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(3600));
-                }
+                std::process::abort();
             }
         };
         Self {
@@ -231,6 +229,19 @@ impl TenantRegistry {
 
             CREATE INDEX IF NOT EXISTS idx_tenants_active
                 ON tenants(is_active);
+
+            CREATE TABLE IF NOT EXISTS web_sessions (
+                token TEXT PRIMARY KEY,
+                did TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_web_sessions_did
+                ON web_sessions(did);
+
+            CREATE INDEX IF NOT EXISTS idx_web_sessions_expires
+                ON web_sessions(expires_at);
             ",
         )
         .map_err(|e| {
@@ -603,6 +614,123 @@ impl TenantRegistry {
         Ok(rows > 0)
     }
 
+    /// Creates a cryptographically secure web session token for an authenticated user.
+    ///
+    /// The token is 256 bits of high-entropy randomness generated via CSPRNG.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] or [`SkybouncerError::Config`] if parameters or storage fail.
+    pub fn create_web_session(&self, did: &str, ttl: Duration) -> Result<String, SkybouncerError> {
+        let clean_did = did.trim();
+        if clean_did.is_empty() {
+            return Err(SkybouncerError::Config(
+                "DID cannot be empty for web session".to_string(),
+            ));
+        }
+
+        // Generate 256 bits of cryptographic entropy (43-char URL-safe base64 string)
+        let token = skyauth::pkce::PkcePair::generate().verifier;
+        let now_us = current_time_us();
+        let ttl_us = u64::try_from(ttl.as_micros()).unwrap_or(u64::MAX / 2);
+        let expires_at_us = now_us.saturating_add(ttl_us);
+
+        let created_at_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
+        let expires_at_i64 = i64::try_from(expires_at_us).unwrap_or(i64::MAX);
+
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO web_sessions (token, did, created_at, expires_at) VALUES (?1, ?2, ?3, ?4);",
+            params![token, clean_did, created_at_i64, expires_at_i64],
+        )
+        .map_err(|e| SkybouncerError::Database(format!("Failed to store web session: {e}")))?;
+
+        Ok(token)
+    }
+
+    /// Validates a web session token and returns the authenticated DID if valid.
+    ///
+    /// If the token is expired, it is deleted and `None` is returned.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn validate_web_session(&self, token: &str) -> Result<Option<String>, SkybouncerError> {
+        let clean_token = token.trim();
+        if clean_token.is_empty() {
+            return Ok(None);
+        }
+
+        let now_us = current_time_us();
+        let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
+
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare_cached("SELECT did, expires_at FROM web_sessions WHERE token = ?1;")?;
+
+        let row = stmt
+            .query_row(params![clean_token], |row| {
+                let did: String = row.get(0)?;
+                let expires_at: i64 = row.get(1)?;
+                Ok((did, expires_at))
+            })
+            .optional()?;
+
+        match row {
+            Some((did, expires_at)) => {
+                if now_i64 > expires_at {
+                    // Expired, purge token
+                    let _ = conn.execute(
+                        "DELETE FROM web_sessions WHERE token = ?1;",
+                        params![clean_token],
+                    );
+                    Ok(None)
+                } else {
+                    Ok(Some(did))
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Invalidates a web session token on logout.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if deletion fails.
+    pub fn delete_web_session(&self, token: &str) -> Result<bool, SkybouncerError> {
+        let clean_token = token.trim();
+        if clean_token.is_empty() {
+            return Ok(false);
+        }
+
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "DELETE FROM web_sessions WHERE token = ?1;",
+                params![clean_token],
+            )
+            .map_err(|e| SkybouncerError::Database(format!("Failed to delete web session: {e}")))?;
+
+        Ok(rows > 0)
+    }
+
+    /// Prunes expired web sessions from the database.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if prune fails.
+    pub fn prune_expired_web_sessions(&self) -> Result<usize, SkybouncerError> {
+        let now_us = current_time_us();
+        let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
+
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "DELETE FROM web_sessions WHERE expires_at < ?1;",
+                params![now_i64],
+            )
+            .map_err(|e| SkybouncerError::Database(format!("Failed to prune web sessions: {e}")))?;
+
+        Ok(rows)
+    }
+
     /// Resolves or initializes a dedicated [`PdsRepoClient`] for an enrolled tenant using their DPoP session.
     ///
     /// If a client was already constructed for this DID and its session is still valid, it is returned from cache immediately (<50ns).
@@ -929,5 +1057,41 @@ mod tests {
             cached_client.session().access_token(),
             "at-auto-refreshed-token"
         );
+    }
+
+    #[test]
+    fn test_web_session_lifecycle() {
+        let registry = TenantRegistry::open_in_memory().unwrap();
+        let did = "did:plc:alice";
+
+        // 1. Create a session token
+        let token = registry
+            .create_web_session(did, Duration::from_secs(3600))
+            .unwrap();
+        assert!(!token.is_empty());
+
+        // 2. Validate token
+        let validated = registry.validate_web_session(&token).unwrap();
+        assert_eq!(validated, Some(did.to_string()));
+
+        // 3. Unknown token returns None
+        assert_eq!(
+            registry.validate_web_session("invalid-token").unwrap(),
+            None
+        );
+
+        // 4. Invalidate / delete token on logout
+        let deleted = registry.delete_web_session(&token).unwrap();
+        assert!(deleted);
+
+        // 5. Subsequent validation fails
+        assert_eq!(registry.validate_web_session(&token).unwrap(), None);
+
+        // 6. Expired token validation
+        let expired_token = registry
+            .create_web_session(did, Duration::from_micros(1))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(registry.validate_web_session(&expired_token).unwrap(), None);
     }
 }

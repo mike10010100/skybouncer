@@ -2072,32 +2072,11 @@ impl SkybouncerEngine {
             return false;
         }
 
-        // Explicit admin DID configured on engine takes precedence
         if let Some(ref admin) = self.config.admin_did {
             let admin_clean = admin.trim();
             if !admin_clean.is_empty() && admin_clean.eq_ignore_ascii_case(clean) {
                 return true;
             }
-        }
-
-        // Environment variable override (ADMIN_DID or SKYBOUNCER_ADMIN_DID)
-        if let Ok(admin_did) =
-            std::env::var("ADMIN_DID").or_else(|_| std::env::var("SKYBOUNCER_ADMIN_DID"))
-        {
-            let admin_clean = admin_did.trim();
-            if !admin_clean.is_empty() && admin_clean.eq_ignore_ascii_case(clean) {
-                return true;
-            }
-        }
-
-        // Legacy / fallback mode: if no admin DID was explicitly configured,
-        // treat any initially protected DID as an administrator.
-        if self.config.admin_did.is_none()
-            && std::env::var("ADMIN_DID").is_err()
-            && std::env::var("SKYBOUNCER_ADMIN_DID").is_err()
-            && self.config.protected_dids.contains(clean)
-        {
-            return true;
         }
 
         false
@@ -2788,7 +2767,11 @@ impl SkybouncerEngineBuilder {
             None => Arc::new(
                 TenantRegistry::from_connection(cache.connection())
                     .or_else(|_| TenantRegistry::open_in_memory())
-                    .unwrap_or_else(|_| TenantRegistry::fallback()),
+                    .map_err(|e| {
+                        SkybouncerError::Database(format!(
+                            "Failed to initialize TenantRegistry: {e}"
+                        ))
+                    })?,
             ),
         };
 

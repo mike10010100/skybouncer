@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-10-04
+
+### Security & Hardening
+
+- **Cryptographic Web Session Authentication**:
+  - Replaced client-asserted `x-skybouncer-did` header and plain DID cookie with 256-bit CSPRNG session tokens stored in SQLite table `web_sessions` with automatic expiration and pruning.
+  - Endpoints (`/api/me`, `/api/rules`, `/api/bounces`, `/api/pardon`, `/api/tenant/toggle`, `/api/admin/*`) strictly validate caller session tokens from `skybouncer_session` cookie or `Authorization: Bearer` header.
+- **Admin Privilege Hardening**:
+  - Eliminated insecure fallback where any protected DID was granted admin privileges when `ADMIN_DID` was unset.
+  - Strictly check configured `admin_did` with zero per-invocation `std::env::var` re-reading.
+- **Strict Multi-Tenant Scoping & Privacy Isolation**:
+  - Scoped `GET /api/bounces` and DM bot `cmd_recent` to caller's own replies only, preventing cross-tenant privacy leaks.
+  - Blocked cross-tenant pardon operations (`POST /api/pardon`) unless caller is fleet administrator.
+  - Guarded tenant rubric updates (`POST /api/rules`) from mutating engine-wide fallback rubric.
+  - Scoped DM bot `cmd_status` to personal tenant metrics, reserving global fleet metrics for administrator.
+- **Server-Side Request Forgery (SSRF) Defense**:
+  - Enforced strict SSRF validation on `/api/simulate` image fetching with pre-resolution IP checking against private/loopback/cloud metadata (`169.254.169.254`) ranges, HTTP redirect blocking, 5-second timeout, and 4MB payload cap.
+- **XSS & DOM Security**:
+  - Enhanced `escapeHtml` to escape quotes (`"`, `'`) in addition to `&`, `<`, `>`.
+  - Replaced inline `onclick` handlers with delegated event listeners.
+  - Injected defense-in-depth HTTP security headers: `Content-Security-Policy`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy`.
+- **CORS & Cookie Hardening**:
+  - Replaced permissive CORS with restricted origin/method/header policy on authenticated and mutating routes.
+  - Issued session cookies with `HttpOnly; SameSite=Lax` and conditional `Secure` on HTTPS.
+- **Resource Exhaustion Mitigation**:
+  - Added `prune_stale` and automatic empty-bucket eviction to `EvaluationRateLimiter` preventing unbounded growth.
+  - Replaced infinite fallback loop in `TenantRegistry::fallback()` with explicit error propagation in engine builder.
+
 ## [0.1.5] - 2026-10-04
 
 ### Fixed

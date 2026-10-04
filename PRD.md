@@ -14,7 +14,7 @@
 | **The Solution** | `skybouncer` allows any Bluesky user to define personalized, natural-language moderation rules (e.g., *"Block crypto scam bots, harassment, and aggressive sea-lioning"*). An interaction watcher monitors incoming mentions, replies, and quotes directed at enrolled users via the Jetstream firehose, evaluates interactions using low-latency System-1 classifiers (**Jev** / lightweight LLMs), and automatically appends offending accounts to each user's sovereign ATProto Moderation List (`app.bsky.graph.listitem`). The user subscribes to their own list, natively muting or blocking violators across the entire Bluesky network. |
 | **Dual UX Topologies** | **1. Public DM Bot Interface (`chat.bsky.convo.*`)**: Conversational onboarding and self-service management for anyone on Bluesky. Unenrolled users receive a friendly greeting and 1-click authorization link; enrolled users configure rules, view recent actions, or adjust sensitivity.<br/>**2. Sovereign Web Portal (`skyauth`)**: Web UI powered by ATProto OAuth 2.0 with PKCE and DPoP cryptographic proofs, featuring multi-tenant onboarding, live rule playground, and audit stream. |
 | **The Sovereign Multi-Tenant Model** | Moderation rules and lists are published directly to each user's sovereign repository on their PDS (e.g., as custom ATProto records or encoded list metadata). The service operates in a **sovereign, multi-tenant mode**—storing only encrypted OAuth DPoP sessions and caching interaction evaluations, with zero platform lock-in. |
-| **Underlying Engine & Release** | Published on crates.io (`skybouncer v0.1.0`), built in 100% Safe Rust (`#![forbid(unsafe_code)]`), powered directly by sibling crates [`skybase`] (Jetstream ingestion, SQLite caching, DPoP PDS write client) and [`skyauth`] (OAuth 2.0 PKCE + DPoP session lifecycle). |
+| **Underlying Engine & Release** | Published on crates.io (`skybouncer v0.1.6`), built in 100% Safe Rust (`#![forbid(unsafe_code)]`), powered directly by sibling crates [`skybase`] (Jetstream ingestion, SQLite caching, DPoP PDS write client) and [`skyauth`] (OAuth 2.0 PKCE + DPoP session lifecycle). |
 
 ---
 
@@ -237,26 +237,24 @@ Adhering to [`AGENTS.md`](AGENTS.md) and [`rust-best-practices`](https://github.
 | **M3: Mod List Provisioning & PDS Mutations** | Integration with `skybase::repo`, `app.bsky.graph.list` creation, `app.bsky.graph.listitem` upsert and pardon mutations with DPoP signing. | ✅ **Completed & Published (`v0.1.0`)** |
 | **M4: ATProto DM Bot Interface** | ATProto Chat client (`chat.bsky.convo.*`), conversational command parser (`rules`, `recent`, `pardon`, `sensitivity`), automated DM alert dispatcher. | ✅ **Completed & Published (`v0.1.0`)** |
 | **M5: Web Dashboard & Automated Release** | Minimal Web UI with `skyauth` OAuth login, dry-run simulator, 100% test coverage, GitHub Actions automated crates.io publish & release pipeline. | ✅ **Completed & Published (`v0.1.0`)** |
-| **M6: Multi-Tenant Hosted Service & Onboarding** | SQLite `TenantRegistry` managing dynamic multi-user DPoP sessions, public bot conversational onboarding flow for unenrolled users, and production Docker Compose with Cloudflare Tunnel isolation. | ✅ **Completed & Published (`v0.1.0`)** |
-| **M7: Scoped Bounces & Offending Post Transparency** | Per-user scoped bounce feeds, offending post URI & text tracking, direct Bluesky post inspection links, schema migration stabilization, and full persistent Tier 1 / Tier 2 evaluation audit log with admin view. | ✅ **Completed & Published (`v0.1.3`)** |
+| **M6: Multi-Tenant Hosted Service & Onboarding** | SQLite `TenantRegistry` managing dynamic multi-user DPoP sessions, public bot conversational onboarding flow for unenrolled users, and production Docker Compose with Cloudflare Tunnel isolation. | ✅ **Completed & Published (`v0.1.2`)** |
+| **M7: Scoped Bounces & Offending Post Transparency** | Per-user scoped bounce feeds, offending post URI & text tracking, direct Bluesky post inspection links, and schema migration stabilization. | ✅ **Completed & Published (`v0.1.3`)** |
+| **M8: Persistent OAuth Token Auto-Refresh** | Background PDS operation token refresh with single-flight deduplication, SQLite token persistence across restarts, and early dashboard activation. | ✅ **Completed & Published (`v0.1.4` / `v0.1.5`)** |
+| **M9: Tier 1 & Tier 2 Evaluation Audit Log** | Persistent SQLite evaluation audit logging, granular telemetry breakdown, retention management, and admin oversight view. | ✅ **Completed & Published (`v0.1.5`)** |
+| **M10: Web & Auth Layer Security Hardening** | 256-bit CSPRNG web session tokens, admin privilege verification, SSRF blocking, DOM XSS prevention, security headers, scoped DM bot privacy, and rate limiter memory eviction. | ✅ **Completed & Published (`v0.1.6`)** |
 
 ---
 
 ## 7. System Hardening & Quality of Life Roadmap
 
-### 7.1 Immediate Operational Hardening (M8)
-1. **Persistent OAuth Token Auto-Refresh for Background PDS Operations** (🔥 Immediate Priority):
-   - **Problem**: When tenant sessions' OAuth access tokens expire after 1–2 hours, background PDS operations (e.g. firehose sovereign config synchronization, modlist verification) fail with `Authentication error: Token expired: exp < now` because the background `PdsRepoClient` lacks access to the `AtprotoOAuthClient`.
-   - **Solution**: Pass `Arc<AtprotoOAuthClient>` into `SkybouncerEngine` and `TenantRegistry`. Equip `engine.pds_client_for(did)` with the OAuth client so expired access tokens are automatically refreshed in the background using stored OAuth refresh tokens.
-
-### 7.2 Moderation Accuracy & Safety QoL (M9)
-2. **Moderation Allowlist & False-Positive Immunization ("Pardon & Whitelist")**:
+### 7.1 Moderation Accuracy & Safety QoL (Future)
+1. **Moderation Allowlist & False-Positive Immunization ("Pardon & Whitelist")**:
    - **Problem**: Pardoning an account currently removes them from the blocklist, but if they reply again in the future, the Non-Followed Gate treats them as an unfollowed candidate and re-evaluates them, risking repeated false positives.
    - **Solution**: Introduce a persistent `allowlist` in SQLite and add a "Pardon & Whitelist" action on the web dashboard and DM bot. The Gate immediately bypasses (`Outcome::Bypassed`) allowlisted DIDs without model calls.
-3. **Temporary "Time-Out" / Cooldown Bounces (TTL Bouncing)**:
+2. **Temporary "Time-Out" / Cooldown Bounces (TTL Bouncing)**:
    - Configurable bounce durations: Permanent, 24-Hour Cooldown, 7-Day Timeout, 30-Day Timeout.
    - Automated background scheduler periodically prunes expired temporary `listitem` records from the user's sovereign PDS repository.
-4. **Tenant-Scoped Evaluation Audit Log (User View)**:
+3. **Tenant-Scoped Evaluation Audit Log (User View)**:
    - Provide a tenant-scoped endpoint `GET /api/evaluations` where `target_did == caller_did`.
    - Regular users who sign in via OAuth can view evaluations performed on interactions targeting their own posts.
 

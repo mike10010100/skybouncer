@@ -182,7 +182,7 @@ pub async fn get_status(State(state): State<ApiState>, headers: HeaderMap) -> Js
     protected_dids.sort();
 
     // Redact private prompt for unauthenticated callers
-    let caller_did = extract_authenticated_caller(&headers);
+    let caller_did = extract_authenticated_caller(&headers, &state.engine);
     let is_admin = caller_did
         .as_deref()
         .is_some_and(|did| state.engine.is_admin(did));
@@ -227,27 +227,42 @@ pub async fn health_check() -> (StatusCode, Json<HealthResponse>) {
     )
 }
 
-/// Extracts the verified authenticated caller DID strictly from Cookie or x-skybouncer-did header.
-pub fn extract_authenticated_caller(headers: &HeaderMap) -> Option<String> {
-    if let Some(cookie_header) = headers.get(header::COOKIE) {
-        if let Ok(s) = cookie_header.to_str() {
-            for part in s.split(';') {
-                let part = part.trim();
-                if let Some(val) = part.strip_prefix("skybouncer_did=") {
-                    let trimmed = val.trim();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
+/// Extracts the verified authenticated caller DID strictly from a valid session token in Cookie or Authorization header.
+///
+/// Unsigned `x-skybouncer-did` headers and unverified cookie DIDs are strictly rejected.
+pub fn extract_authenticated_caller(
+    headers: &HeaderMap,
+    engine: &SkybouncerEngine,
+) -> Option<String> {
+    // 1. Check Authorization: Bearer <session_token>
+    if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
+        if let Ok(s) = auth_header.to_str() {
+            let trimmed = s.trim();
+            if let Some(token) = trimmed.strip_prefix("Bearer ") {
+                let token = token.trim();
+                if !token.is_empty() {
+                    if let Ok(Some(did)) = engine.tenant_registry().validate_web_session(token) {
+                        return Some(did);
                     }
                 }
             }
         }
     }
 
-    if let Some(h) = headers.get("x-skybouncer-did") {
-        if let Ok(s) = h.to_str() {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+    // 2. Check Cookie: skybouncer_session=<session_token>
+    if let Some(cookie_header) = headers.get(header::COOKIE) {
+        if let Ok(s) = cookie_header.to_str() {
+            for part in s.split(';') {
+                let part = part.trim();
+                if let Some(val) = part.strip_prefix("skybouncer_session=") {
+                    let token = val.trim();
+                    if !token.is_empty() {
+                        if let Ok(Some(did)) = engine.tenant_registry().validate_web_session(token)
+                        {
+                            return Some(did);
+                        }
+                    }
+                }
             }
         }
     }
@@ -266,7 +281,7 @@ pub fn resolve_rules_target_did(
     query_did: Option<&str>,
     action_desc: &str,
 ) -> Result<String, (StatusCode, String)> {
-    let caller_did = extract_authenticated_caller(headers).ok_or_else(|| {
+    let caller_did = extract_authenticated_caller(headers, engine).ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
             format!("Authentication required to {action_desc}. Please sign in with Bluesky."),
@@ -362,9 +377,8 @@ pub async fn update_rules(
             .engine
             .tenant_registry()
             .update_rubric(&target_did, &rubric);
-    }
-
-    if state.engine.is_admin(&target_did) || state.engine.is_protected(&target_did) {
+    } else if state.engine.is_protected(&target_did) {
+        // Only non-enrolled protected accounts update the default engine rubric
         state.engine.set_rubric(rubric.clone());
     }
 
@@ -383,24 +397,61 @@ pub async fn update_rules(
 }
 
 /// Handler for `GET /api/bounces`: returns recent bounced violators.
+///
+/// Authentication is strictly required. Non-admin users are restricted to viewing
+/// only bounces on their own posts; admins may view fleet-wide or specify a target DID.
 pub async fn get_bounces(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Query(query): Query<BouncesQuery>,
 ) -> Result<Json<Vec<BouncedUser>>, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to view bounces. Please sign in with Bluesky.".to_string(),
+        )
+    })?;
+
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let user_did = query.user_did.as_deref().filter(|s| !s.trim().is_empty());
+    let is_admin = state.engine.is_admin(&caller_did);
+
+    let filter_did = if is_admin {
+        query.user_did.as_deref().filter(|s| !s.trim().is_empty())
+    } else {
+        if let Some(requested_did) = query.user_did.as_deref().filter(|s| !s.trim().is_empty()) {
+            if requested_did != caller_did {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Access denied: you may only view bounces for your own account.".to_string(),
+                ));
+            }
+        }
+        Some(caller_did.as_str())
+    };
+
     let bounces = state
         .engine
-        .list_recent_bounces_for(user_did, limit)
+        .list_recent_bounces_for(filter_did, limit)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(bounces))
 }
 
 /// Handler for `POST /api/pardon`: unbans a user and removes their listitem from PDS.
+///
+/// Authentication is strictly required. Non-admin callers may only pardon accounts
+/// from their own sovereign moderation list.
 pub async fn pardon_user(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(payload): Json<PardonRequest>,
 ) -> Result<Json<PardonResponse>, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to pardon accounts. Please sign in with Bluesky.".to_string(),
+        )
+    })?;
+
     let subject_did = payload.subject_did.trim().to_string();
     if subject_did.is_empty() {
         return Err((
@@ -409,15 +460,19 @@ pub async fn pardon_user(
         ));
     }
 
+    let is_admin = state.engine.is_admin(&caller_did);
     let protected_did = if let Some(ref pd) = payload.protected_did {
-        pd.trim().to_string()
+        let requested = pd.trim();
+        if requested != caller_did && !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Access denied: you may only pardon users from your own moderation list."
+                    .to_string(),
+            ));
+        }
+        requested.to_string()
     } else {
-        state
-            .engine
-            .protected_dids()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| "did:plc:default".to_string())
+        caller_did.clone()
     };
 
     match state.engine.pardon_user(&protected_did, &subject_did).await {
@@ -438,6 +493,120 @@ pub async fn pardon_user(
             format!("Failed to pardon: {e}"),
         )),
     }
+}
+
+/// Securely fetches a remote image URL for the simulator while enforcing strict SSRF defenses.
+///
+/// Prevents access to private RFC 1918 networks, loopback (`127.0.0.1`, `::1`),
+/// link-local/cloud metadata (`169.254.169.254`), IPv6 ULA, and internal hostnames.
+/// Disallows HTTP redirects to prevent open-redirect SSRF evasions.
+async fn fetch_simulation_image(url_str: &str) -> Result<Vec<u8>, (StatusCode, String)> {
+    let parsed_url = url::Url::parse(url_str)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid image URL: {e}")))?;
+
+    let scheme = parsed_url.scheme();
+    if scheme != "https" && scheme != "http" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Only http and https schemes are permitted for image simulation".to_string(),
+        ));
+    }
+
+    let host = parsed_url.host_str().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Missing host in image URL".to_string(),
+        )
+    })?;
+
+    if skyauth::ssrf::is_blocked_hostname(host) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "SSRF protection: image URL target host is restricted".to_string(),
+        ));
+    }
+
+    // Resolve DNS ahead-of-time and verify all returned addresses against restricted IP ranges
+    let port = parsed_url
+        .port_or_known_default()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+
+    let host_port = format!("{host}:{port}");
+    let addrs = tokio::net::lookup_host(&host_port).await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to resolve image URL host: {e}"),
+        )
+    })?;
+
+    let mut resolved_any = false;
+    for addr in addrs {
+        resolved_any = true;
+        let ip = addr.ip();
+        if skyauth::ssrf::is_restricted_ip(ip) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("SSRF protection: image URL resolves to restricted IP ({ip})"),
+            ));
+        }
+    }
+
+    if !resolved_any {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Could not resolve any IP address for host".to_string(),
+        ));
+    }
+
+    // Fetch with redirect::Policy::none() to prevent open-redirect SSRF
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(5000))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!(
+            "skybouncer/",
+            env!("CARGO_PKG_VERSION"),
+            " (+https://github.com/mike10010100/skybouncer)"
+        ))
+        .build()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("HTTP client error: {e}"),
+            )
+        })?;
+
+    let resp = client.get(url_str).send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to fetch simulation image: {e}"),
+        )
+    })?;
+
+    if !resp.status().is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Simulation image request failed with status: {}",
+                resp.status()
+            ),
+        ));
+    }
+
+    let bytes = resp.bytes().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to read image bytes: {e}"),
+        )
+    })?;
+
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Simulation image exceeds 4MB limit".to_string(),
+        ));
+    }
+
+    Ok(bytes.to_vec())
 }
 
 /// Handler for `POST /api/simulate`: runs a dry-run evaluation on sample text and optional images.
@@ -469,31 +638,11 @@ pub async fn simulate_interaction(
         images_base64.push(b64);
         image_cids.push("simulate-base64-image".to_string());
     } else if let Some(url) = payload.image_url.filter(|s| !s.trim().is_empty()) {
-        // Fetch remote image if valid HTTP/HTTPS URL
-        if url.starts_with("http://") || url.starts_with("https://") {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_millis(5000))
-                .user_agent("skybouncer/0.1.0 (+https://github.com/mike10010100/skybouncer)")
-                .build()
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("HTTP client error: {e}"),
-                    )
-                })?;
-            if let Ok(resp) = client.get(&url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(bytes) = resp.bytes().await {
-                        if bytes.len() <= 4 * 1024 * 1024 {
-                            use base64::Engine;
-                            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            images_base64.push(encoded);
-                            image_cids.push("simulate-url-image".to_string());
-                        }
-                    }
-                }
-            }
-        }
+        let bytes = fetch_simulation_image(&url).await?;
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        images_base64.push(encoded);
+        image_cids.push("simulate-url-image".to_string());
     }
 
     let images_evaluated = images_base64.len();
@@ -924,48 +1073,12 @@ pub struct ToggleTenantResponse {
     pub message: String,
 }
 
-/// Extracts caller DID from query string, custom headers, or cookie.
-fn extract_did_from_headers(headers: &HeaderMap, query_did: Option<&str>) -> Option<String> {
-    if let Some(d) = query_did {
-        let trimmed = d.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-
-    if let Some(h) = headers.get("x-skybouncer-did") {
-        if let Ok(s) = h.to_str() {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-
-    if let Some(cookie_header) = headers.get(header::COOKIE) {
-        if let Ok(s) = cookie_header.to_str() {
-            for part in s.split(';') {
-                let part = part.trim();
-                if let Some(val) = part.strip_prefix("skybouncer_did=") {
-                    let val = val.trim();
-                    if !val.is_empty() {
-                        return Some(val.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
 /// Handler for `GET /api/me`: returns authenticated session info and permissions.
 pub async fn get_current_user(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(query): Query<SessionQuery>,
 ) -> Json<UserSessionResponse> {
-    let did_opt = extract_did_from_headers(&headers, query.did.as_deref());
+    let did_opt = extract_authenticated_caller(&headers, &state.engine);
 
     if let Some(did) = did_opt {
         let is_admin = state.engine.is_admin(&did);
@@ -1044,10 +1157,14 @@ pub async fn get_current_user(
 pub async fn get_admin_tenants(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(query): Query<SessionQuery>,
 ) -> Result<Json<AdminTenantsResponse>, (StatusCode, String)> {
-    let did_opt = extract_did_from_headers(&headers, query.did.as_deref());
-    let caller_did = did_opt.unwrap_or_default();
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to access tenant fleet. Please sign in with Bluesky."
+                .to_string(),
+        )
+    })?;
 
     if !state.engine.is_admin(&caller_did) {
         return Err((
@@ -1139,8 +1256,13 @@ pub async fn get_admin_evaluations(
     headers: HeaderMap,
     Query(query): Query<AdminEvaluationsQuery>,
 ) -> Result<Json<AdminEvaluationsResponse>, (StatusCode, String)> {
-    let did_opt = extract_did_from_headers(&headers, query.did.as_deref());
-    let caller_did = did_opt.unwrap_or_default();
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Administrator privileges required to access evaluation audit logs. Please sign in with Bluesky."
+                .to_string(),
+        )
+    })?;
 
     if !state.engine.is_admin(&caller_did) {
         return Err((
@@ -1173,22 +1295,18 @@ pub async fn get_admin_evaluations(
 pub async fn toggle_tenant(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Query(query): Query<SessionQuery>,
     Json(payload): Json<ToggleTenantRequest>,
 ) -> Result<Json<ToggleTenantResponse>, (StatusCode, String)> {
-    let caller_did = extract_did_from_headers(&headers, query.did.as_deref()).unwrap_or_default();
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to change defense status. Please sign in with Bluesky."
+                .to_string(),
+        )
+    })?;
     let is_admin = state.engine.is_admin(&caller_did);
 
-    let target_did = payload
-        .did
-        .or_else(|| {
-            if !caller_did.is_empty() {
-                Some(caller_did.clone())
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing target DID".to_string()))?;
+    let target_did = payload.did.unwrap_or_else(|| caller_did.clone());
 
     if !is_admin && caller_did != target_did {
         return Err((
@@ -1234,10 +1352,24 @@ pub async fn toggle_tenant(
 }
 
 /// Handler for `POST /api/auth/logout`: clears session cookie and returns unauthenticated state.
-pub async fn logout() -> Response {
+pub async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Some(cookie_header) = headers.get(header::COOKIE) {
+        if let Ok(s) = cookie_header.to_str() {
+            for part in s.split(';') {
+                let part = part.trim();
+                if let Some(val) = part.strip_prefix("skybouncer_session=") {
+                    let token = val.trim();
+                    if !token.is_empty() {
+                        let _ = state.engine.tenant_registry().delete_web_session(token);
+                    }
+                }
+            }
+        }
+    }
+
     let mut resp = Json(serde_json::json!({ "logged_out": true })).into_response();
     if let Ok(cookie_val) =
-        HeaderValue::from_str("skybouncer_did=; Path=/; Max-Age=0; SameSite=Lax")
+        HeaderValue::from_str("skybouncer_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
     {
         resp.headers_mut().insert(header::SET_COOKIE, cookie_val);
     }

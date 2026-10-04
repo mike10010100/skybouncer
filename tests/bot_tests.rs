@@ -52,8 +52,9 @@ async fn setup_test_engine(
 
     let mut protected_dids = HashSet::new();
     protected_dids.insert(protected_did.to_string());
-    let config =
-        SkybouncerConfig::new(protected_dids, rubric).with_enable_heuristic_prefilter(true);
+    let config = SkybouncerConfig::new(protected_dids, rubric)
+        .with_enable_heuristic_prefilter(true)
+        .with_admin_did("did:plc:admin");
 
     let engine = Arc::new(SkybouncerEngine::new(
         config,
@@ -369,12 +370,12 @@ async fn test_command_handler_recent_and_pardon() {
     let (engine, cache, pds) = setup_test_engine("did:plc:protected1").await;
     let handler = BotCommandHandler::new(engine, "did:plc:bot");
 
-    // Initially empty recent list
+    // Initially empty recent list for protected1
     let reply_empty = handler
-        .handle_command("did:plc:user", "recent")
+        .handle_command("did:plc:protected1", "recent")
         .await
         .expect("handle");
-    assert!(reply_empty.contains("No accounts have been bounced yet"));
+    assert!(reply_empty.contains("No accounts have been bounced from your replies yet"));
 
     // Populate bounced user in cache
     cache
@@ -393,19 +394,26 @@ async fn test_command_handler_recent_and_pardon() {
         })
         .expect("record bounce");
 
-    // Check recent list has entry
+    // Check recent list has entry when queried by protected1
     let reply_recent = handler
-        .handle_command("did:plc:user", "recent")
+        .handle_command("did:plc:protected1", "recent")
         .await
         .expect("handle");
-    assert!(reply_recent.contains("Recently Bounced Accounts (last 5):"));
+    assert!(reply_recent.contains("Recently Bounced Accounts from Your Replies (last 5):"));
     assert!(reply_recent.contains("did:plc:spammer1"));
     assert!(reply_recent.contains("96% confidence"));
     assert!(reply_recent.contains("Detected crypto scam keyword"));
 
+    // Multi-tenant privacy: another tenant does NOT see protected1's bounces
+    let reply_other = handler
+        .handle_command("did:plc:other_tenant", "recent")
+        .await
+        .expect("handle");
+    assert!(reply_other.contains("No accounts have been bounced from your replies yet"));
+
     // Pardon an account that is not present
     let reply_pardon_miss = handler
-        .handle_command("did:plc:user", "pardon did:plc:unknown")
+        .handle_command("did:plc:protected1", "pardon did:plc:unknown")
         .await
         .expect("handle");
     assert!(reply_pardon_miss.contains("was not found in your bounced list"));
@@ -430,14 +438,23 @@ async fn test_command_handler_status_and_test() {
     let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
     let handler = BotCommandHandler::new(engine, "did:plc:bot");
 
-    // Status output
+    // Tenant Status output (scoped privacy)
     let reply_status = handler
         .handle_command("did:plc:user", "status")
         .await
         .expect("handle");
-    assert!(reply_status.contains("Skybouncer Engine Status:"));
-    assert!(reply_status.contains("Commits Received: 0"));
-    assert!(reply_status.contains("Violations Detected: 0"));
+    assert!(reply_status.contains("Skybouncer Status for Your Account:"));
+    assert!(reply_status.contains("Defense State: ▶️ ACTIVE"));
+    assert!(reply_status.contains("Accounts Bounced from Your Posts: 0"));
+
+    // Admin Fleet Status output
+    let reply_admin_status = handler
+        .handle_command("did:plc:admin", "status")
+        .await
+        .expect("handle");
+    assert!(reply_admin_status.contains("Skybouncer Engine Status (Admin Fleet View):"));
+    assert!(reply_admin_status.contains("Commits Received: 0"));
+    assert!(reply_admin_status.contains("Violations Detected: 0"));
 
     // Test command: heuristic matches "crypto scam"
     let reply_test_violation = handler
