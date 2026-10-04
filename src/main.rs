@@ -840,6 +840,43 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
         }
     };
 
+    // Setup cancellation and background task supervision
+    let cancel = CancellationToken::new();
+    let mut join_set = JoinSet::new();
+
+    // Start Sovereign Web Dashboard early so OAuth endpoints (e.g. client-metadata.json)
+    // are actively reachable when PDS authorization servers verify OAuth client metadata
+    let web_enabled = std::env::var("WEB_ENABLED")
+        .or_else(|_| std::env::var("SKYBOUNCER_WEB_ENABLED"))
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    let port_configured = std::env::var("PORT").is_ok() || std::env::var("SKYBOUNCER_PORT").is_ok();
+
+    if web_enabled || port_configured {
+        let web_port = web_config.port;
+        let engine_web = std::sync::Arc::new(engine.clone());
+        let cancel_web = cancel.clone();
+        let web_cfg = web_config.clone();
+
+        join_set.spawn(async move {
+            if let Err(e) = skybouncer::web::run_web_server(web_cfg, engine_web, cancel_web).await {
+                error!(
+                    error = %e,
+                    "Sovereign web dashboard server encountered error"
+                );
+            }
+            Ok(Default::default())
+        });
+        info!(
+            port = web_port,
+            "🌐 Sovereign Web Dashboard server activated"
+        );
+        // Allow TCP listener to bind before performing remote PDS verifications
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    } else {
+        info!("ℹ️ Sovereign Web Dashboard disabled (WEB_ENABLED / PORT not configured)");
+    }
+
     // Cold-start follow graph hydration via public AppView
     for did in &config.protected_dids {
         let follows = enricher.fetch_follows(did, 100).await;
@@ -929,10 +966,6 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
     } else if config.dry_run {
         info!("🛡️ Shadow mode active: skipping remote PDS moderation list verification");
     }
-
-    // Setup cancellation and background task supervision
-    let cancel = CancellationToken::new();
-    let mut join_set = JoinSet::new();
 
     // Event channel connecting Jetstream streamer to engine pipeline
     let (tx, rx) = mpsc::channel(config.channel_capacity);
@@ -1068,38 +1101,6 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
         info!("📢 Proactive ATProto DM bounce alert dispatcher activated");
     } else {
         info!("ℹ️ ATProto DM bot disabled (BOT_APP_PASSWORD / CHAT_ACCESS_TOKEN not configured)");
-    }
-
-    // Optional Sovereign Web Dashboard
-    let web_enabled = std::env::var("WEB_ENABLED")
-        .or_else(|_| std::env::var("SKYBOUNCER_WEB_ENABLED"))
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false);
-    let port_configured = std::env::var("PORT").is_ok() || std::env::var("SKYBOUNCER_PORT").is_ok();
-
-    if web_enabled || port_configured {
-        let web_config = skybouncer::web::WebServerConfig::from_env();
-        let web_port = web_config.port;
-        let engine_web = std::sync::Arc::new(engine.clone());
-        let cancel_web = cancel.clone();
-
-        join_set.spawn(async move {
-            if let Err(e) =
-                skybouncer::web::run_web_server(web_config, engine_web, cancel_web).await
-            {
-                error!(
-                    error = %e,
-                    "Sovereign web dashboard server encountered error"
-                );
-            }
-            Ok(Default::default())
-        });
-        info!(
-            port = web_port,
-            "🌐 Sovereign Web Dashboard server activated"
-        );
-    } else {
-        info!("ℹ️ Sovereign Web Dashboard disabled (WEB_ENABLED / PORT not configured)");
     }
 
     info!("🚀 Skybouncer is running! Press Ctrl+C to stop.");
