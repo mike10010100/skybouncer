@@ -202,15 +202,11 @@ pub fn create_web_router(
         .layer(TraceLayer::new_for_http())
 }
 
-/// Runs the Axum HTTP web server until `cancel` is triggered.
-///
-/// # Errors
-/// Returns [`SkybouncerError::Config`] or [`SkybouncerError::Http`] if binding or serving fails.
-pub async fn run_web_server(
-    config: WebServerConfig,
-    engine: Arc<SkybouncerEngine>,
-    cancel: CancellationToken,
-) -> Result<(), SkybouncerError> {
+/// Constructs the [`AtprotoOAuthClient`] and [`OAuthClientMetadata`] from server configuration.
+#[must_use]
+pub fn build_oauth_client(
+    config: &WebServerConfig,
+) -> (Option<Arc<AtprotoOAuthClient>>, OAuthClientMetadata) {
     let client_id = config.client_id();
     let redirect_uri = config.redirect_uri();
 
@@ -228,9 +224,39 @@ pub async fn run_web_server(
     {
         Ok(client) => Some(Arc::new(client)),
         Err(e) => {
-            info!(error = %e, "ATProto OAuth client not activated; running in local dashboard mode");
+            info!(
+                error = %e,
+                "ATProto OAuth client not activated; running in local dashboard mode"
+            );
             None
         }
+    };
+
+    (oauth_client, metadata)
+}
+
+/// Runs the Axum HTTP web server until `cancel` is triggered.
+///
+/// # Errors
+/// Returns [`SkybouncerError::Config`] or [`SkybouncerError::Http`] if binding or serving fails.
+pub async fn run_web_server(
+    config: WebServerConfig,
+    engine: Arc<SkybouncerEngine>,
+    cancel: CancellationToken,
+) -> Result<(), SkybouncerError> {
+    let (oauth_client, metadata) = if let Some(client) = engine.oauth_client() {
+        let client_id = config.client_id();
+        let redirect_uri = config.redirect_uri();
+        let metadata = OAuthClientMetadata::new(client_id, redirect_uri)
+            .with_client_name("Skybouncer Moderation")
+            .with_scope("atproto transition:generic");
+        (Some(client), metadata)
+    } else {
+        let (client, meta) = build_oauth_client(&config);
+        if let Some(ref c) = client {
+            engine.set_oauth_client(Arc::clone(c));
+        }
+        (client, meta)
     };
 
     let app = create_web_router(engine, oauth_client, metadata);

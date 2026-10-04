@@ -819,10 +819,20 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
         skybouncer::enricher::AppViewContextEnricher::with_endpoint(appview_endpoint),
     );
 
-    let engine = match SkybouncerEngine::builder(config.clone())
-        .with_enricher(enricher.clone())
-        .build()
-    {
+    // Initialize Web / OAuth configuration early for background token auto-refreshes
+    let web_config = skybouncer::web::WebServerConfig::from_env();
+    let (oauth_client, _) = skybouncer::web::build_oauth_client(&web_config);
+
+    let mut engine_builder =
+        SkybouncerEngine::builder(config.clone()).with_enricher(enricher.clone());
+    if let Some(ref oc) = oauth_client {
+        info!(
+            "🔑 ATProto OAuth client initialized for automatic background session token refreshes"
+        );
+        engine_builder = engine_builder.with_oauth_client(std::sync::Arc::clone(oc));
+    }
+
+    let engine = match engine_builder.build() {
         Ok(eng) => eng,
         Err(e) => {
             error!(error = %e, "Failed to initialize Skybouncer engine");

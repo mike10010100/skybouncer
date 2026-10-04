@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use skyauth::client::AtprotoOAuthClient;
 use skybase::ingest::{CommitOperation, JetstreamCommit};
 use skybase::repo::PdsRepoClient;
 use tokio::sync::{broadcast, mpsc};
@@ -884,6 +885,7 @@ pub struct SkybouncerEngine {
     stats: Arc<EngineStats>,
     paused: Arc<AtomicBool>,
     bounce_notifier: broadcast::Sender<BounceNotification>,
+    oauth_client: Arc<RwLock<Option<Arc<AtprotoOAuthClient>>>>,
 }
 
 impl SkybouncerEngine {
@@ -934,6 +936,7 @@ impl SkybouncerEngine {
         let stats = Arc::new(EngineStats::default());
         let paused = Arc::new(AtomicBool::new(false));
         let (bounce_notifier, _) = broadcast::channel(256);
+        let oauth_client = Arc::new(RwLock::new(None));
 
         Self {
             config,
@@ -952,7 +955,20 @@ impl SkybouncerEngine {
             stats,
             paused,
             bounce_notifier,
+            oauth_client,
         }
+    }
+
+    /// Configures the active [`AtprotoOAuthClient`] for automatic background session refreshes.
+    pub fn set_oauth_client(&self, client: Arc<AtprotoOAuthClient>) {
+        *self.oauth_client.write() = Some(Arc::clone(&client));
+        self.tenant_registry.set_oauth_client(client);
+    }
+
+    /// Returns a reference to the active [`AtprotoOAuthClient`], if configured.
+    #[must_use]
+    pub fn oauth_client(&self) -> Option<Arc<AtprotoOAuthClient>> {
+        self.oauth_client.read().clone()
     }
 
     /// Evaluates a single Jetstream commit through the full moderation pipeline.
@@ -1688,7 +1704,7 @@ impl SkybouncerEngine {
                 }
 
                 // Actionable violation: bounce on sovereign PDS
-                let pds_client = self.pds_client_for(&target_did);
+                let pds_client = self.pds_client_for(&target_did).await;
                 let bounce_result = self
                     .modlist_manager
                     .bounce_user_with_text(
@@ -1847,7 +1863,7 @@ impl SkybouncerEngine {
         protected_did: &str,
         subject_did: &str,
     ) -> Result<bool, SkybouncerError> {
-        let pds_client = self.pds_client_for(protected_did);
+        let pds_client = self.pds_client_for(protected_did).await;
         self.modlist_manager
             .pardon_user(&pds_client, protected_did, subject_did)
             .await
@@ -1858,7 +1874,7 @@ impl SkybouncerEngine {
     /// # Errors
     /// Returns [`SkybouncerError`] if list provisioning fails.
     pub async fn ensure_mod_list(&self, protected_did: &str) -> Result<String, SkybouncerError> {
-        let pds_client = self.pds_client_for(protected_did);
+        let pds_client = self.pds_client_for(protected_did).await;
         self.modlist_manager
             .ensure_mod_list(&pds_client, protected_did)
             .await
@@ -1873,7 +1889,7 @@ impl SkybouncerEngine {
         protected_did: &str,
         list_uri: &str,
     ) -> Result<(), SkybouncerError> {
-        let pds_client = self.pds_client_for(protected_did);
+        let pds_client = self.pds_client_for(protected_did).await;
         self.modlist_manager
             .ensure_list_blocked(&pds_client, protected_did, list_uri)
             .await
@@ -2111,9 +2127,11 @@ impl SkybouncerEngine {
     }
 
     /// Retrieves the [`PdsRepoClient`] for a specific protected user, falling back to default engine client.
-    #[must_use]
-    pub fn pds_client_for(&self, did: &str) -> Arc<PdsRepoClient> {
-        if let Ok(Some(client)) = self.tenant_registry.get_pds_client(did, None) {
+    ///
+    /// If the tenant's OAuth session has expired or is expiring soon, it is automatically refreshed using the configured [`AtprotoOAuthClient`].
+    pub async fn pds_client_for(&self, did: &str) -> Arc<PdsRepoClient> {
+        let oc = self.oauth_client.read().clone();
+        if let Ok(Some(client)) = self.tenant_registry.get_pds_client(did, oc.as_ref()).await {
             return client;
         }
         Arc::clone(&self.pds_client)
@@ -2129,7 +2147,7 @@ impl SkybouncerEngine {
         &self,
         protected_did: &str,
     ) -> Result<Option<RuleRubric>, SkybouncerError> {
-        let pds_client = self.pds_client_for(protected_did);
+        let pds_client = self.pds_client_for(protected_did).await;
         let pds_rubric = crate::modlist::fetch_sovereign_config(&pds_client, protected_did).await?;
         if let Some(ref rubric) = pds_rubric {
             if self.is_enrolled(protected_did) {
@@ -2154,7 +2172,7 @@ impl SkybouncerEngine {
         protected_did: &str,
     ) -> Result<String, SkybouncerError> {
         let rubric = self.rubric_for(protected_did);
-        let pds_client = self.pds_client_for(protected_did);
+        let pds_client = self.pds_client_for(protected_did).await;
         crate::modlist::publish_sovereign_config(&pds_client, protected_did, &rubric).await
     }
 
@@ -2467,6 +2485,7 @@ pub struct SkybouncerEngineBuilder {
     tenant_registry: Option<Arc<TenantRegistry>>,
     rate_limiter: Option<Arc<EvaluationRateLimiter>>,
     enricher: Option<Arc<dyn ContextEnricher>>,
+    oauth_client: Option<Arc<AtprotoOAuthClient>>,
 }
 
 impl SkybouncerEngineBuilder {
@@ -2486,7 +2505,15 @@ impl SkybouncerEngineBuilder {
             tenant_registry: None,
             rate_limiter: None,
             enricher: None,
+            oauth_client: None,
         }
+    }
+
+    /// Configures an explicit ATProto OAuth client for background session token refreshes.
+    #[must_use]
+    pub fn with_oauth_client(mut self, client: Arc<AtprotoOAuthClient>) -> Self {
+        self.oauth_client = Some(client);
+        self
     }
 
     /// Configures an explicit shared tenant registry.
@@ -2785,6 +2812,10 @@ impl SkybouncerEngineBuilder {
         let stats = Arc::new(EngineStats::default());
         let paused = Arc::new(AtomicBool::new(false));
         let (bounce_notifier, _) = broadcast::channel(256);
+        let oauth_client_arc = Arc::new(RwLock::new(self.oauth_client.clone()));
+        if let Some(ref oc) = self.oauth_client {
+            tenant_registry.set_oauth_client(Arc::clone(oc));
+        }
 
         Ok(SkybouncerEngine {
             config: self.config,
@@ -2803,6 +2834,7 @@ impl SkybouncerEngineBuilder {
             stats,
             paused,
             bounce_notifier,
+            oauth_client: oauth_client_arc,
         })
     }
 }

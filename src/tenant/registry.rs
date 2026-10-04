@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -89,6 +90,7 @@ impl Tenant {
 pub struct TenantRegistry {
     conn: Arc<Mutex<Connection>>,
     pds_clients: Arc<RwLock<HashMap<String, Arc<PdsRepoClient>>>>,
+    oauth_client: Arc<RwLock<Option<Arc<AtprotoOAuthClient>>>>,
 }
 
 impl TenantRegistry {
@@ -118,6 +120,7 @@ impl TenantRegistry {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
+            oauth_client: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -136,6 +139,7 @@ impl TenantRegistry {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
+            oauth_client: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -169,6 +173,7 @@ impl TenantRegistry {
         Self {
             conn: Arc::new(Mutex::new(conn)),
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
+            oauth_client: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -185,6 +190,7 @@ impl TenantRegistry {
         Ok(Self {
             conn,
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
+            oauth_client: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -559,23 +565,67 @@ impl TenantRegistry {
         Ok(usize::try_from(count.max(0)).unwrap_or(0))
     }
 
+    /// Attaches an [`AtprotoOAuthClient`] for background session token refreshes.
+    pub fn set_oauth_client(&self, client: Arc<AtprotoOAuthClient>) {
+        *self.oauth_client.write() = Some(client);
+        self.pds_clients.write().clear();
+    }
+
+    /// Returns a clone of the configured [`AtprotoOAuthClient`], if set.
+    #[must_use]
+    pub fn oauth_client(&self) -> Option<Arc<AtprotoOAuthClient>> {
+        self.oauth_client.read().clone()
+    }
+
+    /// Updates the stored [`OAuthSession`] for an enrolled tenant in SQLite.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if serialization or SQLite execution fails.
+    pub fn update_session(
+        &self,
+        did: &str,
+        session: &OAuthSession,
+    ) -> Result<bool, SkybouncerError> {
+        let serialized = serde_json::to_string(session).map_err(|e| {
+            SkybouncerError::Database(format!("Failed to serialize OAuthSession for {did}: {e}"))
+        })?;
+        let now_us = current_time_us();
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE tenants SET session_json = ?1, updated_at = ?2 WHERE did = ?3",
+                params![serialized, now_us, did],
+            )
+            .map_err(|e| {
+                SkybouncerError::Database(format!("Failed to update session for {did}: {e}"))
+            })?;
+        self.pds_clients.write().remove(did);
+        Ok(rows > 0)
+    }
+
     /// Resolves or initializes a dedicated [`PdsRepoClient`] for an enrolled tenant using their DPoP session.
     ///
-    /// If a client was already constructed for this DID, it is returned from cache immediately (<50ns).
+    /// If a client was already constructed for this DID and its session is still valid, it is returned from cache immediately (<50ns).
+    /// If the session is expired or expiring within 60 seconds, it is automatically refreshed using the configured [`AtprotoOAuthClient`].
     /// If the tenant has no stored session, returns `Ok(None)`.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError`] if client creation fails.
-    pub fn get_pds_client(
+    /// Returns [`SkybouncerError`] if client creation or database lookup fails.
+    pub async fn get_pds_client(
         &self,
         did: &str,
         oauth_client: Option<&Arc<AtprotoOAuthClient>>,
     ) -> Result<Option<Arc<PdsRepoClient>>, SkybouncerError> {
-        // 1. Fast path: check in-memory cache
+        // 1. Fast path: check in-memory cache if the cached client session is still valid
         {
             let guard = self.pds_clients.read();
             if let Some(client) = guard.get(did) {
-                return Ok(Some(Arc::clone(client)));
+                if !client
+                    .session()
+                    .is_expired_with_leeway(Duration::from_secs(60))
+                {
+                    return Ok(Some(Arc::clone(client)));
+                }
             }
         }
 
@@ -585,14 +635,59 @@ impl TenantRegistry {
             None => return Ok(None),
         };
 
-        let session = match tenant.session {
+        let mut session = match tenant.session {
             Some(s) => s,
             None => return Ok(None),
         };
 
+        // 3. Resolve OAuth client
+        let resolved_oauth_client = oauth_client
+            .cloned()
+            .or_else(|| self.oauth_client.read().clone());
+
+        // 4. If session is expired or close to expiring, auto-refresh via OAuth
+        if session.is_expired_with_leeway(Duration::from_secs(60)) {
+            if let Some(ref oc) = resolved_oauth_client {
+                if session.refresh_token().is_some() {
+                    tracing::info!(
+                        did = %did,
+                        "Refreshing expired ATProto OAuth session for tenant PDS client"
+                    );
+                    match oc.refresh_session(&mut session).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                did = %did,
+                                "Successfully refreshed ATProto OAuth session for tenant"
+                            );
+                            if let Err(e) = self.update_session(did, &session) {
+                                tracing::warn!(
+                                    did = %did,
+                                    error = %e,
+                                    "Failed to persist refreshed session to SQLite database"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                did = %did,
+                                error = %e,
+                                "Failed to refresh ATProto OAuth session using refresh token"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        did = %did,
+                        "Tenant session is expired but has no refresh token to refresh with"
+                    );
+                }
+            }
+        }
+
+        // 5. Construct PdsRepoClient
         let session_arc = Arc::new(session);
-        let client = match oauth_client {
-            Some(oc) => PdsRepoClient::new(session_arc, Arc::clone(oc)).map_err(|e| {
+        let client = match resolved_oauth_client {
+            Some(ref oc) => PdsRepoClient::new(session_arc, Arc::clone(oc)).map_err(|e| {
                 SkybouncerError::Config(format!(
                     "Failed to create PDS client with OAuth client for {did}: {e}"
                 ))
@@ -669,8 +764,8 @@ mod tests {
         assert!(!registry.is_enrolled("did:plc:alice").unwrap());
     }
 
-    #[test]
-    fn test_tenant_session_roundtrip_and_pds_client() {
+    #[tokio::test]
+    async fn test_tenant_session_roundtrip_and_pds_client() {
         let registry = TenantRegistry::open_in_memory().unwrap();
 
         let dpop_key = DPoPKey::generate();
@@ -704,12 +799,135 @@ mod tests {
         // Build PdsRepoClient
         let pds_client = registry
             .get_pds_client("did:plc:bob", None)
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(pds_client.did(), "did:plc:bob");
         assert_eq!(
             pds_client.pds_endpoint().unwrap(),
             "https://pds.bob.example.com"
+        );
+
+        // Test update_session
+        let new_dpop_key = DPoPKey::generate();
+        let updated_session = OAuthSession::new(
+            "did:plc:bob",
+            "at_fresh_access_token",
+            Some("rt_fresh_refresh_token".to_string()),
+            "DPoP",
+            Some("atproto transition:generic".to_string()),
+            Some(7200),
+            new_dpop_key,
+            Some("https://pds.bob.example.com".to_string()),
+            Some("https://auth.example.com".to_string()),
+            Some("https://auth.example.com/oauth/token".to_string()),
+        )
+        .unwrap();
+
+        assert!(registry
+            .update_session("did:plc:bob", &updated_session)
+            .unwrap());
+        let refetched = registry.get("did:plc:bob").unwrap().unwrap();
+        assert_eq!(
+            refetched.session.unwrap().access_token(),
+            "at_fresh_access_token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tenant_session_auto_refresh_on_expired_token() {
+        use serde_json::json;
+        use skyauth::client::OAuthClientMetadata;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let token_endpoint = format!("{}/oauth/token", mock_server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .insert_header("dpop-nonce", "fresh-dpop-nonce-123")
+                    .set_body_json(json!({
+                        "access_token": "at-auto-refreshed-token",
+                        "token_type": "DPoP",
+                        "expires_in": 3600,
+                        "refresh_token": "rt-auto-refreshed-token",
+                        "scope": "atproto",
+                        "sub": "did:plc:alice"
+                    })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let oauth_client = Arc::new(
+            AtprotoOAuthClient::builder()
+                .client_metadata(OAuthClientMetadata::new(
+                    "https://skybouncer.example.com/client-metadata.json",
+                    "https://skybouncer.example.com/oauth/callback",
+                ))
+                .allow_insecure_localhost(true)
+                .build()
+                .unwrap(),
+        );
+
+        let registry = TenantRegistry::open_in_memory().unwrap();
+        registry.set_oauth_client(Arc::clone(&oauth_client));
+
+        // Create an expired session (expires_in = Some(0))
+        let dpop_key = DPoPKey::generate();
+        let expired_session = OAuthSession::new(
+            "did:plc:alice",
+            "at-expired-token",
+            Some("rt-initial-refresh-token".to_string()),
+            "DPoP",
+            Some("atproto".to_string()),
+            Some(0),
+            dpop_key,
+            Some("https://pds.example.com".to_string()),
+            Some(mock_server.uri()),
+            Some(token_endpoint),
+        )
+        .unwrap();
+
+        assert!(expired_session.is_expired());
+
+        let tenant = Tenant::new("did:plc:alice")
+            .with_handle("alice.bsky.social")
+            .with_session(expired_session);
+        registry.register_or_update(&tenant).unwrap();
+
+        // Calling get_pds_client should detect the expired session, invoke OAuth refresh, and succeed
+        let pds_client = registry
+            .get_pds_client("did:plc:alice", None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            pds_client.session().access_token(),
+            "at-auto-refreshed-token"
+        );
+        assert!(!pds_client.session().is_expired());
+
+        // Verify that the refreshed session was persisted to the SQLite database
+        let refetched = registry.get("did:plc:alice").unwrap().unwrap();
+        assert_eq!(
+            refetched.session.unwrap().access_token(),
+            "at-auto-refreshed-token"
+        );
+
+        // Subsequent call returns the cached PdsRepoClient immediately
+        let cached_client = registry
+            .get_pds_client("did:plc:alice", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cached_client.session().access_token(),
+            "at-auto-refreshed-token"
         );
     }
 }
