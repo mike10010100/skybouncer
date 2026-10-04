@@ -237,11 +237,40 @@ Adhering to [`AGENTS.md`](AGENTS.md) and [`rust-best-practices`](https://github.
 | **M3: Mod List Provisioning & PDS Mutations** | Integration with `skybase::repo`, `app.bsky.graph.list` creation, `app.bsky.graph.listitem` upsert and pardon mutations with DPoP signing. | ✅ **Completed & Published (`v0.1.0`)** |
 | **M4: ATProto DM Bot Interface** | ATProto Chat client (`chat.bsky.convo.*`), conversational command parser (`rules`, `recent`, `pardon`, `sensitivity`), automated DM alert dispatcher. | ✅ **Completed & Published (`v0.1.0`)** |
 | **M5: Web Dashboard & Automated Release** | Minimal Web UI with `skyauth` OAuth login, dry-run simulator, 100% test coverage, GitHub Actions automated crates.io publish & release pipeline. | ✅ **Completed & Published (`v0.1.0`)** |
-| **M6: Multi-Tenant Hosted Service & Onboarding** | SQLite `TenantRegistry` managing dynamic multi-user DPoP sessions, public bot conversational onboarding flow for unenrolled users, and production Docker Compose with Cloudflare Tunnel isolation. | ✅ **Completed & Verified** |
+| **M6: Multi-Tenant Hosted Service & Onboarding** | SQLite `TenantRegistry` managing dynamic multi-user DPoP sessions, public bot conversational onboarding flow for unenrolled users, and production Docker Compose with Cloudflare Tunnel isolation. | ✅ **Completed & Published (`v0.1.0`)** |
+| **M7: Scoped Bounces & Offending Post Transparency** | Per-user scoped bounce feeds, offending post URI & text tracking, direct Bluesky post inspection links, schema migration stabilization, and full persistent Tier 1 / Tier 2 evaluation audit log with admin view. | ✅ **Completed & Published (`v0.1.3`)** |
 
 ---
 
-## 7. Disambiguation & Namespace Verification
+## 7. System Hardening & Quality of Life Roadmap
+
+### 7.1 Immediate Operational Hardening (M8)
+1. **Persistent OAuth Token Auto-Refresh for Background PDS Operations** (🔥 Immediate Priority):
+   - **Problem**: When tenant sessions' OAuth access tokens expire after 1–2 hours, background PDS operations (e.g. firehose sovereign config synchronization, modlist verification) fail with `Authentication error: Token expired: exp < now` because the background `PdsRepoClient` lacks access to the `AtprotoOAuthClient`.
+   - **Solution**: Pass `Arc<AtprotoOAuthClient>` into `SkybouncerEngine` and `TenantRegistry`. Equip `engine.pds_client_for(did)` with the OAuth client so expired access tokens are automatically refreshed in the background using stored OAuth refresh tokens.
+
+### 7.2 Moderation Accuracy & Safety QoL (M9)
+2. **Moderation Allowlist & False-Positive Immunization ("Pardon & Whitelist")**:
+   - **Problem**: Pardoning an account currently removes them from the blocklist, but if they reply again in the future, the Non-Followed Gate treats them as an unfollowed candidate and re-evaluates them, risking repeated false positives.
+   - **Solution**: Introduce a persistent `allowlist` in SQLite and add a "Pardon & Whitelist" action on the web dashboard and DM bot. The Gate immediately bypasses (`Outcome::Bypassed`) allowlisted DIDs without model calls.
+3. **Temporary "Time-Out" / Cooldown Bounces (TTL Bouncing)**:
+   - Configurable bounce durations: Permanent, 24-Hour Cooldown, 7-Day Timeout, 30-Day Timeout.
+   - Automated background scheduler periodically prunes expired temporary `listitem` records from the user's sovereign PDS repository.
+4. **Tenant-Scoped Evaluation Audit Log (User View)**:
+   - Provide a tenant-scoped endpoint `GET /api/evaluations` where `target_did == caller_did`.
+   - Regular users who sign in via OAuth can view evaluations performed on interactions targeting their own posts.
+
+### 7.3 UX & Observability Polish (M10)
+5. **Dashboard Rubric Presets & Bounced Search**:
+   - Quick-select rubric templates in the Web Rules Editor (e.g. *Balanced Defense*, *Zero Crypto / Airdrop Spam*, *Anti-Hostility / Harassment*, *Anti-Ragebait / Sealioning*).
+   - Search bar and filtering on the Recently Bounced dashboard table by handle, DID, or offending post keyword.
+6. **Production Observability & Webhook Notifications**:
+   - Native Prometheus `/metrics` endpoint exposing event ingestion rates, evaluation latency, bounce counts, and error metrics.
+   - Discord/Slack webhook notifications alerting moderators when an account is bounced with direct link to the offending post.
+
+---
+
+## 8. Disambiguation & Namespace Verification
 
 * **Crate Name**: `skybouncer`
 * **Crates.io Status**: ✅ **Published & Active** ([`skybouncer 0.1.0`](https://crates.io/api/v1/crates/skybouncer/0.1.0) and [`skybase 0.1.0`](https://crates.io/api/v1/crates/skybase/0.1.0) are live on crates.io).

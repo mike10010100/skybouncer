@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-10-04
+
+### Added
+
+- **Persistent OAuth Token Auto-Refresh for Background PDS Operations**:
+  - Integrated `AtprotoOAuthClient` with `SkybouncerEngine` and `TenantRegistry` for automated background session lifecycle management.
+  - Automatic detection of expired or expiring (within 60s) DPoP OAuth access tokens when resolving tenant `PdsRepoClient`s.
+  - Seamless token refresh against the authorization server using stored OAuth refresh tokens with single-flight deduplication.
+  - Automatic persistence of refreshed session tokens to SQLite (`update_session`), preserving updated credentials across service restarts.
+  - Resolved `Token expired` warnings during startup sovereign config synchronization, listblock checks, and firehose config mutations.
+  - Added comprehensive unit test `test_tenant_session_auto_refresh_on_expired_token` verifying transparent token refresh, SQLite cache consistency, and in-memory caching.
+
 ## [0.1.3] - 2026-10-04
 
 ### Added
