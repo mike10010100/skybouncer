@@ -243,30 +243,22 @@ Adhering to [`AGENTS.md`](AGENTS.md) and [`rust-best-practices`](https://github.
 | **M9: Tier 1 & Tier 2 Evaluation Audit Log** | Persistent SQLite evaluation audit logging, granular telemetry breakdown, retention management, and admin oversight view. | ✅ **Completed & Published (`v0.1.5`)** |
 | **M10: Web & Auth Layer Security Hardening** | 256-bit CSPRNG web session tokens, admin privilege verification, SSRF blocking, DOM XSS prevention, security headers, scoped DM bot privacy, and rate limiter memory eviction. | ✅ **Completed & Published (`v0.1.6`)** |
 | **M11: AES-256-GCM Session Encryption at Rest** | Authenticated AES-256-GCM encryption with CSPRNG nonces for OAuth tokens/DPoP keys at rest, `enc:v1:` versioning, zero-downtime legacy passthrough, and key management via `SKYBOUNCER_SESSION_ENCRYPTION_KEY`. | ✅ **Completed & Published (`v0.1.7`)** |
+| **M12: Moderation Allowlist & Pardon Immunization** | Persistent SQLite `allowlist` table, sub-microsecond non-followed gate bypass (`<1µs`), ATProto DM bot commands (`allow`, `unallow`, `allowlist`), and "Pardon & Allow" UI integration. | ✅ **Completed & Published (`v0.1.11`)** |
+| **M13: Temporary TTL Bouncing & Cooldown Lifecycles** | Flexible `BounceDuration` (Permanent, 24h, 7d, 30d, custom), SQLite expiration indexing, automated background PDS `listitem` pruning, segmented duration UI control, and DM bot `duration` commands. | ✅ **Completed & Published (`v0.1.11` / `v0.1.12`)** |
+| **M14: Tenant-Scoped Evaluation Audit Log** | Isolated `GET /api/evaluations` scoped by caller DID, real-time telemetry card, and fleet-wide admin oversight. | ✅ **Completed & Published (`v0.1.11`)** |
+| **M15: Production Observability & Prometheus Metrics** | Native `GET /metrics` and `GET /api/metrics` exposing Prometheus 0.0.4 text format telemetry for commits, gate bypasses, cache hits, model evaluations, and queue depth. | ✅ **Completed & Published (`v0.1.11`)** |
+| **M16: Dashboard Presets & Real-Time Search Filtering** | Quick-select rubric templates (*Balanced Defense*, *Zero Crypto*, *Anti-Hostility*, *Anti-Ragebait*) and client-side real-time search filtering on Recently Bounced table. | ✅ **Completed & Published (`v0.1.11`)** |
 
 
 ---
 
 ## 7. System Hardening & Quality of Life Roadmap
 
-### 7.1 Moderation Accuracy & Safety QoL (Future)
-1. **Moderation Allowlist & False-Positive Immunization ("Pardon & Whitelist")**:
-   - **Problem**: Pardoning an account currently removes them from the blocklist, but if they reply again in the future, the Non-Followed Gate treats them as an unfollowed candidate and re-evaluates them, risking repeated false positives.
-   - **Solution**: Introduce a persistent `allowlist` in SQLite and add a "Pardon & Whitelist" action on the web dashboard and DM bot. The Gate immediately bypasses (`Outcome::Bypassed`) allowlisted DIDs without model calls.
-2. **Temporary "Time-Out" / Cooldown Bounces (TTL Bouncing)**:
-   - Configurable bounce durations: Permanent, 24-Hour Cooldown, 7-Day Timeout, 30-Day Timeout.
-   - Automated background scheduler periodically prunes expired temporary `listitem` records from the user's sovereign PDS repository.
-3. **Tenant-Scoped Evaluation Audit Log (User View)**:
-   - Provide a tenant-scoped endpoint `GET /api/evaluations` where `target_did == caller_did`.
-   - Regular users who sign in via OAuth can view evaluations performed on interactions targeting their own posts.
-
-### 7.3 UX & Observability Polish (M10)
-5. **Dashboard Rubric Presets & Bounced Search**:
-   - Quick-select rubric templates in the Web Rules Editor (e.g. *Balanced Defense*, *Zero Crypto / Airdrop Spam*, *Anti-Hostility / Harassment*, *Anti-Ragebait / Sealioning*).
-   - Search bar and filtering on the Recently Bounced dashboard table by handle, DID, or offending post keyword.
-6. **Production Observability & Webhook Notifications**:
-   - Native Prometheus `/metrics` endpoint exposing event ingestion rates, evaluation latency, bounce counts, and error metrics.
-   - Discord/Slack webhook notifications alerting moderators when an account is bounced with direct link to the offending post.
+### 7.1 Future Architectural Extensions
+1. **Generic `LlmClassifier` Provider Interface**:
+   - Structured JSON schema prompt integration for OpenAI-compatible, Gemini Flash, Claude Haiku, or local Ollama endpoints as an alternative/fallback to Jev System-1 classification.
+2. **Dynamic In-App Notification Delivery**:
+   - Native ATProto notifications or DM digests summarizing daily bounced interactions for enrolled tenants.
 
 ---
 
