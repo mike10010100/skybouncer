@@ -145,6 +145,7 @@ impl DeduplicationCache {
     }
 
     fn init_schema(conn: &Connection) -> Result<(), SkybouncerError> {
+        // 1. Base tables
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS mod_list_config (
@@ -167,7 +168,25 @@ impl DeduplicationCache {
                 protected_did TEXT NOT NULL DEFAULT '',
                 post_text TEXT NOT NULL DEFAULT ''
             );
+            ",
+        )
+        .map_err(|e| {
+            SkybouncerError::Database(format!("Failed to initialize base cache schema: {e}"))
+        })?;
 
+        // 2. Ensure columns exist on legacy tables BEFORE creating indexes on them
+        let _ = conn.execute(
+            "ALTER TABLE bounced_users ADD COLUMN protected_did TEXT NOT NULL DEFAULT '';",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE bounced_users ADD COLUMN post_text TEXT NOT NULL DEFAULT '';",
+            [],
+        );
+
+        // 3. Dependent tables and indexes
+        conn.execute_batch(
+            "
             CREATE INDEX IF NOT EXISTS idx_bounced_users_bounced_at
                 ON bounced_users(bounced_at);
 
@@ -211,22 +230,8 @@ impl DeduplicationCache {
             ",
         )
         .map_err(|e| {
-            SkybouncerError::Database(format!("Failed to initialize cache schema: {e}"))
+            SkybouncerError::Database(format!("Failed to initialize cache schema indexes: {e}"))
         })?;
-
-        // Forward-compatible migrations for existing databases
-        let _ = conn.execute(
-            "ALTER TABLE bounced_users ADD COLUMN protected_did TEXT NOT NULL DEFAULT '';",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE bounced_users ADD COLUMN post_text TEXT NOT NULL DEFAULT '';",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_bounced_users_protected ON bounced_users(protected_did);",
-            [],
-        );
 
         Ok(())
     }
@@ -906,5 +911,55 @@ mod tests {
         // Pruning removes expired entries
         let pruned = cache.prune_expired_evaluations().unwrap();
         let _ = pruned;
+    }
+
+    #[test]
+    fn test_legacy_schema_migration_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Create the legacy table without protected_did or post_text
+        conn.execute_batch(
+            "
+            CREATE TABLE bounced_users (
+                subject_did TEXT PRIMARY KEY,
+                listitem_uri TEXT NOT NULL,
+                listitem_rkey TEXT NOT NULL,
+                listitem_cid TEXT NOT NULL,
+                category TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                reason TEXT NOT NULL,
+                post_uri TEXT NOT NULL,
+                bounced_at INTEGER NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+
+        // init_schema must smoothly migrate the legacy table and create the index without erroring
+        DeduplicationCache::init_schema(&conn).unwrap();
+
+        // Verify columns and index now exist
+        let cache = DeduplicationCache {
+            conn: Arc::new(parking_lot::Mutex::new(conn)),
+        };
+        let bounce = BouncedUser {
+            subject_did: "did:plc:migrated_user".to_string(),
+            protected_did: "did:plc:legacy_owner".to_string(),
+            listitem_uri: "at://did:plc:legacy_owner/app.bsky.graph.listitem/item1".to_string(),
+            listitem_rkey: "item1".to_string(),
+            listitem_cid: "bafyitemcid".to_string(),
+            category: "spam".to_string(),
+            confidence: 0.95,
+            reason: "Legacy migration test".to_string(),
+            post_uri: "at://did:plc:migrated_user/app.bsky.feed.post/1".to_string(),
+            post_text: "Migrated text".to_string(),
+            bounced_at: 1_700_000_000,
+        };
+        cache.record_bounce(&bounce).unwrap();
+        let fetched = cache
+            .get_bounced_user("did:plc:migrated_user")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.protected_did, "did:plc:legacy_owner");
+        assert_eq!(fetched.post_text, "Migrated text");
     }
 }
