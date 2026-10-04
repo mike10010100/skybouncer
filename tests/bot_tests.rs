@@ -614,6 +614,73 @@ async fn test_command_handler_sensitivity() {
 }
 
 #[tokio::test]
+async fn test_command_handler_duration() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
+
+    // Stranger sending duration is rejected
+    let reply_unauth = handler
+        .handle_command("did:plc:stranger", "duration 24h")
+        .await
+        .expect("handle");
+    assert!(reply_unauth.contains("You do not have an active bouncer session"));
+
+    // Usage prompt when argument is missing
+    let reply_no_arg = handler
+        .handle_command("did:plc:protected1", "duration")
+        .await
+        .expect("handle");
+    assert!(reply_no_arg.contains("Usage: `duration <permanent|24h|7d|30d>`"));
+
+    // Set 24h cooldown
+    let reply_24h = handler
+        .handle_command("did:plc:protected1", "duration 24h")
+        .await
+        .expect("handle");
+    assert!(reply_24h.contains("Moderation duration updated to **24-Hour Cooldown**"));
+    assert_eq!(
+        engine.rubric().bounce_duration,
+        skybouncer::classifier::BounceDuration::Cooldown24h
+    );
+
+    // Set 7d timeout
+    let reply_7d = handler
+        .handle_command("did:plc:protected1", "set timeout 7d")
+        .await
+        .expect("handle");
+    assert!(reply_7d.contains("Moderation duration updated to **7-Day Timeout**"));
+    assert_eq!(
+        engine.rubric().bounce_duration,
+        skybouncer::classifier::BounceDuration::Timeout7d
+    );
+
+    // Rules command displays duration
+    let reply_rules = handler
+        .handle_command("did:plc:protected1", "rules")
+        .await
+        .expect("handle");
+    assert!(reply_rules.contains("Duration: 7-Day Timeout"));
+
+    // Set permanent
+    let reply_perm = handler
+        .handle_command("did:plc:protected1", "duration permanent")
+        .await
+        .expect("handle");
+    assert!(reply_perm.contains("Moderation duration updated to **Permanent**"));
+    assert_eq!(
+        engine.rubric().bounce_duration,
+        skybouncer::classifier::BounceDuration::Permanent
+    );
+
+    // Invalid duration
+    let reply_invalid = handler
+        .handle_command("did:plc:protected1", "duration eternity")
+        .await
+        .expect("handle");
+    assert!(reply_invalid.contains("Invalid duration"));
+}
+
+#[tokio::test]
 async fn test_command_handler_recent_and_pardon() {
     let (engine, cache, pds) = setup_test_engine("did:plc:protected1").await;
     let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");

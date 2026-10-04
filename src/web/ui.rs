@@ -595,9 +595,9 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </label>
             <div class="segmented-control">
               <button class="segmented-btn active" id="dur-perm" onclick="setBounceDuration('permanent')">Permanent</button>
-              <button class="segmented-btn" id="dur-24h" onclick="setBounceDuration('24h')">24h Cooldown</button>
-              <button class="segmented-btn" id="dur-7d" onclick="setBounceDuration('7d')">7d Timeout</button>
-              <button class="segmented-btn" id="dur-30d" onclick="setBounceDuration('30d')">30d Timeout</button>
+              <button class="segmented-btn" id="dur-24h" onclick="setBounceDuration('cooldown24h')">24h Cooldown</button>
+              <button class="segmented-btn" id="dur-7d" onclick="setBounceDuration('timeout7d')">7d Timeout</button>
+              <button class="segmented-btn" id="dur-30d" onclick="setBounceDuration('timeout30d')">30d Timeout</button>
             </div>
           </div>
           <div style="margin-bottom: 1rem;">
@@ -885,12 +885,21 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     let activeBounceDuration = "permanent";
 
     function setBounceDuration(val) {
-      activeBounceDuration = val || "permanent";
-      const norm = (activeBounceDuration || "").toLowerCase();
-      const is24h = norm === "cooldown24h" || norm === "24h" || norm === "1d";
-      const is7d = norm === "timeout7d" || norm === "7d" || norm === "1w";
-      const is30d = norm === "timeout30d" || norm === "30d" || norm === "1m";
+      const norm = (val || "").toString().toLowerCase().trim();
+      const is24h = norm === "cooldown24h" || norm === "cooldown_24h" || norm === "24h" || norm === "1d" || norm === "86400";
+      const is7d = norm === "timeout7d" || norm === "timeout_7d" || norm === "7d" || norm === "1w" || norm === "604800";
+      const is30d = norm === "timeout30d" || norm === "timeout_30d" || norm === "30d" || norm === "1m" || norm === "2592000";
       const isPerm = !is24h && !is7d && !is30d;
+
+      if (is24h) {
+        activeBounceDuration = "cooldown24h";
+      } else if (is7d) {
+        activeBounceDuration = "timeout7d";
+      } else if (is30d) {
+        activeBounceDuration = "timeout30d";
+      } else {
+        activeBounceDuration = "permanent";
+      }
 
       const permBtn = document.getElementById("dur-perm");
       const b24hBtn = document.getElementById("dur-24h");

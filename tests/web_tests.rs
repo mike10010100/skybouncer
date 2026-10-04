@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use skyauth::client::OAuthClientMetadata;
-use skybouncer::classifier::{RuleRubric, Sensitivity, Verdict};
+use skybouncer::classifier::{BounceDuration, RuleRubric, Sensitivity, Verdict};
 use skybouncer::engine::{SkybouncerConfig, SkybouncerEngine};
 use skybouncer::matcher::{FollowGraph, NonFollowedGate};
 use skybouncer::modlist::cache::NewEvaluationLog;
@@ -349,6 +349,143 @@ async fn test_api_get_and_update_rules() {
         .unwrap();
     let bad_resp = app.oneshot(bad_req).await.unwrap();
     assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_api_update_rules_bounce_duration_variants() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let alice_token = create_test_session(&engine, "did:plc:alice");
+
+    // 1. Update rules with bounce_duration: "24h" (as sent by UI button click)
+    let payload_24h = json!({
+        "prompt": "Test rules for 24h cooldown",
+        "sensitivity": "medium",
+        "bounce_duration": "24h"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/rules")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload_24h).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let rules: RulesResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rules.bounce_duration, BounceDuration::Cooldown24h);
+
+    // Verify engine reflects the 24h duration
+    assert_eq!(
+        engine.rubric_for("did:plc:alice").bounce_duration,
+        BounceDuration::Cooldown24h
+    );
+    assert_eq!(engine.rubric().bounce_duration, BounceDuration::Cooldown24h);
+
+    // Also verify enrolled multi-tenant user updates and SQLite persistence
+    let bob_did = "did:plc:bob";
+    let bob_tenant = skybouncer::tenant::Tenant::new(bob_did)
+        .with_handle("bob.test")
+        .with_rubric(RuleRubric::new("Bob rules", Sensitivity::Low));
+    engine
+        .tenant_registry()
+        .register_or_update(&bob_tenant)
+        .unwrap();
+    let bob_token = create_test_session(&engine, bob_did);
+
+    let bob_req = Request::builder()
+        .method("POST")
+        .uri("/api/rules")
+        .header("cookie", format!("skybouncer_session={bob_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "prompt": "Bob updated rules",
+                "bounce_duration": "24h"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let bob_resp = app.clone().oneshot(bob_req).await.unwrap();
+    assert_eq!(bob_resp.status(), StatusCode::OK);
+    let bob_loaded = engine.tenant_registry().get(bob_did).unwrap().unwrap();
+    assert_eq!(
+        bob_loaded.rubric.unwrap().bounce_duration,
+        BounceDuration::Cooldown24h
+    );
+
+    // 2. Update rules with bounce_duration: "7d"
+    let payload_7d = json!({
+        "bounce_duration": "7d"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/rules")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload_7d).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let rules: RulesResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rules.bounce_duration, BounceDuration::Timeout7d);
+
+    // 3. Update rules with bounce_duration: "timeout30d"
+    let payload_30d = json!({
+        "bounce_duration": "timeout30d"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/rules")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload_30d).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let rules: RulesResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rules.bounce_duration, BounceDuration::Timeout30d);
+
+    // 4. Update rules with bounce_duration: "permanent"
+    let payload_perm = json!({
+        "bounce_duration": "permanent"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/rules")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&payload_perm).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let rules: RulesResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rules.bounce_duration, BounceDuration::Permanent);
+
+    // 5. GET /api/rules returns the current duration
+    let get_req = Request::builder()
+        .uri("/api/rules")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let get_resp = app.oneshot(get_req).await.unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let rules: RulesResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rules.bounce_duration, BounceDuration::Permanent);
 }
 
 // =============================================================================

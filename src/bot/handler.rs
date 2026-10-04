@@ -139,6 +139,24 @@ impl BotCommandHandler {
             return self.cmd_set_sensitivity(sender_did, sens.trim());
         }
 
+        if trimmed.eq_ignore_ascii_case("duration") || trimmed.eq_ignore_ascii_case("timeout") {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
+            return Ok("Usage: `duration <permanent|24h|7d|30d>`".to_string());
+        }
+
+        if let Some(dur) = strip_prefix_ci(trimmed, "duration ")
+            .or_else(|| strip_prefix_ci(trimmed, "timeout "))
+            .or_else(|| strip_prefix_ci(trimmed, "set duration "))
+            .or_else(|| strip_prefix_ci(trimmed, "set timeout "))
+        {
+            if !self.is_authorized_sender(sender_did) {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_set_duration(sender_did, dur.trim());
+        }
+
         if trimmed.eq_ignore_ascii_case("recent") {
             if !self.is_authorized_sender(sender_did) {
                 return Ok(self.unauthorized_response());
@@ -249,6 +267,7 @@ impl BotCommandHandler {
              • `rules` — View your active moderation prompt & sensitivity\n\
              • `set rules <prompt>` — Update your moderation prompt\n\
              • `sensitivity <low|medium|high>` — Adjust detection sensitivity\n\
+             • `duration <permanent|24h|7d|30d>` — Set timeout/cooldown duration\n\
              • `pause` — Temporarily suspend automated moderation\n\
              • `resume` — Reactivate automated moderation\n\
              • `recent` — List the 5 most recently bounced accounts\n\
@@ -307,10 +326,12 @@ impl BotCommandHandler {
         format!(
             "📋 Current Moderation Rubric:\n\n\
              Prompt: \"{}\"\n\
-             Sensitivity: {} (threshold: {:.2})",
+             Sensitivity: {} (threshold: {:.2})\n\
+             Duration: {}",
             rubric.prompt,
             rubric.sensitivity,
-            rubric.sensitivity.threshold()
+            rubric.sensitivity.threshold(),
+            rubric.bounce_duration.display_label()
         )
     }
 
@@ -350,8 +371,11 @@ impl BotCommandHandler {
         Ok(format!(
             "✅ Moderation rubric updated successfully!\n\n\
              Prompt: \"{}\"\n\
-             Sensitivity: {}",
-            parsed.prompt, parsed.sensitivity
+             Sensitivity: {}\n\
+             Duration: {}",
+            parsed.prompt,
+            parsed.sensitivity,
+            parsed.bounce_duration.display_label()
         ))
     }
 
@@ -405,6 +429,53 @@ impl BotCommandHandler {
             "✅ Sensitivity threshold updated to **{}** (confidence: {:.2}).",
             sens,
             sens.threshold()
+        ))
+    }
+
+    fn cmd_set_duration(&self, sender_did: &str, dur_str: &str) -> Result<String, SkybouncerError> {
+        let dur = match dur_str.trim().parse::<crate::classifier::BounceDuration>() {
+            Ok(d) => d,
+            Err(_) => {
+                return Ok(
+                    "Invalid duration. Options: `permanent`, `24h` (cooldown), `7d`, `30d` (timeout), or seconds."
+                        .to_string(),
+                );
+            }
+        };
+
+        let mut rubric = self.engine.rubric_for(sender_did);
+        rubric.bounce_duration = dur;
+        if self.engine.is_enrolled(sender_did) {
+            if let Err(e) = self
+                .engine
+                .tenant_registry()
+                .update_rubric(sender_did, &rubric)
+            {
+                tracing::warn!(error = %e, sender_did, "Failed to update tenant duration in registry");
+                return Ok(format!("❌ Failed to update duration: {e}"));
+            }
+        } else if self.engine.is_admin(sender_did)
+            || (self.engine.is_single_tenant() && self.engine.is_protected(sender_did))
+        {
+            self.engine.set_rubric(rubric);
+        } else {
+            return Ok(
+                "❌ You can only update duration for your own enrolled account.".to_string(),
+            );
+        }
+
+        // Asynchronously persist to sender's sovereign PDS repo
+        let eng = self.engine.clone();
+        let did = sender_did.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = eng.publish_sovereign_config(&did).await {
+                tracing::warn!(error = %e, did = %did, "Failed to publish sovereign config to PDS");
+            }
+        });
+
+        Ok(format!(
+            "✅ Moderation duration updated to **{}**.",
+            dur.display_label()
         ))
     }
 
