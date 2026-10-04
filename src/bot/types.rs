@@ -56,6 +56,9 @@ pub struct ConvoView {
     /// Number of unread messages for the authenticated caller.
     #[serde(rename = "unreadCount", default)]
     pub unread_count: u64,
+    /// Status of the conversation for the caller ("request" | "accepted").
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 /// Response payload from `chat.bsky.convo.listConvos`.
@@ -67,6 +70,33 @@ pub struct ListConvosResponse {
     /// Pagination cursor string if more conversations exist.
     #[serde(default)]
     pub cursor: Option<String>,
+}
+
+/// Response payload from `chat.bsky.convo.listConvoRequests`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListConvoRequestsResponse {
+    /// Conversation requests returned in the current page.
+    #[serde(default)]
+    pub requests: Vec<ConvoView>,
+    /// Pagination cursor string if more conversation requests exist.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Request body for `chat.bsky.convo.acceptConvo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptConvoRequest {
+    /// Target conversation ID to accept.
+    #[serde(rename = "convoId")]
+    pub convo_id: String,
+}
+
+/// Response payload from `chat.bsky.convo.acceptConvo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptConvoResponse {
+    /// Revision identifier when accepted, or None if already accepted.
+    #[serde(default)]
+    pub rev: Option<String>,
 }
 
 /// Response payload from `chat.bsky.convo.getMessages`.

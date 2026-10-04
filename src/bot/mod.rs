@@ -17,6 +17,7 @@ pub use dispatcher::{format_bounce_alert, run_bounce_alert_dispatcher};
 pub use handler::BotCommandHandler;
 pub use poller::{run_bot_poller, DEFAULT_BOT_POLL_INTERVAL};
 pub use types::{
-    ConvoMember, ConvoView, GetMessagesResponse, ListConvosResponse, MessageSender, MessageView,
-    SendMessagePayload, SendMessageRequest, UpdateReadRequest,
+    AcceptConvoRequest, AcceptConvoResponse, ConvoMember, ConvoView, GetMessagesResponse,
+    ListConvoRequestsResponse, ListConvosResponse, MessageSender, MessageView, SendMessagePayload,
+    SendMessageRequest, UpdateReadRequest,
 };
