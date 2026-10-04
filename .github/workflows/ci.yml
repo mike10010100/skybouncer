@@ -18,6 +18,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  version-bump-check:
+    name: Enforce Semantic Version Bump & CHANGELOG on PRs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify Semantic Version Bump & CHANGELOG Entry
+        run: |
+          chmod +x ./scripts/check_version_bump.sh
+          ./scripts/check_version_bump.sh
+
   quality-gate:
     name: Rust Quality Gate
     runs-on: ubuntu-latest
