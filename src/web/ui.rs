@@ -613,6 +613,13 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </div>
             <textarea id="rules-prompt" rows="4" placeholder="Describe what content should be automatically filtered..."></textarea>
           </div>
+          <div style="margin-bottom: 1rem; display: flex; align-items: center; gap: 0.6rem;">
+            <input type="checkbox" id="bypass-followers-toggle" checked style="width: 1.05rem; height: 1.05rem; accent-color: var(--accent); cursor: pointer; flex-shrink: 0;">
+            <label for="bypass-followers-toggle" style="font-size: 0.9rem; cursor: pointer;">
+              Trust accounts that follow me
+              <span style="display: block; font-size: 0.75rem; color: var(--text-muted);">Skip moderation for anyone who follows me — they bypass all checks at zero cost.</span>
+            </label>
+          </div>
           <div>
             <button class="btn" onclick="saveRules()">💾 Save Rubric</button>
           </div>
@@ -921,6 +928,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         document.getElementById("rules-prompt").value = rubric.prompt || "";
         setSensitivity(rubric.sensitivity || "medium");
         setBounceDuration(rubric.bounce_duration || "permanent");
+        const bypassToggle = document.getElementById("bypass-followers-toggle");
+        if (bypassToggle) bypassToggle.checked = rubric.bypass_incoming_followers !== false;
       }
     }
 
@@ -931,6 +940,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       if (authBox) authBox.style.display = "none";
       const promptEl = document.getElementById("rules-prompt");
       if (promptEl) promptEl.value = "";
+      const bypassEl = document.getElementById("bypass-followers-toggle");
+      if (bypassEl) bypassEl.checked = true;
     }
 
     async function loadRules() {
@@ -968,6 +979,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         return;
       }
       const prompt = document.getElementById("rules-prompt").value;
+      const bypassEl = document.getElementById("bypass-followers-toggle");
+      const bypassIncomingFollowers = bypassEl ? bypassEl.checked : true;
       try {
         const res = await fetch("/api/rules", {
           method: "POST",
@@ -978,7 +991,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           body: JSON.stringify({
             prompt,
             sensitivity: activeSensitivity,
-            bounce_duration: activeBounceDuration
+            bounce_duration: activeBounceDuration,
+            bypass_incoming_followers: bypassIncomingFollowers
           })
         });
         if (res.ok) {

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.19] - 2026-10-05
+
+### Added
+
+- **Dashboard Control for Incoming-Follower Trust**:
+  - Added a "Trust accounts that follow me" checkbox to the dashboard moderation rules card so each user can toggle the incoming-follower bypass directly, instead of relying on the undocumented `bypass_followers:` rubric directive.
+  - `RulesResponse` now includes `bypass_incoming_followers`, and `UpdateRulesRequest` accepts `bypass_incoming_followers: Option<bool>`, so `GET /api/rules` echoes the current setting and `POST /api/rules` updates it.
+  - `update_rules` applies the toggle to the in-memory gate immediately via `SkybouncerEngine::set_bypass_incoming_followers`, so the change takes effect without a restart, and it persists through the tenant registry and the user's sovereign PDS config as before.
+  - The outgoing "following" bypass remains unconditionally enabled by design; only the incoming direction is user-configurable.
+  - Added API round-trip coverage and expanded the dashboard DOM-contract test to assert the toggle is present and wired into the rules load/save JavaScript.
+
 ## [0.1.18] - 2026-10-05
 
 ### Added
