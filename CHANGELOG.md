@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.20] - 2026-10-05
+
+### Changed
+
+- **Canonical Property-Test Suite (`tests/property_tests.rs`)**:
+  - Consolidated library-facing property tests into the blueprint-mandated `tests/property_tests.rs`, matching the `rust-best-practices` convention that `proptest` is the preferred structured/typed testing tool (over `cargo-fuzz`).
+  - Moved the heuristic classifier `proptest!` blocks out of `classifier_tests.rs` into the canonical suite; speculative test-local property tests (type-redesign `Confidence`/`AtDid`) intentionally remain colocated with those types in `type_redesign_verification_tests.rs`.
+
+### Added
+
+- **Duration, Scheduling & Panic-Freedom Property Coverage**:
+  - Added `proptest` algebraic laws for `BounceDuration`: `expires_at_us` is `None` iff `Permanent`, is monotonic non-decreasing in `now`, saturates to `u64::MAX` on overflow (clock-warp / overflow safety), and preserves its effective timeout duration across `to_db_string`/`FromStr` round-trips.
+  - Added sliding-window scheduling-bound laws for `EvaluationRateLimiter`: a fresh limiter permits exactly `max_evaluations`, `remaining()` decreases monotonically, and `reset` restores the full allowance.
+  - Added `Sensitivity` threshold ordering/bounds laws and panic-freedom/well-formedness properties for `extract_did_from_at_uri`/`extract_did_for_collection` and `format_system_time_iso8601`.
+
 ## [0.1.19] - 2026-10-05
 
 ### Added

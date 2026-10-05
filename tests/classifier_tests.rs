@@ -1,11 +1,11 @@
-//! Hermetic unit, integration, and property tests for Classifier engine.
+//! Hermetic unit and integration tests for Classifier engine.
 //!
-//! Covers JevClassifier with Wiremock, HeuristicClassifier with proptest,
-//! MockClassifier, RuleRubric, Sensitivity, and Verdict models.
+//! Covers JevClassifier with Wiremock, HeuristicClassifier, MockClassifier,
+//! RuleRubric, Sensitivity, and Verdict models. Property tests live in
+//! `tests/property_tests.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
-use proptest::prelude::*;
 use serde_json::json;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -959,25 +959,5 @@ async fn test_tiered_classifier_integration_decisive_violation_bypass() {
     assert_eq!(tiered.stats().fallback_escalated.load(Ordering::Relaxed), 0);
 }
 
-// =============================================================================
-// 5. Property Tests (proptest)
-// =============================================================================
-
-proptest! {
-    #[test]
-    fn proptest_heuristic_never_panics_on_arbitrary_strings(s in "\\PC*") {
-        let classifier = HeuristicClassifier::default();
-        let _ = classifier.evaluate_text(&s);
-    }
-
-    #[test]
-    fn proptest_heuristic_always_detects_embedded_triggers(
-        prefix in "[a-zA-Z0-9 ]{0,30}",
-        suffix in "[a-zA-Z0-9 ]{0,30}",
-    ) {
-        let classifier = HeuristicClassifier::default();
-        let text = format!("{prefix} connect wallet {suffix}");
-        let verdict = classifier.evaluate_text(&text);
-        prop_assert!(verdict.is_violation());
-    }
-}
+// Property tests for the heuristic classifier now live in the canonical
+// `tests/property_tests.rs` (see `rust-best-practices` blueprint).
