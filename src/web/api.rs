@@ -267,6 +267,7 @@ pub async fn get_status(State(state): State<ApiState>, headers: HeaderMap) -> Js
             prompt: "[Protected sovereign rubric - sign in to view]".to_string(),
             sensitivity: state.engine.rubric().sensitivity,
             bounce_duration: state.engine.rubric().bounce_duration,
+            bypass_incoming_followers: state.engine.rubric().bypass_incoming_followers,
         }
     };
 
@@ -353,6 +354,11 @@ pub async fn get_prometheus_metrics(State(state): State<ApiState>) -> Response {
         out,
         "skybouncer_gate_bypassed_total{{reason=\"followed\"}} {}",
         stats.gate_bypassed_followed
+    );
+    let _ = writeln!(
+        out,
+        "skybouncer_gate_bypassed_total{{reason=\"follower\"}} {}",
+        stats.gate_bypassed_follower
     );
     let _ = writeln!(
         out,

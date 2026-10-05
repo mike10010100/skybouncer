@@ -286,6 +286,11 @@ impl fmt::Display for BounceDuration {
     }
 }
 
+/// Returns `true`, used as the serde default for opt-out moderation bypass flags.
+fn default_true() -> bool {
+    true
+}
+
 /// Configured house rules and sensitivity rubric for moderation evaluation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RuleRubric {
@@ -296,6 +301,12 @@ pub struct RuleRubric {
     /// Configurable bounce duration / timeout for violations (defaults to Permanent).
     #[serde(default)]
     pub bounce_duration: BounceDuration,
+    /// Whether accounts that follow the protected user bypass moderation evaluation.
+    ///
+    /// Defaults to `true` so that incoming followers inherit the same zero-cost trust
+    /// as accounts the protected user follows.
+    #[serde(default = "default_true")]
+    pub bypass_incoming_followers: bool,
 }
 
 impl RuleRubric {
@@ -306,6 +317,7 @@ impl RuleRubric {
             prompt: prompt.into(),
             sensitivity,
             bounce_duration: BounceDuration::Permanent,
+            bypass_incoming_followers: true,
         }
     }
 
@@ -316,6 +328,7 @@ impl RuleRubric {
             prompt: prompt.into(),
             sensitivity: Sensitivity::default(),
             bounce_duration: BounceDuration::Permanent,
+            bypass_incoming_followers: true,
         }
     }
 
@@ -323,6 +336,13 @@ impl RuleRubric {
     #[must_use]
     pub fn with_bounce_duration(mut self, bounce_duration: BounceDuration) -> Self {
         self.bounce_duration = bounce_duration;
+        self
+    }
+
+    /// Sets whether accounts following the protected user bypass moderation evaluation.
+    #[must_use]
+    pub fn with_bypass_incoming_followers(mut self, bypass: bool) -> Self {
+        self.bypass_incoming_followers = bypass;
         self
     }
 
@@ -396,6 +416,7 @@ impl RuleRubric {
 
         let mut sensitivity = Sensitivity::Medium;
         let mut bounce_duration = BounceDuration::Permanent;
+        let mut bypass_incoming_followers = true;
         let mut prompt_lines = Vec::new();
 
         for line in trimmed.lines() {
@@ -423,6 +444,20 @@ impl RuleRubric {
             } else if let Some(rest) = directive.strip_prefix("timeout =") {
                 let dur_str = rest.trim().trim_matches('"');
                 bounce_duration = dur_str.parse::<BounceDuration>()?;
+            } else if let Some(rest) = directive.strip_prefix("bypass_followers:") {
+                let flag = rest.trim();
+                bypass_incoming_followers = flag.parse::<bool>().map_err(|_| {
+                    SkybouncerError::Config(format!(
+                        "Invalid bypass_followers value '{flag}'; expected true or false"
+                    ))
+                })?;
+            } else if let Some(rest) = directive.strip_prefix("bypass_followers =") {
+                let flag = rest.trim().trim_matches('"');
+                bypass_incoming_followers = flag.parse::<bool>().map_err(|_| {
+                    SkybouncerError::Config(format!(
+                        "Invalid bypass_followers value '{flag}'; expected true or false"
+                    ))
+                })?;
             } else if let Some(idx) = line_trimmed.rfind('[') {
                 if let Some(rest) = line_trimmed[idx..].strip_suffix(']') {
                     let inline_dir = &rest[1..];
@@ -467,6 +502,7 @@ impl RuleRubric {
             prompt,
             sensitivity,
             bounce_duration,
+            bypass_incoming_followers,
         })
     }
 }
@@ -477,6 +513,7 @@ impl Default for RuleRubric {
             prompt: "Block crypto airdrop spam, scam bots, phishing, targeted harassment, and bad-faith sea-lioning.".to_string(),
             sensitivity: Sensitivity::Medium,
             bounce_duration: BounceDuration::Permanent,
+            bypass_incoming_followers: true,
         }
     }
 }
@@ -540,6 +577,28 @@ mod tests {
         assert_eq!(serialized, "\"cooldown24h\"");
         let round_trip: BounceDuration = serde_json::from_str(&serialized).unwrap();
         assert_eq!(round_trip, BounceDuration::Cooldown24h);
+    }
+
+    #[test]
+    fn test_rubric_bypass_incoming_followers_default_and_parse() {
+        // Default is enabled.
+        assert!(RuleRubric::default().bypass_incoming_followers);
+        assert!(RuleRubric::new("block spam", Sensitivity::Medium).bypass_incoming_followers);
+
+        // Legacy JSON without the field deserializes to the enabled default.
+        let legacy: RuleRubric =
+            serde_json::from_str(r#"{"prompt":"block spam","sensitivity":"medium"}"#).unwrap();
+        assert!(legacy.bypass_incoming_followers);
+
+        // Explicit opt-out is honored and round-trips.
+        let parsed = RuleRubric::parse("block spam\nbypass_followers: false").unwrap();
+        assert!(!parsed.bypass_incoming_followers);
+        let round_trip: RuleRubric =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert!(!round_trip.bypass_incoming_followers);
+
+        // Invalid directive value is a typed config error.
+        assert!(RuleRubric::parse("block spam\nbypass_followers: maybe").is_err());
     }
 
     #[test]

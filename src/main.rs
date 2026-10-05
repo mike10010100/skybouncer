@@ -171,7 +171,7 @@ async fn run_cli_status(args: &[String]) -> Result<(), SkybouncerError> {
         .map_err(|e| SkybouncerError::Config(format!("Failed to parse status response: {e}")))?;
 
     let s = &status.stats;
-    let total_bypassed = s.gate_bypassed_self + s.gate_bypassed_followed;
+    let total_bypassed = s.gate_bypassed_self + s.gate_bypassed_followed + s.gate_bypassed_follower;
     let bypass_rate = if s.interactions_matched > 0 {
         format!(
             "{:.1}%",
@@ -228,6 +228,10 @@ async fn run_cli_status(args: &[String]) -> Result<(), SkybouncerError> {
     println!(
         "  Gate Bypassed (Followed):   {}",
         format_number(s.gate_bypassed_followed)
+    );
+    println!(
+        "  Gate Bypassed (Followers):  {}",
+        format_number(s.gate_bypassed_follower)
     );
     println!(
         "  Total Bypassed ($0 / <1µs): {} ({bypass_rate} saved before model)",
@@ -901,6 +905,16 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
                 );
             }
         }
+
+        let followers = enricher.fetch_followers(did, 100).await;
+        if !followers.is_empty() {
+            let count = engine.hydrate_followers(did, followers);
+            info!(
+                did = %did,
+                count = count,
+                "Hydrated initial incoming followers from AppView (cold start)"
+            );
+        }
     }
 
     // Ensure moderation list and listblock exist on PDS for configured protected DIDs and enrolled tenants
@@ -1161,6 +1175,10 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
     info!(
         "   Gate Bypassed (Followed):     {}",
         stats.gate_bypassed_followed
+    );
+    info!(
+        "   Gate Bypassed (Followers):    {}",
+        stats.gate_bypassed_follower
     );
     info!(
         "   Dedup Cache Hits:             {}",

@@ -477,6 +477,8 @@ pub struct EngineStats {
     pub gate_bypassed_self: AtomicU64,
     /// Interactions dropped because author is actively followed by the protected user.
     pub gate_bypassed_followed: AtomicU64,
+    /// Interactions dropped because author follows the protected user (incoming follower).
+    pub gate_bypassed_follower: AtomicU64,
     /// Interactions dropped because author is on the protected user's persistent moderation allowlist.
     pub gate_bypassed_allowlist: AtomicU64,
     /// Interactions that passed the gate and were evaluated.
@@ -536,6 +538,7 @@ impl EngineStats {
             interactions_matched: AtomicU64::new(snapshot.interactions_matched),
             gate_bypassed_self: AtomicU64::new(snapshot.gate_bypassed_self),
             gate_bypassed_followed: AtomicU64::new(snapshot.gate_bypassed_followed),
+            gate_bypassed_follower: AtomicU64::new(snapshot.gate_bypassed_follower),
             gate_bypassed_allowlist: AtomicU64::new(snapshot.gate_bypassed_allowlist),
             candidates_evaluated: AtomicU64::new(snapshot.candidates_evaluated),
             dedup_cache_hits: AtomicU64::new(snapshot.dedup_cache_hits),
@@ -571,6 +574,7 @@ impl EngineStats {
             interactions_matched: self.interactions_matched.load(Ordering::Relaxed),
             gate_bypassed_self: self.gate_bypassed_self.load(Ordering::Relaxed),
             gate_bypassed_followed: self.gate_bypassed_followed.load(Ordering::Relaxed),
+            gate_bypassed_follower: self.gate_bypassed_follower.load(Ordering::Relaxed),
             gate_bypassed_allowlist: self.gate_bypassed_allowlist.load(Ordering::Relaxed),
             candidates_evaluated: self.candidates_evaluated.load(Ordering::Relaxed),
             dedup_cache_hits: self.dedup_cache_hits.load(Ordering::Relaxed),
@@ -614,6 +618,9 @@ pub struct EngineStatsSnapshot {
     pub gate_bypassed_self: u64,
     /// Interactions dropped because author is actively followed by the protected user.
     pub gate_bypassed_followed: u64,
+    /// Interactions dropped because author follows the protected user (incoming follower).
+    #[serde(default)]
+    pub gate_bypassed_follower: u64,
     /// Interactions dropped because author is on the protected user's persistent moderation allowlist.
     #[serde(default)]
     pub gate_bypassed_allowlist: u64,
@@ -669,7 +676,7 @@ pub struct EngineStatsSnapshot {
 /// Outcome of evaluating an interaction candidate through the moderation pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InteractionOutcome {
-    /// Dropped at the gate (self-interaction, followed author, or allowlisted author) with zero network/model cost.
+    /// Dropped at the gate (self-interaction, followed author, incoming follower, or allowlisted author) with zero network/model cost.
     Bypassed {
         /// Reason for bypassing evaluation.
         reason: BypassReason,
@@ -1034,6 +1041,10 @@ impl SkybouncerEngine {
             }
         }
 
+        for did in &config.protected_dids {
+            gate.set_bypass_incoming_followers(did, config.rubric.bypass_incoming_followers);
+        }
+
         Self {
             config,
             protected_dids,
@@ -1250,6 +1261,11 @@ impl SkybouncerEngine {
                         .gate_bypassed_followed
                         .fetch_add(1, Ordering::Relaxed);
                 }
+                BypassReason::FollowerAuthor => {
+                    self.stats
+                        .gate_bypassed_follower
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 BypassReason::AllowlistedAuthor => {
                     self.stats
                         .gate_bypassed_allowlist
@@ -1384,6 +1400,11 @@ impl SkybouncerEngine {
                 BypassReason::FollowedAuthor => {
                     self.stats
                         .gate_bypassed_followed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                BypassReason::FollowerAuthor => {
+                    self.stats
+                        .gate_bypassed_follower
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 BypassReason::AllowlistedAuthor => {
@@ -1930,6 +1951,18 @@ impl SkybouncerEngine {
         count
     }
 
+    /// Pre-seeds incoming follower DIDs for a protected user on cold start.
+    ///
+    /// The public AppView exposes no repository rkeys for followers, so deterministic
+    /// synthetic `hydrate_in_{n}` keys are generated.
+    pub fn hydrate_followers<I, S>(&self, protected_did: impl Into<String>, dids: I) -> usize
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.follow_graph.hydrate_followers(protected_did, dids)
+    }
+
     /// Checks whether an account is currently recorded as bounced in the SQLite cache.
     ///
     /// # Errors
@@ -2261,6 +2294,21 @@ impl SkybouncerEngine {
         self.classifier.set_rubric(rubric);
     }
 
+    /// Sets whether incoming followers bypass moderation for a protected user.
+    ///
+    /// Updates only the in-memory gate flag; persistence is handled separately via
+    /// [`SkybouncerEngine::add_to_allowlist`]-style registry writes.
+    pub fn set_bypass_incoming_followers(&self, protected_did: &str, bypass: bool) {
+        self.gate
+            .set_bypass_incoming_followers(protected_did, bypass);
+    }
+
+    /// Returns whether incoming followers bypass moderation for a protected user.
+    #[must_use]
+    pub fn bypass_incoming_followers(&self, protected_did: &str) -> bool {
+        self.gate.bypass_incoming_followers(protected_did)
+    }
+
     /// Returns a reference to the heuristic classifier.
     #[must_use]
     pub fn heuristic_classifier(&self) -> &HeuristicClassifier {
@@ -2465,6 +2513,8 @@ impl SkybouncerEngine {
         let pds_client = self.resolve_pds_client_for(protected_did).await?;
         let pds_rubric = crate::modlist::fetch_sovereign_config(&pds_client, protected_did).await?;
         if let Some(ref rubric) = pds_rubric {
+            self.gate
+                .set_bypass_incoming_followers(protected_did, rubric.bypass_incoming_followers);
             if self.is_enrolled(protected_did) {
                 let _ = self.tenant_registry.update_rubric(protected_did, rubric);
             }
@@ -2505,6 +2555,10 @@ impl SkybouncerEngine {
                     ) {
                         Ok(config_record) => {
                             let rubric = config_record.to_rubric();
+                            self.gate.set_bypass_incoming_followers(
+                                &commit.did,
+                                rubric.bypass_incoming_followers,
+                            );
                             if self.is_enrolled(&commit.did) {
                                 let _ = self.tenant_registry.update_rubric(&commit.did, &rubric);
                             }
@@ -2546,6 +2600,10 @@ impl SkybouncerEngine {
             CommitOperation::Delete => {
                 if commit.rkey == crate::modlist::SOVEREIGN_CONFIG_RKEY {
                     let default_rubric = self.config.rubric.clone();
+                    self.gate.set_bypass_incoming_followers(
+                        &commit.did,
+                        default_rubric.bypass_incoming_followers,
+                    );
                     if self.is_enrolled(&commit.did) {
                         if let Err(e) = self
                             .tenant_registry
@@ -2591,6 +2649,10 @@ impl SkybouncerEngine {
         if let Some(ref record_val) = commit.record {
             if let Some(desc) = record_val.get("description").and_then(|d| d.as_str()) {
                 if let Some(rubric) = crate::modlist::extract_rubric_from_list_description(desc) {
+                    self.gate.set_bypass_incoming_followers(
+                        &commit.did,
+                        rubric.bypass_incoming_followers,
+                    );
                     if self.is_enrolled(&commit.did) {
                         let _ = self.tenant_registry.update_rubric(&commit.did, &rubric);
                     }
@@ -3085,6 +3147,10 @@ impl SkybouncerEngineBuilder {
             }
         }
 
+        for did in &self.config.protected_dids {
+            gate.set_bypass_incoming_followers(did, self.config.rubric.bypass_incoming_followers);
+        }
+
         // 3. Initialize HeuristicClassifier
         let heuristic_classifier = self.heuristic_classifier.unwrap_or_else(|| {
             if self.config.enable_heuristic_prefilter {
@@ -3234,6 +3300,23 @@ impl SkybouncerEngineBuilder {
                     })?,
             ),
         };
+
+        // 7.5. Seed per-user incoming-follower bypass flags into the in-memory gate.
+        // Config-level protected DIDs inherit the engine default rubric; enrolled tenants
+        // override with their own per-user sovereign flag.
+        for did in &self.config.protected_dids {
+            gate.set_bypass_incoming_followers(did, self.config.rubric.bypass_incoming_followers);
+        }
+        if let Ok(active) = tenant_registry.list_active() {
+            for tenant in active {
+                if let Some(ref rubric) = tenant.rubric {
+                    gate.set_bypass_incoming_followers(
+                        &tenant.did,
+                        rubric.bypass_incoming_followers,
+                    );
+                }
+            }
+        }
 
         let rate_limiter = self.rate_limiter.unwrap_or_else(|| {
             Arc::new(EvaluationRateLimiter::new(

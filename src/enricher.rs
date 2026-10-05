@@ -449,6 +449,57 @@ impl AppViewContextEnricher {
         all_follows
     }
 
+    /// Fetches initial incoming follower DIDs for an actor from the public AppView (XRPC `app.bsky.graph.getFollowers`).
+    ///
+    /// Used for zero-credential cold-start hydration of the local incoming follower graph.
+    /// Paginates through follower records up to 10,000 followers to ensure complete coverage.
+    pub async fn fetch_followers(&self, actor: &str, limit: u8) -> Vec<String> {
+        let mut all_followers = Vec::new();
+        let mut cursor: Option<String> = None;
+        let page_limit = limit.clamp(1, 100);
+
+        for _ in 0..100 {
+            let url = format!("{}/xrpc/app.bsky.graph.getFollowers", self.appview_url);
+            let mut req = self
+                .http_client
+                .get(&url)
+                .query(&[("actor", actor), ("limit", &page_limit.to_string())]);
+            if let Some(ref c) = cursor {
+                req = req.query(&[("cursor", c)]);
+            }
+
+            let resp = match req.send().await {
+                Ok(r) if r.status().is_success() => r,
+                _ => break,
+            };
+
+            #[derive(Deserialize)]
+            struct FollowerProfile {
+                did: String,
+            }
+
+            #[derive(Deserialize)]
+            struct GetFollowersResponse {
+                followers: Vec<FollowerProfile>,
+                cursor: Option<String>,
+            }
+
+            match resp.json::<GetFollowersResponse>().await {
+                Ok(body) => {
+                    let count = body.followers.len();
+                    all_followers.extend(body.followers.into_iter().map(|f| f.did));
+                    if count == 0 || body.cursor.is_none() {
+                        break;
+                    }
+                    cursor = body.cursor;
+                }
+                Err(_) => break,
+            }
+        }
+
+        all_followers
+    }
+
     /// Fetches follow records `(rkey, followed_did)` for an actor via `com.atproto.repo.listRecords`.
     ///
     /// Used for cold-start hydration of the local follow graph with real repository rkeys,

@@ -367,6 +367,63 @@ async fn test_scenario_3_toxic_followed_user_exemption_zero_cost_bypass() {
 }
 
 // =============================================================================
+// Scenario 3b: Incoming Follower Exemption ($0 Cost Guarantee)
+// =============================================================================
+
+#[tokio::test]
+async fn test_scenario_3b_incoming_follower_exemption_zero_cost_bypass() {
+    let fixture = TestEngineFixture::start("did:plc:alice").await;
+
+    // Mallory follows Alice (incoming), but Alice does not follow Mallory back.
+    fixture
+        .follow_graph
+        .add_follower("did:plc:alice", "did:plc:mallory", "incoming_rkey_mallory");
+
+    // Mallory posts identical toxic text that would normally be bounced.
+    let commit = make_reply_commit(
+        "did:plc:mallory",
+        "did:plc:alice",
+        "reply_toxic_mallory",
+        "root_1",
+        "You are an idiot and should delete your account! Free crypto at https://evil.scam",
+    );
+
+    let result = fixture
+        .engine
+        .process_commit(&commit)
+        .await
+        .expect("process commit");
+    let outcomes = result.outcomes();
+    assert_eq!(outcomes.len(), 1);
+
+    match &outcomes[0] {
+        InteractionOutcome::Bypassed {
+            reason,
+            author_did,
+            target_did,
+        } => {
+            assert_eq!(*reason, BypassReason::FollowerAuthor);
+            assert_eq!(author_did, "did:plc:mallory");
+            assert_eq!(target_did, "did:plc:alice");
+        }
+        other => panic!("Expected Bypassed outcome, got {other:?}"),
+    }
+
+    // CRITICAL: Mathematically verify $0 cost & zero network overhead
+    assert_eq!(
+        fixture.jev.classify_count.load(Ordering::SeqCst),
+        0,
+        "Classifier must NEVER be called for incoming followers ($0 cost invariant)"
+    );
+    assert_eq!(
+        fixture.pds.created_records.lock().len(),
+        0,
+        "PDS must NEVER be mutated for incoming followers"
+    );
+    assert!(!fixture.is_bounced("did:plc:mallory"));
+}
+
+// =============================================================================
 // Scenario 4: Dynamic Follow Lifecycle (Follow / Unfollow / Bounce / Pardon)
 // =============================================================================
 

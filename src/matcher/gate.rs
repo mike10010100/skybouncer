@@ -19,6 +19,8 @@ pub enum BypassReason {
     SelfInteraction,
     /// Author is actively followed by the protected user.
     FollowedAuthor,
+    /// Author follows the protected user (incoming follower).
+    FollowerAuthor,
     /// Author is explicitly on the protected user's moderation allowlist.
     AllowlistedAuthor,
 }
@@ -30,6 +32,7 @@ impl BypassReason {
         match self {
             Self::SelfInteraction => "self_interaction",
             Self::FollowedAuthor => "followed_author",
+            Self::FollowerAuthor => "follower_author",
             Self::AllowlistedAuthor => "allowlisted_author",
         }
     }
@@ -95,6 +98,7 @@ impl GateDecision {
 pub struct NonFollowedGate {
     follow_graph: Arc<FollowGraph>,
     allowlist: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    bypass_flags: Arc<RwLock<HashMap<String, bool>>>,
 }
 
 impl NonFollowedGate {
@@ -104,6 +108,7 @@ impl NonFollowedGate {
         Self {
             follow_graph,
             allowlist: Arc::new(RwLock::new(HashMap::new())),
+            bypass_flags: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -116,6 +121,7 @@ impl NonFollowedGate {
         Self {
             follow_graph,
             allowlist,
+            bypass_flags: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -129,6 +135,34 @@ impl NonFollowedGate {
     #[must_use]
     pub fn allowlist(&self) -> &Arc<RwLock<HashMap<String, HashSet<String>>>> {
         &self.allowlist
+    }
+
+    /// Returns a reference to the per-user incoming-follower bypass flags.
+    #[must_use]
+    pub fn bypass_flags(&self) -> &Arc<RwLock<HashMap<String, bool>>> {
+        &self.bypass_flags
+    }
+
+    /// Sets whether incoming followers bypass moderation for a protected user.
+    ///
+    /// This is an in-memory mirror of the per-user sovereign rubric flag, keeping the
+    /// gate lookup at `<1µs` without a per-interaction SQLite query.
+    pub fn set_bypass_incoming_followers(&self, protected_did: impl Into<String>, bypass: bool) {
+        self.bypass_flags
+            .write()
+            .insert(protected_did.into(), bypass);
+    }
+
+    /// Returns whether incoming followers bypass moderation for a protected user.
+    ///
+    /// Defaults to `true` when the protected user has no explicit override.
+    #[must_use]
+    pub fn bypass_incoming_followers(&self, protected_did: &str) -> bool {
+        self.bypass_flags
+            .read()
+            .get(protected_did)
+            .copied()
+            .unwrap_or(true)
     }
 
     /// Checks whether an author is in the protected user's allowlist in $<1\mu s$ memory access.
@@ -188,6 +222,18 @@ impl NonFollowedGate {
             };
         }
 
+        // Stage 2.5: Incoming follower lookup (~65ns, $0 cost), gated by per-user opt-out
+        if self.bypass_incoming_followers(&interaction.target_did)
+            && self
+                .follow_graph
+                .is_followed_by(&interaction.target_did, &interaction.author_did)
+        {
+            return GateDecision::Bypassed {
+                reason: BypassReason::FollowerAuthor,
+                interaction,
+            };
+        }
+
         // Stage 3: Allowlist lookup (~60ns, $0 cost)
         if self.is_allowlisted(&interaction.target_did, &interaction.author_did) {
             return GateDecision::Bypassed {
@@ -226,6 +272,14 @@ impl NonFollowedGate {
             };
         }
 
+        // Stage 2.5: Incoming follower lookup (~65ns, $0 cost); defaults to enabled.
+        if follow_graph.is_followed_by(&interaction.target_did, &interaction.author_did) {
+            return GateDecision::Bypassed {
+                reason: BypassReason::FollowerAuthor,
+                interaction,
+            };
+        }
+
         // Stage 3: Author is not followed and not self -> forward to classifier
         GateDecision::Candidate(interaction)
     }
@@ -247,6 +301,13 @@ impl NonFollowedGate {
         if follow_graph.is_following(&interaction.target_did, &interaction.author_did) {
             return GateDecision::Bypassed {
                 reason: BypassReason::FollowedAuthor,
+                interaction,
+            };
+        }
+
+        if follow_graph.is_followed_by(&interaction.target_did, &interaction.author_did) {
+            return GateDecision::Bypassed {
+                reason: BypassReason::FollowerAuthor,
                 interaction,
             };
         }
@@ -318,5 +379,68 @@ mod tests {
         // Remove from allowlist
         assert!(gate.remove_from_allowlist(protected_did, allowlisted_author));
         assert!(!gate.is_allowlisted(protected_did, allowlisted_author));
+    }
+
+    #[test]
+    fn test_gate_incoming_follower_bypass() {
+        let follow_graph = Arc::new(FollowGraph::new());
+        let protected = "did:plc:protected";
+        let follower = "did:plc:follower";
+
+        // Follower follows the protected user (incoming), but protected does not follow back.
+        follow_graph.add_follower(protected, follower, "rk_in");
+
+        let interaction = Interaction::new(
+            follower,
+            protected,
+            InteractionType::DirectReply,
+            "at://did:plc:follower/app.bsky.feed.post/123",
+            "bafytest",
+            "hey there",
+        );
+
+        let gate = NonFollowedGate::new(Arc::clone(&follow_graph));
+        let decision = gate.evaluate(interaction.clone());
+        assert_eq!(decision.bypass_reason(), Some(BypassReason::FollowerAuthor));
+        assert_eq!(BypassReason::FollowerAuthor.as_str(), "follower_author");
+
+        // Opting out disables the incoming-follower bypass.
+        gate.set_bypass_incoming_followers(protected, false);
+        assert!(!gate.bypass_incoming_followers(protected));
+        assert!(gate.evaluate(interaction).is_candidate());
+
+        // Default for unknown users is enabled.
+        assert!(gate.bypass_incoming_followers("did:plc:someone_else"));
+    }
+
+    #[test]
+    fn test_follow_graph_incoming_add_remove() {
+        let graph = FollowGraph::new();
+        let protected = "did:plc:alice";
+        let follower = "did:plc:bob";
+
+        assert!(!graph.is_followed_by(protected, follower));
+        graph.add_follower(protected, follower, "rk1");
+        assert!(graph.is_followed_by(protected, follower));
+        assert_eq!(graph.follower_count(protected), 1);
+        // Incoming follow must not be visible as an outgoing follow.
+        assert!(!graph.is_following(protected, follower));
+
+        let removed = graph.remove_follower_by_rkey(follower, "rk1");
+        assert_eq!(removed.as_deref(), Some(protected));
+        assert!(!graph.is_followed_by(protected, follower));
+        assert_eq!(graph.follower_count(protected), 0);
+    }
+
+    #[test]
+    fn test_follow_graph_hydrate_followers_and_clear() {
+        let graph = FollowGraph::new();
+        let protected = "did:plc:alice";
+        let count = graph.hydrate_followers(protected, ["did:plc:a", "did:plc:b"]);
+        assert_eq!(count, 2);
+        assert!(graph.is_followed_by(protected, "did:plc:a"));
+        assert!(graph.is_followed_by(protected, "did:plc:b"));
+        graph.clear();
+        assert!(!graph.is_followed_by(protected, "did:plc:a"));
     }
 }

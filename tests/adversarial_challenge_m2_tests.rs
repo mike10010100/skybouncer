@@ -179,7 +179,9 @@ fn test_adversarial_multiple_hydrated_follows_exhaustion() {
             FollowSyncEvent::Ignored => {
                 panic!("Expected FollowRemoved for commit {i}, got Ignored");
             }
-            FollowSyncEvent::FollowAdded { .. } => unreachable!(),
+            FollowSyncEvent::FollowAdded { .. }
+            | FollowSyncEvent::FollowerAdded { .. }
+            | FollowSyncEvent::FollowerRemoved { .. } => unreachable!(),
         }
 
         assert_eq!(graph.follow_count(PROTECTED_ALICE), 5 - (i + 1));

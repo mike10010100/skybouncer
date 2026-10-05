@@ -804,7 +804,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         const data = await res.json();
         document.getElementById("kpi-commits").innerText = data.stats.commits_received.toLocaleString();
         document.getElementById("kpi-matched").innerText = data.stats.interactions_matched.toLocaleString();
-        document.getElementById("kpi-bypassed").innerText = (data.stats.gate_bypassed_followed + data.stats.gate_bypassed_self).toLocaleString();
+        document.getElementById("kpi-bypassed").innerText = (data.stats.gate_bypassed_followed + data.stats.gate_bypassed_self + (data.stats.gate_bypassed_follower || 0)).toLocaleString();
         document.getElementById("kpi-dedup").innerText = data.stats.dedup_cache_hits.toLocaleString();
         
         const tier1Count = data.stats.tier1_evaluations !== undefined ? data.stats.tier1_evaluations : data.stats.model_evaluations;

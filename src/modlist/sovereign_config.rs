@@ -30,8 +30,23 @@ pub struct SovereignConfigRecord {
     /// Optional bounce duration string (`"permanent"`, `"cooldown24h"`, `"timeout7d"`, `"timeout30d"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bounce_duration: Option<String>,
+    /// Whether accounts following the protected user bypass moderation evaluation.
+    ///
+    /// Defaults to `true` when absent, matching [`RuleRubric::bypass_incoming_followers`].
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub bypass_incoming_followers: bool,
     /// Timestamp of last modification in ISO 8601 format.
     pub updated_at: String,
+}
+
+/// Returns `true`, used as the serde default for opt-out bypass flags.
+fn default_true() -> bool {
+    true
+}
+
+/// Returns whether the flag is `true`, used to omit the default value during serialization.
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl SovereignConfigRecord {
@@ -43,6 +58,7 @@ impl SovereignConfigRecord {
             rules: rubric.prompt.clone(),
             sensitivity: rubric.sensitivity.as_str().to_string(),
             bounce_duration: Some(rubric.bounce_duration.to_db_string()),
+            bypass_incoming_followers: rubric.bypass_incoming_followers,
             updated_at: crate::types::now_iso8601(),
         }
     }
@@ -64,6 +80,7 @@ impl SovereignConfigRecord {
             prompt: self.rules.clone(),
             sensitivity,
             bounce_duration,
+            bypass_incoming_followers: self.bypass_incoming_followers,
         }
     }
 }
@@ -74,6 +91,8 @@ struct ListMetadata {
     sensitivity: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bounce_duration: Option<String>,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    bypass_incoming_followers: bool,
 }
 
 /// Encodes rubric parameters into moderation list description metadata.
@@ -91,6 +110,7 @@ pub fn format_list_description_with_rubric(base_description: &str, rubric: &Rule
         rules: rubric.prompt.clone(),
         sensitivity: rubric.sensitivity.as_str().to_string(),
         bounce_duration: Some(rubric.bounce_duration.to_db_string()),
+        bypass_incoming_followers: rubric.bypass_incoming_followers,
     };
 
     let json_str = serde_json::to_string(&meta).unwrap_or_default();
@@ -127,6 +147,7 @@ pub fn extract_rubric_from_list_description(description: &str) -> Option<RuleRub
         prompt: meta.rules,
         sensitivity,
         bounce_duration,
+        bypass_incoming_followers: meta.bypass_incoming_followers,
     })
 }
 

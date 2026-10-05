@@ -184,6 +184,41 @@ fn test_follow_graph_handle_commit_ignores_untracked_did() {
 }
 
 #[test]
+fn test_follow_graph_handle_commit_incoming_follower() {
+    let graph = FollowGraph::new();
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+
+    // A stranger follows the protected user: incoming direction.
+    let commit = make_follow_create_commit("did:plc:stranger", "did:plc:alice", "incoming_rk");
+    let event = graph.handle_commit(&commit, &protected_dids);
+    assert_eq!(
+        event,
+        FollowSyncEvent::FollowerAdded {
+            protected_did: "did:plc:alice".to_string(),
+            follower_did: "did:plc:stranger".to_string(),
+            rkey: "incoming_rk".to_string(),
+        }
+    );
+    assert!(graph.is_followed_by("did:plc:alice", "did:plc:stranger"));
+    // Must NOT be recorded as an outgoing follow.
+    assert!(!graph.is_following("did:plc:alice", "did:plc:stranger"));
+
+    // Delete with real rkey resolves via the incoming reverse index.
+    let delete = make_follow_delete_commit("did:plc:stranger", "incoming_rk");
+    let event = graph.handle_commit(&delete, &protected_dids);
+    assert_eq!(
+        event,
+        FollowSyncEvent::FollowerRemoved {
+            protected_did: "did:plc:alice".to_string(),
+            follower_did: "did:plc:stranger".to_string(),
+            rkey: "incoming_rk".to_string(),
+        }
+    );
+    assert!(!graph.is_followed_by("did:plc:alice", "did:plc:stranger"));
+}
+
+#[test]
 fn test_follow_graph_hydrate_batch_and_dids() {
     let graph = FollowGraph::new();
     let batch = vec![
