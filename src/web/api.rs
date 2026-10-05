@@ -776,13 +776,6 @@ pub struct BouncedUserWithHandle {
     pub handle: Option<String>,
 }
 
-impl std::ops::Deref for BouncedUserWithHandle {
-    type Target = BouncedUser;
-    fn deref(&self) -> &Self::Target {
-        &self.user
-    }
-}
-
 /// Handler for `GET /api/bounces`: returns recent bounced violators.
 ///
 /// Authentication is strictly required. Non-admin users are restricted to viewing
@@ -821,11 +814,13 @@ pub async fn get_bounces(
         .list_recent_bounces_for(filter_did, limit)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mut enriched = Vec::with_capacity(bounces.len());
-    for b in bounces {
-        let handle = state.engine.resolve_did_to_handle(&b.subject_did).await;
-        enriched.push(BouncedUserWithHandle { user: b, handle });
-    }
+    let enriched = bounces
+        .into_iter()
+        .map(|b| {
+            let handle = state.engine.cached_handle_for_did(&b.subject_did);
+            BouncedUserWithHandle { user: b, handle }
+        })
+        .collect();
     Ok(Json(enriched))
 }
 
@@ -949,7 +944,7 @@ pub async fn get_allowlist(
         Ok(mut entries) => {
             for entry in &mut entries {
                 if entry.handle.is_none() {
-                    entry.handle = state.engine.resolve_did_to_handle(&entry.subject_did).await;
+                    entry.handle = state.engine.cached_handle_for_did(&entry.subject_did);
                 }
             }
             Ok(Json(entries))
@@ -1808,11 +1803,9 @@ pub async fn get_admin_tenants(
             .flatten()
             .map(|c| c.list_uri);
 
-        let handle = if let Some(h) = t.handle {
-            Some(h)
-        } else {
-            state.engine.resolve_did_to_handle(&t.did).await
-        };
+        let handle = t
+            .handle
+            .or_else(|| state.engine.cached_handle_for_did(&t.did));
 
         summaries.push(TenantSummary {
             did: t.did,
@@ -2090,10 +2083,22 @@ pub struct ResolveResponse {
 }
 
 /// Handler for `GET /api/resolve`: resolves a DID to a handle, or a handle to a DID.
+///
+/// Authentication is strictly required, as resolution may perform outbound AppView/PLC
+/// lookups for cache misses.
 pub async fn resolve_identity(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Query(query): Query<ResolveQuery>,
 ) -> Result<Json<ResolveResponse>, (StatusCode, String)> {
+    extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to resolve identities. Please sign in with Bluesky."
+                .to_string(),
+        )
+    })?;
+
     let raw_did = query.did.as_deref().or_else(|| {
         query
             .actor

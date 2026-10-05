@@ -1752,6 +1752,37 @@ impl DeduplicationCache {
         stmt.execute(params![clean_did, clean_handle, now_i64])?;
         Ok(())
     }
+
+    /// Prunes stale DID-to-handle cache entries and bounds the table size.
+    ///
+    /// First deletes mappings whose `updated_at` is strictly older than `older_than_us`,
+    /// then, if more than `max_retained` rows remain, deletes the oldest mappings until
+    /// only the `max_retained` most recently updated entries survive.
+    ///
+    /// Returns the total number of deleted rows.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite execution fails.
+    pub fn prune_did_handles(
+        &self,
+        older_than_us: u64,
+        max_retained: usize,
+    ) -> Result<usize, SkybouncerError> {
+        let conn = self.conn.lock();
+        let cutoff_i64 = i64::try_from(older_than_us).unwrap_or(i64::MAX);
+        let mut expire_stmt =
+            conn.prepare_cached("DELETE FROM did_handles WHERE updated_at < ?1;")?;
+        let mut deleted = expire_stmt.execute(params![cutoff_i64])?;
+
+        let max_i64 = i64::try_from(max_retained.max(1)).unwrap_or(i64::MAX);
+        let mut cap_stmt = conn.prepare_cached(
+            "DELETE FROM did_handles WHERE did NOT IN (
+                SELECT did FROM did_handles ORDER BY updated_at DESC LIMIT ?1
+             );",
+        )?;
+        deleted = deleted.saturating_add(cap_stmt.execute(params![max_i64])?);
+        Ok(deleted)
+    }
 }
 
 /// Computes clock-warp safe microsecond timestamp since Unix epoch.
@@ -2272,6 +2303,43 @@ mod tests {
         cache.set_handle_for_did("   ", "some.handle").unwrap();
         cache.set_handle_for_did(did, "   ").unwrap();
         assert_eq!(cache.get_handle_for_did("").unwrap(), None);
+    }
+
+    #[test]
+    fn test_prune_did_handles_by_age_and_capacity() {
+        let cache = DeduplicationCache::open_in_memory().unwrap();
+
+        // All inserted with "now"; a zero cutoff ages out nothing, so only the
+        // capacity bound should apply.
+        for i in 0..10 {
+            cache
+                .set_handle_for_did(&format!("did:plc:user{i}"), &format!("user{i}.bsky.social"))
+                .unwrap();
+        }
+
+        // Capacity bound retains the 3 most recently updated entries.
+        let deleted = cache.prune_did_handles(0, 3).unwrap();
+        assert_eq!(deleted, 7);
+        let remaining = (0..10)
+            .filter(|i| {
+                cache
+                    .get_handle_for_did(&format!("did:plc:user{i}"))
+                    .unwrap()
+                    .is_some()
+            })
+            .count();
+        assert_eq!(remaining, 3);
+
+        // A cutoff in the future expires all remaining rows regardless of capacity.
+        let all_deleted = cache.prune_did_handles(u64::MAX, 1000).unwrap();
+        assert_eq!(all_deleted, 3);
+
+        // Zero cutoff with max_retained=0 still keeps at least one row (max(1)).
+        cache
+            .set_handle_for_did("did:plc:only", "only.bsky.social")
+            .unwrap();
+        assert_eq!(cache.prune_did_handles(0, 0).unwrap(), 0);
+        assert!(cache.get_handle_for_did("did:plc:only").unwrap().is_some());
     }
 
     #[test]

@@ -58,6 +58,12 @@ pub const DEFAULT_EVALUATION_CACHE_TTL: Duration = Duration::from_secs(86400);
 /// Default periodic cache maintenance interval (60 seconds).
 pub const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Default maximum age for cached DID-to-handle mappings (30 days) before eviction.
+pub const DEFAULT_DID_HANDLE_CACHE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Default upper bound on retained DID-to-handle cache entries.
+pub const DEFAULT_DID_HANDLE_CACHE_MAX_ENTRIES: usize = 50_000;
+
 /// Default graceful shutdown timeout (5 seconds).
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -2055,11 +2061,12 @@ impl SkybouncerEngine {
         None
     }
 
-    /// Resolves an ATProto DID to a handle using cached tenant data, local handle cache, or the configured context enricher.
+    /// Resolves an ATProto DID to a handle using only local caches (tenant registry and SQLite).
     ///
-    /// If the handle was not already cached in the local tenant registry and is successfully resolved
-    /// via the enricher, it is automatically cached into SQLite for future instant retrieval.
-    pub async fn resolve_did_to_handle(&self, did: &str) -> Option<String> {
+    /// This never performs network I/O and is intended for enriching list responses where
+    /// outbound resolution would otherwise cause an N+1 fan-out of remote lookups.
+    #[must_use]
+    pub fn cached_handle_for_did(&self, did: &str) -> Option<String> {
         let clean = did.trim();
         if !clean.starts_with("did:") {
             return None;
@@ -2083,7 +2090,24 @@ impl SkybouncerEngine {
             }
         }
 
-        // 3. Resolve via enricher
+        None
+    }
+
+    /// Resolves an ATProto DID to a handle using cached tenant data, local handle cache, or the configured context enricher.
+    ///
+    /// If the handle was not already cached in the local tenant registry and is successfully resolved
+    /// via the enricher, it is automatically cached into SQLite for future instant retrieval.
+    pub async fn resolve_did_to_handle(&self, did: &str) -> Option<String> {
+        let clean = did.trim();
+        if !clean.starts_with("did:") {
+            return None;
+        }
+
+        if let Some(cached) = self.cached_handle_for_did(clean) {
+            return Some(cached);
+        }
+
+        // Resolve via enricher
         if let Some(resolved) = self.enricher.resolve_did(clean).await {
             let trimmed = resolved.trim().trim_start_matches('@').to_string();
             if !trimmed.is_empty() {
@@ -2659,6 +2683,23 @@ impl SkybouncerEngine {
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to prune expired bounces in maintenance task");
+                        }
+                    }
+                    let now_us = current_time_us();
+                    let did_handle_cutoff = now_us.saturating_sub(
+                        u64::try_from(DEFAULT_DID_HANDLE_CACHE_TTL.as_micros()).unwrap_or(u64::MAX),
+                    );
+                    match self
+                        .cache
+                        .prune_did_handles(did_handle_cutoff, DEFAULT_DID_HANDLE_CACHE_MAX_ENTRIES)
+                    {
+                        Ok(count) => {
+                            if count > 0 {
+                                debug!(count, "Pruned stale DID-to-handle cache entries");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to prune DID-to-handle cache in maintenance task");
                         }
                     }
                 }

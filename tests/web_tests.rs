@@ -2219,7 +2219,9 @@ fn test_ui_dom_allowlist_and_timestamp_contract_validation() {
 #[tokio::test]
 async fn test_api_resolve_identity_endpoint() {
     let protected_did = "did:plc:owner123";
-    let (_engine, cache, _pds, app) = setup_test_web_environment(protected_did).await;
+    let (engine, cache, _pds, app) = setup_test_web_environment(protected_did).await;
+    let owner_token = create_test_session(&engine, protected_did);
+    let cookie = format!("skybouncer_session={owner_token}");
 
     // Seed SQLite handle cache
     let test_did = "did:plc:7nf3vqbvea5gpbet3kmibxpm";
@@ -2228,10 +2230,20 @@ async fn test_api_resolve_identity_endpoint() {
         .set_handle_for_did(test_did, test_handle)
         .expect("cache handle");
 
+    // 0. Unauthenticated request is rejected
+    let req_unauth = Request::builder()
+        .uri(format!("/api/resolve?did={test_did}"))
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp_unauth = app.clone().oneshot(req_unauth).await.unwrap();
+    assert_eq!(resp_unauth.status(), StatusCode::UNAUTHORIZED);
+
     // 1. Resolve DID to handle via ?did=...
     let req_did = Request::builder()
         .uri(format!("/api/resolve?did={test_did}"))
         .method("GET")
+        .header("Cookie", cookie.clone())
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req_did).await.unwrap();
@@ -2247,6 +2259,7 @@ async fn test_api_resolve_identity_endpoint() {
     let req_handle = Request::builder()
         .uri(format!("/api/resolve?handle={test_handle}"))
         .method("GET")
+        .header("Cookie", cookie.clone())
         .body(Body::empty())
         .unwrap();
     let resp2 = app.clone().oneshot(req_handle).await.unwrap();
@@ -2262,6 +2275,7 @@ async fn test_api_resolve_identity_endpoint() {
     let req_actor_did = Request::builder()
         .uri(format!("/api/resolve?actor={test_did}"))
         .method("GET")
+        .header("Cookie", cookie.clone())
         .body(Body::empty())
         .unwrap();
     let resp3 = app.clone().oneshot(req_actor_did).await.unwrap();
@@ -2277,6 +2291,7 @@ async fn test_api_resolve_identity_endpoint() {
     let req_actor_handle = Request::builder()
         .uri(format!("/api/resolve?actor=@{test_handle}"))
         .method("GET")
+        .header("Cookie", cookie.clone())
         .body(Body::empty())
         .unwrap();
     let resp4 = app.clone().oneshot(req_actor_handle).await.unwrap();
@@ -2292,6 +2307,7 @@ async fn test_api_resolve_identity_endpoint() {
     let req_bad = Request::builder()
         .uri("/api/resolve")
         .method("GET")
+        .header("Cookie", cookie.clone())
         .body(Body::empty())
         .unwrap();
     let resp5 = app.clone().oneshot(req_bad).await.unwrap();
@@ -2345,7 +2361,7 @@ async fn test_api_bounces_and_allowlist_handle_enrichment() {
     // Verify both BouncedUserWithHandle and BouncedUser deserialize seamlessly
     let enriched: Vec<BouncedUserWithHandle> = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(enriched.len(), 1);
-    assert_eq!(enriched[0].subject_did, violator_did);
+    assert_eq!(enriched[0].user.subject_did, violator_did);
     assert_eq!(enriched[0].handle.as_deref(), Some(violator_handle));
 
     let standard: Vec<BouncedUser> = serde_json::from_slice(&bytes).unwrap();

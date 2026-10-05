@@ -13,10 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `did_handles` SQLite table with an `updated_at` index to persist resolved DID ↔ handle mappings across restarts, powering instant, network-free lookups.
   - Added `DeduplicationCache::{set_handle_for_did, get_handle_for_did, get_did_for_handle}` with input normalization (whitespace and leading `@` trimming) and case-insensitive handle matching.
   - Extended `SkybouncerEngine::resolve_handle` and `resolve_did_to_handle` to consult the local DID/handle cache before falling back to the context enricher, and to persist successfully resolved mappings.
-  - Added `GET /api/resolve` endpoint (`ResolveQuery`/`ResolveResponse`) resolving a DID to a handle or a handle to a DID via `did`, `handle`, or generic `actor` query parameters.
+  - Added `GET /api/resolve` endpoint (`ResolveQuery`/`ResolveResponse`) resolving a DID to a handle or a handle to a DID via `did`, `handle`, or generic `actor` query parameters. The endpoint requires authentication since cache misses trigger outbound AppView/PLC lookups.
+  - Added `DeduplicationCache::prune_did_handles` for age- and capacity-bounded eviction of stale mappings, wired into the periodic maintenance loop (`DEFAULT_DID_HANDLE_CACHE_TTL` of 30 days, `DEFAULT_DID_HANDLE_CACHE_MAX_ENTRIES` of 50,000).
 - **Handle Enrichment Across Dashboard & API**:
   - `GET /api/bounces` now returns `BouncedUserWithHandle` entries enriched with resolved ATProto handles while remaining forward/backward compatible with plain `BouncedUser` deserialization.
-  - `GET /api/allowlist` and `POST /api/allowlist` responses now include resolved handles (via LEFT JOIN on `did_handles`), and `AddAllowlistResponse` reports the resolved handle.
+  - `GET /api/allowlist`, `POST /api/allowlist`, and `GET /api/admin/tenants` responses now include resolved handles (via LEFT JOIN on `did_handles` and the local cache), and `AddAllowlistResponse` reports the resolved handle.
+  - List endpoints now resolve handles from local caches only (`SkybouncerEngine::cached_handle_for_did`), eliminating an N+1 fan-out of serial outbound lookups; unresolved entries are progressively backfilled client-side.
   - `AllowlistEntry` gained an optional `handle` field with `skip_serializing_if` semantics.
 - **Dashboard Account Display**:
   - Replaced raw DID columns in the bounces, allowlist, admin fleet, and evaluation audit tables with a shared `formatAccountCell` renderer that shows `@handle` with DID subtext and a Bluesky profile link.
