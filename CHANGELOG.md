@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.17] - 2026-10-05
+
+### Added & Enhanced
+
+- **Persistent Dashboard Telemetry Counters**:
+  - Dashboard KPI counters for both users and administrators now survive process restarts and deployments instead of resetting to zero.
+  - Added a single-row `dashboard_stats` SQLite table and `DeduplicationCache::{save_dashboard_stats, load_dashboard_stats}` to persist the serialized `EngineStatsSnapshot` via an atomic `ON CONFLICT` upsert; the loader tolerates corrupt/legacy payloads by falling back to defaults.
+  - Added `EngineStats::from_snapshot` to rehydrate live atomic counters from a persisted snapshot, and `SkybouncerEngine::persist_stats` to snapshot the current counters to durable storage.
+  - Cumulative counters are now restored at engine construction (`SkybouncerEngine::new` and `SkybouncerEngineBuilder::build`) and flushed on every maintenance tick (drift-free 60s loop) and during graceful shutdown in `main`.
+
+### Added
+
+- **Consistent SQLite Backup Tooling**:
+  - Added `scripts/backup.sh`, which takes a consistent online backup of the Skybouncer database from its Docker named volume using SQLite's `.backup` API, verifies it with `PRAGMA integrity_check`, gzip-compresses it, and prunes old snapshots (default: retain 5).
+  - Runs in an ephemeral container from the already-present `skybouncer` image, so it is safe while the service is live and the app container need not be running; supports `SKYBOUNCER_BACKUP_DIR`, `SKYBOUNCER_BACKUP_RETAIN`, `SKYBOUNCER_VOLUME`, `SKYBOUNCER_DB_NAME`, and `SKYBOUNCER_IMAGE` overrides.
+  - Documented Docker and systemd backup/restore procedures in `docs/DEPLOYMENT.md`.
+
 ## [0.1.16] - 2026-10-05
 
 ### Fixed & Remediated

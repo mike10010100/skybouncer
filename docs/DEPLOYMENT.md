@@ -223,14 +223,56 @@ sudo systemctl restart skybouncer
 
 ### Database Backup & Maintenance
 
-The SQLite database (`skybouncer.db`) stores evaluated author TTLs, list metadata, and audit logs using Write-Ahead Logging (`WAL`).
+The SQLite database (`skybouncer.db`) stores evaluated author TTLs, list metadata, tenant sessions, and audit logs using Write-Ahead Logging (`WAL`). Snapshots **must** be taken with SQLite's online backup API (`.backup` / `VACUUM INTO`) rather than copying the file, so that WAL contents are captured consistently while the service is live.
 
-To take a live, lock-free online backup:
+#### Docker Deployment (recommended)
+
+`scripts/backup.sh` takes a consistent online snapshot from the `skybouncer_data`
+named volume (via an ephemeral container running as root), verifies it with
+`PRAGMA integrity_check`, gzip-compresses it, and prunes old snapshots. It works
+whether or not the application container is running.
+
+```bash
+# Ad-hoc backup using the defaults (writes to ~/backups/skybouncer, keeps 5)
+/home/mike10010100/git/skybouncer/scripts/backup.sh
+```
+
+Behavior is configurable via environment variables:
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `SKYBOUNCER_BACKUP_DIR` | `/home/mike10010100/backups/skybouncer` | Destination directory for snapshots. |
+| `SKYBOUNCER_BACKUP_RETAIN` | `5` | Number of most-recent daily snapshots to keep. |
+| `SKYBOUNCER_VOLUME` | `skybouncer_data` | Docker named volume holding the database. |
+| `SKYBOUNCER_DB_NAME` | `skybouncer.db` | Database filename within the volume. |
+| `SKYBOUNCER_IMAGE` | `skybouncer:latest` | Image providing `sqlite3` + `gzip`. |
+
+Snapshots are named `skybouncer-YYYY-MM-DD.db.gz`. A simple crontab entry to run
+daily at 03:00 and retain the last 5 days:
+
+```cron
+0 3 * * * /home/mike10010100/git/skybouncer/scripts/backup.sh >> /home/mike10010100/backups/skybouncer/backup.log 2>&1
+```
+
+To restore a snapshot, stop the service, decompress over the volume database, and
+restart:
+
+```bash
+docker compose stop skybouncer
+gunzip -c ~/backups/skybouncer/skybouncer-2026-10-04.db.gz \
+  | docker run --rm -i -v skybouncer_data:/data --user 0:0 \
+      --entrypoint sh skybouncer:latest -c 'cat > /data/skybouncer.db && chown 10001:10001 /data/skybouncer.db'
+docker compose up -d skybouncer
+```
+
+#### systemd (non-Docker) Deployment
+
+For the bare-metal systemd install, take an online backup directly:
+
 ```bash
 sqlite3 /var/lib/skybouncer/skybouncer.db ".backup /var/backups/skybouncer-$(date +%Y%m%d%H%M%S).db"
 ```
 
-To schedule daily automated backups via crontab:
 ```cron
 0 3 * * * sqlite3 /var/lib/skybouncer/skybouncer.db ".backup /var/backups/skybouncer-$(date +\%F).db" && find /var/backups -name "skybouncer-*.db" -mtime +14 -delete
 ```
