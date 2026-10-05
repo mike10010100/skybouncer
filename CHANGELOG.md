@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.18] - 2026-10-05
+
+### Added
+
+- **Incoming Follower Trust (Reverse-Direction Bypass)**:
+  - Accounts that follow a protected user now bypass moderation evaluation at the `$0` cost-control gate, mirroring the existing treatment of accounts the protected user follows. Previously only the outgoing direction (`protected -> author`) was honored, so an inbound-only follower could be classified and auto-blocked.
+  - `FollowGraph` now tracks the reverse direction with `is_followed_by(protected_did, candidate_did)` plus an `incoming_rkey_index` (`follower_did -> rkey -> protected_did`) so real-time unfollow `Delete` commits — which omit the record subject — resolve without any network calls.
+  - `FollowGraph::handle_commit` now records inbound follows from untracked authors when the record `subject` is a protected DID, emitting new `FollowSyncEvent::FollowerAdded` / `FollowerRemoved` variants. A cheap read-lock probe (`tracks_incoming_follower`) avoids write-lock contention for unfollows from accounts that never followed a protected user.
+  - New `BypassReason::FollowerAuthor` (`"follower_author"`) evaluated as gate stage 2.5, wired through both `process_interaction` and `process_interaction_queued` with a new `gate_bypassed_follower` telemetry counter.
+  - Added `AppViewContextEnricher::fetch_followers` (XRPC `app.bsky.graph.getFollowers`) and cold-start hydration of incoming followers via deterministic synthetic `hydrate_in_{n}` rkeys, including synthetic-rkey reconciliation on delete.
+- **Per-User Opt-Out for Incoming-Follower Trust**:
+  - Added `RuleRubric::bypass_incoming_followers` (default `true`), configurable via the `bypass_followers: false` rubric directive or `with_bypass_incoming_followers`.
+  - Persisted through `SovereignConfigRecord` and moderation-list metadata (legacy payloads default to enabled) and a new `bypass_followers` tenants column with an idempotent `ALTER TABLE` migration.
+  - `NonFollowedGate` mirrors the flag in an in-memory cache (`set_bypass_incoming_followers` / `bypass_incoming_followers`), seeded at startup and refreshed on sovereign-config hot-reload, preserving the `<1µs`, zero-query gate guarantee.
+- **Telemetry & Dashboards**: `gate_bypassed_follower` surfaced in `EngineStats`/`EngineStatsSnapshot`, the Prometheus `skybouncer_gate_bypassed_total{reason="follower"}` metric, the CLI status/summary output, and the web dashboard and bot status KPIs.
+
 ## [0.1.17] - 2026-10-05
 
 ### Added & Enhanced

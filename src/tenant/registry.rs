@@ -258,6 +258,7 @@ impl TenantRegistry {
                 rubric_prompt TEXT,
                 sensitivity TEXT,
                 bounce_duration TEXT,
+                bypass_followers INTEGER,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
@@ -290,6 +291,10 @@ impl TenantRegistry {
 
         // Idempotent column migrations for existing databases
         let _ = conn.execute("ALTER TABLE tenants ADD COLUMN bounce_duration TEXT;", []);
+        let _ = conn.execute(
+            "ALTER TABLE tenants ADD COLUMN bypass_followers INTEGER;",
+            [],
+        );
         let _ = conn.execute(
             "ALTER TABLE tenants ADD COLUMN handle_updated_at INTEGER;",
             [],
@@ -324,13 +329,14 @@ impl TenantRegistry {
             None => None,
         };
 
-        let (rubric_prompt, sensitivity, bounce_duration) = match tenant.rubric {
+        let (rubric_prompt, sensitivity, bounce_duration, bypass_followers) = match tenant.rubric {
             Some(ref r) => (
                 Some(r.prompt.clone()),
                 Some(r.sensitivity.to_string()),
                 Some(r.bounce_duration.to_db_string()),
+                Some(i64::from(r.bypass_incoming_followers)),
             ),
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
 
         let is_active_int: i64 = if tenant.is_active { 1 } else { 0 };
@@ -347,14 +353,15 @@ impl TenantRegistry {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "INSERT INTO tenants (
-                did, handle, session_json, rubric_prompt, sensitivity, bounce_duration, is_active, created_at, updated_at, handle_updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                did, handle, session_json, rubric_prompt, sensitivity, bounce_duration, bypass_followers, is_active, created_at, updated_at, handle_updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(did) DO UPDATE SET
                  handle = COALESCE(excluded.handle, tenants.handle),
                  session_json = COALESCE(excluded.session_json, tenants.session_json),
                  rubric_prompt = COALESCE(excluded.rubric_prompt, tenants.rubric_prompt),
                  sensitivity = COALESCE(excluded.sensitivity, tenants.sensitivity),
                  bounce_duration = COALESCE(excluded.bounce_duration, tenants.bounce_duration),
+                 bypass_followers = COALESCE(excluded.bypass_followers, tenants.bypass_followers),
                  is_active = excluded.is_active,
                  updated_at = excluded.updated_at,
                  handle_updated_at = COALESCE(excluded.handle_updated_at, tenants.handle_updated_at);",
@@ -367,6 +374,7 @@ impl TenantRegistry {
             rubric_prompt,
             sensitivity,
             bounce_duration,
+            bypass_followers,
             is_active_int,
             created_at_i64,
             updated_at_i64,
@@ -386,7 +394,7 @@ impl TenantRegistry {
     pub fn get(&self, did: &str) -> Result<Option<Tenant>, SkybouncerError> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
-            "SELECT did, handle, session_json, rubric_prompt, sensitivity, bounce_duration, is_active, created_at, updated_at
+            "SELECT did, handle, session_json, rubric_prompt, sensitivity, bounce_duration, bypass_followers, is_active, created_at, updated_at
              FROM tenants WHERE did = ?1;",
         )?;
 
@@ -398,9 +406,10 @@ impl TenantRegistry {
                 let rubric_prompt: Option<String> = row.get(3)?;
                 let sensitivity_str: Option<String> = row.get(4)?;
                 let bounce_duration_str: Option<String> = row.get(5)?;
-                let is_active_int: i64 = row.get(6)?;
-                let created_at_i64: i64 = row.get(7)?;
-                let updated_at_i64: i64 = row.get(8)?;
+                let bypass_followers_int: Option<i64> = row.get(6)?;
+                let is_active_int: i64 = row.get(7)?;
+                let created_at_i64: i64 = row.get(8)?;
+                let updated_at_i64: i64 = row.get(9)?;
 
                 Ok((
                     did,
@@ -409,6 +418,7 @@ impl TenantRegistry {
                     rubric_prompt,
                     sensitivity_str,
                     bounce_duration_str,
+                    bypass_followers_int,
                     is_active_int,
                     created_at_i64,
                     updated_at_i64,
@@ -424,6 +434,7 @@ impl TenantRegistry {
                 rubric_prompt,
                 sensitivity_str,
                 bounce_duration_str,
+                bypass_followers_int,
                 is_active_int,
                 created_at_i64,
                 updated_at_i64,
@@ -458,6 +469,8 @@ impl TenantRegistry {
                     .and_then(|s| s.parse::<crate::classifier::BounceDuration>().ok())
                     .unwrap_or_default();
 
+                let bypass_incoming_followers = bypass_followers_int.is_none_or(|v| v != 0);
+
                 let rubric: Option<RuleRubric> = match (rubric_prompt, sensitivity_str) {
                     (Some(prompt), Some(sens_str)) => {
                         let sens = match sens_str.to_ascii_lowercase().as_str() {
@@ -469,18 +482,21 @@ impl TenantRegistry {
                             prompt,
                             sensitivity: sens,
                             bounce_duration,
+                            bypass_incoming_followers,
                         })
                     }
                     (Some(prompt), None) => Some(
                         RuleRubric::parse(&prompt)
                             .map(|mut r| {
                                 r.bounce_duration = bounce_duration;
+                                r.bypass_incoming_followers = bypass_incoming_followers;
                                 r
                             })
                             .unwrap_or(RuleRubric {
                                 prompt,
                                 sensitivity: crate::classifier::Sensitivity::Medium,
                                 bounce_duration,
+                                bypass_incoming_followers,
                             }),
                     ),
                     _ => None,
@@ -670,13 +686,14 @@ impl TenantRegistry {
 
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
-            "UPDATE tenants SET rubric_prompt = ?1, sensitivity = ?2, bounce_duration = ?3, updated_at = ?4 WHERE did = ?5;",
+            "UPDATE tenants SET rubric_prompt = ?1, sensitivity = ?2, bounce_duration = ?3, bypass_followers = ?4, updated_at = ?5 WHERE did = ?6;",
         )?;
 
         let count = stmt.execute(params![
             rubric.prompt,
             rubric.sensitivity.to_string(),
             rubric.bounce_duration.to_db_string(),
+            i64::from(rubric.bypass_incoming_followers),
             now_i64,
             did
         ])?;
@@ -1096,6 +1113,29 @@ mod tests {
         assert!(registry.remove("did:plc:alice").unwrap());
         assert_eq!(registry.count().unwrap(), 0);
         assert!(!registry.is_enrolled("did:plc:alice").unwrap());
+    }
+
+    #[test]
+    fn test_tenant_bypass_followers_persistence() {
+        let registry = TenantRegistry::open_in_memory().unwrap();
+
+        // Opt-out is persisted and reloaded.
+        let tenant = Tenant::new("did:plc:carol").with_rubric(
+            RuleRubric::parse("Block spam")
+                .unwrap()
+                .with_bypass_incoming_followers(false),
+        );
+        registry.register_or_update(&tenant).unwrap();
+        let fetched = registry.get("did:plc:carol").unwrap().unwrap();
+        assert!(!fetched.rubric.unwrap().bypass_incoming_followers);
+
+        // update_rubric overwrites the flag.
+        let updated = RuleRubric::parse("Block spam")
+            .unwrap()
+            .with_bypass_incoming_followers(true);
+        assert!(registry.update_rubric("did:plc:carol", &updated).unwrap());
+        let fetched = registry.get("did:plc:carol").unwrap().unwrap();
+        assert!(fetched.rubric.unwrap().bypass_incoming_followers);
     }
 
     #[tokio::test]

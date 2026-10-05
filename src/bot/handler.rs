@@ -743,6 +743,7 @@ impl BotCommandHandler {
                  • Follows Synced: {}\n\
                  • Interactions Matched: {}\n\
                  • Bypassed (Followed Author): {}\n\
+                 • Bypassed (Incoming Follower): {}\n\
                  • Bypassed (Self-Interaction): {}\n\
                  • Bypassed (Allowlisted): {}\n\
                  • Dedup Cache Hits: {}\n\
@@ -758,6 +759,7 @@ impl BotCommandHandler {
                 stats.follows_synced,
                 stats.interactions_matched,
                 stats.gate_bypassed_followed,
+                stats.gate_bypassed_follower,
                 stats.gate_bypassed_self,
                 stats.gate_bypassed_allowlist,
                 stats.dedup_cache_hits,

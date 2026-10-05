@@ -1042,6 +1042,7 @@ async fn test_pipeline_typestate_compile_and_transition_invariants() {
         prompt: "Block spam".to_string(),
         sensitivity: Sensitivity::Medium, // 0.75 threshold
         bounce_duration: skybouncer::classifier::BounceDuration::Permanent,
+        bypass_incoming_followers: true,
     };
 
     let actionable = evaluated.filter_actionable(&rubric);
@@ -1120,6 +1121,7 @@ fn test_sovereign_tenant_lifecycle_transitions() {
         prompt: "No spam".to_string(),
         sensitivity: Sensitivity::Medium,
         bounce_duration: skybouncer::classifier::BounceDuration::Permanent,
+        bypass_incoming_followers: true,
     };
 
     // Activate tenant
@@ -1330,6 +1332,7 @@ fn test_adversarial_paused_tenant_pds_client_resolution() {
         prompt: "No spam".to_string(),
         sensitivity: Sensitivity::Medium,
         bounce_duration: skybouncer::classifier::BounceDuration::Permanent,
+        bypass_incoming_followers: true,
     };
 
     tenant.activate(auth_session, rubric, 200);

@@ -33,6 +33,33 @@ fn test_sovereign_config_record_roundtrip() {
     let parsed_rubric = deserialized.to_rubric();
     assert_eq!(parsed_rubric.prompt, rubric.prompt);
     assert_eq!(parsed_rubric.sensitivity, Sensitivity::High);
+    assert!(parsed_rubric.bypass_incoming_followers);
+}
+
+#[test]
+fn test_sovereign_config_bypass_incoming_followers_roundtrip() {
+    // Opt-out flag must persist through both the record and list-metadata encodings.
+    let rubric =
+        RuleRubric::new("Block spam", Sensitivity::Medium).with_bypass_incoming_followers(false);
+
+    let record = SovereignConfigRecord::from_rubric(&rubric);
+    assert!(!record.bypass_incoming_followers);
+    assert!(!record.to_rubric().bypass_incoming_followers);
+
+    let encoded = format_list_description_with_rubric("My list", &rubric);
+    assert!(encoded.contains("\"bypass_incoming_followers\":false"));
+    let extracted = extract_rubric_from_list_description(&encoded).unwrap();
+    assert!(!extracted.bypass_incoming_followers);
+
+    // Legacy payloads lacking the field default to enabled.
+    let legacy = json!({
+        "$type": SOVEREIGN_CONFIG_COLLECTION,
+        "rules": "Block spam",
+        "sensitivity": "medium",
+        "updatedAt": "2026-01-01T00:00:00.000Z"
+    });
+    let legacy_record: SovereignConfigRecord = serde_json::from_value(legacy).unwrap();
+    assert!(legacy_record.to_rubric().bypass_incoming_followers);
 }
 
 #[test]
