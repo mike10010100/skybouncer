@@ -1133,6 +1133,11 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
     let shutdown_timeout = Duration::from_secs(5);
     let _ = SkybouncerEngine::drain_and_shutdown(&mut join_set, &cancel, shutdown_timeout).await;
 
+    // Persist cumulative telemetry counters so dashboard KPIs survive restarts
+    if let Err(e) = engine.persist_stats() {
+        warn!(error = %e, "Failed to persist dashboard telemetry counters during shutdown");
+    }
+
     // Output final operational telemetry
     let stats = engine.stats().snapshot();
     info!("📊 Final Skybouncer Operational Telemetry:");

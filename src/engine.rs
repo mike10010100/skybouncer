@@ -67,6 +67,25 @@ pub const DEFAULT_DID_HANDLE_CACHE_MAX_ENTRIES: usize = 50_000;
 /// Default graceful shutdown timeout (5 seconds).
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Loads persisted cumulative telemetry counters, falling back to a zeroed [`EngineStats`].
+fn load_persisted_stats(cache: &DeduplicationCache) -> EngineStats {
+    match cache.load_dashboard_stats::<EngineStatsSnapshot>() {
+        Ok(Some(snapshot)) => {
+            info!(
+                commits_received = snapshot.commits_received,
+                bounces_executed = snapshot.bounces_executed,
+                "Restored cumulative dashboard telemetry counters from persistent storage"
+            );
+            EngineStats::from_snapshot(&snapshot)
+        }
+        Ok(None) => EngineStats::default(),
+        Err(e) => {
+            warn!(error = %e, "Failed to load persisted dashboard telemetry counters; starting from zero");
+            EngineStats::default()
+        }
+    }
+}
+
 /// Configuration parameters for [`SkybouncerEngine`].
 #[derive(Debug, Clone)]
 pub struct SkybouncerConfig {
@@ -505,6 +524,43 @@ pub struct EngineStats {
 }
 
 impl EngineStats {
+    /// Reconstructs live counters from a previously captured snapshot.
+    ///
+    /// Used to restore cumulative telemetry across process restarts.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &EngineStatsSnapshot) -> Self {
+        Self {
+            commits_received: AtomicU64::new(snapshot.commits_received),
+            follow_sync_events: AtomicU64::new(snapshot.follow_sync_events),
+            follows_synced: AtomicU64::new(snapshot.follows_synced),
+            interactions_matched: AtomicU64::new(snapshot.interactions_matched),
+            gate_bypassed_self: AtomicU64::new(snapshot.gate_bypassed_self),
+            gate_bypassed_followed: AtomicU64::new(snapshot.gate_bypassed_followed),
+            gate_bypassed_allowlist: AtomicU64::new(snapshot.gate_bypassed_allowlist),
+            candidates_evaluated: AtomicU64::new(snapshot.candidates_evaluated),
+            dedup_cache_hits: AtomicU64::new(snapshot.dedup_cache_hits),
+            eval_cache_hits: AtomicU64::new(snapshot.eval_cache_hits),
+            heuristic_violations: AtomicU64::new(snapshot.heuristic_violations),
+            model_evaluations: AtomicU64::new(snapshot.model_evaluations),
+            tier1_evaluations: AtomicU64::new(snapshot.tier1_evaluations),
+            tier2_evaluations: AtomicU64::new(snapshot.tier2_evaluations),
+            tier2_image_escalations: AtomicU64::new(snapshot.tier2_image_escalations),
+            tier2_uncertainty_escalations: AtomicU64::new(snapshot.tier2_uncertainty_escalations),
+            eval_queue_enqueued: AtomicU64::new(snapshot.eval_queue_enqueued),
+            eval_queue_processed: AtomicU64::new(snapshot.eval_queue_processed),
+            eval_queue_overflows: AtomicU64::new(snapshot.eval_queue_overflows),
+            rate_limited_evaluations: AtomicU64::new(snapshot.rate_limited_evaluations),
+            context_enrichments: AtomicU64::new(snapshot.context_enrichments),
+            violations_detected: AtomicU64::new(snapshot.violations_detected),
+            bounces_executed: AtomicU64::new(snapshot.bounces_executed),
+            bounced: AtomicU64::new(snapshot.bounced),
+            permitted: AtomicU64::new(snapshot.permitted),
+            bounces_skipped_rubric: AtomicU64::new(snapshot.bounces_skipped_rubric),
+            errors_encountered: AtomicU64::new(snapshot.errors_encountered),
+            sovereign_configs_synced: AtomicU64::new(snapshot.sovereign_configs_synced),
+        }
+    }
+
     /// Captures an immutable snapshot of all counters.
     #[must_use]
     pub fn snapshot(&self) -> EngineStatsSnapshot {
@@ -965,7 +1021,7 @@ impl SkybouncerEngine {
             config.rate_limiter_config.clone(),
         ));
         let enricher: Arc<dyn ContextEnricher> = Arc::new(NoopContextEnricher);
-        let stats = Arc::new(EngineStats::default());
+        let stats = Arc::new(load_persisted_stats(&cache));
         let paused = Arc::new(AtomicBool::new(false));
         let (bounce_notifier, _) = broadcast::channel(256);
         let oauth_client = Arc::new(RwLock::new(None));
@@ -2247,6 +2303,18 @@ impl SkybouncerEngine {
         &self.stats
     }
 
+    /// Persists the current cumulative telemetry counters to durable storage.
+    ///
+    /// Called periodically and during graceful shutdown so dashboard KPI totals survive
+    /// process restarts and deployments.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if the snapshot cannot be serialized or written.
+    pub fn persist_stats(&self) -> Result<(), SkybouncerError> {
+        let snapshot = self.stats.snapshot();
+        self.cache.save_dashboard_stats(&snapshot)
+    }
+
     /// Returns a reference to the evaluation rate limiter.
     #[must_use]
     pub fn rate_limiter(&self) -> &Arc<EvaluationRateLimiter> {
@@ -2746,6 +2814,9 @@ impl SkybouncerEngine {
                             warn!(error = %e, "Failed to prune expired evaluations in maintenance task");
                         }
                     }
+                    if let Err(e) = self.persist_stats() {
+                        warn!(error = %e, "Failed to persist dashboard telemetry counters in maintenance task");
+                    }
                     self.rate_limiter.prune_stale();
                     match self.tenant_registry.prune_expired_web_sessions() {
                         Ok(count) => {
@@ -3181,7 +3252,7 @@ impl SkybouncerEngineBuilder {
         }
         let protected_dids = Arc::new(RwLock::new(protected));
         let rubric = Arc::new(RwLock::new(self.config.rubric.clone()));
-        let stats = Arc::new(EngineStats::default());
+        let stats = Arc::new(load_persisted_stats(&cache));
         let paused = Arc::new(AtomicBool::new(false));
         let (bounce_notifier, _) = broadcast::channel(256);
         let oauth_client_arc = Arc::new(RwLock::new(self.oauth_client.clone()));
@@ -3210,5 +3281,28 @@ impl SkybouncerEngineBuilder {
             oauth_client: oauth_client_arc,
             handle_cache,
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_persisted_stats_restores_counters() {
+        let cache = DeduplicationCache::open_in_memory().unwrap();
+
+        let restored = load_persisted_stats(&cache);
+        assert_eq!(restored.snapshot(), EngineStatsSnapshot::default());
+
+        let mut snapshot = EngineStatsSnapshot::default();
+        snapshot.commits_received = 1_234;
+        snapshot.bounces_executed = 56;
+        snapshot.tier2_image_escalations = 3;
+        cache.save_dashboard_stats(&snapshot).unwrap();
+
+        let restored = load_persisted_stats(&cache);
+        assert_eq!(restored.snapshot(), snapshot);
     }
 }

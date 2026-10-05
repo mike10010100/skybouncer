@@ -373,6 +373,12 @@ impl DeduplicationCache {
                 handle TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS dashboard_stats (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                snapshot_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             ",
         )
         .map_err(|e| {
@@ -1578,6 +1584,58 @@ impl DeduplicationCache {
         Ok(deleted)
     }
 
+    /// Persists a serialized dashboard telemetry snapshot for surviving process restarts.
+    ///
+    /// The snapshot is stored as a single well-known row (`id = 1`) and upserted atomically,
+    /// so the latest write always wins without accumulating stale history.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] or [`SkybouncerError::Serialization`] if the
+    /// snapshot cannot be serialized or persisted.
+    pub fn save_dashboard_stats<T: Serialize + ?Sized>(
+        &self,
+        snapshot: &T,
+    ) -> Result<(), SkybouncerError> {
+        let snapshot_json = serde_json::to_string(snapshot)?;
+        let now_us = i64::try_from(current_time_us()).unwrap_or(i64::MAX);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO dashboard_stats (id, snapshot_json, updated_at)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET
+                 snapshot_json = excluded.snapshot_json,
+                 updated_at = excluded.updated_at;",
+        )?;
+        stmt.execute(params![snapshot_json, now_us])?;
+        Ok(())
+    }
+
+    /// Loads the most recently persisted dashboard telemetry snapshot, if any.
+    ///
+    /// Returns `Ok(None)` when no snapshot has ever been saved or the stored payload cannot
+    /// be deserialized (e.g. after a schema change), allowing callers to fall back to defaults.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    pub fn load_dashboard_stats<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Result<Option<T>, SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare_cached("SELECT snapshot_json FROM dashboard_stats WHERE id = 1;")?;
+        let raw: Option<String> = stmt.query_row([], |row| row.get(0)).optional()?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<T>(&raw) {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(e) => {
+                tracing::warn!(error = %e, "Discarding unreadable persisted dashboard telemetry snapshot");
+                Ok(None)
+            }
+        }
+    }
+
     /// Adds an account to the protected user's moderation allowlist.
     ///
     /// # Errors
@@ -2459,5 +2517,48 @@ mod tests {
             .find(|e| e.subject_did == stranger_did)
             .expect("stranger entry present");
         assert_eq!(stranger.handle, None);
+    }
+
+    #[test]
+    fn test_dashboard_stats_roundtrip_and_upsert() {
+        let cache = DeduplicationCache::open_in_memory().unwrap();
+
+        // No snapshot persisted yet.
+        let missing: Option<serde_json::Value> = cache.load_dashboard_stats().unwrap();
+        assert!(missing.is_none());
+
+        let first = serde_json::json!({ "commits_received": 42_u64, "bounces_executed": 7_u64 });
+        cache.save_dashboard_stats(&first).unwrap();
+        let loaded: Option<serde_json::Value> = cache.load_dashboard_stats().unwrap();
+        assert_eq!(loaded, Some(first));
+
+        // Upsert replaces the single well-known row rather than appending.
+        let second = serde_json::json!({ "commits_received": 100_u64, "bounces_executed": 9_u64 });
+        cache.save_dashboard_stats(&second).unwrap();
+        let loaded: Option<serde_json::Value> = cache.load_dashboard_stats().unwrap();
+        assert_eq!(loaded, Some(second));
+
+        let conn = cache.conn.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dashboard_stats;", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_dashboard_stats_corrupt_payload_returns_none() {
+        let cache = DeduplicationCache::open_in_memory().unwrap();
+        {
+            let conn = cache.conn.lock();
+            conn.execute(
+                "INSERT INTO dashboard_stats (id, snapshot_json, updated_at) VALUES (1, 'not-json', 0);",
+                [],
+            )
+            .unwrap();
+        }
+        let loaded: Option<serde_json::Value> = cache.load_dashboard_stats().unwrap();
+        assert!(loaded.is_none());
     }
 }
