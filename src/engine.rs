@@ -3296,10 +3296,12 @@ mod tests {
         let restored = load_persisted_stats(&cache);
         assert_eq!(restored.snapshot(), EngineStatsSnapshot::default());
 
-        let mut snapshot = EngineStatsSnapshot::default();
-        snapshot.commits_received = 1_234;
-        snapshot.bounces_executed = 56;
-        snapshot.tier2_image_escalations = 3;
+        let snapshot = EngineStatsSnapshot {
+            commits_received: 1_234,
+            bounces_executed: 56,
+            tier2_image_escalations: 3,
+            ..Default::default()
+        };
         cache.save_dashboard_stats(&snapshot).unwrap();
 
         let restored = load_persisted_stats(&cache);
