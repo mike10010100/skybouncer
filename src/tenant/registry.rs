@@ -22,6 +22,9 @@ use crate::classifier::RuleRubric;
 use crate::crypto::SessionCipher;
 use crate::error::SkybouncerError;
 
+/// Default time-to-live for handle resolution caching (1 hour).
+pub const DEFAULT_HANDLE_TTL: Duration = Duration::from_secs(3600);
+
 /// Multi-tenant record representing an enrolled Bluesky user.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tenant {
@@ -90,7 +93,8 @@ impl Tenant {
 #[derive(Clone)]
 pub struct TenantRegistry {
     conn: Arc<Mutex<Connection>>,
-    pds_clients: Arc<RwLock<HashMap<String, Arc<PdsRepoClient>>>>,
+    /// In-memory cache of authenticated [`PdsRepoClient`] instances indexed by tenant DID.
+    pub pds_clients: Arc<RwLock<HashMap<String, Arc<PdsRepoClient>>>>,
     oauth_client: Arc<RwLock<Option<Arc<AtprotoOAuthClient>>>>,
     cipher: SessionCipher,
     refresh_locks: Arc<crate::modlist::manager::StripedAsyncLocks>,
@@ -256,7 +260,8 @@ impl TenantRegistry {
                 bounce_duration TEXT,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                handle_updated_at INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_tenants_handle
@@ -283,8 +288,18 @@ impl TenantRegistry {
             SkybouncerError::Database(format!("Failed to initialize tenants schema: {e}"))
         })?;
 
-        // Idempotent column migration for existing databases
+        // Idempotent column migrations for existing databases
         let _ = conn.execute("ALTER TABLE tenants ADD COLUMN bounce_duration TEXT;", []);
+        let _ = conn.execute(
+            "ALTER TABLE tenants ADD COLUMN handle_updated_at INTEGER;",
+            [],
+        );
+        // Backfill handle freshness for rows predating the column so TTL lookups
+        // do not treat existing handle mappings as permanently stale.
+        let _ = conn.execute(
+            "UPDATE tenants SET handle_updated_at = updated_at WHERE handle_updated_at IS NULL;",
+            [],
+        );
 
         Ok(())
     }
@@ -321,12 +336,19 @@ impl TenantRegistry {
         let is_active_int: i64 = if tenant.is_active { 1 } else { 0 };
         let created_at_i64 = i64::try_from(tenant.created_at).unwrap_or(i64::MAX);
         let updated_at_i64 = i64::try_from(tenant.updated_at).unwrap_or(i64::MAX);
+        // Only advance handle freshness when a non-empty handle is being written;
+        // `None` leaves the existing mapping (and its freshness) untouched.
+        let handle_updated_at_i64 = tenant
+            .handle
+            .as_ref()
+            .filter(|h| !h.trim().is_empty())
+            .map(|_| updated_at_i64);
 
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "INSERT INTO tenants (
-                did, handle, session_json, rubric_prompt, sensitivity, bounce_duration, is_active, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                did, handle, session_json, rubric_prompt, sensitivity, bounce_duration, is_active, created_at, updated_at, handle_updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(did) DO UPDATE SET
                  handle = COALESCE(excluded.handle, tenants.handle),
                  session_json = COALESCE(excluded.session_json, tenants.session_json),
@@ -334,7 +356,8 @@ impl TenantRegistry {
                  sensitivity = COALESCE(excluded.sensitivity, tenants.sensitivity),
                  bounce_duration = COALESCE(excluded.bounce_duration, tenants.bounce_duration),
                  is_active = excluded.is_active,
-                 updated_at = excluded.updated_at;",
+                 updated_at = excluded.updated_at,
+                 handle_updated_at = COALESCE(excluded.handle_updated_at, tenants.handle_updated_at);",
         )?;
 
         stmt.execute(params![
@@ -347,6 +370,7 @@ impl TenantRegistry {
             is_active_int,
             created_at_i64,
             updated_at_i64,
+            handle_updated_at_i64,
         ])?;
 
         // Invalidate cached PDS client on credential update
@@ -479,25 +503,73 @@ impl TenantRegistry {
         }
     }
 
-    /// Retrieves an enrolled tenant by Bluesky handle.
+    /// Retrieves an enrolled tenant by Bluesky handle enforcing a maximum TTL age.
+    ///
+    /// Freshness is measured against the dedicated `handle_updated_at` column, which is
+    /// advanced only when the handle mapping itself changes (registration, handle update,
+    /// or explicit invalidation) — never by unrelated writes such as session token refreshes.
+    /// This ensures a stale handle mapping cannot be kept "fresh" by background activity.
+    ///
+    /// The tenant's handle mapping must have been updated within `max_age` of the current time.
+    /// If the handle mapping has expired or does not match, returns `Ok(None)`.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if SQLite lookup fails.
-    pub fn get_by_handle(&self, handle: &str) -> Result<Option<Tenant>, SkybouncerError> {
+    pub fn get_by_handle_with_ttl(
+        &self,
+        handle: &str,
+        max_age: Duration,
+    ) -> Result<Option<Tenant>, SkybouncerError> {
         let clean = handle.trim().trim_start_matches('@');
+        let max_age_us = u64::try_from(max_age.as_micros()).unwrap_or(u64::MAX);
+        let cutoff_us = current_time_us().saturating_sub(max_age_us);
+        let cutoff_i64 = i64::try_from(cutoff_us).unwrap_or(i64::MAX);
+
         let did_opt: Option<String> = {
             let conn = self.conn.lock();
             let mut stmt = conn.prepare_cached(
-                "SELECT did FROM tenants WHERE LOWER(handle) = LOWER(?1) OR LOWER(handle) = LOWER(?2) LIMIT 1;",
+                "SELECT did FROM tenants WHERE (LOWER(handle) = LOWER(?1) OR LOWER(handle) = LOWER(?2))
+                 AND handle_updated_at IS NOT NULL AND handle_updated_at >= ?3 LIMIT 1;",
             )?;
-            stmt.query_row(params![clean, format!("@{clean}")], |row| row.get(0))
-                .optional()?
+            stmt.query_row(params![clean, format!("@{clean}"), cutoff_i64], |row| {
+                row.get(0)
+            })
+            .optional()?
         };
 
         match did_opt {
             Some(did) => self.get(&did),
             None => Ok(None),
         }
+    }
+
+    /// Retrieves an enrolled tenant by Bluesky handle using the default TTL ([`DEFAULT_HANDLE_TTL`]).
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite lookup fails.
+    pub fn get_by_handle(&self, handle: &str) -> Result<Option<Tenant>, SkybouncerError> {
+        self.get_by_handle_with_ttl(handle, DEFAULT_HANDLE_TTL)
+    }
+
+    /// Invalidates a handle mapping in the registry by setting `handle = NULL`
+    /// for any matching tenants.
+    ///
+    /// Returns `true` if any tenant's handle was invalidated.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite update query fails.
+    pub fn invalidate_handle(&self, handle: &str) -> Result<bool, SkybouncerError> {
+        let clean = handle.trim().trim_start_matches('@');
+        let now_us = current_time_us();
+        let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
+
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "UPDATE tenants SET handle = NULL, handle_updated_at = ?1, updated_at = ?1
+             WHERE LOWER(handle) = LOWER(?2) OR LOWER(handle) = LOWER(?3);",
+        )?;
+        let count = stmt.execute(params![now_i64, clean, format!("@{clean}")])?;
+        Ok(count > 0)
     }
 
     /// Checks whether the given DID is registered and enrolled in the tenant registry.
@@ -622,8 +694,9 @@ impl TenantRegistry {
         let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
 
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare_cached("UPDATE tenants SET handle = ?1, updated_at = ?2 WHERE did = ?3;")?;
+        let mut stmt = conn.prepare_cached(
+            "UPDATE tenants SET handle = ?1, handle_updated_at = ?2, updated_at = ?2 WHERE did = ?3;",
+        )?;
 
         let count = stmt.execute(params![handle, now_i64, did])?;
         Ok(count > 0)
@@ -877,41 +950,60 @@ impl TenantRegistry {
 
         // 4. If session is expired or close to expiring, auto-refresh via OAuth
         if session.is_expired_with_leeway(Duration::from_secs(60)) {
-            if let Some(ref oc) = resolved_oauth_client {
-                if session.refresh_token().is_some() {
+            let oc = match resolved_oauth_client.as_ref() {
+                Some(oc) => oc,
+                None => {
+                    self.pds_clients.write().remove(did);
+                    return Err(SkybouncerError::Auth(format!(
+                        "OAuth session for tenant {did} is expired and no OAuth client is configured"
+                    )));
+                }
+            };
+
+            if session.refresh_token().is_none() {
+                self.pds_clients.write().remove(did);
+                return Err(SkybouncerError::Auth(format!(
+                    "OAuth session for tenant {did} is expired and has no refresh token"
+                )));
+            }
+
+            tracing::info!(
+                did = %did,
+                "Refreshing expired ATProto OAuth session for tenant PDS client"
+            );
+            match oc.refresh_session(&mut session).await {
+                Ok(()) => {
                     tracing::info!(
                         did = %did,
-                        "Refreshing expired ATProto OAuth session for tenant PDS client"
+                        "Successfully refreshed ATProto OAuth session for tenant"
                     );
-                    match oc.refresh_session(&mut session).await {
-                        Ok(()) => {
-                            tracing::info!(
-                                did = %did,
-                                "Successfully refreshed ATProto OAuth session for tenant"
-                            );
-                            if let Err(e) = self.update_session(did, &session) {
-                                tracing::warn!(
-                                    did = %did,
-                                    error = %e,
-                                    "Failed to persist refreshed session to SQLite database"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                did = %did,
-                                error = %e,
-                                "Failed to refresh ATProto OAuth session using refresh token"
-                            );
-                        }
+                    if let Err(e) = self.update_session(did, &session) {
+                        tracing::warn!(
+                            did = %did,
+                            error = %e,
+                            "Failed to persist refreshed session to SQLite database"
+                        );
                     }
-                } else {
+                }
+                Err(e) => {
                     tracing::warn!(
                         did = %did,
-                        "Tenant session is expired but has no refresh token to refresh with"
+                        error = %e,
+                        "Failed to refresh ATProto OAuth session using refresh token"
                     );
+                    self.pds_clients.write().remove(did);
+                    return Err(SkybouncerError::Auth(format!(
+                        "Failed to refresh expired OAuth session for tenant {did}: {e}"
+                    )));
                 }
             }
+        }
+
+        if session.is_expired() {
+            self.pds_clients.write().remove(did);
+            return Err(SkybouncerError::Auth(format!(
+                "OAuth session for tenant {did} remains expired"
+            )));
         }
 
         // 5. Construct PdsRepoClient
@@ -1360,5 +1452,132 @@ mod tests {
         // Attempting to retrieve tenant fails authentication tag check
         let fetch_result = registry_b.get("did:plc:protected-key-test");
         assert!(fetch_result.is_err());
+    }
+
+    #[test]
+    fn test_tenant_handle_ttl_and_invalidation() {
+        let registry = TenantRegistry::open_in_memory().unwrap();
+        let tenant = Tenant::new("did:plc:alice").with_handle("alice.bsky.social");
+        registry.register_or_update(&tenant).unwrap();
+
+        // Standard retrieval with default TTL
+        let fetched = registry.get_by_handle("alice.bsky.social").unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().did, "did:plc:alice");
+
+        // Prefix '@' works
+        let with_at = registry.get_by_handle("@alice.bsky.social").unwrap();
+        assert!(with_at.is_some());
+
+        // Zero TTL treats it as expired
+        let expired = registry
+            .get_by_handle_with_ttl("alice.bsky.social", Duration::ZERO)
+            .unwrap();
+        assert!(expired.is_none());
+
+        // Invalidation clears handle
+        let invalidated = registry.invalidate_handle("alice.bsky.social").unwrap();
+        assert!(invalidated);
+
+        // After invalidation, lookup returns None
+        let after = registry.get_by_handle("alice.bsky.social").unwrap();
+        assert!(after.is_none());
+
+        // Re-invalidating non-existent handle returns false
+        let second_inv = registry.invalidate_handle("alice.bsky.social").unwrap();
+        assert!(!second_inv);
+    }
+
+    #[test]
+    fn test_handle_freshness_not_refreshed_by_session_update() {
+        let registry = TenantRegistry::open_in_memory().unwrap();
+
+        // Register with a handle, backdating the handle-freshness timestamp so it is
+        // already older than a 1-second TTL window.
+        let mut tenant = Tenant::new("did:plc:alice").with_handle("alice.bsky.social");
+        let old = crate::modlist::cache::current_time_us().saturating_sub(5_000_000);
+        tenant.created_at = old;
+        tenant.updated_at = old;
+        registry.register_or_update(&tenant).unwrap();
+
+        // Backdate handle_updated_at directly to simulate an old mapping.
+        {
+            let conn = registry.conn.lock();
+            conn.execute(
+                "UPDATE tenants SET handle_updated_at = ?1 WHERE did = 'did:plc:alice';",
+                rusqlite::params![i64::try_from(old).unwrap()],
+            )
+            .unwrap();
+        }
+
+        // With a 1-second TTL, the 5-second-old mapping is considered stale.
+        let stale = registry
+            .get_by_handle_with_ttl("alice.bsky.social", Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            stale.is_none(),
+            "old handle mapping must be treated as stale"
+        );
+
+        // Simulate unrelated activity: update_handle is not called, but other tenant
+        // writes (e.g. rubric/session) bump `updated_at`. Use invalidate-free update via
+        // register_or_update with an unset handle to ensure handle freshness is preserved.
+        let mut unrelated = Tenant::new("did:plc:alice");
+        unrelated.updated_at = crate::modlist::cache::current_time_us();
+        registry.register_or_update(&unrelated).unwrap();
+
+        // The handle mapping is still considered stale: session/tenant activity must not
+        // resurrect freshness.
+        let still_stale = registry
+            .get_by_handle_with_ttl("alice.bsky.social", Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            still_stale.is_none(),
+            "unrelated tenant updates must not refresh handle freshness"
+        );
+
+        // An explicit handle update does refresh freshness.
+        assert!(registry
+            .update_handle("did:plc:alice", "alice.bsky.social")
+            .unwrap());
+        let fresh = registry
+            .get_by_handle_with_ttl("alice.bsky.social", Duration::from_secs(3600))
+            .unwrap();
+        assert!(
+            fresh.is_some(),
+            "explicit handle update must refresh freshness"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expired_session_without_oauth_client_or_refresh_token_errors() {
+        let registry = TenantRegistry::open_in_memory().unwrap();
+        let dpop_key = DPoPKey::generate();
+
+        // Expired session without refresh token
+        let session_no_rt = OAuthSession::new(
+            "did:plc:no-rt",
+            "at_expired",
+            None,
+            "DPoP",
+            None,
+            Some(0),
+            dpop_key,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let tenant = Tenant::new("did:plc:no-rt").with_session(session_no_rt);
+        registry.register_or_update(&tenant).unwrap();
+
+        // Calling get_pds_client without OAuth client errors
+        let res_no_oc = registry.get_pds_client("did:plc:no-rt", None).await;
+        assert!(res_no_oc.is_err());
+        assert!(
+            matches!(res_no_oc, Err(SkybouncerError::Auth(msg)) if msg.contains("no OAuth client"))
+        );
+        assert!(registry.pds_clients.read().get("did:plc:no-rt").is_none());
     }
 }

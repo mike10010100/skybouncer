@@ -34,7 +34,7 @@ pub mod types;
 pub mod web;
 
 pub use crypto::SessionCipher;
-pub use tenant::{Tenant, TenantRegistry};
+pub use tenant::{Tenant, TenantRegistry, DEFAULT_HANDLE_TTL};
 
 pub use bot::{
     extract_link_facets, format_bounce_alert, run_bot_poller, run_bounce_alert_dispatcher,

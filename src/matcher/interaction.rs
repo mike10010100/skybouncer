@@ -66,6 +66,9 @@ pub struct Interaction {
     /// Optional enriched author profile and parent post context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enriched_context: Option<crate::enricher::EnrichedContext>,
+    /// Optional tenant-specific moderation rubric governing this interaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rubric: Option<crate::classifier::RuleRubric>,
 }
 
 impl Interaction {
@@ -92,6 +95,7 @@ impl Interaction {
             image_cids: Vec::new(),
             image_alts: Vec::new(),
             enriched_context: None,
+            rubric: None,
         }
     }
 
@@ -136,6 +140,13 @@ impl Interaction {
         self
     }
 
+    /// Attaches an optional tenant-specific rule rubric.
+    #[must_use]
+    pub fn with_rubric(mut self, rubric: crate::classifier::RuleRubric) -> Self {
+        self.rubric = Some(rubric);
+        self
+    }
+
     /// Helper for creating synthetic interactions in tests.
     #[must_use]
     pub fn mock_test_candidate(author_did: &str, target_did: &str, text: &str) -> Self {
@@ -154,6 +165,7 @@ impl Interaction {
             image_cids: Vec::new(),
             image_alts: Vec::new(),
             enriched_context: None,
+            rubric: None,
         }
     }
 }

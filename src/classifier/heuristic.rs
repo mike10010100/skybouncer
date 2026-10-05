@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use regex::Regex;
 
-use crate::classifier::{Classifier, Verdict, ViolationCategory};
+use crate::classifier::{Classifier, RuleRubric, Verdict, ViolationCategory};
 use crate::error::SkybouncerError;
 use crate::matcher::Interaction;
 
@@ -163,6 +163,14 @@ impl Default for HeuristicClassifier {
 #[async_trait]
 impl Classifier for HeuristicClassifier {
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
+        Ok(self.evaluate(interaction))
+    }
+
+    async fn classify_with_rubric(
+        &self,
+        interaction: &Interaction,
+        _rubric: Option<&RuleRubric>,
+    ) -> Result<Verdict, SkybouncerError> {
         Ok(self.evaluate(interaction))
     }
 

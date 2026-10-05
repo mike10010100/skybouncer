@@ -415,7 +415,27 @@ impl JevClassifier {
     /// Returns [`SkybouncerError::Classifier`] on HTTP client errors, exhausted retries,
     /// or JSON parsing failures.
     pub async fn evaluate(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
+        self.evaluate_with_rubric(interaction, None).await
+    }
+
+    /// Evaluates an interaction candidate against a specific or effective moderation rubric.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Classifier`] on HTTP client errors, exhausted retries,
+    /// or JSON parsing failures.
+    pub async fn evaluate_with_rubric(
+        &self,
+        interaction: &Interaction,
+        rubric: Option<&RuleRubric>,
+    ) -> Result<Verdict, SkybouncerError> {
         let mut last_err = None;
+
+        let effective_rubric = rubric
+            .or(interaction.rubric.as_ref())
+            .cloned()
+            .unwrap_or_else(|| self.rubric.read().clone());
+        let rubric_prompt = effective_rubric.prompt.clone();
+        let sensitivity_str = effective_rubric.sensitivity.as_str().to_string();
 
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
@@ -431,11 +451,6 @@ impl JevClassifier {
             if let Some(ref key) = self.config.api_key {
                 request_builder = request_builder.header("Authorization", format!("Bearer {key}"));
             }
-
-            let (rubric_prompt, sensitivity_str) = {
-                let r = self.rubric.read();
-                (r.prompt.clone(), r.sensitivity.as_str().to_string())
-            };
 
             let images = interaction
                 .enriched_context
@@ -456,7 +471,7 @@ impl JevClassifier {
                             target_did: interaction.target_did.clone(),
                             interaction_type: interaction.interaction_type.as_str().to_string(),
                         },
-                        sensitivity: sensitivity_str,
+                        sensitivity: sensitivity_str.clone(),
                         images,
                     };
                     request_builder.json(&payload).send().await
@@ -678,7 +693,7 @@ impl JevClassifier {
                         }
                     }
                 };
-                return Ok(self.build_verdict(classify_resp));
+                return Ok(self.build_verdict(classify_resp, &effective_rubric));
             }
 
             // Client errors (4xx) are permanent — NEVER RETRY
@@ -711,8 +726,8 @@ impl JevClassifier {
     }
 
     /// Evaluates raw Jev response against configured rubric sensitivity.
-    fn build_verdict(&self, resp: JevClassifyResponse) -> Verdict {
-        let is_actionable = self.rubric.read().is_actionable(resp.confidence);
+    fn build_verdict(&self, resp: JevClassifyResponse, rubric: &RuleRubric) -> Verdict {
+        let is_actionable = rubric.is_actionable(resp.confidence);
         if resp.violates && is_actionable {
             let category = match resp.category.as_deref() {
                 Some("spam") => ViolationCategory::Spam,
@@ -740,7 +755,16 @@ impl JevClassifier {
 #[async_trait]
 impl Classifier for JevClassifier {
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
-        self.evaluate(interaction).await
+        self.classify_with_rubric(interaction, interaction.rubric.as_ref())
+            .await
+    }
+
+    async fn classify_with_rubric(
+        &self,
+        interaction: &Interaction,
+        rubric: Option<&RuleRubric>,
+    ) -> Result<Verdict, SkybouncerError> {
+        self.evaluate_with_rubric(interaction, rubric).await
     }
 
     fn model_name(&self) -> &str {

@@ -1732,6 +1732,32 @@ impl DeduplicationCache {
         Ok(did)
     }
 
+    /// Looks up the cached DID for a handle, ignoring mappings older than `max_age_us`
+    /// microseconds.
+    ///
+    /// This prevents a stale persisted mapping from shadowing a handle that has since
+    /// rotated to a new owner on the network.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn get_did_for_handle_with_ttl(
+        &self,
+        handle: &str,
+        max_age_us: u64,
+    ) -> Result<Option<String>, SkybouncerError> {
+        let clean = handle.trim().trim_start_matches('@');
+        let cutoff_i64 =
+            i64::try_from(current_time_us().saturating_sub(max_age_us)).unwrap_or(i64::MAX);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT did FROM did_handles WHERE handle = ?1 COLLATE NOCASE AND updated_at >= ?2 LIMIT 1;",
+        )?;
+        let did = stmt
+            .query_row(params![clean, cutoff_i64], |row| row.get(0))
+            .optional()?;
+        Ok(did)
+    }
+
     /// Caches a DID to handle mapping in SQLite.
     ///
     /// # Errors
@@ -1751,6 +1777,22 @@ impl DeduplicationCache {
         )?;
         stmt.execute(params![clean_did, clean_handle, now_i64])?;
         Ok(())
+    }
+
+    /// Removes the cached DID-to-handle mapping for a given handle.
+    ///
+    /// Used to invalidate a rotated or stale handle so subsequent lookups
+    /// re-resolve it from the authoritative source.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite execution fails.
+    pub fn remove_handle_for_handle(&self, handle: &str) -> Result<usize, SkybouncerError> {
+        let clean = handle.trim().trim_start_matches('@');
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare_cached("DELETE FROM did_handles WHERE handle = ?1 COLLATE NOCASE;")?;
+        let deleted = stmt.execute(params![clean])?;
+        Ok(deleted)
     }
 
     /// Prunes stale DID-to-handle cache entries and bounds the table size.
@@ -2303,6 +2345,47 @@ mod tests {
         cache.set_handle_for_did("   ", "some.handle").unwrap();
         cache.set_handle_for_did(did, "   ").unwrap();
         assert_eq!(cache.get_handle_for_did("").unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_did_for_handle_with_ttl() {
+        let cache = DeduplicationCache::open_in_memory().unwrap();
+        let did = "did:plc:ttluser";
+        let handle = "ttluser.bsky.social";
+
+        // Missing mapping returns None.
+        assert_eq!(
+            cache.get_did_for_handle_with_ttl(handle, u64::MAX).unwrap(),
+            None
+        );
+
+        cache.set_handle_for_did(did, handle).unwrap();
+
+        // A generous TTL returns the freshly written mapping.
+        assert_eq!(
+            cache
+                .get_did_for_handle_with_ttl(handle, u64::MAX)
+                .unwrap()
+                .as_deref(),
+            Some(did)
+        );
+
+        // A zero TTL treats the mapping as stale (cutoff == now), excluding it.
+        assert_eq!(cache.get_did_for_handle_with_ttl(handle, 0).unwrap(), None);
+
+        // The non-TTL lookup still sees the mapping regardless of age.
+        assert_eq!(
+            cache.get_did_for_handle(handle).unwrap().as_deref(),
+            Some(did)
+        );
+
+        // remove_handle_for_handle clears it from all lookups.
+        let removed = cache.remove_handle_for_handle(handle).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(
+            cache.get_did_for_handle_with_ttl(handle, u64::MAX).unwrap(),
+            None
+        );
     }
 
     #[test]

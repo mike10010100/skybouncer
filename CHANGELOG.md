@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.16] - 2026-10-05
+
+### Fixed & Remediated
+
+- **Per-Tenant Custom Rubric Semantic Inference**:
+  - Threaded tenant-specific `RuleRubric` through `Interaction` (`pub rubric: Option<RuleRubric>`, builder `with_rubric`) and new `Classifier` trait methods (`classify_with_rubric`, `classify_detailed_with_rubric`, `classify_detailed_with_stats_and_rubric`).
+  - Updated `JevClassifier`, `TieredClassifier`, `HeuristicClassifier`, and `MockClassifier` to evaluate against tenant-specific prompt rules and sensitivity thresholds during inference.
+  - `SkybouncerEngine::evaluate_candidate` and `process_interaction` now resolve the target tenant's specific rubric via `rubric_for(&target_did)` and pass it into the classification pipeline, eliminating the defect where tenant-custom rules were ignored in favor of the global fleet rubric.
+- **Sovereign Config Deletion Rubric Reset**:
+  - `SkybouncerEngine::handle_sovereign_config_commit` now handles `CommitOperation::Delete` on `social.skybouncer.config` records, resetting the tenant's rubric back to the default in both `TenantRegistry` (SQLite) and engine in-memory state and emitting `ProcessCommitResult::SovereignConfigSynced(SovereignConfigSyncEvent::Deleted { did })`.
+- **Follow Graph Cold Hydration TID Reconciliation**:
+  - Resolved synthetic vs real TID rkey mismatch when processing unfollow events following cold-start hydration via `hydrate_follows`.
+  - Implemented multi-tiered synthetic fallback reconciliation in `FollowGraph::handle_commit`: exact rkey match, then payload `subject` DID, then a DID-valued rkey, then synthetic-key reconciliation.
+  - Synthetic-fallback selection is now deterministic (ascending `hydrate_<n>` index, then `seed_*` lexicographic) rather than relying on `HashMap` iteration order, and never selects a real rkey, keeping behavior reproducible across restarts.
+- **Handle Resolution Caching TTL & Monotonic Invalidation**:
+  - Added `TenantRegistry::get_by_handle_with_ttl(&self, handle, max_age)` and `invalidate_handle(&self, handle)` with microsecond-precision SQLite timestamp validation against `DEFAULT_HANDLE_TTL` (1 hour).
+  - Added a dedicated `tenants.handle_updated_at` column (with idempotent migration + backfill) so handle freshness is advanced only when the handle mapping itself changes — never by unrelated writes such as OAuth session token refreshes.
+  - Added a monotonic in-memory `handle_cache` to `SkybouncerEngine` using `Instant::now()` and clock-warp safe `saturating_duration_since`, without holding locks across `.await` points.
+  - Unified the resolution hierarchy with the persisted SQLite `did_handles` cache from v0.1.15: in-memory cache -> registry TTL -> **TTL-bounded** persisted cache (`DeduplicationCache::get_did_for_handle_with_ttl`) -> AppView enricher. The persisted cache is now TTL-bounded so a stale mapping cannot shadow a rotated handle.
+  - Added `engine.invalidate_handle()` and `engine.clear_handle_cache()` plus `DeduplicationCache::remove_handle_for_handle` to evict rotated handles across all tiers.
+- **Expired Session Refresh Failure Handling & Client Eviction**:
+  - Hardened `TenantRegistry::get_pds_client` against OAuth token refresh failures: if session refresh fails, the refresh token is missing, or no OAuth client is available for an expired session, it returns a typed `Err(SkybouncerError::Auth(...))` rather than caching and returning a dead client wrapping an expired token.
+  - Synchronously evicts dead or unrefreshable clients from the in-memory `pds_clients` cache upon failure, preventing cache pollution and repeated 401 responses.
+
 ## [0.1.15] - 2026-10-04
 
 ### Added & Enhanced

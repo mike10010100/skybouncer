@@ -41,6 +41,19 @@ pub enum FollowSyncEvent {
     Ignored,
 }
 
+/// Deterministic ordering key for synthetic hydration rkeys.
+///
+/// Ranks `hydrate_<n>` by ascending numeric index (so `hydrate_0` before `hydrate_10`),
+/// then all other synthetic keys (e.g. `seed_*`) lexicographically. Keeps synthetic
+/// fallback selection stable across restarts and repeated commits.
+fn synthetic_key_rank(key: &str) -> (u8, u64, String) {
+    if let Some(rest) = key.strip_prefix("hydrate_") {
+        (0, rest.parse::<u64>().unwrap_or(u64::MAX), String::new())
+    } else {
+        (1, 0, key.to_string())
+    }
+}
+
 /// Internal state holding the follow sets and reverse indexes.
 #[derive(Debug, Default)]
 struct FollowGraphInner {
@@ -178,13 +191,57 @@ impl FollowGraph {
         removed
     }
 
+    /// Removes a synthetic follow relationship when a real Jetstream delete commit arrives
+    /// for an untracked TID, reconciling cold-start hydration desync.
+    ///
+    /// Inspects the reverse index for `protected_did` to find a synthetic key (prefixed with
+    /// `hydrate_` or `seed_`), removes that key, and removes the followed account from the
+    /// active set if not referenced by any other record key.
+    ///
+    /// # Determinism & inherent ambiguity
+    ///
+    /// A follow `Delete` commit does not carry the followed account, so a real-TID delete
+    /// arriving after synthetic hydration cannot be correlated to a specific account. This
+    /// reconciliation is therefore inherently best-effort. To keep behavior reproducible across
+    /// restarts and repeated commits, the synthetic key is selected deterministically
+    /// (lowest numeric `hydrate_*` index first, then `seed_*` lexicographically) rather than
+    /// relying on `HashMap` iteration order. Real (non-synthetic) rkeys are never selected.
+    ///
+    /// # Arguments
+    /// * `protected_did` - DID of the follower (the protected user).
+    ///
+    /// Returns `Some(followed_did)` if a synthetic follow was found and removed, or `None`.
+    pub fn remove_synthetic_follow_fallback(&self, protected_did: &str) -> Option<String> {
+        let mut guard = self.inner.write();
+
+        let (followed_did, still_referenced) = {
+            let user_rkeys = guard.rkey_to_followed.get_mut(protected_did)?;
+            let synthetic_key = user_rkeys
+                .keys()
+                .filter(|k| k.starts_with("hydrate_") || k.starts_with("seed_"))
+                .min_by_key(|k| synthetic_key_rank(k))
+                .cloned()?;
+            let followed_did = user_rkeys.remove(&synthetic_key)?;
+            let still_referenced = user_rkeys.values().any(|v| v == &followed_did);
+            (followed_did, still_referenced)
+        };
+
+        if !still_referenced {
+            if let Some(set) = guard.follows.get_mut(protected_did) {
+                set.remove(&followed_did);
+            }
+        }
+
+        Some(followed_did)
+    }
+
     /// Synchronizes the follow graph from a Jetstream firehose commit in real-time.
     ///
     /// # Invariants
     /// 1. Commits for collections other than `app.bsky.graph.follow` are immediately ignored.
     /// 2. Commits authored by DIDs not in `protected_dids` are immediately ignored with zero lock contention.
     /// 3. [`CommitOperation::Create`] and [`CommitOperation::Update`] parse the `subject` DID from the record payload.
-    /// 4. [`CommitOperation::Delete`] removes the follow using the reverse `rkey` index since the record payload is absent.
+    /// 4. [`CommitOperation::Delete`] removes the follow using the reverse `rkey` index with fallbacks for synthetic hydration keys.
     pub fn handle_commit(
         &self,
         commit: &JetstreamCommit,
@@ -222,7 +279,41 @@ impl FollowGraph {
                 }
             }
             CommitOperation::Delete => {
-                match self.remove_follow_by_rkey(&commit.did, &commit.rkey) {
+                // 1. Try exact rkey match in reverse index
+                let removed = self.remove_follow_by_rkey(&commit.did, &commit.rkey);
+
+                // 2. Fallback: Check if payload specifies subject DID
+                let removed = removed.or_else(|| {
+                    commit
+                        .record
+                        .as_ref()
+                        .and_then(|r| r.get("subject"))
+                        .and_then(|s| s.as_str())
+                        .and_then(|subject| {
+                            if self.remove_follow_by_did(&commit.did, subject) {
+                                Some(subject.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                });
+
+                // 3. Fallback: Check if rkey itself is a DID
+                let removed = removed.or_else(|| {
+                    if commit.rkey.starts_with("did:")
+                        && self.remove_follow_by_did(&commit.did, &commit.rkey)
+                    {
+                        Some(commit.rkey.clone())
+                    } else {
+                        None
+                    }
+                });
+
+                // 4. Fallback: Reconcile synthetic rkey if present
+                let removed =
+                    removed.or_else(|| self.remove_synthetic_follow_fallback(&commit.did));
+
+                match removed {
                     Some(followed_did) => FollowSyncEvent::FollowRemoved {
                         protected_did: commit.did.clone(),
                         rkey: commit.rkey.clone(),

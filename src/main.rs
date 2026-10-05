@@ -597,6 +597,7 @@ async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
         image_cids,
         image_alts: Vec::new(),
         enriched_context,
+        rubric: Some(rubric.clone()),
     };
 
     let heuristic_verdict = heuristic.evaluate(&interaction);

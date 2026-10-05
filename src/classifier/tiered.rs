@@ -231,12 +231,36 @@ impl TieredClassifier {
         interaction: &Interaction,
         record_stats: bool,
     ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        self.evaluate_tiered_with_rubric(interaction, None, record_stats)
+            .await
+    }
+
+    /// Evaluates an incoming candidate interaction with complete multi-tier inspection breakdown against a specific rubric.
+    ///
+    /// # Arguments
+    /// * `interaction` - The candidate ATProto post interaction to evaluate.
+    /// * `rubric` - Optional moderation rule rubric override.
+    /// * `record_stats` - When `true`, operational telemetry counters are incremented.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if classifier evaluation fails or times out.
+    pub async fn evaluate_tiered_with_rubric(
+        &self,
+        interaction: &Interaction,
+        rubric: Option<&RuleRubric>,
+        record_stats: bool,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
         if record_stats {
             self.stats.total_evaluations.fetch_add(1, Ordering::Relaxed);
         }
 
+        let effective_rubric = rubric.or(interaction.rubric.as_ref());
+
         // 1. Evaluate candidate using the fast primary System-1 classifier
-        let primary_verdict = self.primary.classify(interaction).await?;
+        let primary_verdict = self
+            .primary
+            .classify_with_rubric(interaction, effective_rubric)
+            .await?;
         let primary_model = self.primary.model_name().to_string();
         let fallback_model = Some(self.fallback.model_name().to_string());
         let has_images = interaction.has_images();
@@ -285,7 +309,10 @@ impl TieredClassifier {
             };
 
             // 3. Evaluate candidate with the heavier System-2 fallback model
-            let fallback_raw = self.fallback.classify(interaction).await?;
+            let fallback_raw = self
+                .fallback
+                .classify_with_rubric(interaction, effective_rubric)
+                .await?;
             let final_verdict = match fallback_raw.clone() {
                 Verdict::Violation {
                     category,
@@ -341,7 +368,18 @@ impl TieredClassifier {
 #[async_trait]
 impl Classifier for TieredClassifier {
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
-        let result = self.evaluate_tiered(interaction, true).await?;
+        self.classify_with_rubric(interaction, interaction.rubric.as_ref())
+            .await
+    }
+
+    async fn classify_with_rubric(
+        &self,
+        interaction: &Interaction,
+        rubric: Option<&RuleRubric>,
+    ) -> Result<Verdict, SkybouncerError> {
+        let result = self
+            .evaluate_tiered_with_rubric(interaction, rubric, true)
+            .await?;
         Ok(result.final_verdict)
     }
 
@@ -353,7 +391,17 @@ impl Classifier for TieredClassifier {
         &self,
         interaction: &Interaction,
     ) -> Result<TieredEvaluationResult, SkybouncerError> {
-        self.evaluate_tiered(interaction, false).await
+        self.evaluate_tiered_with_rubric(interaction, interaction.rubric.as_ref(), false)
+            .await
+    }
+
+    async fn classify_detailed_with_rubric(
+        &self,
+        interaction: &Interaction,
+        rubric: Option<&RuleRubric>,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        self.evaluate_tiered_with_rubric(interaction, rubric, false)
+            .await
     }
 
     async fn classify_detailed_with_stats(
@@ -361,7 +409,18 @@ impl Classifier for TieredClassifier {
         interaction: &Interaction,
         record_stats: bool,
     ) -> Result<TieredEvaluationResult, SkybouncerError> {
-        self.evaluate_tiered(interaction, record_stats).await
+        self.evaluate_tiered_with_rubric(interaction, interaction.rubric.as_ref(), record_stats)
+            .await
+    }
+
+    async fn classify_detailed_with_stats_and_rubric(
+        &self,
+        interaction: &Interaction,
+        rubric: Option<&RuleRubric>,
+        record_stats: bool,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        self.evaluate_tiered_with_rubric(interaction, rubric, record_stats)
+            .await
     }
 
     fn set_rubric(&self, rubric: RuleRubric) {

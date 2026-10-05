@@ -24,6 +24,8 @@ pub struct MockClassifier {
     simulated_delay: Arc<RwLock<Option<Duration>>>,
     simulated_error: Arc<RwLock<Option<String>>>,
     rubric: Arc<RwLock<Option<RuleRubric>>>,
+    last_evaluated_rubric: Arc<RwLock<Option<RuleRubric>>>,
+    rubric_keyword_verdicts: Arc<RwLock<HashMap<String, Verdict>>>,
 }
 
 impl MockClassifier {
@@ -37,6 +39,8 @@ impl MockClassifier {
             simulated_delay: Arc::new(RwLock::new(None)),
             simulated_error: Arc::new(RwLock::new(None)),
             rubric: Arc::new(RwLock::new(None)),
+            last_evaluated_rubric: Arc::new(RwLock::new(None)),
+            rubric_keyword_verdicts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -111,6 +115,29 @@ impl MockClassifier {
     pub fn rubric(&self) -> Option<RuleRubric> {
         self.rubric.read().clone()
     }
+
+    /// Returns the last moderation rubric passed into classification, if any.
+    #[must_use]
+    pub fn last_evaluated_rubric(&self) -> Option<RuleRubric> {
+        self.last_evaluated_rubric.read().clone()
+    }
+
+    /// Configures a verdict override when the evaluated rubric's prompt contains the specified keyword (case-insensitive).
+    pub fn set_rubric_keyword_verdict(&self, keyword: impl Into<String>, verdict: Verdict) {
+        let key = keyword.into().to_lowercase();
+        self.rubric_keyword_verdicts.write().insert(key, verdict);
+    }
+
+    /// Removes a rubric keyword override.
+    pub fn remove_rubric_keyword_verdict(&self, keyword: &str) -> Option<Verdict> {
+        let key = keyword.to_lowercase();
+        self.rubric_keyword_verdicts.write().remove(&key)
+    }
+
+    /// Clears all rubric keyword-specific verdict overrides.
+    pub fn clear_rubric_keyword_verdicts(&self) {
+        self.rubric_keyword_verdicts.write().clear();
+    }
 }
 
 impl Default for MockClassifier {
@@ -126,6 +153,15 @@ impl Classifier for MockClassifier {
     }
 
     async fn classify(&self, interaction: &Interaction) -> Result<Verdict, SkybouncerError> {
+        self.classify_with_rubric(interaction, interaction.rubric.as_ref())
+            .await
+    }
+
+    async fn classify_with_rubric(
+        &self,
+        interaction: &Interaction,
+        rubric: Option<&RuleRubric>,
+    ) -> Result<Verdict, SkybouncerError> {
         // Atomically record invocation
         self.call_count.fetch_add(1, Ordering::SeqCst);
 
@@ -138,6 +174,13 @@ impl Classifier for MockClassifier {
             return Err(SkybouncerError::Classifier(err_msg));
         }
 
+        // Record effective rubric
+        let effective_rubric = rubric
+            .or(interaction.rubric.as_ref())
+            .cloned()
+            .or_else(|| self.rubric.read().clone());
+        *self.last_evaluated_rubric.write() = effective_rubric.clone();
+
         // Read and drop simulated delay lock before sleeping across await point
         let delay_opt = {
             let guard = self.simulated_delay.read();
@@ -147,7 +190,25 @@ impl Classifier for MockClassifier {
             tokio::time::sleep(delay).await;
         }
 
-        // Inspect keyword overrides (case-insensitive substring search)
+        // 1. Inspect rubric keyword overrides (case-insensitive substring search on prompt)
+        if let Some(ref r) = effective_rubric {
+            let lower_prompt = r.prompt.to_lowercase();
+            let rubric_kw_match = {
+                let guard = self.rubric_keyword_verdicts.read();
+                guard.iter().find_map(|(kw, verdict)| {
+                    if lower_prompt.contains(kw) {
+                        Some(verdict.clone())
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some(verdict) = rubric_kw_match {
+                return Ok(verdict);
+            }
+        }
+
+        // 2. Inspect candidate text keyword overrides (case-insensitive substring search)
         let lower_text = interaction.text.to_lowercase();
         let keyword_match = {
             let guard = self.keyword_verdicts.read();

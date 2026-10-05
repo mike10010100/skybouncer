@@ -120,6 +120,7 @@ impl TargetMatcher {
                         image_cids: image_cids.clone(),
                         image_alts: image_alts.clone(),
                         enriched_context: None,
+                        rubric: None,
                     });
                 }
             }
@@ -141,6 +142,7 @@ impl TargetMatcher {
                         image_cids: image_cids.clone(),
                         image_alts: image_alts.clone(),
                         enriched_context: None,
+                        rubric: None,
                     });
                 }
             }
@@ -166,6 +168,7 @@ impl TargetMatcher {
                                 image_cids: image_cids.clone(),
                                 image_alts: image_alts.clone(),
                                 enriched_context: None,
+                                rubric: None,
                             });
                         }
                     }
@@ -192,6 +195,7 @@ impl TargetMatcher {
                             image_cids: image_cids.clone(),
                             image_alts: image_alts.clone(),
                             enriched_context: None,
+                            rubric: None,
                         });
                     }
                 }

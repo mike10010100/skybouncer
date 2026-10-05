@@ -12,7 +12,7 @@
 //! 7. **Primary Classifier**: Evaluates surviving candidates against user-defined rubrics (e.g. Jev System-1).
 //! 8. **Sovereign PDS Mutator**: Creates DPoP-signed `app.bsky.graph.listitem` records on the user's PDS.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -118,6 +118,8 @@ pub struct SkybouncerConfig {
     /// When set, only this DID is granted administrative privileges (fleet oversight, tenant management).
     /// The administrator is also automatically included in [`SkybouncerConfig::protected_dids`].
     pub admin_did: Option<String>,
+    /// Time-to-live duration for caching handle-to-DID resolutions.
+    pub handle_cache_ttl: Duration,
 }
 
 impl Default for SkybouncerConfig {
@@ -142,6 +144,7 @@ impl Default for SkybouncerConfig {
             enable_heuristic_prefilter: false,
             dry_run: false,
             admin_did: None,
+            handle_cache_ttl: crate::tenant::DEFAULT_HANDLE_TTL,
         }
     }
 }
@@ -272,6 +275,13 @@ impl SkybouncerConfig {
         let did = admin_did.into();
         self.protected_dids.insert(did.clone());
         self.admin_did = Some(did);
+        self
+    }
+
+    /// Sets the handle resolution cache TTL.
+    #[must_use]
+    pub fn with_handle_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.handle_cache_ttl = ttl;
         self
     }
 
@@ -428,6 +438,7 @@ impl SkybouncerConfig {
             enable_heuristic_prefilter,
             dry_run,
             admin_did,
+            handle_cache_ttl: crate::tenant::DEFAULT_HANDLE_TTL,
         })
     }
 }
@@ -901,6 +912,7 @@ pub struct SkybouncerEngine {
     paused: Arc<AtomicBool>,
     bounce_notifier: broadcast::Sender<BounceNotification>,
     oauth_client: Arc<RwLock<Option<Arc<AtprotoOAuthClient>>>>,
+    handle_cache: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
 }
 
 impl SkybouncerEngine {
@@ -957,6 +969,7 @@ impl SkybouncerEngine {
         let paused = Arc::new(AtomicBool::new(false));
         let (bounce_notifier, _) = broadcast::channel(256);
         let oauth_client = Arc::new(RwLock::new(None));
+        let handle_cache = Arc::new(RwLock::new(HashMap::new()));
 
         if let Ok(loaded_allowlists) = cache.load_all_allowlists() {
             let mut guard = gate.allowlist().write();
@@ -983,6 +996,7 @@ impl SkybouncerEngine {
             paused,
             bounce_notifier,
             oauth_client,
+            handle_cache,
         }
     }
 
@@ -1524,9 +1538,11 @@ impl SkybouncerEngine {
         // Tier 7: Primary Model Evaluation
         self.stats.model_evaluations.fetch_add(1, Ordering::Relaxed);
         self.stats.tier1_evaluations.fetch_add(1, Ordering::Relaxed);
+        let target_rubric = self.rubric_for(&target_did);
+        let interaction = interaction.with_rubric(target_rubric.clone());
         let detailed_eval = self
             .classifier
-            .classify_detailed_with_stats(&interaction, true)
+            .classify_detailed_with_stats_and_rubric(&interaction, Some(&target_rubric), true)
             .await
             .inspect_err(|_e| {
                 self.stats
@@ -2040,7 +2056,9 @@ impl SkybouncerEngine {
         self.bounce_notifier.subscribe()
     }
 
-    /// Resolves an ATProto handle to a DID using the configured context enricher or local cache.
+    /// Resolves an ATProto handle to a DID using in-memory monotonic caching,
+    /// tenant registry handle-mapping TTL caching, the persisted SQLite handle
+    /// cache, and the configured context enricher.
     ///
     /// If the provided handle is already a DID (starts with `did:`), it is returned directly.
     pub async fn resolve_handle(&self, handle: &str) -> Option<String> {
@@ -2048,17 +2066,63 @@ impl SkybouncerEngine {
         if clean.starts_with("did:") {
             return Some(clean.to_string());
         }
-        if let Ok(Some(tenant)) = self.tenant_registry.get_by_handle(clean) {
+        let now = std::time::Instant::now();
+
+        // 1. In-memory monotonic check
+        {
+            let guard = self.handle_cache.read();
+            if let Some((did, cached_at)) = guard.get(clean) {
+                if now.saturating_duration_since(*cached_at) < self.config.handle_cache_ttl {
+                    return Some(did.clone());
+                }
+            }
+        }
+
+        // 2. Tenant registry check with handle-mapping TTL
+        if let Ok(Some(tenant)) = self
+            .tenant_registry
+            .get_by_handle_with_ttl(clean, self.config.handle_cache_ttl)
+        {
+            let _ = self.cache.set_handle_for_did(&tenant.did, clean);
+            self.handle_cache
+                .write()
+                .insert(clean.to_string(), (tenant.did.clone(), now));
             return Some(tenant.did);
         }
-        if let Ok(Some(cached_did)) = self.cache.get_did_for_handle(clean) {
+
+        // 3. Persisted SQLite did_handles cache (TTL-bounded to avoid identity shadowing)
+        let ttl_us = u64::try_from(self.config.handle_cache_ttl.as_micros()).unwrap_or(u64::MAX);
+        if let Ok(Some(cached_did)) = self.cache.get_did_for_handle_with_ttl(clean, ttl_us) {
+            self.handle_cache
+                .write()
+                .insert(clean.to_string(), (cached_did.clone(), now));
             return Some(cached_did);
         }
-        if let Some(resolved_did) = self.enricher.resolve_handle(clean).await {
-            let _ = self.cache.set_handle_for_did(&resolved_did, clean);
-            return Some(resolved_did);
+
+        // 4. Remote AppView resolution via enricher
+        if let Some(live_did) = self.enricher.resolve_handle(clean).await {
+            let _ = self.cache.set_handle_for_did(&live_did, clean);
+            self.handle_cache
+                .write()
+                .insert(clean.to_string(), (live_did.clone(), now));
+            return Some(live_did);
         }
+
         None
+    }
+
+    /// Invalidates a handle across the in-memory cache, the tenant registry, and
+    /// the persisted SQLite handle cache.
+    pub fn invalidate_handle(&self, handle: &str) {
+        let clean = handle.trim().trim_start_matches('@');
+        self.handle_cache.write().remove(clean);
+        let _ = self.tenant_registry.invalidate_handle(clean);
+        let _ = self.cache.remove_handle_for_handle(clean);
+    }
+
+    /// Clears all entries from the in-memory handle cache.
+    pub fn clear_handle_cache(&self) {
+        self.handle_cache.write().clear();
     }
 
     /// Resolves an ATProto DID to a handle using only local caches (tenant registry and SQLite).
@@ -2413,12 +2477,30 @@ impl SkybouncerEngine {
             }
             CommitOperation::Delete => {
                 if commit.rkey == crate::modlist::SOVEREIGN_CONFIG_RKEY {
+                    let default_rubric = self.config.rubric.clone();
+                    if self.is_enrolled(&commit.did) {
+                        if let Err(e) = self
+                            .tenant_registry
+                            .update_rubric(&commit.did, &default_rubric)
+                        {
+                            warn!(
+                                did = %commit.did,
+                                error = %e,
+                                "Failed to reset tenant rubric in registry on sovereign config deletion"
+                            );
+                        }
+                    }
+                    if self.is_admin(&commit.did)
+                        || (self.is_single_tenant() && self.is_protected(&commit.did))
+                    {
+                        self.set_rubric(default_rubric);
+                    }
                     self.stats
                         .sovereign_configs_synced
                         .fetch_add(1, Ordering::Relaxed);
                     info!(
                         did = %commit.did,
-                        "Sovereign configuration record deleted from PDS via firehose"
+                        "Sovereign configuration record deleted from PDS via firehose; reset to default rubric"
                     );
                     ProcessCommitResult::SovereignConfigSynced(SovereignConfigSyncEvent::Deleted {
                         did: commit.did.clone(),
@@ -3106,6 +3188,7 @@ impl SkybouncerEngineBuilder {
         if let Some(ref oc) = self.oauth_client {
             tenant_registry.set_oauth_client(Arc::clone(oc));
         }
+        let handle_cache = Arc::new(RwLock::new(HashMap::new()));
 
         Ok(SkybouncerEngine {
             config: self.config,
@@ -3125,6 +3208,7 @@ impl SkybouncerEngineBuilder {
             paused,
             bounce_notifier,
             oauth_client: oauth_client_arc,
+            handle_cache,
         })
     }
 }

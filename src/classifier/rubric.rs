@@ -287,7 +287,7 @@ impl fmt::Display for BounceDuration {
 }
 
 /// Configured house rules and sensitivity rubric for moderation evaluation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RuleRubric {
     /// Natural language moderation prompt or policy instructions.
     pub prompt: String,
