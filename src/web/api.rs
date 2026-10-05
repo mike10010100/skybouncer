@@ -50,6 +50,14 @@ pub struct RulesResponse {
     /// Configured bounce duration / timeout.
     #[serde(default)]
     pub bounce_duration: BounceDuration,
+    /// Whether accounts following the protected user bypass moderation evaluation.
+    #[serde(default = "default_true")]
+    pub bypass_incoming_followers: bool,
+}
+
+/// Returns `true`, used as the serde default for opt-out moderation bypass flags.
+fn default_true() -> bool {
+    true
 }
 
 /// Request payload to update the moderation rubric prompt and/or sensitivity.
@@ -64,6 +72,9 @@ pub struct UpdateRulesRequest {
     /// Optional updated bounce duration / timeout.
     #[serde(default)]
     pub bounce_duration: Option<BounceDuration>,
+    /// Optional updated incoming-follower bypass toggle.
+    #[serde(default)]
+    pub bypass_incoming_followers: Option<bool>,
 }
 
 /// Query parameters for fetching bounced accounts.
@@ -285,6 +296,7 @@ pub async fn get_status(State(state): State<ApiState>, headers: HeaderMap) -> Js
             sensitivity: rubric.sensitivity,
             threshold: rubric.sensitivity.threshold(),
             bounce_duration: rubric.bounce_duration,
+            bypass_incoming_followers: rubric.bypass_incoming_followers,
         },
         dry_run: state.engine.is_dry_run(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -692,6 +704,7 @@ pub async fn get_rules(
         sensitivity: rubric.sensitivity,
         threshold: rubric.sensitivity.threshold(),
         bounce_duration: rubric.bounce_duration,
+        bypass_incoming_followers: rubric.bypass_incoming_followers,
     }))
 }
 
@@ -732,6 +745,16 @@ pub async fn update_rules(
         rubric.bounce_duration = dur;
     }
 
+    if let Some(bypass) = payload.bypass_incoming_followers {
+        rubric.bypass_incoming_followers = bypass;
+    }
+
+    // Apply the incoming-follower bypass toggle to the in-memory gate immediately so the
+    // change takes effect without a restart (and regardless of enrollment state).
+    state
+        .engine
+        .set_bypass_incoming_followers(&target_did, rubric.bypass_incoming_followers);
+
     let is_enrolled = state
         .engine
         .tenant_registry()
@@ -768,6 +791,7 @@ pub async fn update_rules(
         sensitivity: rubric.sensitivity,
         threshold: rubric.sensitivity.threshold(),
         bounce_duration: rubric.bounce_duration,
+        bypass_incoming_followers: rubric.bypass_incoming_followers,
     }))
 }
 
@@ -1725,6 +1749,7 @@ pub async fn get_current_user(
                     sensitivity: rubric.sensitivity,
                     threshold: rubric.sensitivity.threshold(),
                     bounce_duration: rubric.bounce_duration,
+                    bypass_incoming_followers: rubric.bypass_incoming_followers,
                 }),
                 is_list_blocked,
                 monitored_users_count,
@@ -1745,6 +1770,7 @@ pub async fn get_current_user(
                     sensitivity: rubric.sensitivity,
                     threshold: rubric.sensitivity.threshold(),
                     bounce_duration: rubric.bounce_duration,
+                    bypass_incoming_followers: rubric.bypass_incoming_followers,
                 }),
                 is_list_blocked,
                 monitored_users_count,

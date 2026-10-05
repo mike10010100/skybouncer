@@ -353,6 +353,70 @@ async fn test_api_get_and_update_rules() {
 }
 
 #[tokio::test]
+async fn test_api_rules_bypass_incoming_followers_toggle_roundtrip() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let alice_token = create_test_session(&engine, "did:plc:alice");
+
+    // 1. Default is enabled and echoed in GET /api/rules.
+    let get_req = Request::builder()
+        .uri("/api/rules")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let get_resp = app.clone().oneshot(get_req).await.unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let initial: RulesResponse = serde_json::from_slice(&bytes).unwrap();
+    assert!(initial.bypass_incoming_followers);
+
+    // 2. POST opting out returns the disabled flag and updates the live gate.
+    let disable_payload = json!({ "bypass_incoming_followers": false });
+    let disable_req = Request::builder()
+        .method("POST")
+        .uri("/api/rules")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&disable_payload).unwrap()))
+        .unwrap();
+    let disable_resp = app.clone().oneshot(disable_req).await.unwrap();
+    assert_eq!(disable_resp.status(), StatusCode::OK);
+    let disable_bytes = axum::body::to_bytes(disable_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let disabled: RulesResponse = serde_json::from_slice(&disable_bytes).unwrap();
+    assert!(!disabled.bypass_incoming_followers);
+    assert!(!engine.bypass_incoming_followers("did:plc:alice"));
+
+    // 3. A later GET reflects the persisted opt-out.
+    let get_req2 = Request::builder()
+        .uri("/api/rules")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let get_resp2 = app.clone().oneshot(get_req2).await.unwrap();
+    let bytes2 = axum::body::to_bytes(get_resp2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let reread: RulesResponse = serde_json::from_slice(&bytes2).unwrap();
+    assert!(!reread.bypass_incoming_followers);
+
+    // 4. Re-enabling restores the bypass.
+    let enable_payload = json!({ "bypass_incoming_followers": true });
+    let enable_req = Request::builder()
+        .method("POST")
+        .uri("/api/rules")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&enable_payload).unwrap()))
+        .unwrap();
+    let enable_resp = app.oneshot(enable_req).await.unwrap();
+    assert_eq!(enable_resp.status(), StatusCode::OK);
+    assert!(engine.bypass_incoming_followers("did:plc:alice"));
+}
+
+#[tokio::test]
 async fn test_api_update_rules_bounce_duration_variants() {
     let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
     let alice_token = create_test_session(&engine, "did:plc:alice");
@@ -1920,6 +1984,21 @@ fn test_ui_dom_and_javascript_contract_validation() {
         );
         dur_idx = abs_start + end;
     }
+
+    // 3b. Incoming-follower bypass toggle must exist in the dashboard rules card and be
+    // wired into the rules load/save JavaScript contract.
+    assert!(
+        html.contains("id=\"bypass-followers-toggle\""),
+        "DOM contract failure: incoming-follower bypass toggle missing from dashboard HTML!"
+    );
+    assert!(
+        html.contains("rubric.bypass_incoming_followers !== false"),
+        "DOM contract failure: renderRulesAuthenticated must reflect bypass_incoming_followers!"
+    );
+    assert!(
+        html.contains("bypass_incoming_followers: bypassIncomingFollowers"),
+        "DOM contract failure: saveRules must submit bypass_incoming_followers!"
+    );
 
     // 4. Verify all preset buttons invoke defined RUBRIC_PRESETS
     let presets_marker = "const RUBRIC_PRESETS = {";
