@@ -81,6 +81,9 @@ pub struct AllowlistEntry {
     /// Decentralized identifier (DID) of the allowed/immunized subject.
     #[serde(alias = "allowed_did")]
     pub subject_did: String,
+    /// ATProto handle of the allowed subject, if resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     /// Optional rationale explaining why the account was allowlisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -364,6 +367,12 @@ impl DeduplicationCache {
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (protected_did, subject_did)
             );
+
+            CREATE TABLE IF NOT EXISTS did_handles (
+                did TEXT PRIMARY KEY,
+                handle TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             ",
         )
         .map_err(|e| {
@@ -535,6 +544,9 @@ impl DeduplicationCache {
 
             CREATE INDEX IF NOT EXISTS idx_allowlist_protected
                 ON allowlist(protected_did);
+
+            CREATE INDEX IF NOT EXISTS idx_did_handles_updated
+                ON did_handles(updated_at);
             ",
         )
         .map_err(|e| {
@@ -1639,10 +1651,11 @@ impl DeduplicationCache {
     ) -> Result<Vec<AllowlistEntry>, SkybouncerError> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
-            "SELECT protected_did, subject_did, reason, created_at
-             FROM allowlist
-             WHERE protected_did = ?1
-             ORDER BY created_at DESC;",
+            "SELECT a.protected_did, a.subject_did, a.reason, a.created_at, h.handle
+             FROM allowlist a
+             LEFT JOIN did_handles h ON a.subject_did = h.did
+             WHERE a.protected_did = ?1
+             ORDER BY a.created_at DESC;",
         )?;
         let rows = stmt.query_map(params![protected_did], |row| {
             let p_did: String = row.get(0)?;
@@ -1650,9 +1663,11 @@ impl DeduplicationCache {
             let reason: Option<String> = row.get(2)?;
             let created_at_i64: i64 = row.get(3)?;
             let created_at = u64::try_from(created_at_i64.max(0)).unwrap_or_default();
+            let handle: Option<String> = row.get(4)?;
             Ok(AllowlistEntry {
                 protected_did: p_did,
                 subject_did: s_did,
+                handle,
                 reason,
                 created_at,
             })
@@ -1684,6 +1699,58 @@ impl DeduplicationCache {
             map.entry(p).or_default().insert(s);
         }
         Ok(map)
+    }
+
+    /// Looks up the cached handle for a given DID from SQLite.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn get_handle_for_did(&self, did: &str) -> Result<Option<String>, SkybouncerError> {
+        let conn = self.conn.lock();
+        let clean = did.trim();
+        let mut stmt =
+            conn.prepare_cached("SELECT handle FROM did_handles WHERE did = ?1 LIMIT 1;")?;
+        let handle = stmt
+            .query_row(params![clean], |row| row.get(0))
+            .optional()?;
+        Ok(handle)
+    }
+
+    /// Looks up the cached DID for a given handle from SQLite.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn get_did_for_handle(&self, handle: &str) -> Result<Option<String>, SkybouncerError> {
+        let clean = handle.trim().trim_start_matches('@');
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT did FROM did_handles WHERE handle = ?1 COLLATE NOCASE LIMIT 1;",
+        )?;
+        let did = stmt
+            .query_row(params![clean], |row| row.get(0))
+            .optional()?;
+        Ok(did)
+    }
+
+    /// Caches a DID to handle mapping in SQLite.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite execution fails.
+    pub fn set_handle_for_did(&self, did: &str, handle: &str) -> Result<(), SkybouncerError> {
+        let clean_did = did.trim();
+        let clean_handle = handle.trim().trim_start_matches('@');
+        if clean_did.is_empty() || clean_handle.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        let now_us = current_time_us();
+        let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO did_handles (did, handle, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(did) DO UPDATE SET handle = excluded.handle, updated_at = excluded.updated_at;",
+        )?;
+        stmt.execute(params![clean_did, clean_handle, now_i64])?;
+        Ok(())
     }
 }
 
@@ -2153,5 +2220,93 @@ mod tests {
             .remove_from_allowlist("did:plc:alice", "did:plc:friend")
             .unwrap();
         assert!(!removed_again);
+    }
+
+    #[test]
+    fn test_did_handle_cache_roundtrip_and_normalization() {
+        let cache = DeduplicationCache::open_in_memory().unwrap();
+
+        let did = "did:plc:7nf3vqbvea5gpbet3kmibxpm";
+        let handle = "valoisdubins.bsky.social";
+
+        // Unresolved lookups return None
+        assert_eq!(cache.get_handle_for_did(did).unwrap(), None);
+        assert_eq!(cache.get_did_for_handle(handle).unwrap(), None);
+
+        // Store with surrounding whitespace and leading '@' to verify normalization
+        cache
+            .set_handle_for_did(&format!("  {did}  "), &format!("@{handle}"))
+            .unwrap();
+
+        assert_eq!(
+            cache.get_handle_for_did(did).unwrap().as_deref(),
+            Some(handle)
+        );
+        // get_did_for_handle trims '@' and is case-insensitive
+        assert_eq!(
+            cache.get_did_for_handle(handle).unwrap().as_deref(),
+            Some(did)
+        );
+        assert_eq!(
+            cache
+                .get_did_for_handle(&format!("  @{}  ", handle.to_uppercase()))
+                .unwrap()
+                .as_deref(),
+            Some(did)
+        );
+
+        // Upsert updates the existing mapping in place
+        let updated = "newhandle.bsky.social";
+        cache.set_handle_for_did(did, updated).unwrap();
+        assert_eq!(
+            cache.get_handle_for_did(did).unwrap().as_deref(),
+            Some(updated)
+        );
+        assert_eq!(cache.get_did_for_handle(handle).unwrap(), None);
+        assert_eq!(
+            cache.get_did_for_handle(updated).unwrap().as_deref(),
+            Some(did)
+        );
+
+        // Empty inputs are a no-op and never persisted
+        cache.set_handle_for_did("   ", "some.handle").unwrap();
+        cache.set_handle_for_did(did, "   ").unwrap();
+        assert_eq!(cache.get_handle_for_did("").unwrap(), None);
+    }
+
+    #[test]
+    fn test_allowlist_handle_enrichment_via_join() {
+        let cache = DeduplicationCache::open_in_memory().unwrap();
+
+        let protected = "did:plc:alice";
+        let friend_did = "did:plc:friend";
+        let stranger_did = "did:plc:stranger";
+
+        cache
+            .add_to_allowlist(protected, friend_did, Some("Friend of mine"))
+            .unwrap();
+        cache
+            .add_to_allowlist(protected, stranger_did, None)
+            .unwrap();
+
+        // Only the friend has a cached handle; the stranger resolves to None.
+        cache
+            .set_handle_for_did(friend_did, "friend.bsky.social")
+            .unwrap();
+
+        let entries = cache.list_allowlist(protected).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let friend = entries
+            .iter()
+            .find(|e| e.subject_did == friend_did)
+            .expect("friend entry present");
+        assert_eq!(friend.handle.as_deref(), Some("friend.bsky.social"));
+
+        let stranger = entries
+            .iter()
+            .find(|e| e.subject_did == stranger_did)
+            .expect("stranger entry present");
+        assert_eq!(stranger.handle, None);
     }
 }

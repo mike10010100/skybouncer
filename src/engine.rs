@@ -2034,7 +2034,7 @@ impl SkybouncerEngine {
         self.bounce_notifier.subscribe()
     }
 
-    /// Resolves an ATProto handle to a DID using the configured context enricher.
+    /// Resolves an ATProto handle to a DID using the configured context enricher or local cache.
     ///
     /// If the provided handle is already a DID (starts with `did:`), it is returned directly.
     pub async fn resolve_handle(&self, handle: &str) -> Option<String> {
@@ -2045,10 +2045,17 @@ impl SkybouncerEngine {
         if let Ok(Some(tenant)) = self.tenant_registry.get_by_handle(clean) {
             return Some(tenant.did);
         }
-        self.enricher.resolve_handle(clean).await
+        if let Ok(Some(cached_did)) = self.cache.get_did_for_handle(clean) {
+            return Some(cached_did);
+        }
+        if let Some(resolved_did) = self.enricher.resolve_handle(clean).await {
+            let _ = self.cache.set_handle_for_did(&resolved_did, clean);
+            return Some(resolved_did);
+        }
+        None
     }
 
-    /// Resolves an ATProto DID to a handle using cached tenant data or the configured context enricher.
+    /// Resolves an ATProto DID to a handle using cached tenant data, local handle cache, or the configured context enricher.
     ///
     /// If the handle was not already cached in the local tenant registry and is successfully resolved
     /// via the enricher, it is automatically cached into SQLite for future instant retrieval.
@@ -2068,11 +2075,22 @@ impl SkybouncerEngine {
             }
         }
 
-        // 2. Resolve via enricher
+        // 2. Check SQLite did_handles cache
+        if let Ok(Some(cached_handle)) = self.cache.get_handle_for_did(clean) {
+            let trimmed = cached_handle.trim().trim_start_matches('@').to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+
+        // 3. Resolve via enricher
         if let Some(resolved) = self.enricher.resolve_did(clean).await {
-            // Update local registry if enrolled
-            let _ = self.tenant_registry.update_handle(clean, &resolved);
-            return Some(resolved);
+            let trimmed = resolved.trim().trim_start_matches('@').to_string();
+            if !trimmed.is_empty() {
+                let _ = self.cache.set_handle_for_did(clean, &trimmed);
+                let _ = self.tenant_registry.update_handle(clean, &trimmed);
+                return Some(trimmed);
+            }
         }
 
         None

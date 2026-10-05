@@ -633,7 +633,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <table>
           <thead>
             <tr>
-              <th>Violator DID</th>
+              <th>Violator Account</th>
               <th>Offending Post</th>
               <th>Category</th>
               <th>Confidence</th>
@@ -1245,6 +1245,119 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       return clean;
     }
 
+    const didHandleCache = new Map();
+    const pendingResolutions = new Set();
+
+    function formatAccountCell(did, knownHandle, rawProfileUrl) {
+      if (!did) return '<span style="color: var(--text-muted); font-size: 0.8rem;">—</span>';
+      const cleanDid = String(did).trim();
+      let handle = (knownHandle && String(knownHandle).trim().length > 0) ? String(knownHandle).trim() : (didHandleCache.get(cleanDid) || null);
+      if (handle) {
+        handle = handle.replace(/^@/, "");
+        didHandleCache.set(cleanDid, handle);
+      }
+
+      const profileUrl = rawProfileUrl || bskyProfileUrl(handle || cleanDid);
+      const shortDid = formatDid(cleanDid);
+
+      if (handle) {
+        return `
+          <div class="account-cell" data-did="${escapeHtml(cleanDid)}">
+            <a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); font-weight: 600; text-decoration: none; display: inline-flex; align-items: center; gap: 0.25rem;" title="Open @${escapeHtml(handle)} on Bluesky">
+              <span class="account-handle">@${escapeHtml(handle)}</span> ↗
+            </a>
+            <div class="account-did-subtext" style="font-size: 0.72rem; color: var(--text-muted); font-family: monospace; margin-top: 0.15rem;" title="${escapeHtml(cleanDid)}">
+              ${escapeHtml(shortDid)}
+            </div>
+          </div>
+        `;
+      }
+
+      // If handle is not known yet, render DID as fallback and flag for progressive enhancement
+      return `
+        <div class="account-cell" data-did="${escapeHtml(cleanDid)}" data-needs-resolve="true">
+          <a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); font-weight: 600; text-decoration: none; display: inline-flex; align-items: center; gap: 0.25rem;" title="Open profile on Bluesky">
+            <span class="account-handle" style="font-family: monospace; font-size: 0.8rem;">${escapeHtml(shortDid)}</span> ↗
+          </a>
+          <div class="account-did-subtext" style="font-size: 0.72rem; color: var(--text-muted); font-family: monospace; margin-top: 0.15rem;" title="${escapeHtml(cleanDid)}">
+            ${escapeHtml(shortDid)}
+          </div>
+        </div>
+      `;
+    }
+
+    async function resolveDidToHandle(did) {
+      if (!did) return null;
+      const cleanDid = did.trim();
+      if (didHandleCache.has(cleanDid)) {
+        return didHandleCache.get(cleanDid);
+      }
+      try {
+        const res = await fetch(`/api/resolve?did=${encodeURIComponent(cleanDid)}`, { credentials: "same-origin" });
+        if (!res.ok) return null;
+        const data = await res.json();
+        if (data && data.handle) {
+          const cleanHandle = data.handle.replace(/^@/, "");
+          didHandleCache.set(cleanDid, cleanHandle);
+          return cleanHandle;
+        }
+      } catch (e) {
+        console.warn("Failed to resolve DID:", cleanDid, e);
+      }
+      return null;
+    }
+
+    function updateAccountCellsForDid(did, handle) {
+      const cleanHandle = handle.replace(/^@/, "");
+      const allCells = document.querySelectorAll(".account-cell");
+      allCells.forEach(cell => {
+        if (cell.getAttribute("data-did") === did) {
+          cell.removeAttribute("data-needs-resolve");
+          const handleEl = cell.querySelector(".account-handle");
+          if (handleEl) {
+            handleEl.textContent = `@${cleanHandle}`;
+            handleEl.style.fontFamily = "inherit";
+            handleEl.style.fontSize = "inherit";
+          }
+          const linkEl = cell.querySelector("a");
+          if (linkEl) {
+            linkEl.href = bskyProfileUrl(cleanHandle);
+            linkEl.title = `Open @${cleanHandle} on Bluesky`;
+          }
+        }
+      });
+    }
+
+    function enhanceUnresolvedAccountCells(container) {
+      if (!container) return;
+      const cells = container.querySelectorAll('.account-cell[data-needs-resolve="true"]');
+      if (cells.length === 0) return;
+
+      const didsToResolve = new Set();
+      cells.forEach(cell => {
+        const did = cell.getAttribute("data-did");
+        if (did && !pendingResolutions.has(did)) {
+          if (didHandleCache.has(did)) {
+            updateAccountCellsForDid(did, didHandleCache.get(did));
+          } else {
+            didsToResolve.add(did);
+          }
+        }
+      });
+
+      for (const did of didsToResolve) {
+        pendingResolutions.add(did);
+        resolveDidToHandle(did).then(handle => {
+          pendingResolutions.delete(did);
+          if (handle) {
+            updateAccountCellsForDid(did, handle);
+          }
+        }).catch(() => {
+          pendingResolutions.delete(did);
+        });
+      }
+    }
+
     function formatPostLink(uri, text) {
       if (!uri || uri.trim() === "") {
         return text && text.trim().length > 0
@@ -1315,7 +1428,9 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         return;
       }
       const filtered = allBounces.filter(b => {
+        const handle = b.handle || didHandleCache.get(b.subject_did) || "";
         return (b.subject_did && b.subject_did.toLowerCase().includes(query)) ||
+               (handle && handle.toLowerCase().includes(query)) ||
                (b.category && b.category.toLowerCase().includes(query)) ||
                (b.reason && b.reason.toLowerCase().includes(query)) ||
                (b.post_text && b.post_text.toLowerCase().includes(query));
@@ -1333,7 +1448,9 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       }
 
       tbody.innerHTML = bounces.map(b => {
-        const profileUrl = bskyProfileUrl(b.subject_did);
+        if (b.subject_did && b.handle) {
+          didHandleCache.set(b.subject_did, b.handle.replace(/^@/, ""));
+        }
         const postLinkHtml = formatPostLink(b.post_uri, b.post_text);
         const ttlBadge = b.expires_at ?
           `<span class="status-badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; font-size: 0.7rem; margin-left: 0.35rem;" title="Expires at ${escapeHtml(formatFullDate(b.expires_at) || formatDate(b.expires_at))}">⏳ TTL</span>` :
@@ -1341,11 +1458,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         const bouncedTitle = b.bounced_at ? ` title="Bounced: ${escapeHtml(formatFullDate(b.bounced_at))}"` : '';
         return `
         <tr>
-          <td>
-            <a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none;" title="Open profile on Bluesky">
-              <code style="font-size: 0.8rem; background: rgba(0,0,0,0.2); padding: 0.2rem 0.4rem; border-radius: 4px; color: var(--text-main); font-family: monospace;">${escapeHtml(b.subject_did)}</code>
-            </a>
-          </td>
+          <td>${formatAccountCell(b.subject_did, b.handle)}</td>
           <td>${postLinkHtml}</td>
           <td><span class="status-badge" style="background: var(--danger-bg); color: var(--danger); font-size: 0.75rem;"${bouncedTitle}>${escapeHtml(b.category)}</span>${ttlBadge}</td>
           <td><strong>${Math.round(b.confidence * 100)}%</strong></td>
@@ -1357,6 +1470,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         </tr>
       `;
       }).join("");
+
+      enhanceUnresolvedAccountCells(tbody);
     }
 
     async function loadBounces() {
@@ -1364,6 +1479,11 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         const res = await fetch("/api/bounces?limit=50", { credentials: "same-origin" });
         if (!res.ok) return;
         allBounces = await res.json();
+        allBounces.forEach(b => {
+          if (b.subject_did && b.handle) {
+            didHandleCache.set(b.subject_did, b.handle.replace(/^@/, ""));
+          }
+        });
         filterBounces();
 
         const tbody = document.getElementById("bounces-table");
@@ -1387,9 +1507,11 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     async function pardonUser(did, allowlist = false) {
+      const cachedHandle = didHandleCache.get(did);
+      const displayLabel = cachedHandle ? `@${cachedHandle} (${formatDid(did)})` : did;
       const confirmMsg = allowlist
-        ? `Are you sure you want to pardon ${did} AND add them to your allowlist (immunize)?`
-        : `Are you sure you want to pardon ${did} and remove them from your moderation list?`;
+        ? `Are you sure you want to pardon ${displayLabel} AND add them to your allowlist (immunize)?`
+        : `Are you sure you want to pardon ${displayLabel} and remove them from your moderation list?`;
       if (!confirm(confirmMsg)) return;
 
       try {
@@ -1404,7 +1526,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           })
         });
         if (res.ok) {
-          showToast(allowlist ? `🛡️ Pardoned & allowlisted ${did}` : `✅ Pardoned ${did}`);
+          const toastDisplay = cachedHandle ? `@${cachedHandle}` : did;
+          showToast(allowlist ? `🛡️ Pardoned & allowlisted ${toastDisplay}` : `✅ Pardoned ${toastDisplay}`);
           loadBounces();
           loadAllowlist();
           fetchStatus();
@@ -1421,6 +1544,12 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         const res = await fetch("/api/allowlist", { credentials: "same-origin" });
         if (!res.ok) return;
         const entries = await res.json();
+        entries.forEach(e => {
+          const did = e.subject_did || e.allowed_did;
+          if (did && e.handle) {
+            didHandleCache.set(did, e.handle.replace(/^@/, ""));
+          }
+        });
         const totalEl = document.getElementById("total-allowlisted");
         if (totalEl) totalEl.innerText = entries.length;
         const tbody = document.getElementById("allowlist-table");
@@ -1433,15 +1562,10 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
         tbody.innerHTML = entries.map(e => {
           const did = e.subject_did || e.allowed_did || "";
-          const profileUrl = bskyProfileUrl(did);
           const fullDate = formatFullDate(e.created_at);
           return `
             <tr>
-              <td>
-                <a href="${escapeHtml(profileUrl)}" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none;" title="Open profile on Bluesky">
-                  <code style="font-size: 0.8rem; background: rgba(0,0,0,0.2); padding: 0.2rem 0.4rem; border-radius: 4px; color: var(--text-main); font-family: monospace;">${escapeHtml(did)}</code>
-                </a>
-              </td>
+              <td>${formatAccountCell(did, e.handle)}</td>
               <td><span style="font-size: 0.82rem; color: var(--text-muted);">${escapeHtml(e.reason || "No reason specified")}</span></td>
               <td style="font-size: 0.8rem; color: var(--text-muted);" title="${escapeHtml(fullDate)}">${formatDate(e.created_at)}</td>
               <td>
@@ -1450,6 +1574,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </tr>
           `;
         }).join("");
+
+        enhanceUnresolvedAccountCells(tbody);
 
         if (!tbody.hasAttribute("data-allowlist-remove-attached")) {
           tbody.setAttribute("data-allowlist-remove-attached", "true");
@@ -1487,7 +1613,11 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         });
         if (res.ok) {
           const data = await res.json();
-          showToast(`🛡️ Added ${data.subject_did} to allowlist`);
+          if (data.subject_did && data.handle) {
+            didHandleCache.set(data.subject_did, data.handle.replace(/^@/, ""));
+          }
+          const display = data.handle ? `@${data.handle.replace(/^@/, "")}` : data.subject_did;
+          showToast(`🛡️ Added ${display} to allowlist`);
           subjectInput.value = "";
           if (reasonInput) reasonInput.value = "";
           loadAllowlist();
@@ -1501,14 +1631,17 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     async function removeAllowlistEntry(did) {
-      if (!confirm(`Are you sure you want to remove ${did} from your allowlist?`)) return;
+      const cachedHandle = didHandleCache.get(did);
+      const displayLabel = cachedHandle ? `@${cachedHandle} (${formatDid(did)})` : did;
+      if (!confirm(`Are you sure you want to remove ${displayLabel} from your allowlist?`)) return;
       try {
         const res = await fetch(`/api/allowlist/${encodeURIComponent(did)}`, {
           method: "DELETE",
           credentials: "same-origin"
         });
         if (res.ok) {
-          showToast(`Removed ${did} from allowlist`);
+          const toastDisplay = cachedHandle ? `@${cachedHandle}` : did;
+          showToast(`Removed ${toastDisplay} from allowlist`);
           loadAllowlist();
         } else {
           const err = await res.text();
@@ -1789,6 +1922,13 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           return;
         }
         const data = await res.json();
+        if (data.tenants) {
+          data.tenants.forEach(t => {
+            if (t.did && t.handle) {
+              didHandleCache.set(t.did, t.handle.replace(/^@/, ""));
+            }
+          });
+        }
         const totalEl = document.getElementById("admin-total-tenants");
         if (totalEl) totalEl.innerText = data.total;
         const activeEl = document.getElementById("admin-active-tenants");
@@ -1809,7 +1949,6 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         }
 
         tbody.innerHTML = data.tenants.map(t => {
-          const handleDisplay = t.handle ? `@${escapeHtml(t.handle)}` : '<span style="color: var(--text-muted);">Unresolved</span>';
           const statusBadge = t.is_active
             ? '<span class="status-badge" style="background: var(--success-bg); color: var(--success); font-size: 0.75rem;">Active</span>'
             : '<span class="status-badge" style="background: rgba(245, 158, 11, 0.15); color: var(--warning); font-size: 0.75rem;">Paused</span>';
@@ -1825,10 +1964,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
           return `
             <tr>
-              <td>
-                <div style="font-weight: 600;">${handleDisplay}</div>
-                <code style="font-size: 0.75rem; color: var(--text-muted);">${escapeHtml(t.did)}</code>
-              </td>
+              <td>${formatAccountCell(t.did, t.handle)}</td>
               <td>${statusBadge}</td>
               <td>${sessionBadge}</td>
               <td style="font-size: 0.8rem; color: var(--text-muted);" title="${escapeHtml(formatFullDate(t.created_at))}">${formatDate(t.created_at)}</td>
@@ -1837,6 +1973,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             </tr>
           `;
         }).join("");
+
+        enhanceUnresolvedAccountCells(tbody);
 
         if (!tbody.hasAttribute("data-toggle-attached")) {
           tbody.setAttribute("data-toggle-attached", "true");
@@ -1853,6 +1991,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     }
 
     async function toggleAdminTenant(did, newActive) {
+      const cachedHandle = didHandleCache.get(did);
+      const displayLabel = cachedHandle ? `@${cachedHandle}` : did;
       try {
         const res = await fetch("/api/tenant/toggle", {
           method: "POST",
@@ -1862,7 +2002,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         });
         if (res.ok) {
           const data = await res.json();
-          showToast(data.is_active ? `🟢 Defenses resumed for ${did}` : `⏸️ Defenses paused for ${did}`);
+          showToast(data.is_active ? `🟢 Defenses resumed for ${displayLabel}` : `⏸️ Defenses paused for ${displayLabel}`);
           loadAdminTenants();
           if (currentUser && currentUser.did === did) {
             currentUser.is_active = data.is_active;
@@ -1913,7 +2053,17 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           return;
         }
 
+        data.evaluations.forEach(ev => {
+          if (ev.target_did && ev.target_handle) {
+            didHandleCache.set(ev.target_did, ev.target_handle.replace(/^@/, ""));
+          }
+          if (ev.author_did && ev.author_handle) {
+            didHandleCache.set(ev.author_did, ev.author_handle.replace(/^@/, ""));
+          }
+        });
+
         tbody.innerHTML = data.evaluations.map(renderEvaluationRow).join("");
+        enhanceUnresolvedAccountCells(tbody);
       } catch (e) {
         console.error("Evaluation log load failed", e);
       }
@@ -1927,12 +2077,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         ? '<span class="status-badge" style="background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); font-size: 0.7rem;">📡 Live</span>'
         : '<span class="status-badge" style="background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); font-size: 0.7rem;">🧪 Sim</span>';
 
-      const targetDisplay = ev.target_handle ? `@${escapeHtml(ev.target_handle)}` : formatDid(ev.target_did);
-      const targetLink = bskyProfileUrl(ev.target_handle || ev.target_did);
-
-      const authorDisplay = ev.author_handle ? `@${escapeHtml(ev.author_handle)}` : formatDid(ev.author_did);
-      const authorLink = bskyProfileUrl(ev.author_handle || ev.author_did);
-
+      const targetCellHtml = formatAccountCell(ev.target_did, ev.target_handle);
+      const authorCellHtml = formatAccountCell(ev.author_did, ev.author_handle);
       const postLinkHtml = formatPostLink(ev.post_uri, ev.post_text);
 
       const t1Violates = ev.primary_action === "violation";
@@ -1976,16 +2122,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
         <tr>
           <td style="font-size: 0.75rem; white-space: nowrap; color: var(--text-muted);" title="${escapeHtml(fullTs)}">${escapeHtml(ts)}</td>
           <td>${sourceBadge}</td>
-          <td style="font-size: 0.8rem; white-space: nowrap;">
-            <a href="${escapeHtml(targetLink)}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); text-decoration: none;">
-              ${targetDisplay}
-            </a>
-          </td>
-          <td style="font-size: 0.8rem; white-space: nowrap;">
-            <a href="${escapeHtml(authorLink)}" target="_blank" rel="noopener noreferrer" style="color: var(--text-color); text-decoration: none;">
-              ${authorDisplay}
-            </a>
-          </td>
+          <td style="font-size: 0.8rem; white-space: nowrap;">${targetCellHtml}</td>
+          <td style="font-size: 0.8rem; white-space: nowrap;">${authorCellHtml}</td>
           <td>${postLinkHtml}</td>
           <td>
             <div style="display: flex; flex-direction: column; gap: 0.2rem;">
