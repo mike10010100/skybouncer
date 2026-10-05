@@ -32,9 +32,9 @@ use skybouncer::matcher::{FollowGraph, NonFollowedGate};
 use skybouncer::modlist::cache::NewEvaluationLog;
 use skybouncer::modlist::{AllowlistEntry, BouncedUser, DeduplicationCache, ModListManager};
 use skybouncer::web::{
-    create_web_router, run_web_server, AddAllowlistResponse, EvaluationsResponse, PardonResponse,
-    RemoveAllowlistResponse, RulesResponse, SimulateResponse, StatusResponse, WebServerConfig,
-    DASHBOARD_HTML,
+    create_web_router, run_web_server, AddAllowlistResponse, BouncedUserWithHandle,
+    EvaluationsResponse, PardonResponse, RemoveAllowlistResponse, ResolveResponse, RulesResponse,
+    SimulateResponse, StatusResponse, WebServerConfig, DASHBOARD_HTML,
 };
 
 // =============================================================================
@@ -2185,13 +2185,233 @@ fn test_ui_dom_allowlist_and_timestamp_contract_validation() {
         "DOM contract failure: formatFullDate must be defined in dashboard JavaScript!"
     );
 
-    // 3. Verify allowlist table renders subject DID and uses formatFullDate tooltip
+    // 3. Verify formatAccountCell and progressive handle resolution contracts
     assert!(
-        html.contains("bskyProfileUrl(did)"),
-        "DOM contract failure: allowlist profile link must use resolved did!"
+        html.contains("function formatAccountCell(did, knownHandle, rawProfileUrl)"),
+        "DOM contract failure: formatAccountCell must be defined in dashboard JavaScript!"
+    );
+    assert!(
+        html.contains("function resolveDidToHandle(did)"),
+        "DOM contract failure: resolveDidToHandle must be defined in dashboard JavaScript!"
+    );
+    assert!(
+        html.contains("function enhanceUnresolvedAccountCells(container)"),
+        "DOM contract failure: enhanceUnresolvedAccountCells must be defined in dashboard JavaScript!"
+    );
+    assert!(
+        html.contains("formatAccountCell(did, e.handle)"),
+        "DOM contract failure: allowlist table must format account cells using formatAccountCell!"
+    );
+    assert!(
+        html.contains("formatAccountCell(b.subject_did, b.handle)"),
+        "DOM contract failure: bounces table must format account cells using formatAccountCell!"
     );
     assert!(
         html.contains("data-did=\"${escapeHtml(did)}\""),
         "DOM contract failure: allowlist remove button must use resolved did!"
     );
+    assert!(
+        html.contains("Violator Account"),
+        "DOM contract failure: bounces table header must display 'Violator Account'!"
+    );
+}
+
+#[tokio::test]
+async fn test_api_resolve_identity_endpoint() {
+    let protected_did = "did:plc:owner123";
+    let (engine, cache, _pds, app) = setup_test_web_environment(protected_did).await;
+    let owner_token = create_test_session(&engine, protected_did);
+    let cookie = format!("skybouncer_session={owner_token}");
+
+    // Seed SQLite handle cache
+    let test_did = "did:plc:7nf3vqbvea5gpbet3kmibxpm";
+    let test_handle = "valoisdubins.bsky.social";
+    cache
+        .set_handle_for_did(test_did, test_handle)
+        .expect("cache handle");
+
+    // 0. Unauthenticated request is rejected
+    let req_unauth = Request::builder()
+        .uri(format!("/api/resolve?did={test_did}"))
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp_unauth = app.clone().oneshot(req_unauth).await.unwrap();
+    assert_eq!(resp_unauth.status(), StatusCode::UNAUTHORIZED);
+
+    // 1. Resolve DID to handle via ?did=...
+    let req_did = Request::builder()
+        .uri(format!("/api/resolve?did={test_did}"))
+        .method("GET")
+        .header("Cookie", cookie.clone())
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req_did).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let resolved: ResolveResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(resolved.did.as_deref(), Some(test_did));
+    assert_eq!(resolved.handle.as_deref(), Some(test_handle));
+
+    // 2. Resolve handle to DID via ?handle=...
+    let req_handle = Request::builder()
+        .uri(format!("/api/resolve?handle={test_handle}"))
+        .method("GET")
+        .header("Cookie", cookie.clone())
+        .body(Body::empty())
+        .unwrap();
+    let resp2 = app.clone().oneshot(req_handle).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let bytes2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let resolved2: ResolveResponse = serde_json::from_slice(&bytes2).unwrap();
+    assert_eq!(resolved2.did.as_deref(), Some(test_did));
+    assert_eq!(resolved2.handle.as_deref(), Some(test_handle));
+
+    // 3. Resolve via actor parameter (starts with did:)
+    let req_actor_did = Request::builder()
+        .uri(format!("/api/resolve?actor={test_did}"))
+        .method("GET")
+        .header("Cookie", cookie.clone())
+        .body(Body::empty())
+        .unwrap();
+    let resp3 = app.clone().oneshot(req_actor_did).await.unwrap();
+    assert_eq!(resp3.status(), StatusCode::OK);
+    let bytes3 = axum::body::to_bytes(resp3.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let resolved3: ResolveResponse = serde_json::from_slice(&bytes3).unwrap();
+    assert_eq!(resolved3.did.as_deref(), Some(test_did));
+    assert_eq!(resolved3.handle.as_deref(), Some(test_handle));
+
+    // 4. Resolve via actor parameter with @ prefix
+    let req_actor_handle = Request::builder()
+        .uri(format!("/api/resolve?actor=@{test_handle}"))
+        .method("GET")
+        .header("Cookie", cookie.clone())
+        .body(Body::empty())
+        .unwrap();
+    let resp4 = app.clone().oneshot(req_actor_handle).await.unwrap();
+    assert_eq!(resp4.status(), StatusCode::OK);
+    let bytes4 = axum::body::to_bytes(resp4.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let resolved4: ResolveResponse = serde_json::from_slice(&bytes4).unwrap();
+    assert_eq!(resolved4.did.as_deref(), Some(test_did));
+    assert_eq!(resolved4.handle.as_deref(), Some(test_handle));
+
+    // 5. Missing all parameters returns 400 Bad Request
+    let req_bad = Request::builder()
+        .uri("/api/resolve")
+        .method("GET")
+        .header("Cookie", cookie.clone())
+        .body(Body::empty())
+        .unwrap();
+    let resp5 = app.clone().oneshot(req_bad).await.unwrap();
+    assert_eq!(resp5.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_api_bounces_and_allowlist_handle_enrichment() {
+    let protected_did = "did:plc:owner123";
+    let (engine, cache, _pds, app) = setup_test_web_environment(protected_did).await;
+    let owner_token = create_test_session(&engine, protected_did);
+
+    let violator_did = "did:plc:violator_xyz";
+    let violator_handle = "spammer.bsky.social";
+    cache
+        .set_handle_for_did(violator_did, violator_handle)
+        .expect("cache handle");
+
+    // Record a bounce for this violator
+    let now_us = 1_700_000_000_000_000u64;
+    cache
+        .record_bounce(&BouncedUser {
+            subject_did: violator_did.to_string(),
+            protected_did: protected_did.to_string(),
+            listitem_uri: format!("at://{protected_did}/app.bsky.graph.listitem/item123"),
+            listitem_rkey: "item123".to_string(),
+            listitem_cid: "bafyitem123".to_string(),
+            category: "crypto_spam".to_string(),
+            confidence: 0.98,
+            reason: "Blatant token shill".to_string(),
+            post_uri: format!("at://{violator_did}/app.bsky.feed.post/123"),
+            post_text: "spam text".to_string(),
+            bounced_at: now_us,
+            expires_at: None,
+        })
+        .expect("record bounce");
+
+    // Fetch bounces with authentication
+    let req = Request::builder()
+        .uri("/api/bounces?limit=10")
+        .method("GET")
+        .header("Cookie", format!("skybouncer_session={owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    // Verify both BouncedUserWithHandle and BouncedUser deserialize seamlessly
+    let enriched: Vec<BouncedUserWithHandle> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(enriched.len(), 1);
+    assert_eq!(enriched[0].user.subject_did, violator_did);
+    assert_eq!(enriched[0].handle.as_deref(), Some(violator_handle));
+
+    let standard: Vec<BouncedUser> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(standard.len(), 1);
+    assert_eq!(standard[0].subject_did, violator_did);
+
+    // Now test allowlist handle enrichment
+    let trusted_did = "did:plc:trusted_abc";
+    let trusted_handle = "friend.bsky.social";
+    cache
+        .set_handle_for_did(trusted_did, trusted_handle)
+        .expect("cache handle");
+
+    // Add to allowlist by DID
+    let add_req = Request::builder()
+        .uri("/api/allowlist")
+        .method("POST")
+        .header("Cookie", format!("skybouncer_session={owner_token}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "subject": trusted_did,
+                "reason": "Best friend"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let add_resp = app.clone().oneshot(add_req).await.unwrap();
+    assert_eq!(add_resp.status(), StatusCode::OK);
+    let add_bytes = axum::body::to_bytes(add_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let add_data: AddAllowlistResponse = serde_json::from_slice(&add_bytes).unwrap();
+    assert_eq!(add_data.subject_did, trusted_did);
+    assert_eq!(add_data.handle.as_deref(), Some(trusted_handle));
+
+    // Get allowlist and verify handle is populated
+    let list_req = Request::builder()
+        .uri("/api/allowlist")
+        .method("GET")
+        .header("Cookie", format!("skybouncer_session={owner_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = app.clone().oneshot(list_req).await.unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let entries: Vec<AllowlistEntry> = serde_json::from_slice(&list_bytes).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].subject_did, trusted_did);
+    assert_eq!(entries[0].handle.as_deref(), Some(trusted_handle));
 }

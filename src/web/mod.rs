@@ -22,10 +22,11 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 pub use api::{
-    get_prometheus_metrics, health_check, AddAllowlistRequest, AddAllowlistResponse,
-    AdminEvaluationsQuery, AdminEvaluationsResponse, AdminTenantsResponse, AllowlistQuery,
-    ApiState, BouncesQuery, EvaluationsQuery, EvaluationsResponse, HealthResponse, PardonRequest,
-    PardonResponse, RemoveAllowlistResponse, RulesResponse, SimulateRequest, SimulateResponse,
+    get_prometheus_metrics, health_check, resolve_identity, AddAllowlistRequest,
+    AddAllowlistResponse, AdminEvaluationsQuery, AdminEvaluationsResponse, AdminTenantsResponse,
+    AllowlistQuery, ApiState, BouncedUserWithHandle, BouncesQuery, EvaluationsQuery,
+    EvaluationsResponse, HealthResponse, PardonRequest, PardonResponse, RemoveAllowlistResponse,
+    ResolveQuery, ResolveResponse, RulesResponse, SimulateRequest, SimulateResponse,
     StatusResponse, TenantSummary, ToggleTenantRequest, ToggleTenantResponse, UpdateRulesRequest,
     UserSessionResponse,
 };
@@ -193,6 +194,7 @@ pub fn create_web_router(
         .route("/evaluations", get(api::get_evaluations))
         .route("/tenant/toggle", post(api::toggle_tenant))
         .route("/auth/logout", post(api::logout))
+        .route("/resolve", get(api::resolve_identity))
         .with_state(api_state.clone());
 
     let oauth_router = Router::new()

@@ -130,6 +130,9 @@ pub struct AddAllowlistRequest {
 pub struct AddAllowlistResponse {
     /// The allowlisted subject DID.
     pub subject_did: String,
+    /// ATProto handle if resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     /// Status description message.
     pub message: String,
 }
@@ -762,6 +765,17 @@ pub async fn update_rules(
     }))
 }
 
+/// Record of a bounced violator enriched with the resolved ATProto handle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BouncedUserWithHandle {
+    /// The underlying bounced user record.
+    #[serde(flatten)]
+    pub user: BouncedUser,
+    /// Resolved ATProto handle of the bounced violator, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+}
+
 /// Handler for `GET /api/bounces`: returns recent bounced violators.
 ///
 /// Authentication is strictly required. Non-admin users are restricted to viewing
@@ -770,7 +784,7 @@ pub async fn get_bounces(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<BouncesQuery>,
-) -> Result<Json<Vec<BouncedUser>>, (StatusCode, String)> {
+) -> Result<Json<Vec<BouncedUserWithHandle>>, (StatusCode, String)> {
     let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
@@ -799,7 +813,15 @@ pub async fn get_bounces(
         .engine
         .list_recent_bounces_for(filter_did, limit)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(bounces))
+
+    let enriched = bounces
+        .into_iter()
+        .map(|b| {
+            let handle = state.engine.cached_handle_for_did(&b.subject_did);
+            BouncedUserWithHandle { user: b, handle }
+        })
+        .collect();
+    Ok(Json(enriched))
 }
 
 /// Handler for `POST /api/pardon`: unbans a user and removes their listitem from PDS.
@@ -919,7 +941,14 @@ pub async fn get_allowlist(
     };
 
     match state.engine.list_allowlist(target_did) {
-        Ok(entries) => Ok(Json(entries)),
+        Ok(mut entries) => {
+            for entry in &mut entries {
+                if entry.handle.is_none() {
+                    entry.handle = state.engine.cached_handle_for_did(&entry.subject_did);
+                }
+            }
+            Ok(Json(entries))
+        }
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to list allowlist: {e}"),
@@ -963,11 +992,15 @@ pub async fn add_to_allowlist(
     }
 
     let clean = raw_subject.trim_start_matches('@');
-    let subject_did = if clean.starts_with("did:") {
-        clean.to_string()
+    let (subject_did, resolved_handle) = if clean.starts_with("did:") {
+        let handle = state.engine.resolve_did_to_handle(clean).await;
+        (clean.to_string(), handle)
     } else {
         match state.engine.resolve_handle(clean).await {
-            Some(did) => did,
+            Some(did) => {
+                let _ = state.engine.cache().set_handle_for_did(&did, clean);
+                (did, Some(clean.to_string()))
+            }
             None => {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -984,6 +1017,7 @@ pub async fn add_to_allowlist(
     ) {
         Ok(()) => Ok(Json(AddAllowlistResponse {
             subject_did: subject_did.clone(),
+            handle: resolved_handle,
             message: format!("Account {subject_did} was added to the allowlist."),
         })),
         Err(e) => Err((
@@ -1769,11 +1803,9 @@ pub async fn get_admin_tenants(
             .flatten()
             .map(|c| c.list_uri);
 
-        let handle = if let Some(h) = t.handle {
-            Some(h)
-        } else {
-            state.engine.resolve_did_to_handle(&t.did).await
-        };
+        let handle = t
+            .handle
+            .or_else(|| state.engine.cached_handle_for_did(&t.did));
 
         summaries.push(TenantSummary {
             did: t.did,
@@ -2025,4 +2057,80 @@ pub async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Respon
         resp.headers_mut().insert(header::SET_COOKIE, cookie_val);
     }
     resp
+}
+
+/// Query parameters for resolving a Bluesky identity.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolveQuery {
+    /// Generic identifier (DID or handle).
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// Decentralized identifier (DID).
+    #[serde(default)]
+    pub did: Option<String>,
+    /// Bluesky handle.
+    #[serde(default)]
+    pub handle: Option<String>,
+}
+
+/// Response payload containing resolved DID and handle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveResponse {
+    /// Decentralized identifier (DID), if resolved or provided.
+    pub did: Option<String>,
+    /// Bluesky handle without leading '@', if resolved or provided.
+    pub handle: Option<String>,
+}
+
+/// Handler for `GET /api/resolve`: resolves a DID to a handle, or a handle to a DID.
+///
+/// Authentication is strictly required, as resolution may perform outbound AppView/PLC
+/// lookups for cache misses.
+pub async fn resolve_identity(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<ResolveQuery>,
+) -> Result<Json<ResolveResponse>, (StatusCode, String)> {
+    extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to resolve identities. Please sign in with Bluesky."
+                .to_string(),
+        )
+    })?;
+
+    let raw_did = query.did.as_deref().or_else(|| {
+        query
+            .actor
+            .as_deref()
+            .filter(|s| s.trim().starts_with("did:"))
+    });
+    if let Some(did) = raw_did {
+        let clean_did = did.trim();
+        let handle = state.engine.resolve_did_to_handle(clean_did).await;
+        return Ok(Json(ResolveResponse {
+            did: Some(clean_did.to_string()),
+            handle,
+        }));
+    }
+
+    let raw_handle = query.handle.as_deref().or_else(|| {
+        query
+            .actor
+            .as_deref()
+            .filter(|s| !s.trim().starts_with("did:"))
+    });
+    if let Some(handle) = raw_handle.filter(|s| !s.trim().is_empty()) {
+        let clean_handle = handle.trim().trim_start_matches('@');
+        let did = state.engine.resolve_handle(clean_handle).await;
+        return Ok(Json(ResolveResponse {
+            did,
+            handle: Some(clean_handle.to_string()),
+        }));
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        "Query parameter 'did', 'handle', or 'actor' is required".to_string(),
+    ))
 }
