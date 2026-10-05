@@ -41,6 +41,19 @@ pub enum FollowSyncEvent {
     Ignored,
 }
 
+/// Deterministic ordering key for synthetic hydration rkeys.
+///
+/// Ranks `hydrate_<n>` by ascending numeric index (so `hydrate_0` before `hydrate_10`),
+/// then all other synthetic keys (e.g. `seed_*`) lexicographically. Keeps synthetic
+/// fallback selection stable across restarts and repeated commits.
+fn synthetic_key_rank(key: &str) -> (u8, u64, String) {
+    if let Some(rest) = key.strip_prefix("hydrate_") {
+        (0, rest.parse::<u64>().unwrap_or(u64::MAX), String::new())
+    } else {
+        (1, 0, key.to_string())
+    }
+}
+
 /// Internal state holding the follow sets and reverse indexes.
 #[derive(Debug, Default)]
 struct FollowGraphInner {
@@ -185,6 +198,15 @@ impl FollowGraph {
     /// `hydrate_` or `seed_`), removes that key, and removes the followed account from the
     /// active set if not referenced by any other record key.
     ///
+    /// # Determinism & inherent ambiguity
+    ///
+    /// A follow `Delete` commit does not carry the followed account, so a real-TID delete
+    /// arriving after synthetic hydration cannot be correlated to a specific account. This
+    /// reconciliation is therefore inherently best-effort. To keep behavior reproducible across
+    /// restarts and repeated commits, the synthetic key is selected deterministically
+    /// (lowest numeric `hydrate_*` index first, then `seed_*` lexicographically) rather than
+    /// relying on `HashMap` iteration order. Real (non-synthetic) rkeys are never selected.
+    ///
     /// # Arguments
     /// * `protected_did` - DID of the follower (the protected user).
     ///
@@ -196,8 +218,9 @@ impl FollowGraph {
             let user_rkeys = guard.rkey_to_followed.get_mut(protected_did)?;
             let synthetic_key = user_rkeys
                 .keys()
-                .find(|k| k.starts_with("hydrate_") || k.starts_with("seed_"))?
-                .clone();
+                .filter(|k| k.starts_with("hydrate_") || k.starts_with("seed_"))
+                .min_by_key(|k| synthetic_key_rank(k))
+                .cloned()?;
             let followed_did = user_rkeys.remove(&synthetic_key)?;
             let still_referenced = user_rkeys.values().any(|v| v == &followed_did);
             (followed_did, still_referenced)

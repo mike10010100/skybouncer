@@ -260,7 +260,8 @@ impl TenantRegistry {
                 bounce_duration TEXT,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                handle_updated_at INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_tenants_handle
@@ -287,8 +288,18 @@ impl TenantRegistry {
             SkybouncerError::Database(format!("Failed to initialize tenants schema: {e}"))
         })?;
 
-        // Idempotent column migration for existing databases
+        // Idempotent column migrations for existing databases
         let _ = conn.execute("ALTER TABLE tenants ADD COLUMN bounce_duration TEXT;", []);
+        let _ = conn.execute(
+            "ALTER TABLE tenants ADD COLUMN handle_updated_at INTEGER;",
+            [],
+        );
+        // Backfill handle freshness for rows predating the column so TTL lookups
+        // do not treat existing handle mappings as permanently stale.
+        let _ = conn.execute(
+            "UPDATE tenants SET handle_updated_at = updated_at WHERE handle_updated_at IS NULL;",
+            [],
+        );
 
         Ok(())
     }
@@ -325,12 +336,19 @@ impl TenantRegistry {
         let is_active_int: i64 = if tenant.is_active { 1 } else { 0 };
         let created_at_i64 = i64::try_from(tenant.created_at).unwrap_or(i64::MAX);
         let updated_at_i64 = i64::try_from(tenant.updated_at).unwrap_or(i64::MAX);
+        // Only advance handle freshness when a non-empty handle is being written;
+        // `None` leaves the existing mapping (and its freshness) untouched.
+        let handle_updated_at_i64 = tenant
+            .handle
+            .as_ref()
+            .filter(|h| !h.trim().is_empty())
+            .map(|_| updated_at_i64);
 
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "INSERT INTO tenants (
-                did, handle, session_json, rubric_prompt, sensitivity, bounce_duration, is_active, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                did, handle, session_json, rubric_prompt, sensitivity, bounce_duration, is_active, created_at, updated_at, handle_updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(did) DO UPDATE SET
                  handle = COALESCE(excluded.handle, tenants.handle),
                  session_json = COALESCE(excluded.session_json, tenants.session_json),
@@ -338,7 +356,8 @@ impl TenantRegistry {
                  sensitivity = COALESCE(excluded.sensitivity, tenants.sensitivity),
                  bounce_duration = COALESCE(excluded.bounce_duration, tenants.bounce_duration),
                  is_active = excluded.is_active,
-                 updated_at = excluded.updated_at;",
+                 updated_at = excluded.updated_at,
+                 handle_updated_at = COALESCE(excluded.handle_updated_at, tenants.handle_updated_at);",
         )?;
 
         stmt.execute(params![
@@ -351,6 +370,7 @@ impl TenantRegistry {
             is_active_int,
             created_at_i64,
             updated_at_i64,
+            handle_updated_at_i64,
         ])?;
 
         // Invalidate cached PDS client on credential update
@@ -485,6 +505,11 @@ impl TenantRegistry {
 
     /// Retrieves an enrolled tenant by Bluesky handle enforcing a maximum TTL age.
     ///
+    /// Freshness is measured against the dedicated `handle_updated_at` column, which is
+    /// advanced only when the handle mapping itself changes (registration, handle update,
+    /// or explicit invalidation) — never by unrelated writes such as session token refreshes.
+    /// This ensures a stale handle mapping cannot be kept "fresh" by background activity.
+    ///
     /// The tenant's handle mapping must have been updated within `max_age` of the current time.
     /// If the handle mapping has expired or does not match, returns `Ok(None)`.
     ///
@@ -503,7 +528,8 @@ impl TenantRegistry {
         let did_opt: Option<String> = {
             let conn = self.conn.lock();
             let mut stmt = conn.prepare_cached(
-                "SELECT did FROM tenants WHERE (LOWER(handle) = LOWER(?1) OR LOWER(handle) = LOWER(?2)) AND updated_at >= ?3 LIMIT 1;",
+                "SELECT did FROM tenants WHERE (LOWER(handle) = LOWER(?1) OR LOWER(handle) = LOWER(?2))
+                 AND handle_updated_at IS NOT NULL AND handle_updated_at >= ?3 LIMIT 1;",
             )?;
             stmt.query_row(params![clean, format!("@{clean}"), cutoff_i64], |row| {
                 row.get(0)
@@ -539,7 +565,8 @@ impl TenantRegistry {
 
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
-            "UPDATE tenants SET handle = NULL, updated_at = ?1 WHERE LOWER(handle) = LOWER(?2) OR LOWER(handle) = LOWER(?3);",
+            "UPDATE tenants SET handle = NULL, handle_updated_at = ?1, updated_at = ?1
+             WHERE LOWER(handle) = LOWER(?2) OR LOWER(handle) = LOWER(?3);",
         )?;
         let count = stmt.execute(params![now_i64, clean, format!("@{clean}")])?;
         Ok(count > 0)
@@ -656,18 +683,6 @@ impl TenantRegistry {
         Ok(count > 0)
     }
 
-    /// Resets the moderation rule rubric for an enrolled tenant back to the default rubric.
-    ///
-    /// # Errors
-    /// Returns [`SkybouncerError::Database`] if update query fails.
-    pub fn reset_rubric(
-        &self,
-        did: &str,
-        default_rubric: &RuleRubric,
-    ) -> Result<bool, SkybouncerError> {
-        self.update_rubric(did, default_rubric)
-    }
-
     /// Updates the handle for an enrolled tenant.
     ///
     /// Returns `true` if the tenant was found and updated.
@@ -679,8 +694,9 @@ impl TenantRegistry {
         let now_i64 = i64::try_from(now_us).unwrap_or(i64::MAX);
 
         let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare_cached("UPDATE tenants SET handle = ?1, updated_at = ?2 WHERE did = ?3;")?;
+        let mut stmt = conn.prepare_cached(
+            "UPDATE tenants SET handle = ?1, handle_updated_at = ?2, updated_at = ?2 WHERE did = ?3;",
+        )?;
 
         let count = stmt.execute(params![handle, now_i64, did])?;
         Ok(count > 0)
@@ -1470,6 +1486,67 @@ mod tests {
         // Re-invalidating non-existent handle returns false
         let second_inv = registry.invalidate_handle("alice.bsky.social").unwrap();
         assert!(!second_inv);
+    }
+
+    #[test]
+    fn test_handle_freshness_not_refreshed_by_session_update() {
+        let registry = TenantRegistry::open_in_memory().unwrap();
+
+        // Register with a handle, backdating the handle-freshness timestamp so it is
+        // already older than a 1-second TTL window.
+        let mut tenant = Tenant::new("did:plc:alice").with_handle("alice.bsky.social");
+        let old = crate::modlist::cache::current_time_us().saturating_sub(5_000_000);
+        tenant.created_at = old;
+        tenant.updated_at = old;
+        registry.register_or_update(&tenant).unwrap();
+
+        // Backdate handle_updated_at directly to simulate an old mapping.
+        {
+            let conn = registry.conn.lock();
+            conn.execute(
+                "UPDATE tenants SET handle_updated_at = ?1 WHERE did = 'did:plc:alice';",
+                rusqlite::params![i64::try_from(old).unwrap()],
+            )
+            .unwrap();
+        }
+
+        // With a 1-second TTL, the 5-second-old mapping is considered stale.
+        let stale = registry
+            .get_by_handle_with_ttl("alice.bsky.social", Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            stale.is_none(),
+            "old handle mapping must be treated as stale"
+        );
+
+        // Simulate unrelated activity: update_handle is not called, but other tenant
+        // writes (e.g. rubric/session) bump `updated_at`. Use invalidate-free update via
+        // register_or_update with an unset handle to ensure handle freshness is preserved.
+        let mut unrelated = Tenant::new("did:plc:alice");
+        unrelated.updated_at = crate::modlist::cache::current_time_us();
+        registry.register_or_update(&unrelated).unwrap();
+
+        // The handle mapping is still considered stale: session/tenant activity must not
+        // resurrect freshness.
+        let still_stale = registry
+            .get_by_handle_with_ttl("alice.bsky.social", Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            still_stale.is_none(),
+            "unrelated tenant updates must not refresh handle freshness"
+        );
+
+        // An explicit handle update does refresh freshness.
+        assert!(registry
+            .update_handle("did:plc:alice", "alice.bsky.social")
+            .unwrap());
+        let fresh = registry
+            .get_by_handle_with_ttl("alice.bsky.social", Duration::from_secs(3600))
+            .unwrap();
+        assert!(
+            fresh.is_some(),
+            "explicit handle update must refresh freshness"
+        );
     }
 
     #[tokio::test]

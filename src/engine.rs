@@ -2090,8 +2090,9 @@ impl SkybouncerEngine {
             return Some(tenant.did);
         }
 
-        // 3. Persisted SQLite did_handles cache
-        if let Ok(Some(cached_did)) = self.cache.get_did_for_handle(clean) {
+        // 3. Persisted SQLite did_handles cache (TTL-bounded to avoid identity shadowing)
+        let ttl_us = u64::try_from(self.config.handle_cache_ttl.as_micros()).unwrap_or(u64::MAX);
+        if let Ok(Some(cached_did)) = self.cache.get_did_for_handle_with_ttl(clean, ttl_us) {
             self.handle_cache
                 .write()
                 .insert(clean.to_string(), (cached_did.clone(), now));
