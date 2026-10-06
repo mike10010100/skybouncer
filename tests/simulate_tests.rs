@@ -459,3 +459,41 @@ async fn engine_new_direct_constructor_branches() {
     assert!(engine.is_dry_run());
     assert!(engine.is_allowlisted("did:plc:alice", "did:plc:trusted"));
 }
+
+#[tokio::test]
+async fn engine_modlist_ops_allowlist_and_pardon() {
+    let rig = build_rig(Verdict::permitted("ok"), None, false).await;
+    let engine = &rig.engine;
+    let protected = &rig.protected;
+
+    // add/list/is_allowlisted round-trip.
+    engine
+        .add_to_allowlist(protected, "did:plc:friend", Some("trusted"))
+        .expect("add");
+    assert!(engine.is_allowlisted(protected, "did:plc:friend"));
+    let list = engine.list_allowlist(protected).unwrap();
+    assert!(list.iter().any(|e| e.subject_did == "did:plc:friend"));
+
+    // pardon_and_allowlist on a non-bounced subject (returns false pardoned, still allowlists).
+    let r = engine
+        .pardon_and_allowlist(protected, "did:plc:notbounced", Some("imm"))
+        .await
+        .expect("pardon_and_allowlist");
+    assert!(!r);
+    assert!(engine.is_allowlisted(protected, "did:plc:notbounced"));
+
+    // remove_from_allowlist round-trip.
+    assert!(engine
+        .remove_from_allowlist(protected, "did:plc:friend")
+        .unwrap());
+    assert!(!engine.is_allowlisted(protected, "did:plc:friend"));
+
+    // Bounce listing/retrieval accessors on an empty cache.
+    assert!(engine.list_recent_bounces(10).unwrap().is_empty());
+    assert!(engine
+        .list_recent_bounces_for(Some(protected), 10)
+        .unwrap()
+        .is_empty());
+    assert!(!engine.is_bounced("did:plc:nobody").unwrap());
+    assert!(engine.get_bounced_user("did:plc:nobody").unwrap().is_none());
+}
