@@ -43,14 +43,16 @@ pub fn parsed_or<T: FromStr>(keys: &[&str], default: T) -> T {
     parsed(keys).unwrap_or(default)
 }
 
-/// Interprets the first set value among `keys` as a boolean (`true`/`1`/`yes`, case-insensitive).
+/// Interprets the first set value among `keys` as a boolean: `true`/`1`
+/// (ASCII-case-insensitive).
 ///
-/// Returns `None` when unset, and `Some(false)` for any other non-empty value.
+/// Returns `None` when unset, and `Some(false)` for any other value. This
+/// deliberately matches the historical parsing of `true`/`1` only.
 #[must_use]
 pub fn bool(keys: &[&str]) -> Option<bool> {
     var(keys).map(|value| {
         let lowered = value.to_ascii_lowercase();
-        matches!(lowered.as_str(), "true" | "1" | "yes")
+        matches!(lowered.as_str(), "true" | "1")
     })
 }
 

@@ -739,7 +739,8 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
     // Start Sovereign Web Dashboard early so OAuth endpoints (e.g. client-metadata.json)
     // are actively reachable when PDS authorization servers verify OAuth client metadata
     let web_enabled = skybouncer::env::bool_or(&["WEB_ENABLED", "SKYBOUNCER_WEB_ENABLED"], false);
-    let port_configured = skybouncer::env::var(&["PORT", "SKYBOUNCER_PORT"]).is_some();
+    // Mirror the historical check: a set-but-empty PORT still counts as configured.
+    let port_configured = std::env::var("PORT").is_ok() || std::env::var("SKYBOUNCER_PORT").is_ok();
 
     if web_enabled || port_configured {
         let web_port = web_config.port;
