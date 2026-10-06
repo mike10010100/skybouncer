@@ -196,3 +196,79 @@ pub async fn run_jetstream_streamer(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_has_expected_collections_and_no_cursor() {
+        let cfg = StreamConfig::default();
+        assert_eq!(cfg.endpoint, DEFAULT_JETSTREAM_ENDPOINT);
+        assert_eq!(cfg.cursor, None);
+        assert!(cfg.collections.contains(&"app.bsky.feed.post".to_string()));
+        assert!(cfg
+            .collections
+            .contains(&"app.bsky.graph.follow".to_string()));
+        assert!(cfg.collections.contains(&"app.bsky.graph.list".to_string()));
+        assert!(cfg
+            .collections
+            .contains(&SOVEREIGN_CONFIG_COLLECTION.to_string()));
+    }
+
+    #[test]
+    fn with_collection_appends() {
+        let cfg =
+            StreamConfig::new("wss://example.test/subscribe").with_collection("com.example.custom");
+        assert!(cfg.collections.contains(&"com.example.custom".to_string()));
+    }
+
+    #[test]
+    fn with_cursor_zero_clears_cursor() {
+        assert_eq!(StreamConfig::default().with_cursor(0).cursor, None);
+        assert_eq!(StreamConfig::default().with_cursor(123).cursor, Some(123));
+    }
+
+    #[test]
+    fn build_url_includes_all_wanted_collections() {
+        let cfg = StreamConfig::new("wss://example.test/subscribe");
+        let url = cfg.build_url();
+        assert!(
+            url.starts_with("wss://example.test/subscribe?"),
+            "url={url}"
+        );
+        for col in &cfg.collections {
+            assert!(
+                url.contains(&format!("wantedCollections={col}")),
+                "url={url}"
+            );
+        }
+        // No cursor means no cursor param.
+        assert!(!url.contains("cursor="), "url={url}");
+    }
+
+    #[test]
+    fn build_url_includes_cursor_when_set() {
+        let url = StreamConfig::new("wss://example.test/subscribe")
+            .with_cursor(1_700_000_000_000_000)
+            .build_url();
+        assert!(
+            url.contains("cursor=1700000000000000"),
+            "cursor must be appended, url={url}"
+        );
+    }
+
+    #[test]
+    fn build_url_prefers_existing_query_separator() {
+        let url = StreamConfig::new("wss://example.test/subscribe?foo=bar")
+            .with_collection("app.bsky.feed.post")
+            .build_url();
+        // Existing query string is preserved and joined with '&'.
+        assert!(url.contains("foo=bar"), "url={url}");
+        assert!(
+            url.contains("wantedCollections=app.bsky.feed.post"),
+            "url={url}"
+        );
+    }
+}

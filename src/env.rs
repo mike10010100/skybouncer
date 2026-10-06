@@ -102,3 +102,168 @@ pub fn init_tracing() {
         .compact()
         .try_init();
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Serializes env-mutating tests and yields a globally unique key suffix so
+    /// parallel test threads never observe each other's variables.
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn unique(prefix: &str) -> (String, String) {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        (
+            format!("SKYB_TEST_{prefix}_{n}_A"),
+            format!("SKYB_TEST_{prefix}_{n}_B"),
+        )
+    }
+
+    fn set(key: &str, value: &str) {
+        std::env::set_var(key, value);
+    }
+
+    fn unset(key: &str) {
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn var_returns_none_when_all_unset() {
+        let (a, b) = unique("var_unset");
+        unset(&a);
+        unset(&b);
+        assert_eq!(var(&[&a, &b]), None);
+    }
+
+    #[test]
+    fn var_respects_key_precedence() {
+        let (a, b) = unique("var_prec");
+        set(&a, "first");
+        set(&b, "second");
+        assert_eq!(var(&[&a, &b]).as_deref(), Some("first"));
+        unset(&a);
+        assert_eq!(var(&[&a, &b]).as_deref(), Some("second"));
+        unset(&b);
+    }
+
+    #[test]
+    fn var_trims_and_skips_empty_values() {
+        let (a, b) = unique("var_empty");
+        set(&a, "   ");
+        set(&b, "value");
+        // Empty/whitespace in the higher-precedence key is skipped.
+        assert_eq!(var(&[&a, &b]).as_deref(), Some("value"));
+        unset(&a);
+        unset(&b);
+    }
+
+    #[test]
+    fn var_trims_surrounding_whitespace() {
+        let (a, _b) = unique("var_trim");
+        set(&a, "  spaced  ");
+        assert_eq!(var(&[&a]).as_deref(), Some("spaced"));
+        unset(&a);
+    }
+
+    #[test]
+    fn var_or_falls_back_to_default() {
+        let (a, _b) = unique("varor");
+        unset(&a);
+        assert_eq!(var_or(&[&a], "fallback"), "fallback");
+        set(&a, "present");
+        assert_eq!(var_or(&[&a], "fallback"), "present");
+        unset(&a);
+    }
+
+    #[test]
+    fn parsed_parses_and_rejects_invalid() {
+        let (a, _b) = unique("parsed");
+        set(&a, "42");
+        assert_eq!(parsed::<u16>(&[&a]), Some(42));
+        set(&a, "not-a-number");
+        assert_eq!(parsed::<u16>(&[&a]), None);
+        unset(&a);
+        assert_eq!(parsed::<u16>(&[&a]), None);
+    }
+
+    #[test]
+    fn parsed_or_falls_back_to_default() {
+        let (a, _b) = unique("parsedor");
+        unset(&a);
+        assert_eq!(parsed_or::<usize>(&[&a], 7), 7);
+        set(&a, "9");
+        assert_eq!(parsed_or::<usize>(&[&a], 7), 9);
+        set(&a, "bad");
+        assert_eq!(parsed_or::<usize>(&[&a], 7), 7);
+        unset(&a);
+    }
+
+    #[test]
+    fn bool_accepts_only_true_and_one() {
+        let (a, _b) = unique("bool");
+        for truthy in ["true", "TRUE", "True", "1"] {
+            set(&a, truthy);
+            assert_eq!(bool(&[&a]), Some(true), "{truthy} must parse true");
+        }
+        for falsy in ["false", "0", "yes", "no", "on", "anything"] {
+            set(&a, falsy);
+            assert_eq!(bool(&[&a]), Some(false), "{falsy} must parse false");
+        }
+        unset(&a);
+        assert_eq!(bool(&[&a]), None);
+    }
+
+    #[test]
+    fn bool_or_uses_default_when_unset() {
+        let (a, _b) = unique("boolor");
+        unset(&a);
+        assert!(!bool_or(&[&a], false));
+        assert!(bool_or(&[&a], true));
+        set(&a, "1");
+        assert!(bool_or(&[&a], false));
+        set(&a, "0");
+        assert!(!bool_or(&[&a], true));
+        unset(&a);
+    }
+
+    #[test]
+    fn load_dotenv_file_parses_quotes_comments_and_preserves_existing() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "skyb_env_test_{}.env",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let (existing_key, fresh_key) = unique("dotenv");
+        let quoted_key = format!("{existing_key}_q");
+        set(&existing_key, "original");
+
+        let contents = format!(
+            "# comment line\n\n{existing_key}=should_not_override\n{fresh_key}=fresh \n{quoted_key}=\"quoted value\"\nnot_a_pair\n",
+        );
+        std::fs::write(&path, contents).expect("write temp .env");
+
+        load_dotenv_file(&path);
+
+        // Existing var is never overwritten.
+        assert_eq!(var(&[&existing_key]).as_deref(), Some("original"));
+        // New vars are set, with surrounding quotes stripped.
+        assert_eq!(var(&[&fresh_key]).as_deref(), Some("fresh"));
+        assert_eq!(var(&[&quoted_key]).as_deref(), Some("quoted value"));
+
+        let _ = std::fs::remove_file(&path);
+        unset(&existing_key);
+        unset(&fresh_key);
+        unset(&quoted_key);
+    }
+
+    #[test]
+    fn load_dotenv_file_missing_path_is_noop() {
+        let path = std::env::temp_dir().join("skyb_definitely_missing_env_file.env");
+        let _ = std::fs::remove_file(&path);
+        // Must not panic.
+        load_dotenv_file(&path);
+    }
+}

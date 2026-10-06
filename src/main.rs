@@ -1130,3 +1130,52 @@ async fn main() -> Result<(), SkybouncerError> {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn format_number_groups_thousands() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(1), "1");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1_000), "1,000");
+        assert_eq!(format_number(1_000_000), "1,000,000");
+        assert_eq!(format_number(12_345_678), "12,345,678");
+    }
+
+    #[test]
+    fn arg_value_finds_value_after_flag() {
+        let a = args(&["simulate", "hello", "--url", "http://x", "--image", "y.png"]);
+        assert_eq!(arg_value(&a, "--url"), Some("http://x"));
+        assert_eq!(arg_value(&a, "--image"), Some("y.png"));
+    }
+
+    #[test]
+    fn arg_value_returns_none_when_absent_or_dangling() {
+        let a = args(&["simulate", "hello"]);
+        assert_eq!(arg_value(&a, "--url"), None);
+        // Flag present as the final token with no following value.
+        let b = args(&["simulate", "--url"]);
+        assert_eq!(arg_value(&b, "--url"), None);
+    }
+
+    #[test]
+    fn resolve_daemon_url_prefers_cli_flag() {
+        let a = args(&["status", "--url", "http://example.test:9999/"]);
+        assert_eq!(resolve_daemon_url(&a), "http://example.test:9999");
+    }
+
+    #[test]
+    fn resolve_daemon_url_defaults_to_localhost_port() {
+        let a = args(&["status"]);
+        let url = resolve_daemon_url(&a);
+        assert!(url.starts_with("http://127.0.0.1:"), "url={url}");
+    }
+}
