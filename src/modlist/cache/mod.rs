@@ -865,6 +865,51 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_bounced_user_rkeys_fk_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Legacy bounced_users with single-column PK + a bounced_user_rkeys that has a
+        // foreign key referencing bounced_users, forcing both migration branches.
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE bounced_users (
+                subject_did TEXT PRIMARY KEY,
+                listitem_uri TEXT NOT NULL,
+                listitem_rkey TEXT NOT NULL,
+                listitem_cid TEXT NOT NULL,
+                category TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                reason TEXT NOT NULL,
+                post_uri TEXT NOT NULL,
+                bounced_at INTEGER NOT NULL
+            );
+            CREATE TABLE bounced_user_rkeys (
+                subject_did TEXT NOT NULL,
+                listitem_rkey TEXT NOT NULL PRIMARY KEY,
+                listitem_uri TEXT NOT NULL,
+                listitem_cid TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (subject_did) REFERENCES bounced_users(subject_did)
+            );
+            ",
+        )
+        .unwrap();
+
+        DeduplicationCache::init_schema(&conn).expect("migrate legacy rkeys FK");
+
+        // The migrated rkeys table accepts composite-key inserts.
+        let cache = DeduplicationCache {
+            conn: Arc::new(parking_lot::Mutex::new(conn)),
+        };
+        let bounce = bounce_fixture("did:plc:alice", "did:plc:spammer");
+        cache.record_bounce(&bounce).unwrap();
+        assert!(cache
+            .get_all_bounced_rkeys_for("did:plc:alice", "did:plc:spammer")
+            .unwrap()
+            .contains(&bounce.listitem_rkey));
+    }
+
+    #[test]
     fn test_allowlist_crud_and_loading() {
         let cache = test_cache();
 
