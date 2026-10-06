@@ -50,12 +50,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: mike10010100/skybase
+          ref: refactor/appview-client
           path: skybase
 
       - name: Checkout sibling dependency (skyauth)
         uses: actions/checkout@v4
         with:
           repository: mike10010100/skyauth
+          ref: refactor/sealed-box
           path: skyauth
 
       - name: Install Rust Toolchain
