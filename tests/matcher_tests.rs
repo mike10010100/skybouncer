@@ -923,3 +923,26 @@ fn test_gate_multi_threaded_concurrency() {
     assert!(writer_ops > 0);
     assert!(total_reads > 10_000);
 }
+
+#[test]
+fn test_follow_graph_incoming_synthetic_follower_fallback_prunes_set() {
+    use skybouncer::matcher::FollowGraph;
+
+    let graph = FollowGraph::new();
+    let protected = "did:plc:alice";
+    let follower = "did:plc:bob";
+
+    // Hydrate an incoming follower with a synthetic `hydrate_in_0` rkey.
+    graph.hydrate_followers(protected, [follower]);
+    assert!(graph.is_followed_by(protected, follower));
+    assert_eq!(graph.follower_count(protected), 1);
+
+    // A real-TID delete commit reconciles the synthetic incoming entry.
+    let removed = graph.remove_synthetic_follower_fallback(follower);
+    assert_eq!(removed.as_deref(), Some(protected));
+    assert!(
+        !graph.is_followed_by(protected, follower),
+        "incoming followers set must be pruned after synthetic removal"
+    );
+    assert_eq!(graph.follower_count(protected), 0);
+}

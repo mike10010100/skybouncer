@@ -74,12 +74,15 @@ fn synthetic_key_rank(key: &str) -> (u8, u64, String) {
     }
 }
 
-/// Removes `inner_key` from `guard`'s `index` field, then prunes the resolved value
-/// from the paired `sets` field if no remaining rkey still references it.
+/// Removes `inner_key` from `guard`'s `index`, then prunes the resolved value from the
+/// paired active set if no remaining rkey still references it.
 ///
-/// Shared by the forward (`rkey_to_followed`/`follows`) and incoming
-/// (`incoming_rkey_index`/`followers`) reverse indexes, which use identical
-/// reference-counting semantics despite differing outer-key meanings.
+/// The two indexes have **opposite** set orientations, which this helper encodes via
+/// `forward`:
+/// - forward (`rkey_to_followed`/`follows`): the set is keyed by `outer_key` and stores
+///   the resolved value.
+/// - incoming (`incoming_rkey_index`/`followers`): the set is keyed by the resolved value
+///   and stores `outer_key`.
 fn remove_index_entry(
     guard: &mut FollowGraphInner,
     forward: bool,
@@ -99,13 +102,12 @@ fn remove_index_entry(
         (value, still_referenced)
     };
     if !still_referenced {
-        let sets = if forward {
-            &mut guard.follows
-        } else {
-            &mut guard.followers
-        };
-        if let Some(set) = sets.get_mut(outer_key) {
-            set.remove(&value);
+        if forward {
+            if let Some(set) = guard.follows.get_mut(outer_key) {
+                set.remove(&value);
+            }
+        } else if let Some(set) = guard.followers.get_mut(&value) {
+            set.remove(outer_key);
         }
     }
     Some(value)
@@ -113,7 +115,8 @@ fn remove_index_entry(
 
 /// Deterministically selects and removes the lowest-ranked synthetic rkey in `guard`'s
 /// reverse index, pruning the paired set if the value is no longer referenced. Shared by
-/// the forward and incoming synthetic fallbacks.
+/// the forward and incoming synthetic fallbacks (set orientation per `forward`, see
+/// [`remove_index_entry`]).
 fn remove_synthetic_entry(
     guard: &mut FollowGraphInner,
     forward: bool,
@@ -121,10 +124,10 @@ fn remove_synthetic_entry(
     is_synthetic: impl Fn(&str) -> bool,
 ) -> Option<String> {
     let (value, still_referenced) = {
-        let (index, _) = if forward {
-            (&mut guard.rkey_to_followed, &mut guard.follows)
+        let index = if forward {
+            &mut guard.rkey_to_followed
         } else {
-            (&mut guard.incoming_rkey_index, &mut guard.followers)
+            &mut guard.incoming_rkey_index
         };
         let map = index.get_mut(outer_key)?;
         let synthetic_key = map
@@ -137,13 +140,12 @@ fn remove_synthetic_entry(
         (value, still_referenced)
     };
     if !still_referenced {
-        let sets = if forward {
-            &mut guard.follows
-        } else {
-            &mut guard.followers
-        };
-        if let Some(set) = sets.get_mut(outer_key) {
-            set.remove(&value);
+        if forward {
+            if let Some(set) = guard.follows.get_mut(outer_key) {
+                set.remove(&value);
+            }
+        } else if let Some(set) = guard.followers.get_mut(&value) {
+            set.remove(outer_key);
         }
     }
     Some(value)
