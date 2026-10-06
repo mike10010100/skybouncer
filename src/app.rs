@@ -218,9 +218,11 @@ pub async fn run_cli_pardon(args: &[String]) -> Result<(), SkybouncerError> {
     } else {
         let clean_handle = crate::util::normalize_handle(&raw_subject);
         println!("🔍 Resolving handle @{clean_handle} via ATProto identity directory...");
-        let resolve_url = format!(
-            "https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle={clean_handle}"
+        let resolve_base = crate::env::var_or(
+            &["SKYBOUNCER_RESOLVE_HANDLE_URL"],
+            "https://bsky.social/xrpc/com.atproto.identity.resolveHandle",
         );
+        let resolve_url = format!("{resolve_base}?handle={clean_handle}");
         match client.get(&resolve_url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 let json: serde_json::Value = resp.json().await.map_err(|e| {

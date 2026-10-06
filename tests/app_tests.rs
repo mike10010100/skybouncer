@@ -302,3 +302,61 @@ async fn run_cli_simulate_offline_with_jev_config_uses_local_engine() {
         }
     }
 }
+
+#[tokio::test]
+async fn run_cli_pardon_handle_resolution_via_override() {
+    let server = MockServer::start().await;
+    // Resolution endpoint (SKYBOUNCER_RESOLVE_HANDLE_URL).
+    Mock::given(method("GET"))
+        .and(path("/resolve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"did": "did:plc:resolved"})))
+        .mount(&server)
+        .await;
+    // Daemon pardon endpoint.
+    Mock::given(method("POST"))
+        .and(path("/api/pardon"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "subject_did": "did:plc:resolved",
+            "pardoned": true,
+            "message": "ok"
+        })))
+        .mount(&server)
+        .await;
+
+    let saved = std::env::var("SKYBOUNCER_RESOLVE_HANDLE_URL").ok();
+    std::env::set_var(
+        "SKYBOUNCER_RESOLVE_HANDLE_URL",
+        format!("{}/resolve", server.uri()),
+    );
+    let a = args(&["@alice.bsky.social", "--url", &server.uri()]);
+    let r = run_cli_pardon(&a).await;
+    match saved {
+        Some(v) => std::env::set_var("SKYBOUNCER_RESOLVE_HANDLE_URL", v),
+        None => std::env::remove_var("SKYBOUNCER_RESOLVE_HANDLE_URL"),
+    }
+    r.expect("pardon via resolved handle");
+}
+
+#[tokio::test]
+async fn run_cli_pardon_handle_resolution_error_paths() {
+    let server = MockServer::start().await;
+    // 404 resolution -> Config error.
+    Mock::given(method("GET"))
+        .and(path("/resolve"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .mount(&server)
+        .await;
+
+    let saved = std::env::var("SKYBOUNCER_RESOLVE_HANDLE_URL").ok();
+    std::env::set_var(
+        "SKYBOUNCER_RESOLVE_HANDLE_URL",
+        format!("{}/resolve", server.uri()),
+    );
+    let a = args(&["@ghost.bsky.social", "--url", &server.uri()]);
+    let r = run_cli_pardon(&a).await;
+    match saved {
+        Some(v) => std::env::set_var("SKYBOUNCER_RESOLVE_HANDLE_URL", v),
+        None => std::env::remove_var("SKYBOUNCER_RESOLVE_HANDLE_URL"),
+    }
+    assert!(matches!(r, Err(skybouncer::SkybouncerError::Config(_))));
+}
