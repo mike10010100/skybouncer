@@ -52,7 +52,7 @@ parents unless explicitly requested.
 | D2 | Move `tower` to dev-deps | `Cargo.toml:32` | Only `tests/*.rs` use `tower::ServiceExt`; no library consumer. | `[x]` |
 | D3 | Feature-gate optional subsystems | `Cargo.toml` | Add `[features]`: `web = [dep:axum, dep:tower-http]`, `stream = [dep:tokio-tungstenite]`, `bot`, `telemetry`; `default` = all. Keep `rusqlite`/`ring`/`futures-util` in core. | `[x]` |
 | D4 | Bin-only `tracing-subscriber` | `Cargo.toml:67`, `src/main.rs:29` | Made optional behind `telemetry`; bin requires it. | `[x]` |
-| D5 | `tokio-util` via skybase re-export | `Cargo.toml:48` | **Deferred**: `CancellationToken` is passed across the API by skybouncer itself, so a direct dep is clearer than re-exporting through skybase. | `[!]` |
+| D5 | `tokio-util` via skybase re-export | `Cargo.toml` | Resolved: kept the direct dep (skybouncer passes `CancellationToken` across its own API, so a direct dependency is clearer than routing through skybase). | `[x]` |
 | D6 | Stale `Cargo.lock` versions | `Cargo.lock` | `cargo update` (7 packages); `cargo deny check` clean. Remaining `base64`/`thiserror` dupes are transitive and not directly removable. | `[x]` |
 
 ---
@@ -89,7 +89,7 @@ parents unless explicitly requested.
 | I14 | Jev prompt/state template ×2 | `src/classifier/jev.rs` | Added `enrichment_suffix` + `build_candidate_prompt`; both endpoints use them. | `[x]` |
 | I15 | SQLite pragma setup ×2 | `src/util.rs` | Added `apply_common_pragmas`; cache/registry keep their specific pragmas. | `[x]` |
 | I16 | Shard hashing ×2 | `src/util.rs` | Added `shard_index`; manager `shard_for` and limiter `shard_idx` use it. | `[x]` |
-| I17 | CLI arg parsing ×3 | `src/main.rs` | **Deferred to Phase 3 (E-series)**: covered by env/config unification. | `[!]` |
+| I17 | CLI arg parsing ×3 | `src/main.rs` | Completed via `arg_value` (see E-series). | `[x]` |
 | I18 | Test fixtures | across `#[cfg(test)]` modules | Added `test_cache`/`bounce_fixture`/`eval_log_fixture` (cache) and `test_registry` (registry); migrated 12 + 10 constructor sites. | `[x]` |
 
 ---
