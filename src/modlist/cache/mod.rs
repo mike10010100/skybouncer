@@ -778,6 +778,93 @@ mod tests {
     }
 
     #[test]
+    fn test_bounced_rkey_aliases_and_expiry_and_count() {
+        let cache = test_cache();
+        // Multi-rkey accumulation via record_bounce (which also populates bounced_user_rkeys).
+        let mut entry = bounce_fixture("did:plc:alice", "did:plc:spammer");
+        entry.listitem_rkey = "rk1".to_string();
+        entry.expires_at = Some(1_700_000_500);
+        cache.record_bounce(&entry).unwrap();
+
+        // Re-record with a new rkey for the same subject/protected pair.
+        let mut entry2 = entry.clone();
+        entry2.listitem_rkey = "rk2".to_string();
+        cache.record_bounce(&entry2).unwrap();
+
+        let scoped = cache
+            .get_all_bounced_rkeys_for("did:plc:alice", "did:plc:spammer")
+            .unwrap();
+        assert!(scoped.contains(&"rk1".to_string()));
+        assert!(scoped.contains(&"rk2".to_string()));
+
+        // Unscoped aliases.
+        let all = cache.get_all_bounced_rkeys("did:plc:spammer").unwrap();
+        assert!(all.contains(&"rk1".to_string()));
+        let alias = cache.get_bounced_rkeys("did:plc:spammer").unwrap();
+        assert_eq!(all, alias);
+
+        // list_recent_bounces (unscoped) and count.
+        assert_eq!(cache.count_bounced().unwrap(), 1);
+        assert_eq!(cache.list_recent_bounces(10).unwrap().len(), 1);
+
+        // Expiry query returns the entry once now exceeds expires_at.
+        assert_eq!(cache.list_expired_bounces(1_700_000_400).unwrap().len(), 0);
+        assert_eq!(cache.list_expired_bounces(1_700_000_600).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_remove_all_bounces_and_scoped_removal() {
+        let cache = test_cache();
+        let mut e = bounce_fixture("did:plc:alice", "did:plc:spammer");
+        e.listitem_rkey = "rka".to_string();
+        cache.record_bounce(&e).unwrap();
+        let mut e2 = e.clone();
+        e2.listitem_rkey = "rkb".to_string();
+        cache.record_bounce(&e2).unwrap();
+
+        let removed = cache
+            .remove_all_bounces_for("did:plc:alice", "did:plc:spammer")
+            .unwrap();
+        assert!(!removed.is_empty());
+        assert_eq!(cache.count_bounced().unwrap(), 0);
+        // Removing again yields empty.
+        assert!(cache
+            .remove_all_bounces_for("did:plc:alice", "did:plc:spammer")
+            .unwrap()
+            .is_empty());
+
+        // Unscoped remove_all_bounces alias after re-adding.
+        cache.record_bounce(&e).unwrap();
+        assert!(!cache
+            .remove_all_bounces("did:plc:spammer")
+            .unwrap()
+            .is_empty());
+        assert_eq!(cache.count_bounced().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_get_bounced_user_scoped_and_unscoped() {
+        let cache = test_cache();
+        let e = bounce_fixture("did:plc:alice", "did:plc:spammer");
+        cache.record_bounce(&e).unwrap();
+
+        assert!(cache.get_bounced_user("did:plc:spammer").unwrap().is_some());
+        assert!(cache
+            .get_bounced_user_for("did:plc:alice", "did:plc:spammer")
+            .unwrap()
+            .is_some());
+        assert!(cache
+            .get_bounced_user_for("did:plc:other", "did:plc:spammer")
+            .unwrap()
+            .is_none());
+        // Whitespace/empty protected DID falls back to the unscoped query.
+        assert!(cache
+            .get_bounced_user_for("   ", "did:plc:spammer")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn test_allowlist_crud_and_loading() {
         let cache = test_cache();
 

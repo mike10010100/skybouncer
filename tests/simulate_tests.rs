@@ -217,3 +217,60 @@ async fn simulation_permitted_without_confidence_defaults_to_point_zero_five() {
     assert!(!result.violates);
     assert_eq!(result.confidence, 0.05);
 }
+
+#[tokio::test]
+async fn engine_accessors_and_hydration_paths() {
+    let rig = build_rig(Verdict::permitted("ok"), None, false).await;
+    let engine = &rig.engine;
+
+    // Protected-DID accessors.
+    assert!(engine.is_protected(&rig.protected));
+    assert!(engine.protected_dids().contains(&rig.protected));
+    engine.add_protected_did("did:plc:new");
+    assert!(engine.is_protected("did:plc:new"));
+    assert!(engine.remove_protected_did("did:plc:new"));
+
+    // Component accessors return the shared handles.
+    let _ = engine.is_dry_run();
+    let _ = engine.config();
+    let _ = engine.rubric();
+    let _ = engine.heuristic_classifier();
+    let _ = engine.primary_classifier();
+    let _ = engine.follow_graph();
+    let _ = engine.gate();
+    let _ = engine.cache();
+    let _ = engine.pds_client();
+    let _ = engine.stats();
+    let _ = engine.rate_limiter();
+    let _ = engine.enricher();
+    let _ = engine.tenant_registry();
+    let _ = engine.subscribe_bounces();
+
+    // Pause/resume lifecycle.
+    let _ = engine.pause();
+    assert!(engine.is_paused());
+    let _ = engine.resume();
+    assert!(!engine.is_paused());
+
+    // Bypass flag round-trip.
+    engine.set_bypass_incoming_followers(&rig.protected, false);
+    assert!(!engine.bypass_incoming_followers(&rig.protected));
+    engine.set_bypass_incoming_followers(&rig.protected, true);
+    assert!(engine.bypass_incoming_followers(&rig.protected));
+
+    // Hydration helpers.
+    let n = engine.hydrate_follows("did:plc:h", ["did:plc:a", "did:plc:b"]);
+    assert_eq!(n, 2);
+    assert!(engine.is_following("did:plc:h", "did:plc:a"));
+
+    let n =
+        engine.hydrate_follow_records("did:plc:h2", [("rk1", "did:plc:c"), ("rk2", "did:plc:d")]);
+    assert_eq!(n, 2);
+    assert!(engine.is_following("did:plc:h2", "did:plc:c"));
+
+    let n = engine.hydrate_followers("did:plc:h3", ["did:plc:e"]);
+    assert_eq!(n, 1);
+
+    // Persist stats returns Ok on the in-memory cache.
+    engine.persist_stats().expect("persist stats");
+}
