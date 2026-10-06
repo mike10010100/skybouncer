@@ -410,6 +410,56 @@ mod tests {
     }
 
     #[test]
+    fn test_get_rubric_field_branch_combinations() {
+        use rusqlite::params;
+        let registry = test_registry();
+        let conn = registry.conn.lock();
+        let now: i64 = 1_700_000_000_000_000;
+
+        // rub: prompt + sensitivity (explicit sensitivity path)
+        conn.execute(
+            "INSERT INTO tenants (did, handle, session_json, rubric_prompt, sensitivity, bounce_duration, bypass_followers, is_active, created_at, updated_at)
+             VALUES (?1, NULL, NULL, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
+            params!["did:plc:a", "rules A", "high", "7d", 0i64, now],
+        )
+        .unwrap();
+        // rub2: prompt only (RuleRubric::parse fallback path)
+        conn.execute(
+            "INSERT INTO tenants (did, handle, session_json, rubric_prompt, sensitivity, bounce_duration, bypass_followers, is_active, created_at, updated_at)
+             VALUES (?1, NULL, NULL, ?2, NULL, NULL, NULL, 1, ?3, ?3)",
+            params!["did:plc:b", "parse me rules", now],
+        )
+        .unwrap();
+        // rub3: neither prompt nor sensitivity (None rubric) + inactive
+        conn.execute(
+            "INSERT INTO tenants (did, handle, session_json, rubric_prompt, sensitivity, bounce_duration, bypass_followers, is_active, created_at, updated_at)
+             VALUES (?1, NULL, NULL, NULL, NULL, NULL, NULL, 0, ?2, ?2)",
+            params!["did:plc:c", now],
+        )
+        .unwrap();
+        drop(conn);
+
+        let a = registry.get("did:plc:a").unwrap().unwrap();
+        let ra = a.rubric.unwrap();
+        assert_eq!(ra.sensitivity, crate::classifier::Sensitivity::High);
+        assert_eq!(
+            ra.bounce_duration,
+            crate::classifier::BounceDuration::Timeout7d
+        );
+        assert!(!ra.bypass_incoming_followers, "0 => false");
+
+        let b = registry.get("did:plc:b").unwrap().unwrap();
+        assert_eq!(b.rubric.unwrap().prompt, "parse me rules");
+
+        let c = registry.get("did:plc:c").unwrap().unwrap();
+        assert!(c.rubric.is_none());
+        assert!(!c.is_active);
+
+        // Missing DID returns None.
+        assert!(registry.get("did:plc:missing").unwrap().is_none());
+    }
+
+    #[test]
     fn test_update_session_and_empty_web_session_did() {
         let registry = test_registry();
         let dpop = DPoPKey::generate();
