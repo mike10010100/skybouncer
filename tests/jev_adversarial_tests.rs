@@ -1465,3 +1465,90 @@ async fn test_systemone_missing_confidence_errors() {
         .unwrap_err();
     assert!(err.to_string().contains("missing confidence"));
 }
+
+#[test]
+fn test_jev_accessors_and_from_env() {
+    // from_env uses defaults when nothing is set.
+    for k in [
+        "JEV_API_BASE_URL",
+        "JEV_MODEL",
+        "JEV_TIMEOUT_MS",
+        "JEV_MAX_RETRIES",
+    ] {
+        std::env::remove_var(k);
+    }
+    let c = JevClassifier::from_env(RuleRubric::default()).expect("from_env");
+    assert!(!c.model().is_empty());
+    assert!(!c.classify_url().is_empty());
+    c.set_rubric(RuleRubric::new(
+        "new rules",
+        skybouncer::classifier::Sensitivity::High,
+    ));
+    assert_eq!(c.rubric().prompt, "new rules");
+}
+
+#[tokio::test]
+async fn test_jev_evaluate_delegates_and_ollama_parse_error() {
+    let server = MockServer::start().await;
+    // Ollama wrapper with non-JSON content -> Ollama content parse error.
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": {"role": "assistant", "content": "not a json object"}
+        })))
+        .mount(&server)
+        .await;
+
+    let base = format!("{}/api/chat", server.uri());
+    let classifier = classifier_for(base, "llama3");
+    // evaluate() delegates to evaluate_with_rubric(None).
+    let err = classifier
+        .evaluate(&sample_interaction("x"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Ollama content"));
+}
+
+#[test]
+fn test_jev_endpoint_url_construction_variants() {
+    // /api base -> appends /chat
+    let c = JevClassifier::new(
+        JevConfig {
+            base_url: "http://localhost:11434/api".to_string(),
+            api_key: None,
+            model: "m".to_string(),
+            timeout: Duration::from_millis(100),
+            max_retries: 0,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(c.classify_url().ends_with("/api/chat"));
+
+    // /v1 base -> appends /classify
+    let c = JevClassifier::new(
+        JevConfig {
+            base_url: "https://api.jev.ai/v1".to_string(),
+            api_key: None,
+            model: "m".to_string(),
+            timeout: Duration::from_millis(100),
+            max_retries: 0,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(c.classify_url().ends_with("/v1/classify"));
+
+    // Invalid base URL -> Config error.
+    assert!(JevClassifier::new(
+        JevConfig {
+            base_url: "not a url".to_string(),
+            api_key: None,
+            model: "m".to_string(),
+            timeout: Duration::from_millis(100),
+            max_retries: 0,
+        },
+        RuleRubric::default(),
+    )
+    .is_err());
+}
