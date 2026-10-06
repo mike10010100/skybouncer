@@ -103,3 +103,50 @@ async fn daemon_rejects_blank_rules_argument() {
 
     restore_env(&saved);
 }
+
+#[tokio::test]
+async fn daemon_with_chat_token_spawns_bot_workers() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let saved = clear_env();
+    clear_daemon_vars();
+
+    // Provide a chat token + bot DID so the bot-worker + alert-dispatcher spawn paths run.
+    std::env::set_var("CHAT_ACCESS_TOKEN", "test-token");
+    std::env::set_var("BOT_DID", "did:plc:botworker");
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let args: Vec<String> = vec![
+        "--dry-run".to_string(),
+        "--did".to_string(),
+        "did:plc:daemon-bot".to_string(),
+    ];
+    let result = skybouncer::daemon::run(&args, cancel).await;
+    assert!(result.is_ok(), "daemon run failed: {result:?}");
+
+    restore_env(&saved);
+}
+
+#[tokio::test]
+async fn daemon_enables_web_dashboard_on_port() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let saved = clear_env();
+    clear_daemon_vars();
+
+    // A configured PORT enables the web-dashboard spawn branch.
+    std::env::set_var("PORT", "0");
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let args: Vec<String> = vec![
+        "--dry-run".to_string(),
+        "--did".to_string(),
+        "did:plc:daemon-web".to_string(),
+    ];
+    let result = skybouncer::daemon::run(&args, cancel).await;
+    assert!(result.is_ok(), "daemon run failed: {result:?}");
+
+    restore_env(&saved);
+}
