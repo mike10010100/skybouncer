@@ -119,8 +119,8 @@ parents unless explicitly requested.
 | S5 | Jetstream stream loop | reuse `skybase` | `StreamConfig::build_url` now wraps `build_subscription_url_full`; replaced hand-rolled jitter/doubling with `skybase::ingest::backoff::BackoffManager`; removed `apply_jitter`. | `[x]` |
 | S6 | `SessionCipher` AES-256-GCM envelope | pull up → `skyauth` | Added `skyauth::sealed::SealedBox` (`seal`/`open` + AAD + hex key + envelope prefix) with 10 new tests in `skyauth/tests/sealed_box_tests.rs`; added `CryptoError::{Seal,Open,InvalidEnvelope,Utf8}`. skybouncer `SessionCipher` is now a thin adapter; removed direct `ring` dep. Also bumped `skyauth`'s `rustls` 0.23.43→0.23.45 to clear RUSTSEC-2026-0285. | `[x]` |
 | S7 | AppView XRPC reads + pagination | pull up → `skybase` | Added `skybase::appview::AppViewClient` (typed profile/post/follows/followers/follow-records + generic `get`/`paginate` + `thumbnail_url`) with 8 wiremock tests; `AppViewContextEnricher` now delegates to it (~230 LOC removed from skybouncer). | `[x]` |
-| S8 | Bot chat client | pull up → `skybase` (defer) | Deferred until S5/S7 patterns settle. | `[!]` |
-| S9 | Lexicon record models | pull up → `skybase` (defer) | Deferred (larger cross-repo lift). | `[!]` |
+| S8 | Bot chat client | pull up → `skybase` | Moved `ChatClient` + all `chat.bsky.convo.*` types to `skybase::chat` (7 new tests); added `SkybaseError::Chat`. skybouncer re-exports from `skybase`, deleting `bot/{client,types}.rs` (~1,225 LOC). | `[x]` |
+| S9 | Lexicon record models | pull up → `skybase` (partial) | Moved richtext lexicon (ByteSlice/Facet/FacetFeature/FacetIndex/`extract_link_facets`) to `skybase::lexicon` (10 unit tests). Feed/graph record models still deferred. | `[~]` |
 
 ---
 
@@ -152,6 +152,14 @@ parents unless explicitly requested.
 ---
 
 ## Progress log
+
+- 2026-10-06 (S8 + partial S9): Pulled the ATProto Chat client (`ChatClient` + `chat.bsky.convo.*`
+  types) into `skybase::chat` and the richtext lexicon (`ByteSlice`/`Facet`/`FacetFeature`/
+  `extract_link_facets`) into `skybase::lexicon`; added `SkybaseError::Chat` and
+  `From<SkybaseError> for SkybouncerError`. skybouncer deleted `bot/{client,types}.rs`
+  (~1,225 LOC) and re-exports from skybase. Verified: skybouncer 437 + 55 tests pass,
+  clippy (`--all-targets` + lean core) clean; skybase 294 tests pass, clippy clean;
+  skyauth 890 tests pass. All fmt/deny clean.
 
 - 2026-10-05: Plan authored from two-codebase exploration + standards review. Baseline
   quality gates captured: 446 tests pass, fmt/clippy/deny clean.

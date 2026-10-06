@@ -47,3 +47,21 @@ impl From<rusqlite::Error> for SkybouncerError {
         Self::Database(err.to_string())
     }
 }
+
+impl From<skybase::SkybaseError> for SkybouncerError {
+    fn from(err: skybase::SkybaseError) -> Self {
+        use skybase::SkybaseError;
+        match err {
+            SkybaseError::Chat(msg) => Self::Chat(msg),
+            SkybaseError::Repo(msg) => Self::Repo(msg),
+            SkybaseError::Config(msg) => Self::Config(msg),
+            SkybaseError::Auth(e) => Self::Auth(e.to_string()),
+            SkybaseError::Index(msg) => Self::Database(msg),
+            SkybaseError::Storage(msg) => Self::Database(msg),
+            SkybaseError::Event(msg) => Self::Ingestion(msg),
+            SkybaseError::Network(e) => Self::Http(e),
+            SkybaseError::Serialization(e) => Self::Serialization(e),
+            SkybaseError::Internal(msg) => Self::Config(msg),
+        }
+    }
+}
