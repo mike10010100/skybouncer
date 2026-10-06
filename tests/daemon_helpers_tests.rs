@@ -100,3 +100,81 @@ async fn provision_pds_resources_creates_lists_for_protected_did() {
     let provisioned = skybouncer::daemon::provision_pds_resources(&engine, &dids).await;
     assert_eq!(provisioned, 1);
 }
+
+#[tokio::test]
+async fn resolve_bot_client_no_credentials_returns_none() {
+    let r = skybouncer::daemon::resolve_bot_client(
+        None,
+        None,
+        "https://bsky.social",
+        "https://api.bsky.chat",
+        None,
+        None,
+    )
+    .await;
+    assert!(r.is_none());
+}
+
+#[tokio::test]
+async fn resolve_bot_client_with_token_returns_client() {
+    // A token + DID yields a ChatClient without any network call.
+    let r = skybouncer::daemon::resolve_bot_client(
+        None,
+        None,
+        "https://bsky.social",
+        "https://api.bsky.chat",
+        Some("some_token".to_string()),
+        Some("did:plc:bot".to_string()),
+    )
+    .await;
+    let (client, did) = r.expect("client");
+    assert_eq!(did, "did:plc:bot");
+    assert_eq!(client.current_access_token().await, "some_token");
+}
+
+#[tokio::test]
+async fn resolve_bot_client_app_password_login_success() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.server.createSession"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": "did:plc:botresolved",
+            "accessJwt": "at-jwt",
+            "refreshJwt": "rt-jwt"
+        })))
+        .mount(&server)
+        .await;
+
+    let r = skybouncer::daemon::resolve_bot_client(
+        Some("bot.bsky.social".to_string()),
+        Some("app-password".to_string()),
+        &server.uri(),
+        &server.uri(),
+        None,
+        None,
+    )
+    .await;
+    let (_client, did) = r.expect("client");
+    assert_eq!(did, "did:plc:botresolved");
+}
+
+#[tokio::test]
+async fn resolve_bot_client_app_password_login_failure_returns_none() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.server.createSession"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("bad password"))
+        .mount(&server)
+        .await;
+
+    let r = skybouncer::daemon::resolve_bot_client(
+        Some("bot.bsky.social".to_string()),
+        Some("wrong".to_string()),
+        &server.uri(),
+        &server.uri(),
+        None,
+        None,
+    )
+    .await;
+    assert!(r.is_none());
+}

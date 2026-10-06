@@ -92,6 +92,50 @@ pub async fn provision_pds_resources(
     provisioned
 }
 
+/// Resolves an optional ATProto DM bot client from the provided credentials/token.
+///
+/// Prefers App-Password login (handle + password); otherwise falls back to a bearer
+/// token + DID. Returns `None` when neither is fully configured or authentication fails.
+pub async fn resolve_bot_client(
+    bot_handle: Option<String>,
+    bot_password: Option<String>,
+    pds_endpoint: &str,
+    chat_endpoint: &str,
+    chat_token: Option<String>,
+    bot_did: Option<String>,
+) -> Option<(crate::ChatClient, String)> {
+    if let (Some(handle), Some(pass)) = (bot_handle, bot_password) {
+        info!(handle = %handle, "Authenticating ATProto DM bot via App Password...");
+        match crate::ChatClient::login_with_app_password(
+            pds_endpoint,
+            chat_endpoint,
+            &handle,
+            &pass,
+        )
+        .await
+        {
+            Ok((client, resolved_did)) => {
+                info!(did = %resolved_did, "ATProto DM bot authenticated successfully");
+                Some((client, resolved_did))
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to authenticate bot with App Password");
+                None
+            }
+        }
+    } else if let (Some(token), Some(did)) = (chat_token, bot_did) {
+        match crate::ChatClient::new(chat_endpoint, token) {
+            Ok(c) => Some((c, did)),
+            Err(e) => {
+                error!(error = %e, "Failed to initialize ChatClient from token");
+                None
+            }
+        }
+    } else {
+        None
+    }
+}
+
 /// Runs the live 24/7 Jetstream firehose moderation daemon until `cancel` is triggered.
 ///
 /// Performs startup logging, engine construction, cold-start hydration, PDS provisioning
@@ -264,36 +308,15 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
         .filter(|d| !d.contains("example") && !d.contains("skybouncerbotdid"))
         .or_else(|| config.protected_dids.iter().next().cloned());
 
-    let bot_client_and_did = if let (Some(handle), Some(pass)) = (bot_handle, bot_password) {
-        info!(handle = %handle, "Authenticating ATProto DM bot via App Password...");
-        match crate::ChatClient::login_with_app_password(
-            &pds_endpoint,
-            &chat_endpoint,
-            &handle,
-            &pass,
-        )
-        .await
-        {
-            Ok((client, resolved_did)) => {
-                info!(did = %resolved_did, "ATProto DM bot authenticated successfully");
-                Some((client, resolved_did))
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to authenticate bot with App Password");
-                None
-            }
-        }
-    } else if let (Some(token), Some(did)) = (chat_token, bot_did) {
-        match crate::ChatClient::new(chat_endpoint, token) {
-            Ok(c) => Some((c, did)),
-            Err(e) => {
-                error!(error = %e, "Failed to initialize ChatClient from token");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let bot_client_and_did = resolve_bot_client(
+        bot_handle,
+        bot_password,
+        &pds_endpoint,
+        &chat_endpoint,
+        chat_token,
+        bot_did,
+    )
+    .await;
 
     if let Some((chat_client, did)) = bot_client_and_did {
         let handler = crate::BotCommandHandler::new(std::sync::Arc::new(engine.clone()), did)
