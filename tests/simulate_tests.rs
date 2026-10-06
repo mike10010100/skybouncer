@@ -497,3 +497,54 @@ async fn engine_modlist_ops_allowlist_and_pardon() {
     assert!(!engine.is_bounced("did:plc:nobody").unwrap());
     assert!(engine.get_bounced_user("did:plc:nobody").unwrap().is_none());
 }
+
+#[tokio::test]
+async fn engine_evaluate_candidate_rate_limited_and_paused() {
+    use skybouncer::limiter::RateLimiterConfig;
+
+    // Rate limiter configured to allow 0 evaluations => immediate RateLimited.
+    let pds = common::MockPdsServer::start().await;
+    let cache = std::sync::Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let modlist = std::sync::Arc::new(skybouncer::modlist::ModListManager::from_shared_cache(
+        std::sync::Arc::clone(&cache),
+    ));
+    let classifier: std::sync::Arc<dyn skybouncer::classifier::Classifier> =
+        std::sync::Arc::new(MockClassifier::new(Verdict::permitted("ok")));
+    let protected = "did:plc:alice".to_string();
+    let mut dids = HashSet::new();
+    dids.insert(protected.clone());
+    let config = SkybouncerConfig::new(dids, RuleRubric::new("x", Sensitivity::Medium))
+        .with_rate_limiter_config(RateLimiterConfig {
+            max_evaluations: 0,
+            window_duration: std::time::Duration::from_secs(3600),
+        });
+    let engine = SkybouncerEngine::builder(config)
+        .with_classifier(classifier)
+        .with_cache(std::sync::Arc::clone(&cache))
+        .with_modlist_manager(modlist)
+        .with_pds_client(std::sync::Arc::new(pds.pds_client(&protected)))
+        .build()
+        .expect("engine");
+
+    let interaction = skybouncer::matcher::Interaction::mock_test_candidate(
+        "did:plc:author",
+        &protected,
+        "hello",
+    );
+    let outcome = engine
+        .evaluate_candidate(interaction.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        skybouncer::engine::InteractionOutcome::RateLimited { .. }
+    ));
+
+    // Paused engine => Paused outcome before any model call.
+    let _ = engine.pause();
+    let outcome = engine.evaluate_candidate(interaction).await.unwrap();
+    assert!(matches!(
+        outcome,
+        skybouncer::engine::InteractionOutcome::Paused { .. }
+    ));
+}
