@@ -3,7 +3,13 @@
 //! These exercise `run_cli_status`, `run_cli_pardon`, and `run_cli_simulate` against a
 //! mock HTTP daemon (wiremock), plus the offline simulation path.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    missing_docs,
+    clippy::await_holding_lock
+)]
 
 use serde_json::json;
 use skybouncer::app::{run_cli_pardon, run_cli_simulate, run_cli_status};
@@ -394,4 +400,90 @@ async fn run_cli_status_with_populated_stats_and_shadow_mode() {
 
     let a = args(&["--url", &server.uri()]);
     run_cli_status(&a).await.expect("status with stats");
+}
+
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn set_resolve_url(url: &str) {
+    std::env::set_var("SKYBOUNCER_RESOLVE_HANDLE_URL", url);
+}
+
+#[tokio::test]
+async fn run_cli_pardon_resolves_handle_via_override() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let resolver = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.identity.resolveHandle"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": "did:plc:resolved-spammer"
+        })))
+        .mount(&resolver)
+        .await;
+
+    let daemon = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/pardon"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "subject_did": "did:plc:resolved-spammer",
+            "pardoned": true,
+            "message": "ok"
+        })))
+        .mount(&daemon)
+        .await;
+
+    let resolve_base = format!("{}/xrpc/com.atproto.identity.resolveHandle", resolver.uri());
+    set_resolve_url(&resolve_base);
+    let a = args(&["@Spammer.Bsky.Social", "--url", &daemon.uri()]);
+    let res = run_cli_pardon(&a).await;
+    std::env::remove_var("SKYBOUNCER_RESOLVE_HANDLE_URL");
+    res.expect("handle resolution ok");
+}
+
+#[tokio::test]
+async fn run_cli_pardon_handle_resolution_http_error() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let resolver = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.identity.resolveHandle"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad handle"))
+        .mount(&resolver)
+        .await;
+    set_resolve_url(&format!(
+        "{}/xrpc/com.atproto.identity.resolveHandle",
+        resolver.uri()
+    ));
+    let a = args(&["@nobody.example", "--url", "http://127.0.0.1:1"]);
+    let res = run_cli_pardon(&a).await;
+    std::env::remove_var("SKYBOUNCER_RESOLVE_HANDLE_URL");
+    assert!(matches!(res, Err(skybouncer::SkybouncerError::Config(_))));
+}
+
+#[tokio::test]
+async fn run_cli_pardon_handle_resolution_missing_did_field() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let resolver = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.identity.resolveHandle"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "nope": true })))
+        .mount(&resolver)
+        .await;
+    set_resolve_url(&format!(
+        "{}/xrpc/com.atproto.identity.resolveHandle",
+        resolver.uri()
+    ));
+    let a = args(&["@ghost.example", "--url", "http://127.0.0.1:1"]);
+    let res = run_cli_pardon(&a).await;
+    std::env::remove_var("SKYBOUNCER_RESOLVE_HANDLE_URL");
+    assert!(matches!(res, Err(skybouncer::SkybouncerError::Config(_))));
+}
+
+#[tokio::test]
+async fn dispatch_daemon_with_subcommand_args_reaches_daemon() {
+    use skybouncer::app::dispatch;
+    use tokio_util::sync::CancellationToken;
+    // `daemon <extra>` exercises the args.len() > 2 branch; cancel immediately.
+    let a = args(&["skybouncer", "daemon", "--dry-run"]);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let _ = dispatch(&a, cancel).await;
 }

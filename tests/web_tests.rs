@@ -3212,3 +3212,88 @@ async fn test_oauth_callback_success_seeds_session_cookie() {
         "expected session cookie, got {cookie}"
     );
 }
+
+async fn setup_web_with_mock_enricher(
+    protected_did: &str,
+) -> (Arc<SkybouncerEngine>, axum::Router) {
+    use skybouncer::enricher::MockContextEnricher;
+    let pds = MockPdsServer::start().await;
+    let cache = Arc::new(DeduplicationCache::open_in_memory().expect("cache"));
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let pds_client = Arc::new(pds.pds_client(protected_did));
+    let classifier = Arc::new(skybouncer::classifier::MockClassifier::new(
+        Verdict::permitted("ok"),
+    ));
+    let enricher = Arc::new(MockContextEnricher::new());
+    enricher.set_handle("friend.bsky.social", "did:plc:friend-resolved");
+
+    let mut dids = HashSet::new();
+    dids.insert(protected_did.to_string());
+    let config = SkybouncerConfig::new(dids, rubric).with_admin_did(protected_did);
+    let engine = Arc::new(
+        SkybouncerEngine::builder(config)
+            .with_classifier(classifier)
+            .with_cache(Arc::clone(&cache))
+            .with_modlist_manager(modlist)
+            .with_pds_client(pds_client)
+            .with_follow_graph(follow_graph)
+            .with_gate(gate)
+            .with_enricher(enricher)
+            .build()
+            .expect("engine"),
+    );
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let router = create_web_router(Arc::clone(&engine), None, metadata);
+    (engine, router)
+}
+
+#[tokio::test]
+async fn test_api_allowlist_add_by_handle_resolves_and_removes_by_handle() {
+    let (engine, app) = setup_web_with_mock_enricher("did:plc:alice").await;
+    let token = create_test_session(&engine, "did:plc:alice");
+
+    // Add by @handle -> the handler resolves via the enricher and stores the DID.
+    let add = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/allowlist")
+                .header("cookie", format!("skybouncer_session={token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject": "@friend.bsky.social",
+                        "protected_did": null,
+                        "reason": null
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(add.status(), StatusCode::OK);
+    assert!(engine.is_allowlisted("did:plc:alice", "did:plc:friend-resolved"));
+
+    // Remove by @handle -> resolves and removes.
+    let del = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/allowlist/@friend.bsky.social")
+                .header("cookie", format!("skybouncer_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::OK);
+}
