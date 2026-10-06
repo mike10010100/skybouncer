@@ -443,4 +443,131 @@ mod tests {
         graph.clear();
         assert!(!graph.is_followed_by(protected, "did:plc:a"));
     }
+
+    fn candidate() -> Interaction {
+        Interaction::mock_test_candidate("did:plc:author", "did:plc:target", "hi")
+    }
+
+    #[test]
+    fn gate_decision_accessors() {
+        let decision = GateDecision::Candidate(candidate());
+        assert!(decision.is_candidate());
+        assert!(decision.candidate().is_some());
+        assert!(decision.bypass_reason().is_none());
+        assert!(decision.clone().into_candidate().is_some());
+
+        let bypassed = GateDecision::Bypassed {
+            reason: BypassReason::SelfInteraction,
+            interaction: candidate(),
+        };
+        assert!(!bypassed.is_candidate());
+        assert!(bypassed.candidate().is_none());
+        assert_eq!(
+            bypassed.bypass_reason(),
+            Some(BypassReason::SelfInteraction)
+        );
+        assert!(bypassed.into_candidate().is_none());
+    }
+
+    #[test]
+    fn gate_allowlist_accessors_and_flags() {
+        let graph = Arc::new(FollowGraph::new());
+        let gate = NonFollowedGate::new(Arc::clone(&graph));
+        assert!(gate.follow_graph().is_empty());
+        assert!(!gate.is_allowlisted("did:plc:t", "did:plc:a"));
+
+        gate.add_to_allowlist("did:plc:t", "did:plc:a");
+        assert!(gate.is_allowlisted("did:plc:t", "did:plc:a"));
+        assert!(gate.allowlist().read().contains_key("did:plc:t"));
+        assert!(gate.remove_from_allowlist("did:plc:t", "did:plc:a"));
+        assert!(!gate.remove_from_allowlist("did:plc:t", "did:plc:missing"));
+
+        // Bypass flag defaults true and can be overridden.
+        assert!(gate.bypass_incoming_followers("did:plc:t"));
+        gate.set_bypass_incoming_followers("did:plc:t", false);
+        assert!(!gate.bypass_incoming_followers("did:plc:t"));
+        assert!(gate.bypass_flags().read().contains_key("did:plc:t"));
+    }
+
+    #[test]
+    fn gate_new_with_shared_allowlist_observes_preloaded_entries() {
+        let graph = Arc::new(FollowGraph::new());
+        let mut map = HashMap::new();
+        map.insert(
+            "did:plc:t".to_string(),
+            std::iter::once("did:plc:preloaded".to_string()).collect(),
+        );
+        let allowlist = Arc::new(RwLock::new(map));
+        let gate = NonFollowedGate::new_with_allowlist(Arc::clone(&graph), Arc::clone(&allowlist));
+        assert!(gate.is_allowlisted("did:plc:t", "did:plc:preloaded"));
+
+        // evaluate() bypasses the preloaded author via allowlist.
+        let mut i = candidate();
+        i.target_did = "did:plc:t".to_string();
+        i.author_did = "did:plc:preloaded".to_string();
+        let decision = gate.evaluate(i);
+        assert_eq!(
+            decision.bypass_reason(),
+            Some(BypassReason::AllowlistedAuthor)
+        );
+    }
+
+    #[test]
+    fn gate_filter_returns_option() {
+        let graph = Arc::new(FollowGraph::new());
+        let gate = NonFollowedGate::new(graph);
+        assert!(gate.filter(candidate()).is_some());
+    }
+
+    #[test]
+    fn static_check_interaction_variants() {
+        let graph = FollowGraph::new();
+        // Self interaction bypassed.
+        let mut self_i = candidate();
+        self_i.target_did = self_i.author_did.clone();
+        assert_eq!(
+            NonFollowedGate::check_interaction(self_i, &graph).bypass_reason(),
+            Some(BypassReason::SelfInteraction)
+        );
+
+        // Followed author bypassed.
+        graph.add_follow("did:plc:target", "rk", "did:plc:author");
+        assert_eq!(
+            NonFollowedGate::check_interaction(candidate(), &graph).bypass_reason(),
+            Some(BypassReason::FollowedAuthor)
+        );
+
+        // Incoming follower bypassed (on a fresh graph).
+        let graph2 = FollowGraph::new();
+        graph2.add_follower("did:plc:target", "did:plc:author", "rk");
+        assert_eq!(
+            NonFollowedGate::check_interaction(candidate(), &graph2).bypass_reason(),
+            Some(BypassReason::FollowerAuthor)
+        );
+
+        // Plain candidate.
+        let graph3 = FollowGraph::new();
+        assert!(NonFollowedGate::check_interaction(candidate(), &graph3).is_candidate());
+    }
+
+    #[test]
+    fn static_check_interaction_with_allowlist_covers_all_stages() {
+        let graph = FollowGraph::new();
+        let allowlist = HashMap::new();
+        assert!(
+            NonFollowedGate::check_interaction_with_allowlist(candidate(), &graph, &allowlist)
+                .is_candidate()
+        );
+
+        let mut allow = HashMap::new();
+        allow.insert(
+            "did:plc:target".to_string(),
+            std::iter::once("did:plc:author".to_string()).collect(),
+        );
+        assert_eq!(
+            NonFollowedGate::check_interaction_with_allowlist(candidate(), &graph, &allow)
+                .bypass_reason(),
+            Some(BypassReason::AllowlistedAuthor)
+        );
+    }
 }

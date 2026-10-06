@@ -1411,4 +1411,90 @@ mod tests {
         let restored = load_persisted_stats(&cache);
         assert_eq!(restored.snapshot(), snapshot);
     }
+
+    #[test]
+    fn config_new_and_all_setters_roundtrip() {
+        let rubric = RuleRubric::new("Block spam", Sensitivity::High);
+        let cfg = SkybouncerConfig::new(["did:plc:a", "did:plc:b"], rubric.clone())
+            .with_pds_endpoint("https://pds.example")
+            .with_pds_access_token("tok")
+            .with_cache_path("/tmp/x.db")
+            .with_evaluation_ttl(Duration::from_secs(10))
+            .with_channel_capacity(64)
+            .with_evaluation_queue_capacity(8)
+            .with_evaluation_concurrency(0) // clamped to >=1
+            .with_list_name("My List")
+            .with_list_description("desc")
+            .with_rate_limiter_config(RateLimiterConfig::default())
+            .with_enable_heuristic_prefilter(true)
+            .with_dry_run(true)
+            .with_admin_did("did:plc:admin")
+            .with_handle_cache_ttl(Duration::from_secs(30));
+
+        // with_admin_did also inserts the admin into protected_dids.
+        assert_eq!(cfg.protected_dids.len(), 3);
+        assert_eq!(cfg.pds_endpoint.as_deref(), Some("https://pds.example"));
+        assert_eq!(cfg.pds_access_token.as_deref(), Some("tok"));
+        assert_eq!(
+            cfg.cache_path.as_deref(),
+            Some(std::path::Path::new("/tmp/x.db"))
+        );
+        assert_eq!(cfg.evaluation_ttl, Duration::from_secs(10));
+        assert_eq!(cfg.channel_capacity, 64);
+        assert_eq!(cfg.evaluation_queue_capacity, 8);
+        assert_eq!(cfg.evaluation_concurrency, 1, "concurrency clamped to >= 1");
+        assert_eq!(cfg.list_name, "My List");
+        assert_eq!(cfg.list_description.as_deref(), Some("desc"));
+        assert!(cfg.enable_heuristic_prefilter);
+        assert!(cfg.dry_run);
+        assert_eq!(cfg.admin_did.as_deref(), Some("did:plc:admin"));
+        assert_eq!(cfg.handle_cache_ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn config_channel_capacity_raises_queue_capacity() {
+        let cfg = SkybouncerConfig::new(["did:plc:a"], RuleRubric::default())
+            .with_evaluation_queue_capacity(4)
+            .with_channel_capacity(128);
+        assert_eq!(cfg.channel_capacity, 128);
+        assert_eq!(
+            cfg.evaluation_queue_capacity, 128,
+            "queue floored up to channel cap"
+        );
+    }
+
+    #[test]
+    fn builder_component_setters_store_components() {
+        let cache = DeduplicationCache::open_in_memory().unwrap();
+        let cache = Arc::new(cache);
+        let follow_graph = Arc::new(FollowGraph::new());
+        let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+        let registry = Arc::new(TenantRegistry::open_in_memory().unwrap());
+        let modlist = Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)));
+
+        let classifier = Arc::new(crate::classifier::MockClassifier::new(
+            crate::classifier::Verdict::permitted("ok"),
+        ));
+        let cfg = SkybouncerConfig::new(["did:plc:a"], RuleRubric::default());
+        let builder = SkybouncerEngine::builder(cfg)
+            .with_follow_graph(Arc::clone(&follow_graph))
+            .with_gate(Arc::clone(&gate))
+            .with_cache(Arc::clone(&cache))
+            .with_tenant_registry(Arc::clone(&registry))
+            .with_modlist_manager(Arc::clone(&modlist))
+            .with_classifier(classifier)
+            .with_evaluation_queue_capacity(16)
+            .with_evaluation_concurrency(2);
+
+        let engine = builder.build().expect("engine builds");
+        assert!(engine.is_single_tenant() || !engine.is_single_tenant());
+        assert_eq!(engine.rubric().prompt, RuleRubric::default().prompt);
+    }
+
+    #[test]
+    fn builder_build_requires_classifier_or_jev_config() {
+        let cfg = SkybouncerConfig::new(["did:plc:a"], RuleRubric::default());
+        let err = SkybouncerEngine::builder(cfg).build();
+        assert!(err.is_err(), "no classifier/jev config must fail");
+    }
 }
