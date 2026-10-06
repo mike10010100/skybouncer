@@ -717,6 +717,56 @@ mod tests {
         assert!(serde_json::from_str::<Sensitivity>("\"bogus\"").is_err());
         // Low sensitivity is the strictest (highest confidence bar).
         assert!(Sensitivity::Low.threshold() > Sensitivity::Medium.threshold());
+    }
+
+    #[test]
+    fn test_rubric_parse_inline_trailing_directives() {
+        // Inline `duration:` with no preceding prompt text leaves only the directive line.
+        let r = RuleRubric::parse("Block spam\n[duration: 30d]").unwrap();
+        assert_eq!(r.bounce_duration, BounceDuration::Timeout30d);
+        assert_eq!(r.prompt, "Block spam");
+
+        // Inline `timeout:` form.
+        let r = RuleRubric::parse("Block spam [timeout: 24h]").unwrap();
+        assert_eq!(r.bounce_duration, BounceDuration::Cooldown24h);
+        assert_eq!(r.prompt, "Block spam");
+
+        // Inline `sensitivity:` form.
+        let r = RuleRubric::parse("Block spam [sensitivity: high]").unwrap();
+        assert_eq!(r.sensitivity, Sensitivity::High);
+
+        // A bracketed token that is NOT a recognized directive is kept as prompt text.
+        let r = RuleRubric::parse("Block spam [note]").unwrap();
+        assert!(r.prompt.contains("[note]"));
+
+        // An unbalanced bracket keeps the raw line as prompt text.
+        let r = RuleRubric::parse("Block spam [unclosed").unwrap();
+        assert!(r.prompt.contains("[unclosed"));
+
+        // `bypass_followers:` colon form.
+        let r = RuleRubric::parse("[bypass_followers: false]\nBlock spam").unwrap();
+        assert!(!r.bypass_incoming_followers);
+    }
+
+    #[test]
+    fn test_bounce_duration_from_str_paths() {
+        assert_eq!(
+            "cooldown_24h".parse::<BounceDuration>().unwrap(),
+            BounceDuration::Cooldown24h
+        );
+        assert_eq!(
+            "1w".parse::<BounceDuration>().unwrap(),
+            BounceDuration::Timeout7d
+        );
+        assert_eq!(
+            "1m".parse::<BounceDuration>().unwrap(),
+            BounceDuration::Timeout30d
+        );
+        assert_eq!(
+            "3600".parse::<BounceDuration>().unwrap(),
+            BounceDuration::Custom(3600)
+        );
+        assert!("nonsense".parse::<BounceDuration>().is_err());
         assert!(Sensitivity::Medium.threshold() > Sensitivity::High.threshold());
     }
 }
