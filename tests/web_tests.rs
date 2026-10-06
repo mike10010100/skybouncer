@@ -2994,3 +2994,67 @@ async fn test_oauth_login_and_callback_with_configured_client() {
         .unwrap();
     assert!(cb2.status().is_redirection());
 }
+
+#[tokio::test]
+async fn test_api_allowlist_target_did_and_not_found_branches() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let admin_token = create_test_session(&engine, "did:plc:alice");
+    let bob_token = create_test_session(&engine, "did:plc:bob");
+
+    // Admin adds to a target user's allowlist (protected_did set).
+    let add = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/allowlist")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject": "did:plc:friend2",
+                        "protected_did": "did:plc:bob",
+                        "reason": "target"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(add.status(), StatusCode::OK);
+
+    // Bob removes it (own allowlist, not found after removal second time).
+    let del1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/allowlist/did:plc:friend2")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del1.status(), StatusCode::OK);
+
+    // Removing again yields the "not found" message.
+    let del2 = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/allowlist/did:plc:friend2")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del2.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(del2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let resp: skybouncer::web::RemoveAllowlistResponse = serde_json::from_slice(&body).unwrap();
+    assert!(!resp.removed);
+}
