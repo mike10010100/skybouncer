@@ -1100,3 +1100,138 @@ async fn test_adversarial_empty_vs_bearer_auth_headers() {
     let verdict = classifier.classify(&interaction).await.unwrap();
     assert!(verdict.is_permitted());
 }
+
+// =============================================================================
+// 6. Classifier Accessors, Endpoint Kind Resolution & Category Mapping
+// =============================================================================
+
+#[test]
+fn test_endpoint_kind_as_str_and_url_resolution() {
+    use skybouncer::classifier::JevEndpointKind;
+    assert_eq!(JevEndpointKind::StandardJev.as_str(), "standard_jev");
+    assert_eq!(JevEndpointKind::Ollama.as_str(), "ollama");
+    assert_eq!(JevEndpointKind::SystemOne.as_str(), "system_one");
+}
+
+fn classifier_for_url(base_url: &str) -> JevClassifier {
+    JevClassifier::new(
+        JevConfig {
+            base_url: base_url.to_string(),
+            api_key: Some("k".to_string()),
+            model: "m".to_string(),
+            timeout: Duration::from_millis(500),
+            max_retries: 0,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_classifier_accessors_and_endpoint_kinds() {
+    let c = classifier_for_url("https://api.jev.ai");
+    assert_eq!(c.model(), "m");
+    assert_eq!(c.config().model, "m");
+    assert_eq!(c.rubric().prompt, RuleRubric::default().prompt);
+    assert!(!c.classify_url().is_empty());
+
+    // Ollama endpoint detection from base URL.
+    let ollama = classifier_for_url("http://localhost:11434");
+    assert_eq!(
+        ollama.endpoint_kind(),
+        skybouncer::classifier::JevEndpointKind::Ollama
+    );
+
+    // SystemOne endpoint detection.
+    let sysone = classifier_for_url("https://api.example.com/v1/systemone");
+    assert_eq!(
+        sysone.endpoint_kind(),
+        skybouncer::classifier::JevEndpointKind::SystemOne
+    );
+
+    // set_rubric swaps the active rubric.
+    let new_rubric = RuleRubric::new("Block all spam", skybouncer::classifier::Sensitivity::High);
+    c.set_rubric(new_rubric.clone());
+    assert_eq!(c.rubric().prompt, "Block all spam");
+}
+
+#[tokio::test]
+async fn test_standard_jev_category_mapping_matrix() {
+    // Each category string maps to the expected ViolationCategory.
+    let cases = [
+        ("spam", ViolationCategory::Spam),
+        ("crypto_spam", ViolationCategory::CryptoSpam),
+        ("crypto-spam", ViolationCategory::CryptoSpam),
+        ("harassment", ViolationCategory::Harassment),
+        ("sea_lioning", ViolationCategory::SeaLioning),
+        ("sealioning", ViolationCategory::SeaLioning),
+        ("sealioning_or_bad_faith", ViolationCategory::SeaLioning),
+        ("bad_faith", ViolationCategory::SeaLioning),
+        ("phishing", ViolationCategory::Phishing),
+        ("hate_speech", ViolationCategory::HateSpeech),
+        ("hatespeech", ViolationCategory::HateSpeech),
+    ];
+    for (label, expected) in cases {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/classify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "violates": true,
+                "confidence": 0.99,
+                "reason": "test",
+                "category": label
+            })))
+            .mount(&server)
+            .await;
+
+        let classifier = classifier_for_url(&server.uri());
+        let interaction = sample_interaction("test content");
+        let verdict = classifier.classify(&interaction).await.unwrap();
+        match verdict {
+            skybouncer::classifier::Verdict::Violation { category, .. } => {
+                assert_eq!(category, expected, "category mismatch for {label}");
+            }
+            other => panic!("expected violation for {label}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_unknown_category_maps_to_custom() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "violates": true,
+            "confidence": 0.99,
+            "reason": "test",
+            "category": "totally_novel_category"
+        })))
+        .mount(&server)
+        .await;
+
+    let classifier = classifier_for_url(&server.uri());
+    let interaction = sample_interaction("test content");
+    match classifier.classify(&interaction).await.unwrap() {
+        skybouncer::classifier::Verdict::Violation { category, .. } => {
+            assert!(matches!(category, ViolationCategory::Custom(_)));
+        }
+        other => panic!("expected violation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_all_server_errors_exhaust_retries() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+
+    // max_retries=1 => two attempts, both 500, then a classifier error.
+    let classifier = classifier_for_url(&server.uri());
+    let interaction = sample_interaction("test");
+    let err = classifier.classify(&interaction).await.unwrap_err();
+    assert!(err.to_string().contains("Jev API server error"));
+}
