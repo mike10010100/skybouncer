@@ -374,3 +374,55 @@ async fn engine_lifecycle_maintenance_and_prune() {
     // persist_stats is callable on an in-memory cache.
     engine.persist_stats().expect("persist");
 }
+
+#[test]
+fn config_from_env_reads_fallback_model_and_flags() {
+    // Isolate and set the fallback-model + heuristic env vars.
+    for k in [
+        "FALLBACK_MODEL",
+        "SKYBOUNCER_FALLBACK_MODEL",
+        "FALLBACK_API_BASE_URL",
+        "FALLBACK_API_KEY",
+        "FALLBACK_TIMEOUT_MS",
+        "FALLBACK_MAX_RETRIES",
+        "ENABLE_HEURISTIC_PREFILTER",
+        "SKYBOUNCER_ENABLE_HEURISTIC_PREFILTER",
+        "DRY_RUN",
+        "SKYBOUNCER_DRY_RUN",
+        "PROTECTED_DIDS",
+        "SKYBOUNCER_PROTECTED_DIDS",
+        "ADMIN_DID",
+        "SKYBOUNCER_ADMIN_DID",
+    ] {
+        std::env::remove_var(k);
+    }
+    std::env::set_var("FALLBACK_MODEL", "vision-model");
+    std::env::set_var("FALLBACK_API_BASE_URL", "http://localhost:9999");
+    std::env::set_var("FALLBACK_TIMEOUT_MS", "1234");
+    std::env::set_var("FALLBACK_MAX_RETRIES", "3");
+    std::env::set_var("ENABLE_HEURISTIC_PREFILTER", "1");
+    std::env::set_var("DRY_RUN", "true");
+    std::env::set_var("PROTECTED_DIDS", "did:plc:a, did:plc:b");
+
+    let cfg = SkybouncerConfig::from_env().expect("from_env");
+    let fb = cfg.fallback_jev_config.expect("fallback configured");
+    assert_eq!(fb.model, "vision-model");
+    assert_eq!(fb.base_url, "http://localhost:9999");
+    assert_eq!(fb.timeout.as_millis(), 1234);
+    assert_eq!(fb.max_retries, 3);
+    assert!(cfg.enable_heuristic_prefilter);
+    assert!(cfg.dry_run);
+    assert_eq!(cfg.protected_dids.len(), 2);
+
+    for k in [
+        "FALLBACK_MODEL",
+        "FALLBACK_API_BASE_URL",
+        "FALLBACK_TIMEOUT_MS",
+        "FALLBACK_MAX_RETRIES",
+        "ENABLE_HEURISTIC_PREFILTER",
+        "DRY_RUN",
+        "PROTECTED_DIDS",
+    ] {
+        std::env::remove_var(k);
+    }
+}

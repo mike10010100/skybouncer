@@ -329,3 +329,63 @@ pub async fn run_web_server(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_server_config_default_new_and_accessors() {
+        let d = WebServerConfig::default();
+        assert_eq!(d.host, DEFAULT_WEB_HOST);
+        assert_eq!(d.port, DEFAULT_WEB_PORT);
+        assert!(d.client_id().ends_with("/oauth/client-metadata.json"));
+        assert!(d.redirect_uri().ends_with("/oauth/callback"));
+
+        let c = WebServerConfig::new("0.0.0.0", 8080)
+            .with_public_url("https://example.com/")
+            .with_oauth_endpoints("https://example.com/cid.json", "https://example.com/cb");
+        assert_eq!(c.host, "0.0.0.0");
+        assert_eq!(c.port, 8080);
+        assert_eq!(c.public_url, "https://example.com");
+        assert_eq!(c.client_id(), "https://example.com/cid.json");
+        assert_eq!(c.redirect_uri(), "https://example.com/cb");
+    }
+
+    #[test]
+    fn web_server_config_resolves_redirect_from_public_url() {
+        let c = WebServerConfig::new("127.0.0.1", 3000).with_public_url("https://sky.example");
+        assert_eq!(c.redirect_uri(), "https://sky.example/oauth/callback");
+        // An explicit redirect override wins.
+        let c2 = c.with_oauth_endpoints("id", "https://custom/cb");
+        assert_eq!(c2.redirect_uri(), "https://custom/cb");
+    }
+
+    #[test]
+    fn web_server_config_from_env_uses_defaults_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for k in [
+            "HOST",
+            "SKYBOUNCER_HOST",
+            "PORT",
+            "SKYBOUNCER_PORT",
+            "PUBLIC_URL",
+            "SKYBOUNCER_PUBLIC_URL",
+        ] {
+            std::env::remove_var(k);
+        }
+        let c = WebServerConfig::from_env();
+        assert_eq!(c.host, DEFAULT_WEB_HOST);
+        assert_eq!(c.port, DEFAULT_WEB_PORT);
+    }
+
+    #[test]
+    fn build_oauth_client_returns_metadata_always() {
+        let cfg = WebServerConfig::new("127.0.0.1", 3000);
+        let (_client, metadata) = build_oauth_client(&cfg);
+        assert!(metadata.client_id.contains("client-metadata.json"));
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
