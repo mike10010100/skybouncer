@@ -2865,3 +2865,63 @@ async fn test_api_me_and_toggle_branches() {
         .unwrap();
     assert_eq!(toggle_forbidden.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn test_api_admin_tenants_and_evaluations_filters() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+
+    // Enroll a tenant so the admin-tenants summary loop runs.
+    engine
+        .enroll_tenant(
+            skybouncer::tenant::Tenant::new("did:plc:tenant1").with_handle("tenant1.bsky.social"),
+        )
+        .expect("enroll");
+
+    let admin_token = create_test_session(&engine, "did:plc:alice");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/tenants")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tenants: skybouncer::web::AdminTenantsResponse = serde_json::from_slice(&body).unwrap();
+    assert!(tenants.total >= 1);
+    assert!(tenants.tenants.iter().any(|t| t.did == "did:plc:tenant1"));
+
+    // Evaluations with an admin target_did filter (admin path).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/evaluations?target_did=did:plc:tenant1")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Non-admin evaluations -> only their own.
+    let bob_token = create_test_session(&engine, "did:plc:bob");
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/evaluations")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
