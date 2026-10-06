@@ -24,6 +24,8 @@ use common::*;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use skyauth::client::OAuthClientMetadata;
 use skybouncer::classifier::{BounceDuration, RuleRubric, Sensitivity, Verdict};
@@ -3057,4 +3059,156 @@ async fn test_api_allowlist_target_did_and_not_found_branches() {
         .unwrap();
     let resp: skybouncer::web::RemoveAllowlistResponse = serde_json::from_slice(&body).unwrap();
     assert!(!resp.removed);
+}
+
+#[tokio::test]
+async fn test_oauth_login_missing_handle_with_client_and_callback_error_query() {
+    use skyauth::client::{AtprotoOAuthClient, OAuthClientMetadata};
+
+    let (engine, _cache, _pds, _app) = setup_test_web_environment("did:plc:alice").await;
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let client = std::sync::Arc::new(
+        AtprotoOAuthClient::builder()
+            .client_metadata(metadata.clone())
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+    let app = create_web_router(std::sync::Arc::clone(&engine), Some(client), metadata);
+
+    // Login without a handle (client present) -> 400.
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::BAD_REQUEST);
+
+    // Callback with an OAuth error query -> error redirect (to_callback_params Err path).
+    let cb = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?error=invalid_scope&error_description=nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(cb.status().is_redirection());
+    let loc = cb
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(loc.starts_with("/?auth=error"), "loc={loc}");
+}
+
+#[tokio::test]
+async fn test_oauth_callback_success_seeds_session_cookie() {
+    use skyauth::client::{AtprotoOAuthClient, OAuthClientMetadata, StoredStateEntry};
+    use skyauth::dpop::DPoPKey;
+    use skyauth::store::OAuthStateStore;
+
+    let (engine, _cache, _pds, _app) = setup_test_web_environment("did:plc:alice").await;
+
+    // Mock token endpoint returning a valid session.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("dpop-nonce", "test-nonce-1")
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "access_token": "at-issued-token",
+                    "token_type": "DPoP",
+                    "expires_in": 3600,
+                    "refresh_token": "rt-issued-token",
+                    "scope": "atproto",
+                    "sub": "did:plc:newuser"
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let issuer = server.uri();
+    let token_endpoint = format!("{issuer}/oauth/token");
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let state_store = std::sync::Arc::new(OAuthStateStore::new(Duration::from_secs(300)));
+    let client = std::sync::Arc::new(
+        AtprotoOAuthClient::builder()
+            .client_metadata(metadata.clone())
+            .state_store(std::sync::Arc::clone(&state_store))
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+
+    // Seed a state entry the callback will consume.
+    let entry = StoredStateEntry {
+        state: "state-success".to_string(),
+        client_id: "http://127.0.0.1:3000/oauth/client-metadata.json".to_string(),
+        code_verifier: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~ab"
+            .to_string(),
+        dpop_key: DPoPKey::generate(),
+        issuer: issuer.clone(),
+        did: Some("did:plc:newuser".to_string()),
+        handle: Some("newuser.bsky.social".to_string()),
+        redirect_uri: "http://127.0.0.1:3000/oauth/callback".to_string(),
+        pds_endpoint: issuer.clone(),
+        token_endpoint: token_endpoint.clone(),
+        scopes: "atproto".to_string(),
+        created_at: std::time::SystemTime::now(),
+        expires_in_secs: 300,
+    };
+    state_store
+        .insert_state_sync("state-success".to_string(), entry, Duration::from_secs(300))
+        .expect("seed state");
+
+    let app = create_web_router(std::sync::Arc::clone(&engine), Some(client), metadata);
+
+    let cb = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/oauth/callback?code=auth-code&state=state-success&iss={}",
+                    issuer
+                        .replace("http://", "http%3A%2F%2F")
+                        .replace(':', "%3A")
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(cb.status().is_redirection());
+    let loc = cb
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let cookie = cb
+        .headers()
+        .get(axum::http::header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        loc.contains("auth=success"),
+        "expected success redirect, got {loc}"
+    );
+    assert!(
+        cookie.contains("skybouncer_session="),
+        "expected session cookie, got {cookie}"
+    );
 }
