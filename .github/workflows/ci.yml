@@ -63,7 +63,7 @@ jobs:
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy, rustfmt, llvm-tools-preview
 
       - name: Enable Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -73,10 +73,10 @@ jobs:
             skybase -> skybase/target
             skyauth -> skyauth/target
 
-      - name: Install Cargo Deny
+      - name: Install CI Cargo Utilities
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny
+          tool: cargo-nextest,cargo-llvm-cov,cargo-deny,cargo-audit,cargo-mutants
 
       - name: 1. Enforce Code Formatting
         working-directory: skybouncer
@@ -90,13 +90,31 @@ jobs:
         working-directory: skybouncer
         run: cargo clippy --lib --no-default-features -- -D warnings
 
-      - name: 3. Run All Test Suites
-        working-directory: skybouncer
-        run: cargo test --all-targets
-
-      - name: 4. Dependency Governance & Advisory Scan (cargo-deny)
+      - name: 3. Dependency Policy Governance (cargo-deny)
         working-directory: skybouncer
         run: cargo deny check
+
+      - name: 4. Security Vulnerability Scan (cargo-audit)
+        working-directory: skybouncer
+        run: cargo audit
+
+      - name: 5. Run Test Suite (cargo-nextest)
+        working-directory: skybouncer
+        run: cargo nextest run --all-targets
+
+      - name: 6. Run Documentation Tests
+        working-directory: skybouncer
+        run: cargo test --doc
+
+      - name: 7. Generate Code Coverage (cargo-llvm-cov, >= 92%)
+        working-directory: skybouncer
+        run: cargo llvm-cov --all-targets --fail-under-lines 92 --lcov --output-path lcov.info
+
+      - name: 8. Mutation Testing Smoke Test (cargo-mutants)
+        working-directory: skybouncer
+        # Quick smoke test over a small, high-signal module to verify test
+        # effectiveness without a full (very slow) mutation sweep.
+        run: cargo mutants --file src/time.rs --file src/util.rs
 
   publish:
     name: Auto-Publish to Crates.io & Create GitHub Release

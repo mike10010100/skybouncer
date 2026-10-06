@@ -391,3 +391,42 @@ pub async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
     print_simulation_result(&text, &sim_response, &image_arg);
     Ok(())
 }
+
+/// Dispatches a full argument vector (including the program name) to the matching subcommand.
+///
+/// Supports `status`, `pardon`, `simulate`, `daemon` (default), and the backward-compatible
+/// bare-flag form (e.g. `skybouncer --dry-run`). The supplied [`CancellationToken`] is
+/// forwarded to the daemon so callers (and tests) can drive shutdown.
+///
+/// # Errors
+/// Returns [`SkybouncerError::Config`] for an unknown command, or any error from the
+/// dispatched subcommand.
+pub async fn dispatch(
+    args: &[String],
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), SkybouncerError> {
+    let subcmd = args.get(1).map(|s| s.as_str()).unwrap_or("daemon");
+
+    if args.iter().any(|a| a == "--help" || a == "-h") || subcmd == "help" {
+        print!("{}", crate::cli::help_text());
+        return Ok(());
+    }
+
+    match subcmd {
+        "status" => run_cli_status(&args[2..]).await,
+        "pardon" => run_cli_pardon(&args[2..]).await,
+        "simulate" => run_cli_simulate(&args[2..]).await,
+        "daemon" => {
+            let daemon_args = if args.len() > 2 {
+                &args[2..]
+            } else {
+                &args[0..0]
+            };
+            crate::daemon::run(daemon_args, cancel).await
+        }
+        arg if arg.starts_with("--") => crate::daemon::run(&args[1..], cancel).await,
+        other => Err(SkybouncerError::Config(format!(
+            "Unknown command: '{other}'"
+        ))),
+    }
+}

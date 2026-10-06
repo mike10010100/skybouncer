@@ -185,3 +185,78 @@ async fn run_cli_simulate_falls_back_to_offline_when_daemon_unreachable() {
     let a = args(&["some sample text", "--url", "http://127.0.0.1:1"]);
     let _ = run_cli_simulate(&a).await;
 }
+
+#[tokio::test]
+async fn dispatch_help_and_unknown_command() {
+    use skybouncer::app::dispatch;
+    use tokio_util::sync::CancellationToken;
+
+    // Help forms return Ok without network (note: a bare argv defaults to daemon,
+    // so it is intentionally excluded here).
+    for argv in [
+        vec!["skybouncer", "--help"],
+        vec!["skybouncer", "-h"],
+        vec!["skybouncer", "help"],
+    ] {
+        let a: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        dispatch(&a, CancellationToken::new())
+            .await
+            .expect("help dispatch ok");
+    }
+
+    // Unknown command -> Config error.
+    let a = args(&["skybouncer", "frobnicate"]);
+    let err = dispatch(&a, CancellationToken::new())
+        .await
+        .expect_err("unknown command");
+    assert!(matches!(err, skybouncer::SkybouncerError::Config(_)));
+}
+
+#[tokio::test]
+async fn dispatch_routes_status_and_simulate_to_daemon_url() {
+    use skybouncer::app::dispatch;
+    use tokio_util::sync::CancellationToken;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(status_json()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/simulate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "violates": false,
+            "category": null,
+            "confidence": 0.1,
+            "reason": "benign",
+            "evaluator": "primary_classifier",
+            "meets_threshold": false,
+            "threshold": 0.8,
+            "images_evaluated": 0
+        })))
+        .mount(&server)
+        .await;
+
+    let a = args(&["skybouncer", "status", "--url", &server.uri()]);
+    dispatch(&a, CancellationToken::new())
+        .await
+        .expect("status");
+
+    let a = args(&["skybouncer", "simulate", "hello", "--url", &server.uri()]);
+    dispatch(&a, CancellationToken::new())
+        .await
+        .expect("simulate");
+}
+
+#[tokio::test]
+async fn dispatch_daemon_bare_flag_form_cancels() {
+    use skybouncer::app::dispatch;
+    use tokio_util::sync::CancellationToken;
+
+    // Bare `--dry-run` (no `daemon` keyword) routes to the daemon; cancel immediately.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let a = args(&["skybouncer", "--dry-run", "--did", "did:plc:d1"]);
+    let _ = dispatch(&a, cancel).await;
+}

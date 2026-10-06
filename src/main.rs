@@ -26,14 +26,11 @@ fn load_dotenv_file(path: &Path) {
     skybouncer::env::load_dotenv_file(path);
 }
 
-/// Prints general command-line usage information.
-fn print_help() {
-    println!(
-        "🛡️ Skybouncer v{} - Sovereign Automated Moderation Service for Bluesky",
-        env!("CARGO_PKG_VERSION")
-    );
-    println!();
-    print!("{}", skybouncer::cli::help_text());
+/// Dispatches a full argument vector (including the program name) to the matching subcommand.
+///
+/// Kept in the binary but delegating to the testable [`skybouncer::app::dispatch`].
+async fn dispatch(args: &[String]) -> Result<(), SkybouncerError> {
+    skybouncer::app::dispatch(args, CancellationToken::new()).await
 }
 
 #[tokio::main]
@@ -42,37 +39,5 @@ async fn main() -> Result<(), SkybouncerError> {
     load_dotenv_file(Path::new(".env"));
 
     let args: Vec<String> = std::env::args().collect();
-    let subcmd = args.get(1).map(|s| s.as_str()).unwrap_or("daemon");
-
-    if args.iter().any(|a| a == "--help" || a == "-h") || subcmd == "help" {
-        print_help();
-        return Ok(());
-    }
-
-    match subcmd {
-        "status" => skybouncer::app::run_cli_status(&args[2..]).await,
-        "pardon" => skybouncer::app::run_cli_pardon(&args[2..]).await,
-        "simulate" => skybouncer::app::run_cli_simulate(&args[2..]).await,
-        "daemon" => {
-            let daemon_args = if args.len() > 2 {
-                &args[2..]
-            } else {
-                &args[0..0]
-            };
-            skybouncer::daemon::run(daemon_args, CancellationToken::new()).await
-        }
-        arg if arg.starts_with("--") => {
-            // Backward-compatible invocation where flags are passed directly without "daemon" keyword:
-            // e.g. `skybouncer --dry-run`
-            skybouncer::daemon::run(&args[1..], CancellationToken::new()).await
-        }
-        other => {
-            eprintln!("❌ Unknown command: '{other}'");
-            println!();
-            print_help();
-            Err(SkybouncerError::Config(format!(
-                "Unknown command: '{other}'"
-            )))
-        }
-    }
+    dispatch(&args).await
 }
