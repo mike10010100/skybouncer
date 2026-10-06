@@ -360,3 +360,38 @@ async fn run_cli_pardon_handle_resolution_error_paths() {
     }
     assert!(matches!(r, Err(skybouncer::SkybouncerError::Config(_))));
 }
+
+#[tokio::test]
+async fn run_cli_status_with_populated_stats_and_shadow_mode() {
+    let server = MockServer::start().await;
+    let stats = skybouncer::engine::EngineStatsSnapshot {
+        commits_received: 5000,
+        interactions_matched: 100,
+        gate_bypassed_self: 10,
+        gate_bypassed_followed: 20,
+        gate_bypassed_follower: 15,
+        eval_queue_enqueued: 30,
+        eval_queue_processed: 25,
+        ..Default::default()
+    };
+    Mock::given(method("GET"))
+        .and(path("/api/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "stats": serde_json::to_value(stats).unwrap(),
+            "protected_dids": ["did:plc:alice", "did:plc:bob"],
+            "rubric": {
+                "prompt": "Block spam",
+                "sensitivity": "high",
+                "threshold": 0.6,
+                "bounce_duration": "permanent",
+                "bypass_incoming_followers": true
+            },
+            "dry_run": true,
+            "version": "1.2.3"
+        })))
+        .mount(&server)
+        .await;
+
+    let a = args(&["--url", &server.uri()]);
+    run_cli_status(&a).await.expect("status with stats");
+}
