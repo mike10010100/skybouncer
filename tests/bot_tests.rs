@@ -2125,3 +2125,69 @@ async fn test_command_enrolled_tenant_update_branches() {
     let rec = handler.handle_command(enrolled, "recent").await.unwrap();
     assert!(rec.contains("No accounts have been bounced"));
 }
+
+#[tokio::test]
+async fn test_command_all_privileged_denied_for_stranger() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let stranger = "did:plc:stranger";
+
+    // Every privileged command form must be denied with the unauthorized response,
+    // exercising each inline auth branch.
+    let commands = [
+        "pause",
+        "resume",
+        "rules",
+        "set rules",
+        "set rules Block spam",
+        "sensitivity",
+        "sensitivity high",
+        "duration",
+        "duration 24h",
+        "timeout 7d",
+        "set duration 30d",
+        "set timeout 24h",
+        "recent",
+        "allowlist",
+        "allow list",
+        "allow",
+        "allow did:plc:x",
+        "unallow",
+        "unallow did:plc:x",
+        "pardon",
+        "pardon and allow did:plc:x",
+        "pardon did:plc:x",
+        "pardon did:plc:x and allow did:plc:x",
+        "status",
+        "test",
+        "test some text",
+    ];
+    for cmd in commands {
+        let reply = handler.handle_command(stranger, cmd).await.expect("handle");
+        assert!(
+            reply.contains("active bouncer session"),
+            "command '{cmd}' must be denied for a stranger, got: {reply}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_command_unknown_and_nested_pardon_and_allow() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let protected = "did:plc:protected1";
+
+    // Unknown command for an authorized (protected) user -> tip variant.
+    let unknown = handler
+        .handle_command(protected, "frobnicate")
+        .await
+        .unwrap();
+    assert!(unknown.contains("Unknown command"));
+
+    // `pardon <target> and allow <target2>` nested form.
+    let nested = handler
+        .handle_command(protected, "pardon did:plc:a and allow did:plc:b")
+        .await
+        .unwrap();
+    assert!(!nested.is_empty());
+}
