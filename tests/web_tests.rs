@@ -2660,3 +2660,110 @@ async fn test_api_pardon_validation_and_allowlist_branch() {
         .unwrap();
     assert_eq!(allowlisted.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_api_allowlist_handler_branches() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let alice_token = create_test_session(&engine, "did:plc:alice");
+
+    // Anonymous GET allowlist -> 401.
+    let anon = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/allowlist")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+
+    // Non-admin GET another user's allowlist -> 403.
+    let bob_token = create_test_session(&engine, "did:plc:bob");
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/allowlist?user_did=did:plc:alice")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // Admin add empty subject -> 400.
+    let empty = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/allowlist")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject": "  ",
+                        "protected_did": null,
+                        "reason": null
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+    // Add a DID directly (no resolution needed), then GET shows it, then DELETE removes it.
+    let add = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/allowlist")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject": "did:plc:friend",
+                        "protected_did": null,
+                        "reason": "test"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(add.status(), StatusCode::OK);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/allowlist")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+
+    // Remove the added account via the did path param.
+    let del = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/allowlist/did:plc:friend")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::OK);
+}
