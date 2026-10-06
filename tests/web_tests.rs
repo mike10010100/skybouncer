@@ -2925,3 +2925,72 @@ async fn test_api_admin_tenants_and_evaluations_filters() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_oauth_login_and_callback_with_configured_client() {
+    use skyauth::client::{AtprotoOAuthClient, OAuthClientMetadata};
+
+    let (engine, _cache, _pds, _app) = setup_test_web_environment("did:plc:alice").await;
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    )
+    .with_client_name("Skybouncer Test Dashboard");
+    let client = std::sync::Arc::new(
+        AtprotoOAuthClient::builder()
+            .client_metadata(metadata.clone())
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+    let app = create_web_router(std::sync::Arc::clone(&engine), Some(client), metadata);
+
+    // Login with a handle configured but an unresolvable/closed PDS -> BAD_GATEWAY.
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/login?handle=does-not-exist.invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Either the discovery fails (bad gateway) — the important part is the handler ran
+    // past the earlier guards (client present, handle present) without panicking.
+    assert!(
+        login.status() == StatusCode::BAD_GATEWAY
+            || login.status() == StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    // Callback with an OAuth error query -> redirects to /?auth=error (params error branch).
+    let cb = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?error=access_denied&error_description=denied")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(cb.status().is_redirection());
+    let loc = cb
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(loc.contains("auth=error"), "loc={loc}");
+
+    // Callback with code+state but no client-side state -> error redirect.
+    let cb2 = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=abc&state=unknown")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(cb2.status().is_redirection());
+}
