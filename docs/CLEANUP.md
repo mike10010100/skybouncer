@@ -120,7 +120,7 @@ parents unless explicitly requested.
 | S6 | `SessionCipher` AES-256-GCM envelope | pull up → `skyauth` | Added `skyauth::sealed::SealedBox` (`seal`/`open` + AAD + hex key + envelope prefix) with 10 new tests in `skyauth/tests/sealed_box_tests.rs`; added `CryptoError::{Seal,Open,InvalidEnvelope,Utf8}`. skybouncer `SessionCipher` is now a thin adapter; removed direct `ring` dep. Also bumped `skyauth`'s `rustls` 0.23.43→0.23.45 to clear RUSTSEC-2026-0285. | `[x]` |
 | S7 | AppView XRPC reads + pagination | pull up → `skybase` | Added `skybase::appview::AppViewClient` (typed profile/post/follows/followers/follow-records + generic `get`/`paginate` + `thumbnail_url`) with 8 wiremock tests; `AppViewContextEnricher` now delegates to it (~230 LOC removed from skybouncer). | `[x]` |
 | S8 | Bot chat client | pull up → `skybase` | Moved `ChatClient` + all `chat.bsky.convo.*` types to `skybase::chat` (7 new tests); added `SkybaseError::Chat`. skybouncer re-exports from `skybase`, deleting `bot/{client,types}.rs` (~1,225 LOC). | `[x]` |
-| S9 | Lexicon record models | pull up → `skybase` (partial) | Moved richtext lexicon (ByteSlice/Facet/FacetFeature/FacetIndex/`extract_link_facets`) to `skybase::lexicon` (10 unit tests). Feed/graph record models still deferred. | `[~]` |
+| S9 | Lexicon record models | pull up → `skybase` | Moved the full lexicon to `skybase::lexicon`: richtext (ByteSlice/Facet/FacetFeature/`extract_link_facets`) + records (StrongRef/ReplyRef/Embed/PostRecord/FollowRecord/ModListRecord/ListItemRecord/ListBlockRecord/RepoRecordItem/ListRecordsResponse) + `format/now_iso8601` (18 unit tests). `skybouncer/types.rs` is now a re-export shim. | `[x]` |
 
 ---
 
