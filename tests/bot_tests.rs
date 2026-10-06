@@ -2084,3 +2084,44 @@ async fn test_command_test_allowlist_status_variants() {
         .unwrap();
     assert!(!pa.is_empty());
 }
+
+#[tokio::test]
+async fn test_command_enrolled_tenant_update_branches() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    // Enroll a tenant so the registry-update branches are exercised.
+    engine
+        .enroll_tenant(skybouncer::tenant::Tenant::new("did:plc:enrolled"))
+        .expect("enroll");
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let enrolled = "did:plc:enrolled";
+
+    // set rules (enrolled) -> registry update path.
+    let r = handler
+        .handle_command(enrolled, "set rules Block all spam now")
+        .await
+        .unwrap();
+    assert!(r.contains("Moderation rubric updated successfully"));
+
+    // sensitivity (enrolled) -> registry update path.
+    let s = handler
+        .handle_command(enrolled, "sensitivity high")
+        .await
+        .unwrap();
+    assert!(s.contains("Sensitivity threshold updated"));
+
+    // duration (enrolled) -> registry update path (both usage + set forms).
+    assert!(handler
+        .handle_command(enrolled, "duration")
+        .await
+        .unwrap()
+        .contains("Usage"));
+    let d = handler
+        .handle_command(enrolled, "duration 7d")
+        .await
+        .unwrap();
+    assert!(d.contains("Moderation duration updated"));
+
+    // recent (enrolled) -> empty-list branch.
+    let rec = handler.handle_command(enrolled, "recent").await.unwrap();
+    assert!(rec.contains("No accounts have been bounced"));
+}
