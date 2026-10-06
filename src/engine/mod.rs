@@ -1656,4 +1656,26 @@ mod tests {
         assert!(ignored.into_outcomes().is_empty());
         assert!(ProcessCommitResult::NoMatch.outcomes().is_empty());
     }
+
+    #[test]
+    fn process_commit_result_variant_predicates() {
+        let follow = ProcessCommitResult::FollowSynced(FollowSyncEvent::Ignored);
+        assert!(follow.is_follow_synced());
+        assert!(!follow.is_sovereign_config_synced());
+        assert!(follow.sovereign_config_sync_event().is_none());
+
+        let updated =
+            ProcessCommitResult::SovereignConfigSynced(SovereignConfigSyncEvent::Updated {
+                did: "did:plc:a".to_string(),
+                prompt: "p".to_string(),
+                sensitivity: Sensitivity::High,
+            });
+        assert!(updated.is_sovereign_config_synced());
+        assert!(updated.sovereign_config_sync_event().is_some());
+
+        assert!(ProcessCommitResult::Ignored.is_ignored());
+        assert!(!ProcessCommitResult::Ignored.is_no_match());
+        assert!(ProcessCommitResult::NoMatch.is_no_match());
+        assert!(!ProcessCommitResult::NoMatch.is_ignored());
+    }
 }

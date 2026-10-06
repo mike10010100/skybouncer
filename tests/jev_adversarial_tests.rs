@@ -1235,3 +1235,163 @@ async fn test_all_server_errors_exhaust_retries() {
     let err = classifier.classify(&interaction).await.unwrap_err();
     assert!(err.to_string().contains("Jev API server error"));
 }
+
+// =============================================================================
+// 7. Ollama & SystemOne Endpoint Kinds
+// =============================================================================
+
+fn classifier_for(base_url: String, model: &str) -> JevClassifier {
+    JevClassifier::new(
+        JevConfig {
+            base_url,
+            api_key: None,
+            model: model.to_string(),
+            timeout: Duration::from_millis(500),
+            max_retries: 0,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_ollama_endpoint_parses_wrapped_json() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": {
+                "role": "assistant",
+                "content": "```json\n{\"violates\": true, \"confidence\": 0.91, \"category\": \"spam\", \"reason\": \"promo\"}\n```"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let base = format!("{}/api/chat", server.uri());
+    let classifier = classifier_for(base, "llama3");
+    assert_eq!(
+        classifier.endpoint_kind(),
+        skybouncer::classifier::JevEndpointKind::Ollama
+    );
+    let verdict = classifier
+        .classify(&sample_interaction("buy now spam"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        verdict,
+        skybouncer::classifier::Verdict::Violation { .. }
+    ));
+}
+
+#[tokio::test]
+async fn test_systemone_endpoint_parses_choice_and_probabilities() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "crypto_spam",
+                    "probabilities": {"permitted": 0.05, "crypto_spam": 0.95}
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let base = format!("{}/v1/systemone", server.uri());
+    let classifier = classifier_for(base, "systemone");
+    assert_eq!(
+        classifier.endpoint_kind(),
+        skybouncer::classifier::JevEndpointKind::SystemOne
+    );
+    let verdict = classifier
+        .classify(&sample_interaction("airdrop"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        verdict,
+        skybouncer::classifier::Verdict::Violation { .. }
+    ));
+}
+
+#[tokio::test]
+async fn test_systemone_permitted_choice_uses_probability() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "permitted",
+                    "probabilities": {"permitted": 0.97}
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let base = format!("{}/v1/systemone", server.uri());
+    let classifier = classifier_for(base, "systemone");
+    let verdict = classifier
+        .classify(&sample_interaction("hello friend"))
+        .await
+        .unwrap();
+    assert!(!verdict.is_violation());
+}
+
+#[tokio::test]
+async fn test_systemone_missing_moderation_answer_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"answers": {}})))
+        .mount(&server)
+        .await;
+
+    let base = format!("{}/v1/systemone", server.uri());
+    let classifier = classifier_for(base, "systemone");
+    let err = classifier
+        .classify(&sample_interaction("x"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("missing 'moderation' answer"));
+}
+
+#[tokio::test]
+async fn test_client_error_4xx_is_not_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+        .mount(&server)
+        .await;
+
+    let classifier = classifier_for(server.uri(), "m");
+    let err = classifier
+        .classify(&sample_interaction("x"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Jev API client error"));
+}
+
+#[tokio::test]
+async fn test_ollama_bad_wrapper_json_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .mount(&server)
+        .await;
+
+    let base = format!("{}/api/chat", server.uri());
+    let classifier = classifier_for(base, "llama3");
+    let err = classifier
+        .classify(&sample_interaction("x"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Ollama"));
+}
