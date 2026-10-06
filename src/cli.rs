@@ -511,3 +511,163 @@ mod tests {
         assert!(h.contains("--dry-run"));
     }
 }
+
+/// Formats the final operational telemetry snapshot into a multi-line report.
+#[must_use]
+pub fn format_final_telemetry(stats: &crate::engine::EngineStatsSnapshot) -> String {
+    let mut o = String::new();
+    use std::fmt::Write;
+    let _ = writeln!(o, "📊 Final Skybouncer Operational Telemetry:");
+    let _ = writeln!(
+        o,
+        "   Incoming Commits Received:    {}",
+        stats.commits_received
+    );
+    let _ = writeln!(
+        o,
+        "   Follows Synced:               {}",
+        stats.follows_synced
+    );
+    let _ = writeln!(
+        o,
+        "   Sovereign Configs Synced:     {}",
+        stats.sovereign_configs_synced
+    );
+    let _ = writeln!(
+        o,
+        "   Interactions Matched:         {}",
+        stats.interactions_matched
+    );
+    let _ = writeln!(
+        o,
+        "   Gate Bypassed (Self):         {}",
+        stats.gate_bypassed_self
+    );
+    let _ = writeln!(
+        o,
+        "   Gate Bypassed (Followed):     {}",
+        stats.gate_bypassed_followed
+    );
+    let _ = writeln!(
+        o,
+        "   Gate Bypassed (Followers):    {}",
+        stats.gate_bypassed_follower
+    );
+    let _ = writeln!(
+        o,
+        "   Dedup Cache Hits:             {}",
+        stats.dedup_cache_hits
+    );
+    let _ = writeln!(
+        o,
+        "   Evaluation Cache Hits:        {}",
+        stats.eval_cache_hits
+    );
+    let _ = writeln!(
+        o,
+        "   Heuristic Violations:         {}",
+        stats.heuristic_violations
+    );
+    let _ = writeln!(
+        o,
+        "   Model Evaluations:            {}",
+        stats.model_evaluations
+    );
+    let _ = writeln!(
+        o,
+        "   Eval Queue Enqueued:          {}",
+        stats.eval_queue_enqueued
+    );
+    let _ = writeln!(
+        o,
+        "   Eval Queue Processed:         {}",
+        stats.eval_queue_processed
+    );
+    let _ = writeln!(
+        o,
+        "   Eval Queue Overflows:         {}",
+        stats.eval_queue_overflows
+    );
+    let _ = writeln!(
+        o,
+        "   Violations Detected:          {}",
+        stats.violations_detected
+    );
+    let _ = writeln!(
+        o,
+        "   Bounces Executed on PDS:      {}",
+        stats.bounces_executed
+    );
+    let _ = writeln!(o, "   Permitted Interactions:       {}", stats.permitted);
+    o
+}
+
+/// Formats the daemon startup configuration summary into a multi-line report.
+#[must_use]
+pub fn format_startup_summary(config: &crate::engine::SkybouncerConfig) -> String {
+    use std::fmt::Write;
+    let mut o = String::new();
+    if config.dry_run {
+        o.push_str("🛡️  SHADOW MODE ACTIVE (--dry-run): zero remote PDS writes\n");
+    }
+    if config.protected_dids.is_empty() {
+        o.push_str("⚠️  No PROTECTED_DIDS configured; running in monitoring mode\n");
+    } else {
+        let _ = writeln!(
+            o,
+            "Loaded {} protected user DID(s):",
+            config.protected_dids.len()
+        );
+        for did in &config.protected_dids {
+            let _ = writeln!(o, "   Protected: {did}");
+        }
+    }
+    if let Some(ref admin) = config.admin_did {
+        let _ = writeln!(o, "👑 System administrator: {admin}");
+    }
+    let _ = writeln!(
+        o,
+        "Active rubric: sensitivity={}, threshold={}",
+        config.rubric.sensitivity,
+        config.rubric.sensitivity.threshold()
+    );
+    o
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+
+    #[test]
+    fn format_final_telemetry_contains_counters() {
+        let stats = crate::engine::EngineStatsSnapshot {
+            commits_received: 1234,
+            bounces_executed: 7,
+            permitted: 99,
+            ..Default::default()
+        };
+        let out = format_final_telemetry(&stats);
+        assert!(out.contains("1234"));
+        assert!(out.contains("Bounces Executed on PDS:      7"));
+        assert!(out.contains("Permitted Interactions:       99"));
+        assert!(out.contains("Final Skybouncer Operational Telemetry"));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn format_startup_summary_empty_and_populated() {
+        let cfg = crate::engine::SkybouncerConfig::default();
+        let empty = format_startup_summary(&cfg);
+        assert!(empty.contains("No PROTECTED_DIDS"));
+
+        let mut cfg2 = crate::engine::SkybouncerConfig::default();
+        cfg2.dry_run = true;
+        cfg2.protected_dids.insert("did:plc:alice".to_string());
+        cfg2.admin_did = Some("did:plc:admin".to_string());
+        let out = format_startup_summary(&cfg2);
+        assert!(out.contains("SHADOW MODE"));
+        assert!(out.contains("did:plc:alice"));
+        assert!(out.contains("System administrator: did:plc:admin"));
+        assert!(out.contains("Active rubric"));
+    }
+}

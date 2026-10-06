@@ -26,6 +26,13 @@ pub mod bot;
 pub mod classifier;
 pub mod cli;
 pub mod crypto;
+#[cfg(all(
+    feature = "web",
+    feature = "stream",
+    feature = "bot",
+    feature = "telemetry"
+))]
+pub mod daemon;
 pub mod engine;
 pub mod enricher;
 pub mod env;
