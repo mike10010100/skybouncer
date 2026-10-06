@@ -214,3 +214,90 @@ async fn streamer_ignores_non_commit_frames() {
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
+
+#[tokio::test]
+async fn streamer_reconnects_after_server_close_frame() {
+    let server = MockJetstreamServer::start().await.expect("mock server");
+    let (tx, mut rx) = mpsc::channel::<JetstreamCommit>(16);
+
+    let cancel = CancellationToken::new();
+    let config = StreamConfig::new(server.ws_url());
+    let handle = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move { run_jetstream_streamer(config, tx, cancel).await })
+    };
+
+    wait_for_connection(&server).await;
+    let gen_before = server.total_connections();
+
+    // Server initiates a close frame; the streamer must reconnect.
+    server.close_all(1000, "bye").expect("close");
+
+    let mut reconnected = false;
+    for _ in 0..200 {
+        if server.total_connections() > gen_before {
+            reconnected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(reconnected, "streamer did not reconnect after close frame");
+
+    server
+        .emit_commit_payload(
+            "did:plc:afterclose",
+            1_700_000_000_300_000,
+            "app.bsky.feed.post",
+            "3kafterclose",
+            "create",
+            None,
+            None,
+        )
+        .expect("emit");
+    let commit = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("no commit after close/reconnect")
+        .expect("closed");
+    assert_eq!(commit.did, "did:plc:afterclose");
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}
+
+#[tokio::test]
+async fn streamer_ignores_malformed_and_non_commit_frames() {
+    let server = MockJetstreamServer::start().await.expect("mock server");
+    let (tx, mut rx) = mpsc::channel::<JetstreamCommit>(16);
+
+    let cancel = CancellationToken::new();
+    let config = StreamConfig::new(server.ws_url());
+    let handle = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move { run_jetstream_streamer(config, tx, cancel).await })
+    };
+
+    wait_for_connection(&server).await;
+    // Malformed JSON and a heartbeat are both dropped; a real commit still flows.
+    server.emit_raw("{not-valid-json").expect("raw");
+    server.emit_heartbeat(1_700_000_000_000_000).expect("hb");
+    server
+        .emit_commit_payload(
+            "did:plc:real",
+            1_700_000_000_400_000,
+            "app.bsky.feed.post",
+            "3kreal2",
+            "create",
+            None,
+            None,
+        )
+        .expect("emit");
+
+    let commit = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("no commit")
+        .expect("closed");
+    assert_eq!(commit.did, "did:plc:real");
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}
