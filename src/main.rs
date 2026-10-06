@@ -550,139 +550,56 @@ async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
         }
     }
 
-    // 2. Fallback: Local offline simulation
+    // 2. Fallback: Local offline simulation via a dry-run engine.
     println!("ℹ️ Running local offline simulation...");
-    let config = SkybouncerConfig::from_env()?;
-    let heuristic = skybouncer::classifier::HeuristicClassifier::default();
-    let rubric = config.rubric.clone();
-
-    let mut images_base64 = Vec::new();
-    let mut image_cids = Vec::new();
-    if let Some(b64) = image_base64 {
-        images_base64.push(b64);
-        image_cids.push("local-file-image".to_string());
-    }
-
-    let enriched_context = if !images_base64.is_empty() {
-        let mut ctx = skybouncer::enricher::EnrichedContext::empty();
-        ctx.images_base64 = images_base64;
-        Some(ctx)
-    } else {
-        None
+    let config = SkybouncerConfig::from_env()?.with_dry_run(true);
+    let engine = match SkybouncerEngine::builder(config).build() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("❌ Failed to initialize offline simulation engine: {e}");
+            return Err(e);
+        }
     };
 
-    let interaction = skybouncer::matcher::Interaction::synthetic(
+    let inputs = skybouncer::engine::simulate::SimulationInputs::new(
+        text,
         "did:plc:candidate-author",
         "did:plc:protected-user",
-        text,
-        skybouncer::matcher::InteractionType::DirectReply,
     )
-    .with_post_uri("at://did:plc:cli-sim/app.bsky.feed.post/sample")
-    .with_post_cid("bafyclisim")
-    .with_images(image_cids, Vec::new())
-    .with_enriched_context_opt(enriched_context)
-    .with_rubric(rubric.clone());
+    .with_image(image_base64, false);
 
-    let heuristic_verdict = heuristic.evaluate(&interaction);
-    let sim_response = match heuristic_verdict {
-        skybouncer::classifier::Verdict::Violation {
-            category,
-            confidence,
-            reason,
-        } => {
-            let meets_threshold = rubric.meets_threshold(&category, confidence);
-            skybouncer::web::api::SimulateResponse {
-                violates: true,
-                category: Some(category.to_string()),
-                confidence,
-                threshold: rubric.sensitivity.threshold(),
-                reason,
-                evaluator: "heuristic_prefilter".to_string(),
-                meets_threshold,
-                images_evaluated: if interaction.enriched_context.is_some() {
-                    1
-                } else {
-                    0
-                },
-                tier1: None,
-                tier2: None,
-            }
-        }
-        skybouncer::classifier::Verdict::Permitted { .. } => {
-            if let Some(ref jev_cfg) = config.jev_config {
-                let classifier =
-                    skybouncer::classifier::JevClassifier::new(jev_cfg.clone(), rubric.clone())?;
-                use skybouncer::classifier::Classifier;
-                match classifier.classify(&interaction).await {
-                    Ok(skybouncer::classifier::Verdict::Violation {
-                        category,
-                        confidence,
-                        reason,
-                    }) => {
-                        let meets_threshold = rubric.meets_threshold(&category, confidence);
-                        skybouncer::web::api::SimulateResponse {
-                            violates: true,
-                            category: Some(category.to_string()),
-                            confidence,
-                            threshold: rubric.sensitivity.threshold(),
-                            reason,
-                            evaluator: "primary_classifier".to_string(),
-                            meets_threshold,
-                            images_evaluated: if interaction.enriched_context.is_some() {
-                                1
-                            } else {
-                                0
-                            },
-                            tier1: None,
-                            tier2: None,
-                        }
-                    }
-                    Ok(skybouncer::classifier::Verdict::Permitted { reason, confidence }) => {
-                        skybouncer::web::api::SimulateResponse {
-                            violates: false,
-                            category: None,
-                            confidence: confidence.unwrap_or(0.0),
-                            threshold: rubric.sensitivity.threshold(),
-                            reason,
-                            evaluator: "primary_classifier".to_string(),
-                            meets_threshold: false,
-                            images_evaluated: if interaction.enriched_context.is_some() {
-                                1
-                            } else {
-                                0
-                            },
-                            tier1: None,
-                            tier2: None,
-                        }
-                    }
-                    Err(e) => skybouncer::web::api::SimulateResponse {
-                        violates: false,
-                        category: None,
-                        confidence: 0.0,
-                        threshold: rubric.sensitivity.threshold(),
-                        reason: format!("Primary model error: {e}"),
-                        evaluator: "offline_fallback".to_string(),
-                        meets_threshold: false,
-                        images_evaluated: 0,
-                        tier1: None,
-                        tier2: None,
-                    },
-                }
-            } else {
-                skybouncer::web::api::SimulateResponse {
-                    violates: false,
-                    category: None,
-                    confidence: 0.0,
-                    threshold: rubric.sensitivity.threshold(),
-                    reason: "Passed heuristic filter (primary model not configured)".to_string(),
-                    evaluator: "heuristic_only".to_string(),
-                    meets_threshold: false,
-                    images_evaluated: 0,
-                    tier1: None,
-                    tier2: None,
-                }
-            }
-        }
+    let sim_result = engine.run_simulation(inputs).await?;
+    let sim_response = skybouncer::web::api::SimulateResponse {
+        violates: sim_result.violates,
+        category: sim_result.category,
+        confidence: sim_result.confidence,
+        reason: sim_result.reason,
+        evaluator: sim_result.evaluator,
+        meets_threshold: sim_result.meets_threshold,
+        threshold: sim_result.threshold,
+        images_evaluated: sim_result.images_evaluated,
+        tier1: sim_result
+            .tier1
+            .map(|t| skybouncer::web::api::TierStageDetail {
+                stage_name: t.stage_name,
+                model: t.model,
+                status: t.status,
+                violates: t.violates,
+                category: t.category,
+                confidence: t.confidence,
+                reason: t.reason,
+            }),
+        tier2: sim_result
+            .tier2
+            .map(|t| skybouncer::web::api::TierStageDetail {
+                stage_name: t.stage_name,
+                model: t.model,
+                status: t.status,
+                violates: t.violates,
+                category: t.category,
+                confidence: t.confidence,
+                reason: t.reason,
+            }),
     };
 
     print_simulation_result(text, &sim_response, &image_arg);

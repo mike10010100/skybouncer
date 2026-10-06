@@ -133,7 +133,7 @@ parents unless explicitly requested.
 | T3 | Externalize dashboard HTML | `src/web/ui.rs` | Moved the ~100KB `DASHBOARD_HTML` string to `assets/dashboard.html` + `include_str!`; `ui.rs` is now ~14 lines. Verified `cargo package --list` includes the asset. | `[x]` |
 | T4 | Split `web/api.rs` | `src/web/api/` | Split into `mod` (DTOs/auth helpers/tests) + `telemetry`, `auth`, `bounces`, `simulate`, `tenant`, `resolve`. | `[x]` |
 | T5 | Split `tenant/registry.rs` | `src/tenant/registry/` | Split into `mod` (types/schema/tests) + `core`, `sessions`, `handles`, `admin`. | `[x]` |
-| T6 | Thin `main.rs` | `src/main.rs` | **Deferred**: the offline CLI path uses a flat heuristic+`classify` flow while the web path uses `classify_detailed` with tier reporting; sharing would require reconciling two different response shapes. | `[!]` |
+| T6 | Thin `main.rs` | `src/engine/simulate.rs` | Added `SkybouncerEngine::run_simulation` (+`SimulationInputs`/`SimulationResult`/`SimulateTierStage`), extracting the tiered simulate pipeline shared by the web handler and the CLI `--offline` path (which now builds a dry-run engine). Both paths now use `classify_detailed` and produce tier detail. | `[x]` |
 
 ---
 
@@ -152,6 +152,17 @@ parents unless explicitly requested.
 ---
 
 ## Progress log
+
+- 2026-10-06 (T6 complete): Extracted `SkybouncerEngine::run_simulation` (engine/simulate.rs) as
+  the single dry-run evaluation pipeline; the web `/api/simulate` handler and the CLI
+  `simulate --offline` path (now via a dry-run engine) both delegate to it. skybouncer
+  430 + 48 tests, clippy/fmt/deny clean.
+
+- 2026-10-06 (S9 complete): Extended `skybase::lexicon` with the full record model set
+  (StrongRef/ReplyRef/Embed/PostRecord/FollowRecord/ModListRecord/ListItemRecord/
+  ListBlockRecord/RepoRecordItem/ListRecordsResponse + format/now_iso8601). skybouncer
+  `types.rs` is now a re-export shim (~590 LOC removed). skybase 302 tests, skybouncer
+  430 + 48, all clippy/fmt/deny clean.
 
 - 2026-10-06 (S8 + partial S9): Pulled the ATProto Chat client (`ChatClient` + `chat.bsky.convo.*`
   types) into `skybase::chat` and the richtext lexicon (`ByteSlice`/`Facet`/`FacetFeature`/

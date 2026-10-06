@@ -15,10 +15,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::classifier::{BounceDuration, RuleRubric, Sensitivity, Verdict};
+use crate::classifier::{BounceDuration, RuleRubric, Sensitivity};
 use crate::engine::{EngineStatsSnapshot, SkybouncerEngine};
-use crate::matcher::{Interaction, InteractionType};
-use crate::modlist::cache::{EvaluationLogContext, EvaluationLogEntry, NewEvaluationLog};
+use crate::modlist::cache::EvaluationLogEntry;
 use crate::modlist::BouncedUser;
 use crate::types::default_true;
 
@@ -249,9 +248,6 @@ pub struct BouncedUserWithHandle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
 }
-
-/// Maximum size of a URL-fetched simulation image (2 MiB).
-const MAX_SIMULATION_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Query parameter for session-aware endpoints.
 #[derive(Debug, Clone, Default, Deserialize)]

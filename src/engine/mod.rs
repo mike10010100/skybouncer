@@ -982,6 +982,7 @@ mod handles;
 mod lifecycle;
 mod modlist_ops;
 mod processing;
+pub mod simulate;
 mod tenant_ops;
 
 /// Builder for constructing [`SkybouncerEngine`] with optional component overrides.

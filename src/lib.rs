@@ -75,6 +75,7 @@ pub use classifier::{
     MockClassifier, RuleRubric, Sensitivity, Verdict, ViolationCategory,
 };
 pub use engine::{
+    simulate::{SimulateTierStage, SimulationInputs, SimulationResult},
     BounceNotification, EngineStats, EngineStatsSnapshot, InteractionOutcome, ProcessCommitResult,
     ProcessOutcome, SkybouncerConfig, SkybouncerEngine, SkybouncerEngineBuilder,
     SovereignConfigSyncEvent, DEFAULT_ENGINE_CHANNEL_CAPACITY, DEFAULT_EVALUATION_CACHE_TTL,
