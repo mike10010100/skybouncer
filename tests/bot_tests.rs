@@ -1879,3 +1879,156 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
     // Verify added to allowlist in both memory and db
     assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:violator_to_immunize"));
 }
+
+// =============================================================================
+// Command Branch Matrix: admin vs protected vs enrolled vs stranger,
+// plus pause/resume/status/sensitivity/duration/allow/unallow branches.
+// =============================================================================
+
+#[tokio::test]
+async fn test_command_branch_matrix_admin_and_stranger() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    // Enroll an extra tenant so is_single_tenant becomes false.
+    engine
+        .enroll_tenant(skybouncer::tenant::Tenant::new("did:plc:enrolled"))
+        .expect("enroll");
+
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let admin = "did:plc:admin";
+    let protected = "did:plc:protected1";
+    let enrolled = "did:plc:enrolled";
+    let stranger = "did:plc:stranger";
+
+    // pause/resume: admin + single-tenant protected allowed; stranger denied.
+    assert!(handler
+        .handle_command(admin, "pause")
+        .await
+        .unwrap()
+        .contains("paused"));
+    assert!(handler
+        .handle_command(admin, "resume")
+        .await
+        .unwrap()
+        .contains("resumed"));
+    assert!(handler
+        .handle_command(stranger, "pause")
+        .await
+        .unwrap()
+        .contains("active bouncer session"));
+
+    // status: admin fleet view vs per-account view.
+    assert!(handler
+        .handle_command(admin, "status")
+        .await
+        .unwrap()
+        .contains("Admin Fleet View"));
+    assert!(handler
+        .handle_command(protected, "status")
+        .await
+        .unwrap()
+        .contains("Status for Your Account"));
+
+    // sensitivity: usage, admin set, enrolled set, stranger denied.
+    assert!(handler
+        .handle_command(protected, "sensitivity")
+        .await
+        .unwrap()
+        .contains("Usage"));
+    assert!(handler
+        .handle_command(admin, "sensitivity high")
+        .await
+        .unwrap()
+        .contains("Sensitivity threshold updated"));
+    // Strangers are stopped at the authorization gate before command dispatch.
+    assert!(handler
+        .handle_command(stranger, "sensitivity low")
+        .await
+        .unwrap()
+        .contains("active bouncer session"));
+
+    // duration: usage, admin set, invalid.
+    assert!(handler
+        .handle_command(protected, "duration")
+        .await
+        .unwrap()
+        .contains("Usage"));
+    assert!(handler
+        .handle_command(admin, "duration 24h")
+        .await
+        .unwrap()
+        .contains("duration updated"));
+    assert!(handler
+        .handle_command(admin, "duration nonsense")
+        .await
+        .unwrap()
+        .contains("Invalid duration"));
+
+    // allow/unallow usage forms + enrollment.
+    assert!(handler
+        .handle_command(protected, "allow")
+        .await
+        .unwrap()
+        .contains("Usage"));
+    assert!(handler
+        .handle_command(protected, "unallow")
+        .await
+        .unwrap()
+        .contains("Usage"));
+    assert!(handler
+        .handle_command(protected, "pardon")
+        .await
+        .unwrap()
+        .contains("Usage"));
+
+    // Enrolled tenant can pause/resume via registry path.
+    assert!(handler
+        .handle_command(enrolled, "pause")
+        .await
+        .unwrap()
+        .contains("paused"));
+    assert!(handler
+        .handle_command(enrolled, "resume")
+        .await
+        .unwrap()
+        .contains("resumed"));
+}
+
+#[tokio::test]
+async fn test_command_allowlist_lifecycle_via_bot() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let protected = "did:plc:protected1";
+
+    // Empty allowlist view.
+    assert!(handler
+        .handle_command(protected, "allowlist")
+        .await
+        .unwrap()
+        .contains("allowlist"));
+
+    // Add (DID form), then view, then remove.
+    let add = handler
+        .handle_command(protected, "allow did:plc:friend")
+        .await
+        .unwrap();
+    assert!(add.contains("added to your moderation allowlist"));
+
+    let view = handler
+        .handle_command(protected, "allow list")
+        .await
+        .unwrap();
+    assert!(view.contains("did:plc:friend"));
+
+    let remove = handler
+        .handle_command(protected, "unallow did:plc:friend")
+        .await
+        .unwrap();
+    assert!(remove.contains("removed from your moderation allowlist"));
+
+    // Removing again reports not found.
+    let remove_again = handler
+        .handle_command(protected, "unallow did:plc:friend")
+        .await
+        .unwrap();
+    assert!(remove_again.contains("was not found"));
+}

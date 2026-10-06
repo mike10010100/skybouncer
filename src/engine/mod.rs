@@ -1497,4 +1497,106 @@ mod tests {
         let err = SkybouncerEngine::builder(cfg).build();
         assert!(err.is_err(), "no classifier/jev config must fail");
     }
+
+    fn all_outcomes() -> Vec<InteractionOutcome> {
+        let a = "did:plc:author".to_string();
+        let t = "did:plc:target".to_string();
+        vec![
+            InteractionOutcome::Bypassed {
+                reason: BypassReason::SelfInteraction,
+                author_did: a.clone(),
+                target_did: t.clone(),
+            },
+            InteractionOutcome::AlreadyBounced {
+                author_did: a.clone(),
+                target_did: t.clone(),
+            },
+            InteractionOutcome::Permitted {
+                author_did: a.clone(),
+                target_did: t.clone(),
+                reason: "ok".to_string(),
+            },
+            InteractionOutcome::Bounced {
+                author_did: a.clone(),
+                target_did: t.clone(),
+                listitem_uri: "at://x".to_string(),
+                category: ViolationCategory::Spam,
+                confidence: 0.9,
+                reason: "spam".to_string(),
+            },
+            InteractionOutcome::BelowThreshold {
+                author_did: a.clone(),
+                target_did: t.clone(),
+                category: ViolationCategory::Spam,
+                confidence: 0.5,
+                threshold: 0.8,
+            },
+            InteractionOutcome::RateLimited {
+                author_did: a.clone(),
+                target_did: t.clone(),
+                reason: "limit".to_string(),
+            },
+            InteractionOutcome::QueuedForEvaluation {
+                author_did: a.clone(),
+                target_did: t.clone(),
+                post_uri: "at://p".to_string(),
+            },
+            InteractionOutcome::QueueOverflow {
+                author_did: a.clone(),
+                target_did: t.clone(),
+                post_uri: "at://p".to_string(),
+            },
+            InteractionOutcome::Paused {
+                author_did: a.clone(),
+                target_did: t.clone(),
+            },
+        ]
+    }
+
+    #[test]
+    fn interaction_outcome_accessors_cover_all_variants() {
+        let outcomes = all_outcomes();
+        // Exactly one of each boolean predicate should hold per variant.
+        assert_eq!(outcomes.iter().filter(|o| o.is_bounced()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|o| o.is_permitted()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|o| o.is_bypassed()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|o| o.is_queued()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|o| o.is_queue_overflow()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|o| o.is_paused()).count(), 1);
+
+        for o in &outcomes {
+            assert_eq!(o.author_did(), "did:plc:author");
+            assert_eq!(o.target_did(), Some("did:plc:target"));
+            assert!(!o.label().is_empty());
+        }
+
+        // Labels are stable and distinct where expected.
+        let labels: Vec<&str> = outcomes.iter().map(|o| o.label()).collect();
+        assert!(labels.contains(&"Bounced"));
+        assert!(labels.contains(&"Permitted"));
+        assert!(labels.contains(&"Below Rubric Threshold"));
+        assert!(labels.contains(&"Already Bounced"));
+        assert!(labels.contains(&"Rate Limited"));
+        assert!(labels.contains(&"Paused"));
+        assert!(labels.contains(&"Bypassed"));
+        assert!(labels.contains(&"Queued"));
+        assert!(labels.contains(&"Queue Overflow"));
+    }
+
+    #[test]
+    fn process_commit_result_helpers() {
+        let outcome = InteractionOutcome::Permitted {
+            author_did: "a".to_string(),
+            target_did: "t".to_string(),
+            reason: "ok".to_string(),
+        };
+        let processed = ProcessCommitResult::InteractionsProcessed(vec![outcome.clone()]);
+        assert_eq!(processed.outcomes().len(), 1);
+        assert_eq!(processed.clone().into_outcomes(), vec![outcome]);
+
+        let ignored = ProcessCommitResult::Ignored;
+        assert!(ignored.outcomes().is_empty());
+        assert!(ignored.into_outcomes().is_empty());
+        assert!(ProcessCommitResult::NoMatch.outcomes().is_empty());
+    }
 }
