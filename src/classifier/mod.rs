@@ -539,5 +539,33 @@ mod tests {
 
         // set_rubric default is a no-op and must not panic.
         arc.set_rubric(RuleRubric::default());
+
+        // Box forwarding for every detailed variant.
+        assert!(boxed.classify_with_rubric(&i, None).await.is_ok());
+        assert!(boxed.classify_detailed(&i).await.is_ok());
+        assert!(boxed.classify_detailed_with_rubric(&i, None).await.is_ok());
+        assert!(boxed.classify_detailed_with_stats(&i, false).await.is_ok());
+        assert!(boxed
+            .classify_detailed_with_stats_and_rubric(&i, None, false)
+            .await
+            .is_ok());
+        boxed.set_rubric(RuleRubric::default());
+
+        // Arc forwarding for the remaining detailed variants.
+        assert!(arc.classify_detailed_with_stats(&i, false).await.is_ok());
+        assert!(arc
+            .classify_detailed_with_stats_and_rubric(&i, None, false)
+            .await
+            .is_ok());
+
+        // Verdict sanitization clamps out-of-range confidence.
+        assert_eq!(
+            Verdict::violation(ViolationCategory::Spam, 5.0, "x").confidence(),
+            Some(1.0)
+        );
+        assert_eq!(
+            Verdict::violation(ViolationCategory::Spam, f64::NAN, "x").confidence(),
+            Some(0.0)
+        );
     }
 }
