@@ -1723,6 +1723,25 @@ mod tests {
     }
 
     #[test]
+    fn builder_includes_active_tenants_in_protected_set() {
+        let registry = Arc::new(TenantRegistry::open_in_memory().unwrap());
+        registry
+            .register_or_update(&crate::tenant::Tenant::new("did:plc:active-tenant"))
+            .unwrap();
+        let classifier = Arc::new(crate::classifier::MockClassifier::new(
+            crate::classifier::Verdict::permitted("ok"),
+        ));
+        let cfg = SkybouncerConfig::new(["did:plc:cfg"], RuleRubric::default());
+        let engine = SkybouncerEngine::builder(cfg)
+            .with_tenant_registry(registry)
+            .with_classifier(classifier)
+            .build()
+            .expect("engine builds");
+        // The active tenant is folded into the protected set.
+        assert!(engine.is_protected("did:plc:active-tenant"));
+    }
+
+    #[test]
     fn process_commit_result_helpers() {
         let outcome = InteractionOutcome::Permitted {
             author_did: "a".to_string(),
