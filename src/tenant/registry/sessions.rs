@@ -486,15 +486,11 @@ impl TenantRegistry {
         // 5. Construct PdsRepoClient
         let session_arc = Arc::new(session);
         let client = match resolved_oauth_client {
-            Some(ref oc) => PdsRepoClient::new(session_arc, Arc::clone(oc)).map_err(|e| {
-                SkybouncerError::Config(format!(
-                    "Failed to create PDS client with OAuth client for {did}: {e}"
-                ))
+            Some(ref oc) => PdsRepoClient::new(session_arc, Arc::clone(oc)).inspect_err(|e| {
+                tracing::warn!(did = %did, error = %e, "Failed to create PDS client with OAuth client");
             })?,
-            None => PdsRepoClient::from_session(session_arc).map_err(|e| {
-                SkybouncerError::Config(format!(
-                    "Failed to create PDS client from session for {did}: {e}"
-                ))
+            None => PdsRepoClient::from_session(session_arc).inspect_err(|e| {
+                tracing::warn!(did = %did, error = %e, "Failed to create PDS client from session");
             })?,
         };
 

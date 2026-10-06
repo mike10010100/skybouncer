@@ -74,6 +74,81 @@ fn synthetic_key_rank(key: &str) -> (u8, u64, String) {
     }
 }
 
+/// Removes `inner_key` from `guard`'s `index` field, then prunes the resolved value
+/// from the paired `sets` field if no remaining rkey still references it.
+///
+/// Shared by the forward (`rkey_to_followed`/`follows`) and incoming
+/// (`incoming_rkey_index`/`followers`) reverse indexes, which use identical
+/// reference-counting semantics despite differing outer-key meanings.
+fn remove_index_entry(
+    guard: &mut FollowGraphInner,
+    forward: bool,
+    inner_key: &str,
+    outer_key: &str,
+) -> Option<String> {
+    let (value, still_referenced) = {
+        let index = if forward {
+            &mut guard.rkey_to_followed
+        } else {
+            &mut guard.incoming_rkey_index
+        };
+        let value = index.get_mut(outer_key)?.remove(inner_key)?;
+        let still_referenced = index
+            .get(outer_key)
+            .is_some_and(|m| m.values().any(|v| v == &value));
+        (value, still_referenced)
+    };
+    if !still_referenced {
+        let sets = if forward {
+            &mut guard.follows
+        } else {
+            &mut guard.followers
+        };
+        if let Some(set) = sets.get_mut(outer_key) {
+            set.remove(&value);
+        }
+    }
+    Some(value)
+}
+
+/// Deterministically selects and removes the lowest-ranked synthetic rkey in `guard`'s
+/// reverse index, pruning the paired set if the value is no longer referenced. Shared by
+/// the forward and incoming synthetic fallbacks.
+fn remove_synthetic_entry(
+    guard: &mut FollowGraphInner,
+    forward: bool,
+    outer_key: &str,
+    is_synthetic: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let (value, still_referenced) = {
+        let (index, _) = if forward {
+            (&mut guard.rkey_to_followed, &mut guard.follows)
+        } else {
+            (&mut guard.incoming_rkey_index, &mut guard.followers)
+        };
+        let map = index.get_mut(outer_key)?;
+        let synthetic_key = map
+            .keys()
+            .filter(|k| is_synthetic(k))
+            .min_by_key(|k| synthetic_key_rank(k))
+            .cloned()?;
+        let value = map.remove(&synthetic_key)?;
+        let still_referenced = map.values().any(|v| v == &value);
+        (value, still_referenced)
+    };
+    if !still_referenced {
+        let sets = if forward {
+            &mut guard.follows
+        } else {
+            &mut guard.followers
+        };
+        if let Some(set) = sets.get_mut(outer_key) {
+            set.remove(&value);
+        }
+    }
+    Some(value)
+}
+
 /// Internal state holding the follow sets and reverse indexes.
 #[derive(Debug, Default)]
 struct FollowGraphInner {
@@ -286,7 +361,6 @@ impl FollowGraph {
 
         guard.follows.entry(p_did).or_default().insert(f_did);
     }
-
     /// Removes a followed account using its record key (`rkey`).
     ///
     /// Uses the reverse index to resolve `rkey -> followed_did` and removes the
@@ -295,25 +369,7 @@ impl FollowGraph {
     /// Returns `Some(followed_did)` if the follow existed and was removed, or `None`.
     pub fn remove_follow_by_rkey(&self, protected_did: &str, rkey: &str) -> Option<String> {
         let mut guard = self.inner.write();
-
-        let followed_did = guard
-            .rkey_to_followed
-            .get_mut(protected_did)?
-            .remove(rkey)?;
-
-        // Only remove from active follows if no other rkey references the same followed DID
-        let still_referenced = guard
-            .rkey_to_followed
-            .get(protected_did)
-            .is_some_and(|m| m.values().any(|v| v == &followed_did));
-
-        if !still_referenced {
-            if let Some(set) = guard.follows.get_mut(protected_did) {
-                set.remove(&followed_did);
-            }
-        }
-
-        Some(followed_did)
+        remove_index_entry(&mut guard, true, rkey, protected_did)
     }
 
     /// Removes a followed account directly by target DID.
@@ -359,26 +415,9 @@ impl FollowGraph {
     /// Returns `Some(followed_did)` if a synthetic follow was found and removed, or `None`.
     pub fn remove_synthetic_follow_fallback(&self, protected_did: &str) -> Option<String> {
         let mut guard = self.inner.write();
-
-        let (followed_did, still_referenced) = {
-            let user_rkeys = guard.rkey_to_followed.get_mut(protected_did)?;
-            let synthetic_key = user_rkeys
-                .keys()
-                .filter(|k| k.starts_with("hydrate_") || k.starts_with("seed_"))
-                .min_by_key(|k| synthetic_key_rank(k))
-                .cloned()?;
-            let followed_did = user_rkeys.remove(&synthetic_key)?;
-            let still_referenced = user_rkeys.values().any(|v| v == &followed_did);
-            (followed_did, still_referenced)
-        };
-
-        if !still_referenced {
-            if let Some(set) = guard.follows.get_mut(protected_did) {
-                set.remove(&followed_did);
-            }
-        }
-
-        Some(followed_did)
+        remove_synthetic_entry(&mut guard, true, protected_did, |k| {
+            k.starts_with("hydrate_") || k.starts_with("seed_")
+        })
     }
 
     /// Removes a synthetic incoming follow relationship when a real Jetstream delete commit
@@ -390,26 +429,9 @@ impl FollowGraph {
     /// Returns `Some(protected_did)` if a synthetic follower was found and removed, or `None`.
     pub fn remove_synthetic_follower_fallback(&self, follower_did: &str) -> Option<String> {
         let mut guard = self.inner.write();
-
-        let (protected_did, still_referenced) = {
-            let user_rkeys = guard.incoming_rkey_index.get_mut(follower_did)?;
-            let synthetic_key = user_rkeys
-                .keys()
-                .filter(|k| k.starts_with("hydrate_in_"))
-                .min_by_key(|k| synthetic_key_rank(k))
-                .cloned()?;
-            let protected_did = user_rkeys.remove(&synthetic_key)?;
-            let still_referenced = user_rkeys.values().any(|v| v == &protected_did);
-            (protected_did, still_referenced)
-        };
-
-        if !still_referenced {
-            if let Some(set) = guard.followers.get_mut(&protected_did) {
-                set.remove(follower_did);
-            }
-        }
-
-        Some(protected_did)
+        remove_synthetic_entry(&mut guard, false, follower_did, |k| {
+            k.starts_with("hydrate_in_")
+        })
     }
 
     /// Synchronizes the follow graph from a Jetstream firehose commit in real-time.

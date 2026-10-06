@@ -1265,9 +1265,10 @@ impl SkybouncerEngineBuilder {
                         .as_deref()
                         .unwrap_or("shadow_placeholder_token");
                     Arc::new(
-                        PdsRepoClient::from_credentials(endpoint, primary_did, token).map_err(
-                            |e| SkybouncerError::Config(format!("Failed to build PDS client: {e}")),
-                        )?,
+                        PdsRepoClient::from_credentials(endpoint, primary_did, token)
+                            .inspect_err(|e| {
+                                tracing::warn!(error = %e, "Failed to build shadow-mode PDS client");
+                            })?,
                     )
                 } else if self.config.pds_endpoint.is_some()
                     && self.config.pds_access_token.is_some()
@@ -1286,8 +1287,10 @@ impl SkybouncerEngineBuilder {
                         .map(String::as_str)
                         .unwrap_or("did:plc:skybouncer_admin");
                     Arc::new(
-                        PdsRepoClient::from_credentials(endpoint, primary_did, token).map_err(
-                            |e| SkybouncerError::Config(format!("Failed to build PDS client: {e}")),
+                        PdsRepoClient::from_credentials(endpoint, primary_did, token).inspect_err(
+                            |e| {
+                                tracing::warn!(error = %e, "Failed to build configured PDS client");
+                            },
                         )?,
                     )
                 } else {
@@ -1297,10 +1300,8 @@ impl SkybouncerEngineBuilder {
                             "did:plc:skybouncer_multi_tenant",
                             "multi_tenant_placeholder_token",
                         )
-                        .map_err(|e| {
-                            SkybouncerError::Config(format!(
-                                "Failed to build fallback PDS client: {e}"
-                            ))
+                        .inspect_err(|e| {
+                            tracing::warn!(error = %e, "Failed to build fallback PDS client");
                         })?,
                     )
                 }

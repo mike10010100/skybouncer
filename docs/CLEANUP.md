@@ -115,7 +115,7 @@ parents unless explicitly requested.
 | S1 | SSRF image fetch reuse | reuse `skyauth` | Replaced 118-line `fetch_simulation_image` with `SsrfFilter::default().safe_get(url, 2MiB)` + `map_ssrf_error`. SSRF test passes. | `[x]` |
 | S2 | Handle/DID normalization reuse | reuse `skyauth` | Added `util::normalize_handle` (preserves skybouncer's trim + strip-`@`, case-preserving semantics) and migrated ~24 sites. Strict `skyauth::identity::normalize_handle` intentionally not used for cache keys (case-folding/label validation would change behavior). | `[x]` |
 | S3 | AT-URI helpers reuse | reuse `skybase` | Deduped the two local parsers via `split_at_uri`; kept behavior (skybase `parse_at_uri` rejects `at://did:x` with no collection, which skybouncer accepts). | `[x]` |
-| S4 | Error composition | reuse both | **Deferred**: adding `#[from]` transparent variants changes `SkybouncerError`'s public shape and 44 tests match on variants; treat as a dedicated breaking change. | `[!]` |
+| S4 | Error composition | reuse both | Added `From<SkybaseError> for SkybouncerError` (variant mapping, preserving causes) and converted PDS-client construction sites from `map_err(format!)` stringification to `?` + `inspect_err` (engine builder, tenant session resolution). Transparent `#[from]` enum variants left out to avoid a breaking public-API change. | `[x]` |
 | S5 | Jetstream stream loop | reuse `skybase` | `StreamConfig::build_url` now wraps `build_subscription_url_full`; replaced hand-rolled jitter/doubling with `skybase::ingest::backoff::BackoffManager`; removed `apply_jitter`. | `[x]` |
 | S6 | `SessionCipher` AES-256-GCM envelope | pull up → `skyauth` | Added `skyauth::sealed::SealedBox` (`seal`/`open` + AAD + hex key + envelope prefix) with 10 new tests in `skyauth/tests/sealed_box_tests.rs`; added `CryptoError::{Seal,Open,InvalidEnvelope,Utf8}`. skybouncer `SessionCipher` is now a thin adapter; removed direct `ring` dep. Also bumped `skyauth`'s `rustls` 0.23.43→0.23.45 to clear RUSTSEC-2026-0285. | `[x]` |
 | S7 | AppView XRPC reads + pagination | pull up → `skybase` | Added `skybase::appview::AppViewClient` (typed profile/post/follows/followers/follow-records + generic `get`/`paginate` + `thumbnail_url`) with 8 wiremock tests; `AppViewContextEnricher` now delegates to it (~230 LOC removed from skybouncer). | `[x]` |
@@ -143,7 +143,7 @@ parents unless explicitly requested.
 |----|------|----------|--------|--------|
 | P1 | `process_commit` / `_queued` twins | `engine.rs` | Extracted `dispatch_commit -> CommitDispatch`; both entry points are now ~15-line wrappers. | `[x]` |
 | P2 | `process_interaction` / `_queued` fast path | `engine.rs` | Extracted `fast_path -> FastPath`; sync path emits the heuristic audit log (including the error case) via `FastPath::Heuristic(Result, Verdict)`. | `[x]` |
-| P3 | `FollowGraph` reverse-index mirror | `matcher/follow_graph.rs` | **Deferred**: the two indexes are asymmetric (incoming index is keyed by follower but stores the protected DID, not a set member), so a single generic `ReverseIndex` cannot model both without risking real-time unfollow reconciliation. | `[!]` |
+| P3 | `FollowGraph` reverse-index mirror | `matcher/follow_graph.rs` | Extracted `remove_index_entry` + `remove_synthetic_entry` (`forward: bool` selects the index/set pair), deduping rkey-removal and synthetic-fallback logic across both directions. Behavior preserved; all follow-graph/matcher tests pass. | `[x]` |
 | P4 | `list_active` / `list_all` merge | `tenant/registry.rs` | Added `list_filtered(active_only)`; both public methods delegate. | `[x]` |
 | P7 | Generic pagination helper | `enricher.rs` | Added private `paginate<T,I,F>`; `fetch_follows`/`fetch_followers`/`fetch_follow_records` now thin projections. | `[x]` |
 | P5 | Bot dispatch auth guard ×15 | `bot/handler.rs` | Hoisted one `is_authorized_sender` probe (`authorized`) replacing 20 inline checks; added `resolve_dm_target` + `authorized_protected` replacing 4 duplicated target/permission blocks. `help`/onboarding stay ungated. | `[x]` |
@@ -152,6 +152,11 @@ parents unless explicitly requested.
 ---
 
 ## Progress log
+
+- 2026-10-06 (S4 + P3): S4 — added `From<SkybaseError>` and replaced PDS-client
+  `map_err(format!)` stringification with `?`/`inspect_err` (causes preserved; no breaking
+  enum change). P3 — deduped `FollowGraph` forward/incoming reverse-index maintenance via
+  `remove_index_entry`/`remove_synthetic_entry`. skybouncer 430 + 48 tests, clippy/fmt/deny clean.
 
 - 2026-10-06 (T6 complete): Extracted `SkybouncerEngine::run_simulation` (engine/simulate.rs) as
   the single dry-run evaluation pipeline; the web `/api/simulate` handler and the CLI
