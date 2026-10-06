@@ -2032,3 +2032,55 @@ async fn test_command_allowlist_lifecycle_via_bot() {
         .unwrap();
     assert!(remove_again.contains("was not found"));
 }
+
+#[tokio::test]
+async fn test_command_test_allowlist_status_variants() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let protected = "did:plc:protected1";
+    let admin = "did:plc:admin";
+
+    // `test` command: heuristic-only path (permitted verdict from MockClassifier).
+    let t = handler
+        .handle_command(protected, "test A perfectly benign message")
+        .await
+        .unwrap();
+    assert!(t.contains("Test Evaluation"));
+
+    // `test` usage form.
+    assert!(handler
+        .handle_command(protected, "test")
+        .await
+        .unwrap()
+        .contains("Usage"));
+
+    // allowlist view with an entry (populated branch + pluralization).
+    handler
+        .handle_command(protected, "allow did:plc:friend1")
+        .await
+        .unwrap();
+    let view = handler
+        .handle_command(protected, "allowlist")
+        .await
+        .unwrap();
+    assert!(view.contains("Allowlist (1 account)"));
+
+    // Non-admin `status` shows the per-account view; admin shows the fleet view.
+    assert!(handler
+        .handle_command(protected, "status")
+        .await
+        .unwrap()
+        .contains("Status for Your Account"));
+    assert!(handler
+        .handle_command(admin, "status")
+        .await
+        .unwrap()
+        .contains("Admin Fleet View"));
+
+    // `pardon and allow <did>` alias resolves to the pardon+allowlist handler.
+    let pa = handler
+        .handle_command(protected, "pardon and allow did:plc:someuser")
+        .await
+        .unwrap();
+    assert!(!pa.is_empty());
+}
