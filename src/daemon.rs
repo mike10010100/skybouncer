@@ -15,6 +15,91 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 /// Executes the live 24/7 firehose streamer and moderation daemon.
+/// Cold-start hydration: pre-seeds the follow graph (with real rkeys when available,
+/// else DIDs) and incoming followers for each protected DID via the AppView enricher.
+///
+/// Best-effort: empty responses are skipped. Returns the total number of relationships
+/// hydrated across all protected DIDs.
+pub async fn hydrate_cold_start(
+    engine: &SkybouncerEngine,
+    enricher: &crate::enricher::AppViewContextEnricher,
+    protected_dids: &std::collections::HashSet<String>,
+) -> usize {
+    let mut hydrated: usize = 0;
+    for did in protected_dids {
+        let follow_records = enricher.fetch_follow_records(did, 100).await;
+        if !follow_records.is_empty() {
+            hydrated = hydrated.saturating_add(engine.hydrate_follow_records(did, follow_records));
+        } else {
+            let follows = enricher.fetch_follows(did, 100).await;
+            if !follows.is_empty() {
+                hydrated = hydrated.saturating_add(engine.hydrate_follows(did, follows));
+            }
+        }
+        let followers = enricher.fetch_followers(did, 100).await;
+        if !followers.is_empty() {
+            hydrated = hydrated.saturating_add(engine.hydrate_followers(did, followers));
+        }
+    }
+    hydrated
+}
+
+/// Provisions (or verifies) the moderation list + listblock on the sovereign PDS for every
+/// configured protected DID and enrolled tenant, and reconciles the sovereign rubric.
+///
+/// Returns the number of DIDs successfully provisioned.
+pub async fn provision_pds_resources(
+    engine: &SkybouncerEngine,
+    protected_dids: &std::collections::HashSet<String>,
+) -> usize {
+    let mut all_dids = protected_dids.clone();
+    if let Ok(tenants) = engine.tenant_registry().list_all() {
+        for t in tenants {
+            if t.session.is_some() {
+                all_dids.insert(t.did);
+            }
+        }
+    }
+
+    let mut provisioned = 0;
+    for did in &all_dids {
+        match engine.ensure_mod_list(did).await {
+            Ok(list_uri) => {
+                provisioned += 1;
+                if let Err(e) = engine.ensure_list_blocked(did, &list_uri).await {
+                    warn!(did = %did, error = %e, "Could not verify auto-blocking listblock on PDS");
+                }
+            }
+            Err(e) => {
+                warn!(did = %did, error = %e, "Could not verify moderation list on PDS");
+            }
+        }
+
+        match engine.sync_sovereign_config(did).await {
+            Ok(Some(pds_rubric)) => {
+                info!(did = %did, prompt = %pds_rubric.prompt, "Synchronized sovereign rules from PDS repo");
+            }
+            Ok(None) => {
+                if let Err(e) = engine.publish_sovereign_config(did).await {
+                    warn!(did = %did, error = %e, "Could not publish initial sovereign rules to PDS");
+                }
+            }
+            Err(e) => {
+                warn!(did = %did, error = %e, "Could not sync sovereign config from PDS");
+            }
+        }
+    }
+    provisioned
+}
+
+/// Runs the live 24/7 Jetstream firehose moderation daemon until `cancel` is triggered.
+///
+/// Performs startup logging, engine construction, cold-start hydration, PDS provisioning
+/// (skipped in shadow mode), background task supervision (engine pipeline, streamer,
+/// maintenance, optional DM bot), then graceful drain and final telemetry.
+///
+/// # Errors
+/// Returns [`SkybouncerError`] if configuration loading or engine construction fails.
 pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), SkybouncerError> {
     // Initialize structured tracing subscriber
     crate::env::init_tracing();
@@ -111,112 +196,20 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
         info!("ℹ️ Sovereign Web Dashboard disabled (WEB_ENABLED / PORT not configured)");
     }
 
-    // Cold-start follow graph hydration via public AppView
-    for did in &config.protected_dids {
-        let follow_records = enricher.fetch_follow_records(did, 100).await;
-        if !follow_records.is_empty() {
-            let count = engine.hydrate_follow_records(did, follow_records);
-            info!(
-                did = %did,
-                count = count,
-                "Hydrated initial follow graph with real rkeys from AppView (cold start)"
-            );
-        } else {
-            let follows = enricher.fetch_follows(did, 100).await;
-            if !follows.is_empty() {
-                let count = engine.hydrate_follows(did, follows);
-                info!(
-                    did = %did,
-                    count = count,
-                    "Hydrated initial follow graph from AppView (fallback)"
-                );
-            }
-        }
+    // Cold-start follow graph hydration via public AppView.
+    let hydrated = hydrate_cold_start(&engine, &enricher, &config.protected_dids).await;
+    info!(
+        count = hydrated,
+        "Cold-start follow graph hydration complete"
+    );
 
-        let followers = enricher.fetch_followers(did, 100).await;
-        if !followers.is_empty() {
-            let count = engine.hydrate_followers(did, followers);
-            info!(
-                did = %did,
-                count = count,
-                "Hydrated initial incoming followers from AppView (cold start)"
-            );
-        }
-    }
-
-    // Ensure moderation list and listblock exist on PDS for configured protected DIDs and enrolled tenants
+    // Ensure moderation list and listblock exist on PDS (skipped in shadow mode).
     if !config.dry_run {
-        let mut all_dids = config.protected_dids.clone();
-        if let Ok(tenants) = engine.tenant_registry().list_all() {
-            for t in tenants {
-                if t.session.is_some() {
-                    all_dids.insert(t.did);
-                }
-            }
-        }
-
-        for did in &all_dids {
-            match engine.ensure_mod_list(did).await {
-                Ok(list_uri) => {
-                    info!(
-                        did = %did,
-                        list_uri = %list_uri,
-                        "Moderation list verified on sovereign PDS"
-                    );
-                    if let Err(e) = engine.ensure_list_blocked(did, &list_uri).await {
-                        warn!(
-                            did = %did,
-                            error = %e,
-                            "Could not verify auto-blocking listblock on PDS"
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        did = %did,
-                        error = %e,
-                        "Could not verify moderation list on PDS"
-                    );
-                }
-            }
-
-            // Synchronize sovereign moderation rubric from user's PDS repository
-            match engine.sync_sovereign_config(did).await {
-                Ok(Some(pds_rubric)) => {
-                    info!(
-                        did = %did,
-                        prompt = %pds_rubric.prompt,
-                        "Synchronized sovereign rules from PDS repo (social.skybouncer.config)"
-                    );
-                }
-                Ok(None) => {
-                    // No sovereign config on PDS yet: publish initial configured rubric to PDS
-                    match engine.publish_sovereign_config(did).await {
-                        Ok(uri) => {
-                            info!(
-                                did = %did,
-                                uri = %uri,
-                                "Published initial sovereign rules to PDS repo (social.skybouncer.config)"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                did = %did,
-                                error = %e,
-                                "Could not publish initial sovereign rules to PDS"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        did = %did,
-                        error = %e,
-                        "Could not sync sovereign config from PDS"
-                    );
-                }
-            }
-        }
+        let provisioned = provision_pds_resources(&engine, &config.protected_dids).await;
+        info!(
+            count = provisioned,
+            "Sovereign PDS resource provisioning complete"
+        );
     } else if config.dry_run {
         info!("🛡️ Shadow mode active: skipping remote PDS moderation list verification");
     }
