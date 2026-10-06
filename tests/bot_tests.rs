@@ -2191,3 +2191,75 @@ async fn test_command_unknown_and_nested_pardon_and_allow() {
         .unwrap();
     assert!(!nested.is_empty());
 }
+
+#[tokio::test]
+async fn test_command_pardon_allow_usage_and_resolution_failures() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let protected = "did:plc:protected1";
+
+    // Unresolvable handles exercise the Err(msg) branches of resolve_dm_target.
+    assert!(handler
+        .handle_command(protected, "pardon @ghost.invalid.handle")
+        .await
+        .unwrap()
+        .contains("Could not resolve handle"));
+    assert!(handler
+        .handle_command(protected, "pardon and allow @ghost.invalid.handle")
+        .await
+        .unwrap()
+        .contains("Could not resolve handle"));
+    assert!(handler
+        .handle_command(protected, "allow @ghost.invalid.handle")
+        .await
+        .unwrap()
+        .contains("Could not resolve handle"));
+    assert!(handler
+        .handle_command(protected, "unallow @ghost.invalid.handle")
+        .await
+        .unwrap()
+        .contains("Could not resolve handle"));
+}
+
+#[tokio::test]
+async fn test_command_status_dry_run_variants() {
+    // Build an engine in dry-run mode to hit the shadow-mode status strings.
+    let pds = MockPdsServer::start().await;
+    let cache = Arc::new(DeduplicationCache::open_in_memory().expect("cache"));
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let pds_client = Arc::new(pds.pds_client("did:plc:protected1"));
+    let classifier = Arc::new(skybouncer::classifier::MockClassifier::new(
+        Verdict::permitted("ok"),
+    ));
+    let mut dids = HashSet::new();
+    dids.insert("did:plc:protected1".to_string());
+    let config = SkybouncerConfig::new(dids, rubric)
+        .with_admin_did("did:plc:admin")
+        .with_dry_run(true);
+    let engine = Arc::new(SkybouncerEngine::new(
+        config,
+        follow_graph,
+        gate,
+        classifier,
+        modlist,
+        pds_client,
+    ));
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+
+    // Admin status in dry-run -> "Yes (shadow)".
+    let admin = handler
+        .handle_command("did:plc:admin", "status")
+        .await
+        .unwrap();
+    assert!(admin.contains("shadow") || admin.contains("Yes"));
+    // Non-admin status in dry-run -> "Dry-Run (simulated)".
+    let user = handler
+        .handle_command("did:plc:protected1", "status")
+        .await
+        .unwrap();
+    assert!(user.contains("Dry-Run") || user.contains("simulated"));
+}
