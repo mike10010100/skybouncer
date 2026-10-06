@@ -3,9 +3,7 @@
 //! Enforces a configurable sliding-window ceiling on model evaluations per protected user,
 //! preventing malicious actors from triggering expensive external classifier calls via mention floods.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -44,10 +42,10 @@ impl RateLimiterConfig {
     /// - `SKYBOUNCER_RATE_LIMIT_EVALS_PER_HOUR`: Max evaluations per hour (defaults to 100).
     #[must_use]
     pub fn from_env() -> Self {
-        let max_evaluations = std::env::var("SKYBOUNCER_RATE_LIMIT_EVALS_PER_HOUR")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_MAX_EVALUATIONS_PER_WINDOW);
+        let max_evaluations = crate::env::parsed_or(
+            &["SKYBOUNCER_RATE_LIMIT_EVALS_PER_HOUR"],
+            DEFAULT_MAX_EVALUATIONS_PER_WINDOW,
+        );
 
         Self {
             max_evaluations,
@@ -91,9 +89,7 @@ impl EvaluationRateLimiter {
 
     /// Selects the internal shard index for a target DID.
     fn shard_idx(&self, target_did: &str) -> usize {
-        let mut hasher = DefaultHasher::new();
-        target_did.hash(&mut hasher);
-        (hasher.finish() as usize) % NUM_SHARDS
+        crate::util::shard_index(target_did, NUM_SHARDS)
     }
 
     /// Checks whether an evaluation is permitted for `target_did` and records it if allowed.

@@ -26,7 +26,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use common::MockPdsServer;
 use skybouncer::classifier::ViolationCategory;
 use skybouncer::error::SkybouncerError;
-use skybouncer::modlist::ModListManager;
+use skybouncer::modlist::{BounceRequest, ModListManager};
 
 // =============================================================================
 // 1. Adversarial PDS Network Conditions & Fault Injection
@@ -51,14 +51,16 @@ async fn test_adversarial_pds_repeated_500_create_record() {
             .await;
 
         let res = manager
-            .bounce_user(
+            .bounce(
                 &client,
-                "did:plc:alice",
-                "did:plc:resilient_spammer",
-                &ViolationCategory::CryptoSpam,
-                0.95,
-                "Airdrop phishing",
-                &format!("at://did:plc:resilient_spammer/app.bsky.feed.post/{attempt}"),
+                BounceRequest::new(
+                    "did:plc:alice",
+                    "did:plc:resilient_spammer",
+                    &ViolationCategory::CryptoSpam,
+                    0.95,
+                    "Airdrop phishing",
+                    &format!("at://did:plc:resilient_spammer/app.bsky.feed.post/{attempt}"),
+                ),
             )
             .await;
 
@@ -80,14 +82,16 @@ async fn test_adversarial_pds_repeated_500_create_record() {
 
     // Now PDS recovers: bounce should succeed cleanly
     let res = manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:resilient_spammer",
-            &ViolationCategory::CryptoSpam,
-            0.95,
-            "Airdrop phishing",
-            "at://did:plc:resilient_spammer/app.bsky.feed.post/recovery",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:resilient_spammer",
+                &ViolationCategory::CryptoSpam,
+                0.95,
+                "Airdrop phishing",
+                "at://did:plc:resilient_spammer/app.bsky.feed.post/recovery",
+            ),
         )
         .await
         .unwrap();
@@ -129,14 +133,16 @@ async fn test_adversarial_pds_malformed_json_create_record() {
     manager.cache().set_mod_list(&config).unwrap();
 
     let res = manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:malformed_json_target",
-            &ViolationCategory::Spam,
-            0.90,
-            "Spam test",
-            "at://did:plc:malformed_json_target/app.bsky.feed.post/1",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:malformed_json_target",
+                &ViolationCategory::Spam,
+                0.90,
+                "Spam test",
+                "at://did:plc:malformed_json_target/app.bsky.feed.post/1",
+            ),
         )
         .await;
 
@@ -178,14 +184,16 @@ async fn test_adversarial_pds_socket_drop_on_create_record() {
     manager.cache().set_mod_list(&config).unwrap();
 
     let res = manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:socket_drop_user",
-            &ViolationCategory::Spam,
-            0.90,
-            "Spam test",
-            "at://did:plc:socket_drop_user/app.bsky.feed.post/1",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:socket_drop_user",
+                &ViolationCategory::Spam,
+                0.90,
+                "Spam test",
+                "at://did:plc:socket_drop_user/app.bsky.feed.post/1",
+            ),
         )
         .await;
 
@@ -203,14 +211,16 @@ async fn test_adversarial_pds_repeated_500_delete_record() {
 
     // Pre-bounce user
     manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:pardon_target",
-            &ViolationCategory::Harassment,
-            0.88,
-            "Harassment violation",
-            "at://did:plc:pardon_target/app.bsky.feed.post/1",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:pardon_target",
+                &ViolationCategory::Harassment,
+                0.88,
+                "Harassment violation",
+                "at://did:plc:pardon_target/app.bsky.feed.post/1",
+            ),
         )
         .await
         .unwrap();
@@ -395,14 +405,16 @@ async fn test_adversarial_pds_400_invalid_request_create_record() {
         .await;
 
     let res = manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:bad_request_target",
-            &ViolationCategory::Spam,
-            0.90,
-            "Spam test",
-            "at://did:plc:bad_request_target/app.bsky.feed.post/1",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:bad_request_target",
+                &ViolationCategory::Spam,
+                0.90,
+                "Spam test",
+                "at://did:plc:bad_request_target/app.bsky.feed.post/1",
+            ),
         )
         .await;
 
@@ -433,14 +445,16 @@ async fn test_rapid_oscillating_bounce_pardon_bounce_lifecycle() {
     for cycle in 1..=5 {
         // 1. Bounce user
         let bounce_res = manager
-            .bounce_user(
+            .bounce(
                 &client,
-                "did:plc:alice",
-                target_did,
-                &ViolationCategory::CryptoSpam,
-                0.95,
-                &format!("Cycle {cycle} violation"),
-                &format!("at://{target_did}/app.bsky.feed.post/{cycle}"),
+                BounceRequest::new(
+                    "did:plc:alice",
+                    target_did,
+                    &ViolationCategory::CryptoSpam,
+                    0.95,
+                    &format!("Cycle {cycle} violation"),
+                    &format!("at://{target_did}/app.bsky.feed.post/{cycle}"),
+                ),
             )
             .await
             .unwrap();
@@ -462,14 +476,16 @@ async fn test_rapid_oscillating_bounce_pardon_bounce_lifecycle() {
 
         // Deduplication check: repeated bounce in same cycle drops with 0 PDS writes
         let dupe_res = manager
-            .bounce_user(
+            .bounce(
                 &client,
-                "did:plc:alice",
-                target_did,
-                &ViolationCategory::CryptoSpam,
-                0.99,
-                "Duplicate trigger",
-                &format!("at://{target_did}/app.bsky.feed.post/{cycle}_dupe"),
+                BounceRequest::new(
+                    "did:plc:alice",
+                    target_did,
+                    &ViolationCategory::CryptoSpam,
+                    0.99,
+                    "Duplicate trigger",
+                    &format!("at://{target_did}/app.bsky.feed.post/{cycle}_dupe"),
+                ),
             )
             .await
             .unwrap();
@@ -556,14 +572,16 @@ async fn test_concurrent_bounce_race_same_violator() {
 
         handles.push(tokio::spawn(async move {
             b.wait().await;
-            mgr.bounce_user(
+            mgr.bounce(
                 &cl,
-                "did:plc:alice",
-                &did,
-                &ViolationCategory::CryptoSpam,
-                0.90 + (i as f64 * 0.005),
-                "Concurrent race attack",
-                &format!("at://{did}/app.bsky.feed.post/{i}"),
+                BounceRequest::new(
+                    "did:plc:alice",
+                    &did,
+                    &ViolationCategory::CryptoSpam,
+                    0.90 + (i as f64 * 0.005),
+                    "Concurrent race attack",
+                    &format!("at://{did}/app.bsky.feed.post/{i}"),
+                ),
             )
             .await
         }));

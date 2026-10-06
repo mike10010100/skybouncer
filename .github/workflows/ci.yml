@@ -84,6 +84,10 @@ jobs:
         working-directory: skybouncer
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: 2b. Enforce Lean Core Build (no default features)
+        working-directory: skybouncer
+        run: cargo clippy --lib --no-default-features -- -D warnings
+
       - name: 3. Run All Test Suites
         working-directory: skybouncer
         run: cargo test --all-targets

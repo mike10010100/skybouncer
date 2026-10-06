@@ -686,7 +686,7 @@ async fn test_adversarial_rubric_precedence() {
 /// When the engine default rubric is Medium sensitivity (threshold 0.75), but a tenant
 /// configures a custom rubric with High sensitivity (threshold 0.50):
 /// 1. `SkybouncerEngine` Tier 8 checks `tenant_rubric.meets_threshold()` -> passes for confidence 0.70.
-/// 2. `ModListManager::bounce_user_with_text` re-checks its internal global rubric (`meets_threshold()`).
+/// 2. `ModListManager::bounce` re-checks its internal global rubric (`meets_threshold()`).
 /// 3. Because `0.70 < 0.75`, `ModListManager` drops the bounce and returns `Ok(None)`.
 /// 4. `SkybouncerEngine` assumes `None` means `AlreadyBounced` ("double-checked lock hit").
 ///

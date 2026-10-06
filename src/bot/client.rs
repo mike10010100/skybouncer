@@ -23,7 +23,6 @@ pub const ATPROTO_CHAT_PROXY_DID: &str = "did:web:api.bsky.chat#bsky_chat";
 
 #[derive(Debug, Deserialize)]
 struct CreateSessionResponse {
-    #[allow(dead_code)]
     did: String,
     #[serde(rename = "accessJwt")]
     access_jwt: String,
@@ -310,11 +309,7 @@ impl ChatClient {
         body: Option<serde_json::Value>,
     ) -> Result<reqwest::Response, SkybouncerError> {
         let current_token = self.auth_state.read().await.access_jwt.clone();
-        let mut req = self.client.request(method.clone(), url);
-        req = req.header(AUTHORIZATION, format!("Bearer {current_token}"));
-        if let Some(ref b) = body {
-            req = req.json(b);
-        }
+        let req = self.build_request(method.clone(), url, &current_token, body.as_ref());
 
         let resp = req.send().await?;
         let status = resp.status();
@@ -341,11 +336,7 @@ impl ChatClient {
             }
 
             let new_token = self.auth_state.read().await.access_jwt.clone();
-            let mut retry_req = self.client.request(method, url);
-            retry_req = retry_req.header(AUTHORIZATION, format!("Bearer {new_token}"));
-            if let Some(ref b) = body {
-                retry_req = retry_req.json(b);
-            }
+            let retry_req = self.build_request(method, url, &new_token, body.as_ref());
 
             let retry_resp = retry_req.send().await?;
             if !retry_resp.status().is_success() {
@@ -362,6 +353,24 @@ impl ChatClient {
         Err(SkybouncerError::Chat(format!(
             "{op_name} failed with status {status}: {body_text}"
         )))
+    }
+
+    /// Builds a bearer-authenticated XRPC request, optionally attaching a JSON body.
+    fn build_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        token: &str,
+        body: Option<&serde_json::Value>,
+    ) -> reqwest::RequestBuilder {
+        let mut req = self
+            .client
+            .request(method, url)
+            .header(AUTHORIZATION, format!("Bearer {token}"));
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        req
     }
 
     /// Lists active conversations for the authenticated user.

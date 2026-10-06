@@ -2,6 +2,7 @@
 
 use crate::classifier::Verdict;
 use crate::error::SkybouncerError;
+use crate::types::default_true;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -79,6 +80,15 @@ impl FromStr for Sensitivity {
             ))),
         }
     }
+}
+
+/// Parses a persisted sensitivity string, defaulting to [`Sensitivity::Medium`] when
+/// the value is absent or unrecognized (legacy database compatibility).
+#[must_use]
+pub fn sensitivity_from_db(value: Option<&str>) -> Sensitivity {
+    value
+        .and_then(|s| s.parse::<Sensitivity>().ok())
+        .unwrap_or(Sensitivity::Medium)
 }
 
 /// Configurable duration for moderation list entries (permanent vs temporary timeout).
@@ -286,9 +296,13 @@ impl fmt::Display for BounceDuration {
     }
 }
 
-/// Returns `true`, used as the serde default for opt-out moderation bypass flags.
-fn default_true() -> bool {
-    true
+/// Parses a persisted bounce-duration string, defaulting to [`BounceDuration::default`]
+/// when the value is absent or unrecognized.
+#[must_use]
+pub fn bounce_duration_from_db(value: Option<&str>) -> BounceDuration {
+    value
+        .and_then(|s| s.parse::<BounceDuration>().ok())
+        .unwrap_or_default()
 }
 
 /// Configured house rules and sensitivity rubric for moderation evaluation.

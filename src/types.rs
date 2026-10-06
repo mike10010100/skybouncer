@@ -7,6 +7,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Returns `true`, used as the serde default for opt-out moderation bypass flags.
+pub(crate) fn default_true() -> bool {
+    true
+}
+
+/// Returns whether the flag is `true`, used to omit the default value during serialization.
+pub(crate) fn is_true(value: &bool) -> bool {
+    *value
+}
+
 /// Strong reference to an ATProto repository record (`com.atproto.repo.strongRef`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StrongRef {

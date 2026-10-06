@@ -3,12 +3,11 @@
 pub mod follow_graph;
 pub mod gate;
 pub mod interaction;
-#[allow(clippy::module_inception)]
-pub mod matcher;
+pub mod target;
 
 pub use follow_graph::{FollowGraph, FollowSyncEvent};
 pub use gate::{BypassReason, GateDecision, NonFollowedGate};
 pub use interaction::{
     extract_did_for_collection, extract_did_from_at_uri, Interaction, InteractionType,
 };
-pub use matcher::TargetMatcher;
+pub use target::TargetMatcher;

@@ -16,7 +16,9 @@ pub mod tiered;
 pub use heuristic::{HeuristicClassifier, HeuristicRule};
 pub use jev::{JevClassifier, JevConfig, JevEndpointKind};
 pub use mock::MockClassifier;
-pub use rubric::{BounceDuration, RuleRubric, Sensitivity};
+pub use rubric::{
+    bounce_duration_from_db, sensitivity_from_db, BounceDuration, RuleRubric, Sensitivity,
+};
 pub use tiered::{
     CertaintyConfig, TieredClassifier, TieredClassifierStats, TieredEvaluationResult,
     TieredStatsSnapshot,

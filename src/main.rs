@@ -26,25 +26,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
 
 /// Loads environment variables from a `.env` file if it exists on disk.
 fn load_dotenv_file(path: &Path) {
-    if let Ok(content) = std::fs::read_to_string(path) {
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some((k, v)) = line.split_once('=') {
-                let key = k.trim();
-                let val = v.trim().trim_matches('"').trim_matches('\'');
-                if std::env::var_os(key).is_none() {
-                    std::env::set_var(key, val);
-                }
-            }
-        }
-    }
+    skybouncer::env::load_dotenv_file(path);
 }
 
 /// Formats an integer with thousands separator commas (e.g. 1000000 -> "1,000,000").
@@ -62,22 +47,26 @@ fn format_number(n: u64) -> String {
 
 /// Resolves the target daemon base URL from CLI arguments, environment, or default fallback.
 fn resolve_daemon_url(args: &[String]) -> String {
+    if let Some(url) = arg_value(args, "--url") {
+        return url.trim_end_matches('/').to_string();
+    }
+    if let Some(url) = skybouncer::env::var(&["SKYBOUNCER_URL", "SKYBOUNCER_STATUS_URL"]) {
+        return url.trim_end_matches('/').to_string();
+    }
+    let web_config = skybouncer::web::WebServerConfig::from_env();
+    format!("http://127.0.0.1:{}", web_config.port)
+}
+
+/// Returns the value following `name` in `args`, if present.
+fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--url" && i + 1 < args.len() {
-            return args[i + 1].trim_end_matches('/').to_string();
+        if args[i] == name && i + 1 < args.len() {
+            return Some(args[i + 1].as_str());
         }
         i += 1;
     }
-    if let Ok(url) =
-        std::env::var("SKYBOUNCER_URL").or_else(|_| std::env::var("SKYBOUNCER_STATUS_URL"))
-    {
-        return url.trim_end_matches('/').to_string();
-    }
-    let port = std::env::var("PORT")
-        .or_else(|_| std::env::var("SKYBOUNCER_PORT"))
-        .unwrap_or_else(|_| "3000".to_string());
-    format!("http://127.0.0.1:{port}")
+    None
 }
 
 /// Prints general command-line usage information.
@@ -295,16 +284,11 @@ async fn run_cli_status(args: &[String]) -> Result<(), SkybouncerError> {
 async fn run_cli_pardon(args: &[String]) -> Result<(), SkybouncerError> {
     let daemon_url = resolve_daemon_url(args);
     let mut subject = None;
-    let mut protected_did = None;
+    let protected_did = arg_value(args, "--target").map(str::to_string);
 
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--url" && i + 1 < args.len() {
-            i += 2;
-            continue;
-        }
-        if args[i] == "--target" && i + 1 < args.len() {
-            protected_did = Some(args[i + 1].clone());
             i += 2;
             continue;
         }
@@ -336,7 +320,7 @@ async fn run_cli_pardon(args: &[String]) -> Result<(), SkybouncerError> {
     let subject_did = if raw_subject.starts_with("did:") {
         raw_subject
     } else {
-        let clean_handle = raw_subject.trim_start_matches('@');
+        let clean_handle = skybouncer::util::normalize_handle(&raw_subject);
         println!("🔍 Resolving handle @{clean_handle} via ATProto identity directory...");
         let resolve_url = format!(
             "https://bsky.social/xrpc/com.atproto.identity.resolveHandle?handle={clean_handle}"
@@ -483,7 +467,7 @@ fn print_simulation_result(
 async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
     let daemon_url = resolve_daemon_url(args);
     let offline_flag = args.iter().any(|a| a == "--offline");
-    let mut image_arg = None;
+    let image_arg = arg_value(args, "--image").map(str::to_string);
     let mut text_parts = Vec::new();
 
     let mut i = 0;
@@ -493,7 +477,6 @@ async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
             continue;
         }
         if args[i] == "--image" && i + 1 < args.len() {
-            image_arg = Some(args[i + 1].clone());
             i += 2;
             continue;
         }
@@ -588,21 +571,17 @@ async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
         None
     };
 
-    let interaction = skybouncer::matcher::Interaction {
-        post_uri: "at://did:plc:cli-sim/app.bsky.feed.post/sample".to_string(),
-        post_cid: Some("bafyclisim".to_string()),
-        author_did: "did:plc:candidate-author".to_string(),
-        target_did: "did:plc:protected-user".to_string(),
-        text: text.to_string(),
-        interaction_type: skybouncer::matcher::InteractionType::DirectReply,
-        parent_uri: None,
-        root_uri: None,
-        created_at_us: 0,
-        image_cids,
-        image_alts: Vec::new(),
-        enriched_context,
-        rubric: Some(rubric.clone()),
-    };
+    let interaction = skybouncer::matcher::Interaction::synthetic(
+        "did:plc:candidate-author",
+        "did:plc:protected-user",
+        text,
+        skybouncer::matcher::InteractionType::DirectReply,
+    )
+    .with_post_uri("at://did:plc:cli-sim/app.bsky.feed.post/sample")
+    .with_post_cid("bafyclisim")
+    .with_images(image_cids, Vec::new())
+    .with_enriched_context_opt(enriched_context)
+    .with_rubric(rubric.clone());
 
     let heuristic_verdict = heuristic.evaluate(&interaction);
     let sim_response = match heuristic_verdict {
@@ -713,13 +692,7 @@ async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
 /// Executes the live 24/7 firehose streamer and moderation daemon.
 async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
     // Initialize structured tracing subscriber
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("skybouncer=info,skybase=info,info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .compact()
-        .try_init();
+    skybouncer::env::init_tracing();
 
     info!("🛡️ Starting Skybouncer v{}", env!("CARGO_PKG_VERSION"));
     info!("   Sovereign, Rule-Driven Auto-Moderation & Bouncer Service for ATProto & Bluesky");
@@ -819,12 +792,7 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
     }
 
     // Build the unified Skybouncer engine with context enricher
-    let appview_endpoint = std::env::var("APPVIEW_ENDPOINT")
-        .or_else(|_| std::env::var("SKYBOUNCER_APPVIEW_ENDPOINT"))
-        .unwrap_or_else(|_| skybouncer::enricher::DEFAULT_APPVIEW_ENDPOINT.to_string());
-    let enricher = std::sync::Arc::new(
-        skybouncer::enricher::AppViewContextEnricher::with_endpoint(appview_endpoint),
-    );
+    let enricher = std::sync::Arc::new(skybouncer::enricher::AppViewContextEnricher::from_env());
 
     // Initialize Web / OAuth configuration early for background token auto-refreshes
     let web_config = skybouncer::web::WebServerConfig::from_env();
@@ -853,11 +821,8 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
 
     // Start Sovereign Web Dashboard early so OAuth endpoints (e.g. client-metadata.json)
     // are actively reachable when PDS authorization servers verify OAuth client metadata
-    let web_enabled = std::env::var("WEB_ENABLED")
-        .or_else(|_| std::env::var("SKYBOUNCER_WEB_ENABLED"))
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false);
-    let port_configured = std::env::var("PORT").is_ok() || std::env::var("SKYBOUNCER_PORT").is_ok();
+    let web_enabled = skybouncer::env::bool_or(&["WEB_ENABLED", "SKYBOUNCER_WEB_ENABLED"], false);
+    let port_configured = skybouncer::env::var(&["PORT", "SKYBOUNCER_PORT"]).is_some();
 
     if web_enabled || port_configured {
         let web_port = web_config.port;
@@ -1011,8 +976,8 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
     });
 
     // Spawn Jetstream firehose streamer
-    let jetstream_url = std::env::var("JETSTREAM_ENDPOINT")
-        .unwrap_or_else(|_| DEFAULT_JETSTREAM_ENDPOINT.to_string());
+    let jetstream_url =
+        skybouncer::env::var_or(&["JETSTREAM_ENDPOINT"], DEFAULT_JETSTREAM_ENDPOINT);
     let stream_config = StreamConfig::new(jetstream_url);
     let cancel_stream = cancel.clone();
     join_set.spawn(async move {
@@ -1033,28 +998,17 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
     });
 
     // Optional ATProto DM Bot worker
-    let bot_handle = std::env::var("BOT_HANDLE")
-        .or_else(|_| std::env::var("BOT_IDENTIFIER"))
-        .ok()
-        .filter(|h| !h.trim().is_empty());
-    let bot_password = std::env::var("BOT_APP_PASSWORD")
-        .or_else(|_| std::env::var("BLUESKY_APP_PASSWORD"))
-        .ok()
-        .filter(|p| !p.trim().is_empty() && !p.contains("xxxx"));
-    let pds_endpoint =
-        std::env::var("PDS_ENDPOINT").unwrap_or_else(|_| "https://bsky.social".to_string());
+    let bot_handle = skybouncer::env::var(&["BOT_HANDLE", "BOT_IDENTIFIER"]);
+    let bot_password = skybouncer::env::var(&["BOT_APP_PASSWORD", "BLUESKY_APP_PASSWORD"])
+        .filter(|p| !p.contains("xxxx"));
+    let pds_endpoint = skybouncer::env::var_or(&["PDS_ENDPOINT"], "https://bsky.social");
 
-    let chat_endpoint = std::env::var("CHAT_ENDPOINT")
-        .unwrap_or_else(|_| skybouncer::DEFAULT_CHAT_ENDPOINT.to_string());
-    let chat_token = std::env::var("CHAT_ACCESS_TOKEN")
-        .ok()
-        .or_else(|| std::env::var("PDS_ACCESS_TOKEN").ok())
-        .filter(|t| !t.trim().is_empty() && !t.contains("xxxx"));
-    let bot_did = std::env::var("BOT_DID")
-        .ok()
-        .filter(|d| {
-            !d.trim().is_empty() && !d.contains("example") && !d.contains("skybouncerbotdid")
-        })
+    let chat_endpoint =
+        skybouncer::env::var_or(&["CHAT_ENDPOINT"], skybouncer::DEFAULT_CHAT_ENDPOINT);
+    let chat_token = skybouncer::env::var(&["CHAT_ACCESS_TOKEN", "PDS_ACCESS_TOKEN"])
+        .filter(|t| !t.contains("xxxx"));
+    let bot_did = skybouncer::env::var(&["BOT_DID"])
+        .filter(|d| !d.contains("example") && !d.contains("skybouncerbotdid"))
         .or_else(|| config.protected_dids.iter().next().cloned());
 
     let bot_client_and_did = if let (Some(handle), Some(pass)) = (bot_handle, bot_password) {
@@ -1089,7 +1043,6 @@ async fn run_daemon(args: &[String]) -> Result<(), SkybouncerError> {
     };
 
     if let Some((chat_client, did)) = bot_client_and_did {
-        let web_config = skybouncer::web::WebServerConfig::from_env();
         let handler = skybouncer::BotCommandHandler::new(std::sync::Arc::new(engine.clone()), did)
             .with_public_url(web_config.public_url);
         let poller_client = chat_client.clone();

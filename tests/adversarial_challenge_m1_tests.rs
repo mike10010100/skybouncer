@@ -452,7 +452,7 @@ async fn test_adversarial_per_tenant_sensitivity_threshold_enforcement() {
 /// Demonstrates that when a tenant has Sensitivity::High (threshold 0.60) in a deployment where the
 /// fleet default rubric has Sensitivity::Medium (threshold 0.75), a violation with confidence 0.70
 /// (which is actionable under the tenant's rubric) passes `act_on_verdict`'s tenant rubric check,
-/// but is rejected by `ModListManager::bounce_user_with_text` (which checks its internal global rubric).
+/// but is rejected by `ModListManager::bounce` (which checks its internal global rubric).
 /// `act_on_verdict` then misinterprets the `Ok(None)` return value as a double-checked lock collision
 /// and falsely returns `InteractionOutcome::AlreadyBounced` even though the author was never bounced!
 #[tokio::test]

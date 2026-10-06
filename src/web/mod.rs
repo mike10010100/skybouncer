@@ -124,27 +124,19 @@ impl WebServerConfig {
     /// Loads web server configuration from environment variables with fallback defaults.
     #[must_use]
     pub fn from_env() -> Self {
-        let host = std::env::var("HOST")
-            .or_else(|_| std::env::var("SKYBOUNCER_HOST"))
-            .unwrap_or_else(|_| DEFAULT_WEB_HOST.to_string());
+        let host = crate::env::var_or(&["HOST", "SKYBOUNCER_HOST"], DEFAULT_WEB_HOST);
 
-        let port = std::env::var("PORT")
-            .or_else(|_| std::env::var("SKYBOUNCER_PORT"))
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(DEFAULT_WEB_PORT);
+        let port = crate::env::parsed_or(&["PORT", "SKYBOUNCER_PORT"], DEFAULT_WEB_PORT);
 
-        let public_url = std::env::var("PUBLIC_URL")
-            .or_else(|_| std::env::var("SKYBOUNCER_PUBLIC_URL"))
-            .unwrap_or_else(|_| format!("http://{host}:{port}"));
+        let public_url = crate::env::var_or(
+            &["PUBLIC_URL", "SKYBOUNCER_PUBLIC_URL"],
+            &format!("http://{host}:{port}"),
+        );
 
-        let client_id = std::env::var("OAUTH_CLIENT_ID")
-            .or_else(|_| std::env::var("SKYBOUNCER_OAUTH_CLIENT_ID"))
-            .ok();
+        let client_id = crate::env::var(&["OAUTH_CLIENT_ID", "SKYBOUNCER_OAUTH_CLIENT_ID"]);
 
-        let redirect_uri = std::env::var("OAUTH_REDIRECT_URI")
-            .or_else(|_| std::env::var("SKYBOUNCER_OAUTH_REDIRECT_URI"))
-            .ok();
+        let redirect_uri =
+            crate::env::var(&["OAUTH_REDIRECT_URI", "SKYBOUNCER_OAUTH_REDIRECT_URI"]);
 
         Self {
             host,

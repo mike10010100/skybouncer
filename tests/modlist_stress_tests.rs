@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use common::MockPdsServer;
 use skybouncer::classifier::{Verdict, ViolationCategory};
-use skybouncer::modlist::{BouncedUser, DeduplicationCache, ModListConfig, ModListManager};
+use skybouncer::modlist::{
+    BounceRequest, BouncedUser, DeduplicationCache, ModListConfig, ModListManager,
+};
 
 // ============================================================================
 // 1. High-Concurrency Multi-Threaded Load (20+ Threads) on Shared In-Memory Cache
@@ -278,14 +280,16 @@ async fn test_extreme_thundering_herd_same_candidate_bounce() {
         let cand = target_candidate.to_string();
 
         tasks.push(tokio::spawn(async move {
-            mgr.bounce_user(
+            mgr.bounce(
                 &cl,
-                "did:plc:alice",
-                &cand,
-                &ViolationCategory::HateSpeech,
-                0.97,
-                "Targeted coordinated attack",
-                "at://did:plc:target_herd_victim/app.bsky.feed.post/100",
+                BounceRequest::new(
+                    "did:plc:alice",
+                    &cand,
+                    &ViolationCategory::HateSpeech,
+                    0.97,
+                    "Targeted coordinated attack",
+                    "at://did:plc:target_herd_victim/app.bsky.feed.post/100",
+                ),
             )
             .await
         }));
@@ -644,14 +648,16 @@ async fn test_concurrent_pardon_and_bounce_race() {
         let target = candidate_pool[i % pool_size].clone();
         tasks.push(tokio::spawn(async move {
             let _ = mgr
-                .bounce_user(
+                .bounce(
                     &cl,
-                    "did:plc:alice",
-                    &target,
-                    &ViolationCategory::CryptoSpam,
-                    0.95,
-                    "Race bounce",
-                    &format!("at://{target}/app.bsky.feed.post/1"),
+                    BounceRequest::new(
+                        "did:plc:alice",
+                        &target,
+                        &ViolationCategory::CryptoSpam,
+                        0.95,
+                        "Race bounce",
+                        &format!("at://{target}/app.bsky.feed.post/1"),
+                    ),
                 )
                 .await;
         }));

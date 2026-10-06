@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use skybase::ingest::backoff::BackoffManager;
 use skybase::ingest::events::{parse_jetstream_frame, JetstreamCommit, JetstreamEvent};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
@@ -79,41 +80,13 @@ impl StreamConfig {
     /// Constructs the full WebSocket subscription URL with query parameters.
     #[must_use]
     pub fn build_url(&self) -> String {
-        let mut url = self.endpoint.clone();
-        let mut params = Vec::new();
-
-        for col in &self.collections {
-            params.push(format!("wantedCollections={col}"));
-        }
-
-        if let Some(cursor) = self.cursor {
-            params.push(format!("cursor={cursor}"));
-        }
-
-        if !params.is_empty() {
-            let separator = if url.contains('?') { '&' } else { '?' };
-            url.push(separator);
-            url.push_str(&params.join("&"));
-        }
-
-        url
+        skybase::ingest::build_subscription_url_full(
+            &self.endpoint,
+            &self.collections,
+            &[],
+            self.cursor.filter(|c| *c > 0),
+        )
     }
-}
-
-fn apply_jitter(duration: Duration) -> Duration {
-    let nanos = duration.as_nanos();
-    let jitter_range = nanos / 4;
-    if jitter_range == 0 {
-        return duration;
-    }
-    let rand = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos() as u128);
-    let offset = rand % jitter_range;
-    let jittered = nanos.saturating_add(offset);
-    let capped = jittered.min(MAX_BACKOFF.as_nanos());
-    #[allow(clippy::cast_possible_truncation)]
-    Duration::from_nanos(capped as u64)
 }
 
 /// Connects to Jetstream and forwards parsed commits to `tx` until `cancel` is triggered.
@@ -128,7 +101,7 @@ pub async fn run_jetstream_streamer(
     tx: mpsc::Sender<JetstreamCommit>,
     cancel: CancellationToken,
 ) -> Result<(), SkybouncerError> {
-    let mut backoff = INITIAL_BACKOFF;
+    let mut backoff = BackoffManager::new(INITIAL_BACKOFF, MAX_BACKOFF);
     let mut current_cursor: Option<u64> = config.cursor;
 
     while !cancel.is_cancelled() {
@@ -140,7 +113,6 @@ pub async fn run_jetstream_streamer(
         let url = active_config.build_url();
         info!(endpoint = %url, cursor = ?active_config.cursor, "Connecting to Jetstream firehose");
 
-        let mut frames_processed: usize = 0;
         match connect_async(&url).await {
             Ok((ws_stream, response)) => {
                 debug!(status = %response.status(), "WebSocket connection established");
@@ -161,11 +133,8 @@ pub async fn run_jetstream_streamer(
                                     if let Some(JetstreamEvent::Commit(commit)) =
                                         parse_jetstream_frame(&text)
                                     {
-                                        frames_processed = frames_processed.saturating_add(1);
                                         current_cursor = Some(commit.time_us);
-                                        if frames_processed >= 5 {
-                                            backoff = INITIAL_BACKOFF;
-                                        }
+                                        backoff.reset();
                                         if tx.send(commit).await.is_err() {
                                             debug!("Commit receiver dropped; stopping streamer");
                                             return Ok(());
@@ -177,11 +146,8 @@ pub async fn run_jetstream_streamer(
                                         if let Some(JetstreamEvent::Commit(commit)) =
                                             parse_jetstream_frame(text)
                                         {
-                                            frames_processed = frames_processed.saturating_add(1);
                                             current_cursor = Some(commit.time_us);
-                                            if frames_processed >= 5 {
-                                                backoff = INITIAL_BACKOFF;
-                                            }
+                                            backoff.reset();
                                             if tx.send(commit).await.is_err() {
                                                 debug!("Commit receiver dropped; stopping streamer");
                                                 return Ok(());
@@ -213,20 +179,18 @@ pub async fn run_jetstream_streamer(
                 }
             }
             Err(e) => {
-                error!(error = %e, backoff = ?backoff, "Failed to connect to Jetstream");
+                error!(error = %e, "Failed to connect to Jetstream");
             }
         }
 
-        // Backoff delay before attempting reconnect with jitter
-        let jittered_delay = apply_jitter(backoff);
+        // Backoff delay before attempting reconnect (exponential with jitter)
+        let delay = backoff.next_backoff();
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 return Ok(());
             }
-            _ = tokio::time::sleep(jittered_delay) => {
-                backoff = (backoff.saturating_mul(2)).min(MAX_BACKOFF);
-            }
+            _ = tokio::time::sleep(delay) => {}
         }
     }
 

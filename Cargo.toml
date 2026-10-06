@@ -20,18 +20,27 @@ path = "src/lib.rs"
 [[bin]]
 name = "skybouncer"
 path = "src/main.rs"
+required-features = ["web", "stream", "bot", "telemetry"]
 
+[features]
+default = ["web", "stream", "bot", "telemetry"]
+# Axum HTTP API, dashboard, and OAuth callback endpoints.
+web = ["dep:axum", "dep:tower-http", "skyauth/axum"]
+# Jetstream firehose WebSocket ingestion.
+stream = ["dep:tokio-tungstenite"]
+# ATProto Chat/DM bot command handling.
+bot = []
+# `tracing-subscriber` initialization helper for binaries.
+telemetry = ["dep:tracing-subscriber"]
 
 [dependencies]
 # Sibling workspace dependencies
 skybase = { path = "../skybase", version = "0.1" }
-skyauth = { path = "../skyauth", version = "0.3", features = ["axum"] }
+skyauth = { path = "../skyauth", version = "0.3" }
 
 # HTTP Web Framework & Networking
-axum = { version = "0.7", default-features = false, features = ["json", "query", "tokio", "macros", "http1"] }
-tower = { version = "0.5", default-features = false, features = ["util"] }
-tower-http = { version = "0.6", default-features = false, features = ["cors", "trace"] }
-http = "1.1"
+axum = { version = "0.7", optional = true, default-features = false, features = ["json", "query", "tokio", "macros", "http1"] }
+tower-http = { version = "0.6", optional = true, default-features = false, features = ["cors", "trace"] }
 
 # Concurrency & Async Runtime
 tokio = { version = "1.40", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
@@ -58,18 +67,16 @@ url = { version = "2.5", features = ["serde"] }
 # Error Handling & Observability
 thiserror = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
-
-# Cryptography & Encryption at Rest
-ring = "0.17"
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["env-filter", "fmt", "ansi"] }
 
 # WebSocket Stream Ingestion for Live Daemon
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.24", optional = true, features = ["rustls-tls-native-roots"] }
 futures-util = { version = "0.3", features = ["sink"] }
 
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["full", "test-util"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 wiremock = "0.6"
 tempfile = "3"
 proptest = "1.5"

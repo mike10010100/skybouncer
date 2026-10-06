@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use common::MockPdsServer;
 use skybouncer::classifier::{BounceDuration, RuleRubric, Sensitivity, Verdict, ViolationCategory};
-use skybouncer::modlist::{BouncedUser, DeduplicationCache, ModListConfig, ModListManager};
+use skybouncer::modlist::{
+    BounceRequest, BouncedUser, DeduplicationCache, ModListConfig, ModListManager,
+};
 
 // ============================================================================
 // 1. SQLite Cache Unit Tests
@@ -240,14 +242,16 @@ async fn test_bounce_user_success_and_cache_population() {
     let manager = ModListManager::open_in_memory().unwrap();
 
     let res = manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:violator_crypto",
-            &ViolationCategory::CryptoSpam,
-            0.96,
-            "Airdrop phishing scam",
-            "at://did:plc:violator_crypto/app.bsky.feed.post/123",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:violator_crypto",
+                &ViolationCategory::CryptoSpam,
+                0.96,
+                "Airdrop phishing scam",
+                "at://did:plc:violator_crypto/app.bsky.feed.post/123",
+            ),
         )
         .await
         .unwrap();
@@ -284,14 +288,16 @@ async fn test_bounce_user_deduplication_drops_redundant_writes() {
 
     // First bounce
     let res1 = manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:repeated_spammer",
-            &ViolationCategory::Spam,
-            0.92,
-            "First spam attack",
-            "at://did:plc:repeated_spammer/app.bsky.feed.post/1",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:repeated_spammer",
+                &ViolationCategory::Spam,
+                0.92,
+                "First spam attack",
+                "at://did:plc:repeated_spammer/app.bsky.feed.post/1",
+            ),
         )
         .await
         .unwrap();
@@ -300,14 +306,16 @@ async fn test_bounce_user_deduplication_drops_redundant_writes() {
 
     // Second bounce: same candidate DID drops immediately at zero cost
     let res2 = manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:repeated_spammer",
-            &ViolationCategory::Spam,
-            0.99,
-            "Second spam attack",
-            "at://did:plc:repeated_spammer/app.bsky.feed.post/2",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:repeated_spammer",
+                &ViolationCategory::Spam,
+                0.99,
+                "Second spam attack",
+                "at://did:plc:repeated_spammer/app.bsky.feed.post/2",
+            ),
         )
         .await
         .unwrap();
@@ -326,14 +334,16 @@ async fn test_bounce_user_sensitivity_threshold_filter() {
 
     // Below threshold (0.65 < 0.75) -> dropped without network or DB writes
     let res = manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:borderline_user",
-            &ViolationCategory::Harassment,
-            0.65,
-            "Mild sarcasm",
-            "at://did:plc:borderline_user/app.bsky.feed.post/1",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:borderline_user",
+                &ViolationCategory::Harassment,
+                0.65,
+                "Mild sarcasm",
+                "at://did:plc:borderline_user/app.bsky.feed.post/1",
+            ),
         )
         .await
         .unwrap();
@@ -355,14 +365,16 @@ async fn test_pardon_user_deletes_record_and_purges_cache() {
 
     // 1. Bounce user
     manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:reformed_user",
-            &ViolationCategory::SeaLioning,
-            0.85,
-            "Badgering questions",
-            "at://did:plc:reformed_user/app.bsky.feed.post/1",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:reformed_user",
+                &ViolationCategory::SeaLioning,
+                0.85,
+                "Badgering questions",
+                "at://did:plc:reformed_user/app.bsky.feed.post/1",
+            ),
         )
         .await
         .unwrap();
@@ -413,14 +425,16 @@ async fn test_bounce_user_recovers_from_dpop_nonce_challenge() {
         .await;
 
     let res = manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:dpop_challenge_violator",
-            &ViolationCategory::Phishing,
-            0.99,
-            "Credential harvester",
-            "at://did:plc:dpop_challenge_violator/app.bsky.feed.post/1",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:dpop_challenge_violator",
+                &ViolationCategory::Phishing,
+                0.99,
+                "Credential harvester",
+                "at://did:plc:dpop_challenge_violator/app.bsky.feed.post/1",
+            ),
         )
         .await
         .unwrap();
@@ -442,14 +456,16 @@ async fn test_bounce_user_pds_failure_preserves_cache() {
         .await;
 
     let res = manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:failed_bounce_user",
-            &ViolationCategory::HateSpeech,
-            0.95,
-            "Hate speech violation",
-            "at://did:plc:failed_bounce_user/app.bsky.feed.post/1",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:failed_bounce_user",
+                &ViolationCategory::HateSpeech,
+                0.95,
+                "Hate speech violation",
+                "at://did:plc:failed_bounce_user/app.bsky.feed.post/1",
+            ),
         )
         .await;
 
@@ -466,14 +482,16 @@ async fn test_pardon_user_pds_failure_preserves_cache() {
 
     // 1. Bounce user
     manager
-        .bounce_user(
+        .bounce(
             &client,
-            "did:plc:alice",
-            "did:plc:failed_pardon_user",
-            &ViolationCategory::Spam,
-            0.90,
-            "Spam comment",
-            "at://did:plc:failed_pardon_user/app.bsky.feed.post/1",
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:failed_pardon_user",
+                &ViolationCategory::Spam,
+                0.90,
+                "Spam comment",
+                "at://did:plc:failed_pardon_user/app.bsky.feed.post/1",
+            ),
         )
         .await
         .unwrap();
@@ -510,14 +528,16 @@ async fn test_concurrent_distinct_violator_bounces() {
         let cl = client.clone();
         handles.push(tokio::spawn(async move {
             let did = format!("did:plc:concurrent_violator_{i}");
-            mgr.bounce_user(
+            mgr.bounce(
                 &cl,
-                "did:plc:alice",
-                &did,
-                &ViolationCategory::CryptoSpam,
-                0.90,
-                "Mass airdrop spam",
-                &format!("at://{did}/app.bsky.feed.post/1"),
+                BounceRequest::new(
+                    "did:plc:alice",
+                    &did,
+                    &ViolationCategory::CryptoSpam,
+                    0.90,
+                    "Mass airdrop spam",
+                    &format!("at://{did}/app.bsky.feed.post/1"),
+                ),
             )
             .await
         }));
@@ -543,14 +563,16 @@ async fn test_file_backed_sqlite_persistence() {
     {
         let manager = ModListManager::open(&db_path).unwrap();
         manager
-            .bounce_user(
+            .bounce(
                 &client,
-                "did:plc:alice",
-                "did:plc:disk_persisted_user",
-                &ViolationCategory::Spam,
-                0.95,
-                "Disk persistence test spam",
-                "at://did:plc:disk_persisted_user/app.bsky.feed.post/1",
+                BounceRequest::new(
+                    "did:plc:alice",
+                    "did:plc:disk_persisted_user",
+                    &ViolationCategory::Spam,
+                    0.95,
+                    "Disk persistence test spam",
+                    "at://did:plc:disk_persisted_user/app.bsky.feed.post/1",
+                ),
             )
             .await
             .unwrap();

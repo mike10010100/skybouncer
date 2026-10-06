@@ -35,7 +35,7 @@ use skybase::ingest::events::{CommitOperation, JetstreamCommit};
 use skybouncer::classifier::{Classifier, JevClassifier, JevConfig, RuleRubric, Sensitivity};
 use skybouncer::engine::{ProcessCommitResult, SkybouncerConfig, SkybouncerEngine};
 use skybouncer::matcher::{FollowGraph, NonFollowedGate};
-use skybouncer::modlist::{DeduplicationCache, ModListManager};
+use skybouncer::modlist::{BounceRequest, DeduplicationCache, ModListManager};
 
 // =============================================================================
 // Helper Test Fixture Builders
@@ -1211,14 +1211,16 @@ async fn test_adversarial_pds_connection_reset_during_pardon() {
     // First bounce a violator
     let bounce_res = rig
         .modlist_manager
-        .bounce_user(
+        .bounce(
             &rig.pds.pds_client(&rig.protected_did),
-            &rig.protected_did,
-            "did:plc:pardon_violator",
-            &skybouncer::classifier::ViolationCategory::Harassment,
-            0.95,
-            "Hostility",
-            "at://did:plc:pardon_violator/app.bsky.feed.post/1",
+            BounceRequest::new(
+                &rig.protected_did,
+                "did:plc:pardon_violator",
+                &skybouncer::classifier::ViolationCategory::Harassment,
+                0.95,
+                "Hostility",
+                "at://did:plc:pardon_violator/app.bsky.feed.post/1",
+            ),
         )
         .await
         .unwrap();
