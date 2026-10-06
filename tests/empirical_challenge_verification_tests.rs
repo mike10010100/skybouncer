@@ -434,3 +434,99 @@ async fn test_claim_5_session_refresh_failure_caches_expired_client() {
         "Expired client must be evicted from pds_clients cache upon refresh failure"
     );
 }
+
+/// Tier 4/5 fast-path cache tests: pre-seeded bounce and evaluation caches must
+/// short-circuit `process_interaction` with zero model/network calls.
+#[tokio::test]
+async fn test_fast_path_dedup_and_eval_cache_short_circuits() {
+    use skybouncer::classifier::{MockClassifier, ViolationCategory};
+    use skybouncer::matcher::Interaction;
+    use skybouncer::modlist::cache::BouncedUser;
+
+    let target_did = "did:plc:fastpath_tenant";
+    let author_did = "did:plc:fastpath_author";
+
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let classifier = Arc::new(MockClassifier::permitted());
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert(target_did.to_string());
+    let config = SkybouncerConfig::new(protected_dids, rubric).with_dry_run(true);
+
+    let engine = SkybouncerEngine::builder(config)
+        .with_cache(Arc::clone(&cache))
+        .with_modlist_manager(modlist)
+        .with_classifier(classifier)
+        .build()
+        .unwrap();
+
+    let make = |uri: &str| Interaction {
+        post_uri: uri.to_string(),
+        post_cid: Some("bafyfast".to_string()),
+        author_did: author_did.to_string(),
+        target_did: target_did.to_string(),
+        text: "perfectly benign message".to_string(),
+        interaction_type: skybouncer::matcher::InteractionType::DirectReply,
+        parent_uri: Some(format!("at://{target_did}/app.bsky.feed.post/root")),
+        root_uri: Some(format!("at://{target_did}/app.bsky.feed.post/root")),
+        created_at_us: 1_700_000_000_000_000,
+        image_cids: Vec::new(),
+        image_alts: Vec::new(),
+        enriched_context: None,
+        rubric: None,
+    };
+
+    // Tier 4: pre-seed a bounce for (protected, subject) -> AlreadyBounced.
+    cache
+        .record_bounce(&BouncedUser {
+            subject_did: author_did.to_string(),
+            protected_did: target_did.to_string(),
+            listitem_uri: "at://list/1".to_string(),
+            listitem_rkey: "1".to_string(),
+            listitem_cid: "bafy".to_string(),
+            category: "CryptoSpam".to_string(),
+            confidence: 0.99,
+            reason: "seed".to_string(),
+            post_uri: "at://seed".to_string(),
+            post_text: "seed".to_string(),
+            bounced_at: 1_700_000_000_000_000,
+            expires_at: None,
+        })
+        .unwrap();
+    let bounced_out = engine
+        .process_interaction(make(
+            "at://did:plc:fastpath_author/app.bsky.feed.post/tier4",
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        bounced_out,
+        skybouncer::engine::InteractionOutcome::AlreadyBounced { .. }
+    ));
+
+    // Clear the bounce so we can reach Tier 5.
+    cache.remove_bounce(author_did).unwrap();
+
+    // Tier 5: pre-seed an evaluation verdict -> eval-cache hit resolves directly.
+    let eval_uri = "at://did:plc:fastpath_author/app.bsky.feed.post/tier5";
+    let eval_key = format!("{eval_uri}:{target_did}");
+    cache
+        .set_evaluation(
+            &eval_key,
+            author_did,
+            &Verdict::violation(ViolationCategory::CryptoSpam, 0.97, "cached verdict"),
+            Duration::from_secs(600),
+        )
+        .unwrap();
+    let eval_out = engine.process_interaction(make(eval_uri)).await.unwrap();
+    assert!(matches!(
+        eval_out,
+        skybouncer::engine::InteractionOutcome::Bounced { .. }
+    ));
+
+    let stats = engine.stats().snapshot();
+    assert!(stats.dedup_cache_hits >= 1);
+    assert!(stats.eval_cache_hits >= 1);
+}

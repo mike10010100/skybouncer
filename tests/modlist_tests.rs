@@ -753,3 +753,53 @@ async fn test_temporary_ttl_bounce_expiration_and_cache_pruning() {
     assert!(pardoned);
     assert!(!manager.is_bounced(&expired_user.subject_did).unwrap());
 }
+
+#[tokio::test]
+async fn test_manager_wrapper_open_rubric_is_bounced_for_and_pardon_scoped() {
+    // File-backed constructor populates an empty cache.
+    let dir = std::env::temp_dir().join(format!("skybouncer_mgr_{}", std::process::id()));
+    let db = dir.join("mgr.db");
+    let manager = ModListManager::open(&db).unwrap();
+    assert_eq!(manager.rubric(), None);
+
+    // `pardon` (scoped to the client DID) delegates to `pardon_user`.
+    let pds = MockPdsServer::start().await;
+    let client = pds.pds_client("did:plc:alice");
+    let pardoned = manager.pardon(&client, "did:plc:never").await.unwrap();
+    assert!(!pardoned);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_manager_is_bounced_for_delegates_to_cache() {
+    let pds = MockPdsServer::start().await;
+    let client = pds.pds_client("did:plc:alice");
+    let manager = ModListManager::open_in_memory().unwrap();
+
+    assert!(!manager
+        .is_bounced_for("did:plc:alice", "did:plc:x")
+        .unwrap());
+
+    manager
+        .bounce(
+            &client,
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:scoped",
+                &ViolationCategory::Spam,
+                0.9,
+                "spam",
+                "at://did:plc:scoped/app.bsky.feed.post/1",
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(manager
+        .is_bounced_for("did:plc:alice", "did:plc:scoped")
+        .unwrap());
+    // Different protected user is not affected.
+    assert!(!manager
+        .is_bounced_for("did:plc:bob", "did:plc:scoped")
+        .unwrap());
+}

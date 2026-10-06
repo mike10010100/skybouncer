@@ -2284,3 +2284,118 @@ async fn test_command_sensitivity_medium_and_stranger_unknown_tip() {
     assert!(tip.contains("Unknown command"));
     assert!(tip.contains("not yet protected") || tip.contains("activate"));
 }
+
+#[tokio::test]
+async fn test_run_bot_poller_multiple_unread_fetches_history_and_handles_failures() {
+    let server = MockServer::start().await;
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let bot_did = "did:plc:skybouncer-bot";
+    let handler = BotCommandHandler::new(engine, bot_did);
+
+    let list_called = Arc::new(AtomicUsize::new(0));
+    let lc = Arc::clone(&list_called);
+    let get_called = Arc::new(AtomicUsize::new(0));
+    let gc = Arc::clone(&get_called);
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .respond_with(move |_: &wiremock::Request| {
+            // First tick: convo with multiple unread messages; later ticks: none.
+            if lc.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "convos": [{
+                        "id": "convo_multi",
+                        "rev": "rev_1",
+                        "unreadCount": 2,
+                        "members": [
+                            {"did": "did:plc:protected1"},
+                            {"did": "did:plc:skybouncer-bot"}
+                        ],
+                        "lastMessage": {
+                            "id": "msg_newest",
+                            "rev": "rev_1",
+                            "text": "help",
+                            "sender": {"did": "did:plc:protected1"},
+                            "sentAt": "2026-10-02T03:00:00Z"
+                        }
+                    }],
+                    "cursor": null
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({"convos": [], "cursor": null}))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    // getMessages returns newest-first; includes a self-authored message (skipped) + a real one.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.getMessages"))
+        .respond_with(move |_: &wiremock::Request| {
+            gc.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "messages": [
+                    {
+                        "id": "msg_real",
+                        "rev": "rev_b",
+                        "text": "help",
+                        "sender": {"did": "did:plc:protected1"},
+                        "sentAt": "2026-10-02T03:00:00Z"
+                    },
+                    {
+                        "id": "msg_self",
+                        "rev": "rev_a",
+                        "text": "welcome",
+                        "sender": {"did": "did:plc:skybouncer-bot"},
+                        "sentAt": "2026-10-02T02:59:00Z"
+                    }
+                ]
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_reply",
+            "rev": "rev_r",
+            "text": "reply",
+            "sender": {"did": "did:plc:skybouncer-bot"},
+            "sentAt": "2026-10-02T03:00:01Z"
+        })))
+        .mount(&server)
+        .await;
+
+    // updateRead fails -> warn branch.
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.updateRead"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+
+    // listConvoRequests fails -> debug branch.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvoRequests"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("nope"))
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "test_token").expect("client");
+    let cancel = CancellationToken::new();
+    let cancel_poller = cancel.clone();
+
+    let poller_task = tokio::spawn(async move {
+        run_bot_poller(client, handler, Duration::from_millis(20), cancel_poller).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancel.cancel();
+
+    let res = tokio::time::timeout(Duration::from_millis(500), poller_task)
+        .await
+        .expect("poller shutdown within timeout")
+        .expect("join task");
+    assert!(res.is_ok());
+    assert!(get_called.load(Ordering::SeqCst) >= 1);
+}
