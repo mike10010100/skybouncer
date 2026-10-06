@@ -129,6 +129,54 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_open_persistent_path_creates_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "skybouncer_reg_test_{}",
+            crate::time::current_time_us()
+        ));
+        let db = dir.join("nested").join("tenants.db");
+        let registry = TenantRegistry::open(&db).expect("open persistent registry");
+        assert_eq!(registry.count().unwrap(), 0);
+        assert!(db.exists(), "database file must be created");
+        drop(registry);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_registry_from_connection_reuses_schema() {
+        let conn = std::sync::Arc::new(parking_lot::Mutex::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        ));
+        let a = TenantRegistry::from_connection(std::sync::Arc::clone(&conn)).unwrap();
+        a.register_or_update(&Tenant::new("did:plc:shared"))
+            .unwrap();
+
+        // A second registry over the same connection sees the persisted row.
+        let b = TenantRegistry::from_connection(std::sync::Arc::clone(&conn)).unwrap();
+        assert_eq!(b.count().unwrap(), 1);
+        assert!(b.is_enrolled("did:plc:shared").unwrap());
+    }
+
+    #[test]
+    fn test_registry_fallback_constructs_usable_registry() {
+        let registry = TenantRegistry::fallback();
+        assert_eq!(registry.count().unwrap(), 0);
+        registry
+            .register_or_update(&Tenant::new("did:plc:fb"))
+            .unwrap();
+        assert!(registry.is_enrolled("did:plc:fb").unwrap());
+    }
+
+    #[test]
+    fn test_registry_with_cipher_and_accessor() {
+        let cipher = crate::crypto::SessionCipher::from_secret_passphrase("unit-test-key");
+        let registry = test_registry().with_cipher(cipher);
+        // Accessor returns the configured cipher (no panic / borrow issue).
+        let _ = registry.cipher();
+        assert_eq!(registry.count().unwrap(), 0);
+    }
+
+    #[test]
     pub(super) fn test_tenant_crud_in_memory() {
         let registry = test_registry();
         assert_eq!(registry.count().unwrap(), 0);
