@@ -1584,6 +1584,63 @@ mod tests {
     }
 
     #[test]
+    fn builder_dry_run_uses_shadow_cache_and_modlist() {
+        let dir = std::env::temp_dir().join(format!(
+            "skyb_builder_test_{}",
+            crate::time::current_time_us()
+        ));
+        let db = dir.join("cache.db");
+        let cache = DeduplicationCache::open(&db).unwrap();
+        let classifier = Arc::new(crate::classifier::MockClassifier::new(
+            crate::classifier::Verdict::permitted("ok"),
+        ));
+        let cfg = SkybouncerConfig::new(["did:plc:a"], RuleRubric::default())
+            .with_dry_run(true)
+            .with_list_description("desc");
+        let engine = SkybouncerEngine::builder(cfg)
+            .with_cache(Arc::new(cache))
+            .with_classifier(classifier)
+            .build()
+            .expect("dry-run engine builds");
+        assert!(engine.is_dry_run());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builder_from_jev_config_constructs_primary_classifier() {
+        let jev = JevConfig {
+            base_url: "http://localhost:11434".to_string(),
+            api_key: None,
+            model: "test-model".to_string(),
+            timeout: Duration::from_millis(500),
+            max_retries: 0,
+        };
+        let cfg = SkybouncerConfig::new(["did:plc:a"], RuleRubric::default())
+            .with_jev_config(jev.clone())
+            .with_fallback_jev_config(jev)
+            .with_dry_run(true);
+        // No explicit classifier => builds from JevConfig, with fallback => TieredClassifier.
+        let engine = SkybouncerEngine::builder(cfg)
+            .build()
+            .expect("engine builds from jev config");
+        assert_eq!(engine.primary_classifier().model_name(), "tiered");
+    }
+
+    #[test]
+    fn builder_fallback_pds_client_branches() {
+        // No endpoint/token + not dry-run => fallback multi-tenant PDS client path.
+        let classifier = Arc::new(crate::classifier::MockClassifier::new(
+            crate::classifier::Verdict::permitted("ok"),
+        ));
+        let cfg = SkybouncerConfig::new(["did:plc:a"], RuleRubric::default());
+        let engine = SkybouncerEngine::builder(cfg)
+            .with_classifier(classifier)
+            .build()
+            .expect("fallback pds client builds");
+        assert!(!engine.pds_client().did().is_empty());
+    }
+
+    #[test]
     fn process_commit_result_helpers() {
         let outcome = InteractionOutcome::Permitted {
             author_did: "a".to_string(),
