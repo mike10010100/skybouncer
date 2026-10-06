@@ -274,3 +274,44 @@ async fn engine_accessors_and_hydration_paths() {
     // Persist stats returns Ok on the in-memory cache.
     engine.persist_stats().expect("persist stats");
 }
+
+#[tokio::test]
+async fn engine_tenant_ops_paths() {
+    let rig = build_rig(Verdict::permitted("ok"), None, false).await;
+    let engine = &rig.engine;
+
+    // is_admin: configured admin only; empty/unknown are not admin.
+    assert!(!engine.is_admin(""));
+    assert!(!engine.is_admin("did:plc:someone"));
+
+    // Enroll a tenant, then it is enrolled and its rubric is returned.
+    use skybouncer::tenant::Tenant;
+    let tenant =
+        Tenant::new("did:plc:enrolled").with_rubric(skybouncer::classifier::RuleRubric::new(
+            "Enrolled rules",
+            skybouncer::classifier::Sensitivity::High,
+        ));
+    engine.enroll_tenant(tenant).expect("enroll");
+    assert!(engine.is_enrolled("did:plc:enrolled"));
+    assert_eq!(
+        engine.rubric_for("did:plc:enrolled").prompt,
+        "Enrolled rules"
+    );
+    // Unknown DID falls back to engine default rubric.
+    assert_eq!(
+        engine.rubric_for("did:plc:nobody").prompt,
+        engine.rubric().prompt
+    );
+
+    // is_tenant_paused: engine-wide pause affects any tenant.
+    let _ = engine.pause();
+    assert!(engine.is_tenant_paused("did:plc:enrolled"));
+    let _ = engine.resume();
+    assert!(!engine.is_tenant_paused("did:plc:nobody"));
+
+    // resolve_pds_client_for: the fallback client DID resolves directly.
+    let fallback_did = engine.pds_client().did().to_string();
+    assert!(engine.resolve_pds_client_for(&fallback_did).await.is_ok());
+    // pds_client_for always returns a client (fallback on error).
+    let _ = engine.pds_client_for("did:plc:unknown").await;
+}
