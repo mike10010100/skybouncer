@@ -426,3 +426,36 @@ fn config_from_env_reads_fallback_model_and_flags() {
         std::env::remove_var(k);
     }
 }
+
+#[tokio::test]
+async fn engine_new_direct_constructor_branches() {
+    use skybouncer::matcher::{FollowGraph, NonFollowedGate};
+    use skybouncer::modlist::{DeduplicationCache, ModListManager};
+
+    let pds = common::MockPdsServer::start().await;
+    let cache = std::sync::Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    // Preload an allowlist entry so the constructor's allowlist-loading loop runs.
+    cache
+        .add_to_allowlist("did:plc:alice", "did:plc:trusted", Some("t"))
+        .unwrap();
+
+    let follow_graph = std::sync::Arc::new(FollowGraph::new());
+    let gate = std::sync::Arc::new(NonFollowedGate::new(std::sync::Arc::clone(&follow_graph)));
+    let mut rubric = skybouncer::classifier::RuleRubric::new("Block spam", Sensitivity::Medium);
+    rubric.bypass_incoming_followers = true;
+    // Non-dry-run manager + dry_run config => constructor force-enables manager dry-run.
+    let modlist = std::sync::Arc::new(
+        ModListManager::from_shared_cache(std::sync::Arc::clone(&cache))
+            .with_rubric(rubric.clone()),
+    );
+    let pds_client = std::sync::Arc::new(pds.pds_client("did:plc:alice"));
+    let classifier = std::sync::Arc::new(MockClassifier::new(Verdict::permitted("ok")));
+
+    let mut dids = HashSet::new();
+    dids.insert("did:plc:alice".to_string());
+    let config = SkybouncerConfig::new(dids, rubric).with_dry_run(true);
+
+    let engine = SkybouncerEngine::new(config, follow_graph, gate, classifier, modlist, pds_client);
+    assert!(engine.is_dry_run());
+    assert!(engine.is_allowlisted("did:plc:alice", "did:plc:trusted"));
+}
