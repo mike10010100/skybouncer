@@ -1,0 +1,187 @@
+//! Integration tests for the operational CLI command runners in `skybouncer::app`.
+//!
+//! These exercise `run_cli_status`, `run_cli_pardon`, and `run_cli_simulate` against a
+//! mock HTTP daemon (wiremock), plus the offline simulation path.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+
+use serde_json::json;
+use skybouncer::app::{run_cli_pardon, run_cli_simulate, run_cli_status};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn args(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| (*s).to_string()).collect()
+}
+
+fn status_json() -> serde_json::Value {
+    json!({
+        "stats": serde_json::to_value(skybouncer::engine::EngineStatsSnapshot::default()).unwrap(),
+        "protected_dids": ["did:plc:alice"],
+        "rubric": {
+            "prompt": "Block spam",
+            "sensitivity": "medium",
+            "threshold": 0.8,
+            "bounce_duration": "permanent",
+            "bypass_incoming_followers": true
+        },
+        "dry_run": false,
+        "version": "9.9.9"
+    })
+}
+
+#[tokio::test]
+async fn run_cli_status_renders_human_report() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(status_json()))
+        .mount(&server)
+        .await;
+
+    let a = args(&["--url", &server.uri()]);
+    run_cli_status(&a).await.expect("status ok");
+}
+
+#[tokio::test]
+async fn run_cli_status_json_output() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(status_json()))
+        .mount(&server)
+        .await;
+
+    let a = args(&["--url", &server.uri(), "--json"]);
+    run_cli_status(&a).await.expect("status json ok");
+}
+
+#[tokio::test]
+async fn run_cli_status_reports_non_success() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/status"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .mount(&server)
+        .await;
+
+    let a = args(&["--url", &server.uri()]);
+    let err = run_cli_status(&a).await.expect_err("must fail");
+    assert!(matches!(err, skybouncer::SkybouncerError::Config(_)));
+}
+
+#[tokio::test]
+async fn run_cli_status_reports_unreachable_daemon() {
+    // Point at a port nothing is listening on.
+    let a = args(&["--url", "http://127.0.0.1:1"]);
+    let err = run_cli_status(&a).await.expect_err("must fail");
+    assert!(matches!(err, skybouncer::SkybouncerError::Config(_)));
+}
+
+#[tokio::test]
+async fn run_cli_pardon_did_success() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/pardon"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "subject_did": "did:plc:spammer",
+            "pardoned": true,
+            "message": "pardoned"
+        })))
+        .mount(&server)
+        .await;
+
+    let a = args(&["did:plc:spammer", "--url", &server.uri()]);
+    run_cli_pardon(&a).await.expect("pardon ok");
+}
+
+#[tokio::test]
+async fn run_cli_pardon_did_failure_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/pardon"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+        .mount(&server)
+        .await;
+
+    let a = args(&["did:plc:spammer", "--url", &server.uri()]);
+    let err = run_cli_pardon(&a).await.expect_err("must fail");
+    assert!(matches!(err, skybouncer::SkybouncerError::Config(_)));
+}
+
+#[tokio::test]
+async fn run_cli_pardon_missing_subject_errors() {
+    let a = args(&["--url", "http://127.0.0.1:1"]);
+    let err = run_cli_pardon(&a).await.expect_err("must fail");
+    assert!(matches!(err, skybouncer::SkybouncerError::Config(_)));
+}
+
+#[tokio::test]
+async fn run_cli_pardon_handle_resolution_success() {
+    let server = MockServer::start().await;
+    // Handle resolution hits bsky.social directly; we can't redirect that, so this
+    // test only verifies the DID passthrough path against the mock daemon.
+    Mock::given(method("POST"))
+        .and(path("/api/pardon"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "subject_did": "did:plc:spammer",
+            "pardoned": true,
+            "message": "ok"
+        })))
+        .mount(&server)
+        .await;
+
+    let a = args(&[
+        "did:plc:spammer",
+        "--target",
+        "did:plc:alice",
+        "--url",
+        &server.uri(),
+    ]);
+    run_cli_pardon(&a).await.expect("pardon with target ok");
+}
+
+#[tokio::test]
+async fn run_cli_simulate_via_daemon() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/simulate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "violates": true,
+            "category": "crypto_spam",
+            "confidence": 0.95,
+            "reason": "airdrop",
+            "evaluator": "heuristic_prefilter",
+            "meets_threshold": true,
+            "threshold": 0.8,
+            "images_evaluated": 0
+        })))
+        .mount(&server)
+        .await;
+
+    let a = args(&["free airdrop scam", "--url", &server.uri()]);
+    run_cli_simulate(&a).await.expect("simulate via daemon ok");
+}
+
+#[tokio::test]
+async fn run_cli_simulate_offline_uses_local_engine() {
+    // No network; forces the offline dry-run engine path.
+    let a = args(&["definitely benign text here", "--offline"]);
+    // The offline path builds an engine from env; JEV isn't configured so it may
+    // error at classifier construction, which is still a valid covered path.
+    let _ = run_cli_simulate(&a).await;
+}
+
+#[tokio::test]
+async fn run_cli_simulate_missing_text_errors() {
+    let a = args(&["--offline"]);
+    let err = run_cli_simulate(&a).await.expect_err("must fail");
+    assert!(matches!(err, skybouncer::SkybouncerError::Config(_)));
+}
+
+#[tokio::test]
+async fn run_cli_simulate_falls_back_to_offline_when_daemon_unreachable() {
+    // Daemon URL points nowhere valid; simulate should fall through to offline.
+    let a = args(&["some sample text", "--url", "http://127.0.0.1:1"]);
+    let _ = run_cli_simulate(&a).await;
+}

@@ -19,9 +19,12 @@
     rust_2018_idioms
 )]
 
+#[cfg(feature = "web")]
+pub mod app;
 #[cfg(feature = "bot")]
 pub mod bot;
 pub mod classifier;
+pub mod cli;
 pub mod crypto;
 pub mod engine;
 pub mod enricher;
