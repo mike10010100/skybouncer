@@ -1395,3 +1395,73 @@ async fn test_ollama_bad_wrapper_json_errors() {
         .unwrap_err();
     assert!(err.to_string().contains("Ollama"));
 }
+
+#[tokio::test]
+async fn test_systemone_violation_uses_choice_probability_when_no_permitted() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "spam",
+                    "probabilities": {"spam": 0.8}
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let base = format!("{}/v1/systemone", server.uri());
+    let classifier = classifier_for(base, "systemone");
+    let v = classifier.classify(&sample_interaction("x")).await.unwrap();
+    assert!(v.is_violation());
+    assert_eq!(v.confidence(), Some(0.8));
+}
+
+#[tokio::test]
+async fn test_systemone_uses_scalar_confidence_when_no_probabilities() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "permitted",
+                    "confidence": 0.66
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let base = format!("{}/v1/systemone", server.uri());
+    let classifier = classifier_for(base, "systemone");
+    let v = classifier.classify(&sample_interaction("x")).await.unwrap();
+    assert!(!v.is_violation());
+    assert_eq!(v.confidence(), Some(0.66));
+}
+
+#[tokio::test]
+async fn test_systemone_missing_confidence_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {"type": "choice", "choice": "spam"}
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let base = format!("{}/v1/systemone", server.uri());
+    let classifier = classifier_for(base, "systemone");
+    let err = classifier
+        .classify(&sample_interaction("x"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("missing confidence"));
+}
