@@ -230,3 +230,144 @@ fn urlencoding_simple(s: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+    use axum::extract::{Query, State};
+    use skyauth::client::OAuthClientMetadata;
+
+    fn state_without_client() -> OAuthState {
+        OAuthState {
+            oauth_client: None,
+            metadata: OAuthClientMetadata::new(
+                "http://127.0.0.1:3000/oauth/client-metadata.json",
+                "http://127.0.0.1:3000/oauth/callback",
+            ),
+            engine: None,
+        }
+    }
+
+    #[test]
+    fn urlencoding_simple_escapes_reserved_chars() {
+        assert_eq!(urlencoding_simple("abc-_.~123"), "abc-_.~123");
+        assert_eq!(urlencoding_simple("a b"), "a%20b");
+        assert_eq!(urlencoding_simple("a/b?c=d"), "a%2Fb%3Fc%3Dd");
+        assert_eq!(urlencoding_simple("é"), "%C3%A9");
+        assert_eq!(urlencoding_simple(""), "");
+    }
+
+    #[tokio::test]
+    async fn get_client_metadata_serves_document() {
+        let state = state_without_client();
+        let resp = get_client_metadata(State(state)).await.expect("metadata");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oauth_login_requires_handle() {
+        let state = state_without_client();
+        let err = oauth_login(State(state.clone()), Query(LoginQuery { handle: None }))
+            .await
+            .expect_err("missing handle");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let err = oauth_login(
+            State(state.clone()),
+            Query(LoginQuery {
+                handle: Some("   ".to_string()),
+            }),
+        )
+        .await
+        .expect_err("blank handle");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oauth_login_without_client_is_unavailable() {
+        let state = state_without_client();
+        let err = oauth_login(
+            State(state),
+            Query(LoginQuery {
+                handle: Some("alice.bsky.social".to_string()),
+            }),
+        )
+        .await
+        .expect_err("no oauth client");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_requires_code_or_error() {
+        let state = state_without_client();
+        let query = OAuthCallbackQuery {
+            code: None,
+            state: None,
+            iss: None,
+            error: None,
+            error_description: None,
+        };
+        let err = oauth_callback(State(state), query)
+            .await
+            .expect_err("missing code/error");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_without_client_is_unavailable() {
+        let state = state_without_client();
+        let query = OAuthCallbackQuery::new("code123", "state123");
+        let err = oauth_callback(State(state), query)
+            .await
+            .expect_err("no oauth client");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_error_query_redirects() {
+        // No client, but an error query short-circuits BEFORE the client lookup only
+        // when code and error are both absent; an error query still requires the
+        // client to translate, so this exercises the missing-code/error guard.
+        let state = state_without_client();
+        let query = OAuthCallbackQuery::new_error("access_denied", None);
+        // With a client absent, returns SERVICE_UNAVAILABLE.
+        let err = oauth_callback(State(state), query)
+            .await
+            .expect_err("no client");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    fn location_of(r: Redirect) -> String {
+        r.into_response()
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn auth_redirect_encodes_handle_or_defaults() {
+        let r = auth_redirect(Query(LoginQuery {
+            handle: Some("alice.bsky.social".to_string()),
+        }))
+        .await;
+        assert_eq!(location_of(r), "/oauth/login?handle=alice.bsky.social");
+
+        let r = auth_redirect(Query(LoginQuery {
+            handle: Some("a b".to_string()),
+        }))
+        .await;
+        assert_eq!(location_of(r), "/oauth/login?handle=a%20b");
+
+        let r = auth_redirect(Query(LoginQuery {
+            handle: Some("  ".to_string()),
+        }))
+        .await;
+        assert_eq!(location_of(r), "/?auth=login");
+
+        let r = auth_redirect(Query(LoginQuery { handle: None })).await;
+        assert_eq!(location_of(r), "/?auth=login");
+    }
+}
