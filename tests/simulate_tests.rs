@@ -315,3 +315,62 @@ async fn engine_tenant_ops_paths() {
     // pds_client_for always returns a client (fallback on error).
     let _ = engine.pds_client_for("did:plc:unknown").await;
 }
+
+#[tokio::test]
+async fn engine_lifecycle_run_pipeline_spawn_and_drain() {
+    use tokio::task::JoinSet;
+    use tokio_util::sync::CancellationToken;
+
+    let rig = build_rig(Verdict::permitted("ok"), None, false).await;
+    let engine = &rig.engine;
+
+    // run_pipeline: feed no commits and cancel immediately.
+    let (_tx, rx) = tokio::sync::mpsc::channel(4);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let _ = engine.run_pipeline(rx, cancel).await;
+
+    // spawn_in_join_set returns a sender; drain_and_shutdown cancels the worker.
+    let mut join_set: JoinSet<
+        Result<skybouncer::engine::EngineStatsSnapshot, skybouncer::SkybouncerError>,
+    > = JoinSet::new();
+    let cancel2 = CancellationToken::new();
+    let _tx = engine.spawn_in_join_set(&mut join_set, cancel2.clone());
+    cancel2.cancel();
+    skybouncer::engine::SkybouncerEngine::drain_and_shutdown(
+        &mut join_set,
+        &cancel2,
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .expect("drain");
+}
+
+#[tokio::test]
+async fn engine_lifecycle_maintenance_and_prune() {
+    use tokio_util::sync::CancellationToken;
+
+    let rig = build_rig(Verdict::permitted("ok"), None, false).await;
+    let engine = &rig.engine;
+
+    // No expired bounces => prune returns 0.
+    assert_eq!(engine.prune_expired_bounces().await.unwrap(), 0);
+
+    // run_maintenance runs at least one tick then stops on cancel.
+    let cancel = CancellationToken::new();
+    let c2 = cancel.clone();
+    let maint = tokio::spawn({
+        let engine = rig.engine.clone();
+        async move {
+            let _ = engine
+                .run_maintenance(std::time::Duration::from_millis(10), c2)
+                .await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cancel.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), maint).await;
+
+    // persist_stats is callable on an in-memory cache.
+    engine.persist_stats().expect("persist");
+}
