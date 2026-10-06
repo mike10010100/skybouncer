@@ -2263,3 +2263,24 @@ async fn test_command_status_dry_run_variants() {
         .unwrap();
     assert!(user.contains("Dry-Run") || user.contains("simulated"));
 }
+
+#[tokio::test]
+async fn test_command_sensitivity_medium_and_stranger_unknown_tip() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+
+    // `sensitivity medium` exercises the "medium" match arm.
+    let m = handler
+        .handle_command("did:plc:protected1", "sensitivity medium")
+        .await
+        .unwrap();
+    assert!(m.contains("Sensitivity threshold updated"));
+
+    // Unknown command from an unauthorized sender includes the activation tip.
+    let tip = handler
+        .handle_command("did:plc:stranger", "totally-unknown-cmd")
+        .await
+        .unwrap();
+    assert!(tip.contains("Unknown command"));
+    assert!(tip.contains("not yet protected") || tip.contains("activate"));
+}

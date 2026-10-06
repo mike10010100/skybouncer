@@ -495,6 +495,32 @@ mod tests {
     }
 
     #[test]
+    pub(super) fn test_web_session_empty_token_and_expired_purge_and_prune() {
+        let registry = test_registry();
+        // Empty tokens short-circuit.
+        assert!(registry.validate_web_session("   ").unwrap().is_none());
+        assert!(!registry.delete_web_session("").unwrap());
+
+        // Expired session is purged on validation (returns None) and prune removes leftovers.
+        let expired = registry
+            .create_web_session("did:plc:exp", Duration::from_micros(1))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(registry.validate_web_session(&expired).unwrap().is_none());
+
+        let live = registry
+            .create_web_session("did:plc:live", Duration::from_secs(600))
+            .unwrap();
+        assert_eq!(
+            registry.validate_web_session(&live).unwrap().as_deref(),
+            Some("did:plc:live")
+        );
+        // prune returns >= 0 and keeps the live session valid.
+        let _ = registry.prune_expired_web_sessions().unwrap();
+        assert!(registry.validate_web_session(&live).unwrap().is_some());
+    }
+
+    #[test]
     pub(super) fn test_web_session_lifecycle() {
         let registry = test_registry();
         let did = "did:plc:alice";

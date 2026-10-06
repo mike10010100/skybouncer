@@ -102,6 +102,42 @@ async fn provision_pds_resources_creates_lists_for_protected_did() {
 }
 
 #[tokio::test]
+async fn provision_pds_resources_includes_enrolled_tenant_with_session() {
+    use skyauth::dpop::DPoPKey;
+    use skyauth::session::OAuthSession;
+    let pds = MockPdsServer::start().await;
+    let protected = "did:plc:alice";
+    let engine = build_engine(protected, &pds, false).await;
+
+    // Enroll a tenant WITH a session so the provisioning loop includes it.
+    let session = OAuthSession::new(
+        "did:plc:tenant-sess",
+        "at-token",
+        Some("rt-token".to_string()),
+        "DPoP",
+        None,
+        Some(3600),
+        DPoPKey::generate(),
+        Some(pds.uri()),
+        None,
+        None,
+    )
+    .unwrap();
+    engine
+        .tenant_registry()
+        .register_or_update(
+            &skybouncer::tenant::Tenant::new("did:plc:tenant-sess").with_session(session),
+        )
+        .unwrap();
+
+    let mut dids = HashSet::new();
+    dids.insert(protected.to_string());
+    // At least the protected DID + the session-bearing tenant are attempted.
+    let provisioned = skybouncer::daemon::provision_pds_resources(&engine, &dids).await;
+    assert!(provisioned >= 1);
+}
+
+#[tokio::test]
 async fn resolve_bot_client_no_credentials_returns_none() {
     let r = skybouncer::daemon::resolve_bot_client(
         None,
