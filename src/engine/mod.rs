@@ -1680,6 +1680,49 @@ mod tests {
     }
 
     #[test]
+    fn builder_heuristic_and_rate_limiter_and_cache_from_modlist() {
+        use crate::limiter::{EvaluationRateLimiter, RateLimiterConfig};
+        let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+        let modlist = Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)));
+        let classifier = Arc::new(crate::classifier::MockClassifier::new(
+            crate::classifier::Verdict::permitted("ok"),
+        ));
+        let cfg = SkybouncerConfig::new(["did:plc:a"], RuleRubric::default());
+        // No explicit cache: build() reuses the modlist manager's cache.
+        let engine = SkybouncerEngine::builder(cfg)
+            .with_modlist_manager(Arc::clone(&modlist))
+            .with_classifier(classifier)
+            .with_heuristic_classifier(HeuristicClassifier::empty())
+            .with_rate_limiter(Arc::new(EvaluationRateLimiter::new(
+                RateLimiterConfig::default(),
+            )))
+            .build()
+            .expect("engine builds");
+        assert!(engine.cache().count_bounced().is_ok());
+    }
+
+    #[test]
+    fn builder_cache_path_persistent_branch() {
+        // No cache, no modlist manager, but a config cache_path -> open persistent cache.
+        let dir = std::env::temp_dir().join(format!(
+            "skyb_builder_persist_{}",
+            crate::time::current_time_us()
+        ));
+        let db = dir.join("cache.db");
+        let classifier = Arc::new(crate::classifier::MockClassifier::new(
+            crate::classifier::Verdict::permitted("ok"),
+        ));
+        let cfg = SkybouncerConfig::new(["did:plc:a"], RuleRubric::default()).with_cache_path(&db);
+        let engine = SkybouncerEngine::builder(cfg)
+            .with_classifier(classifier)
+            .build()
+            .expect("engine builds with persistent cache");
+        assert!(engine.is_protected("did:plc:a"));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn process_commit_result_helpers() {
         let outcome = InteractionOutcome::Permitted {
             author_did: "a".to_string(),
