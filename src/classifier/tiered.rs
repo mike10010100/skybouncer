@@ -572,4 +572,63 @@ mod tests {
         assert_eq!(primary.rubric(), Some(new_rubric.clone()));
         assert_eq!(fallback.rubric(), Some(new_rubric));
     }
+
+    #[test]
+    fn certainty_config_nan_clamp_and_uncertain() {
+        // NaN inputs fall back to safe bounds and min<=max is enforced.
+        let c = CertaintyConfig::new(f64::NAN, f64::NAN, true);
+        assert_eq!(c.min_confidence, 0.0);
+        assert_eq!(c.max_confidence, 1.0);
+        // Inverted bounds are ordered.
+        let c = CertaintyConfig::new(0.9, 0.2, false);
+        assert!(c.min_confidence <= c.max_confidence);
+        // Uncertainty band is [min, max); NaN is uncertain.
+        assert!(c.is_uncertain(f64::NAN));
+        assert!(c.is_uncertain(0.5));
+        assert!(!c.is_uncertain(1.0));
+    }
+
+    #[test]
+    fn certainty_should_escalate_matrix() {
+        let c = CertaintyConfig::new(0.4, 0.85, true);
+        // Decisive high-confidence violation with images does NOT escalate.
+        let decisive = Verdict::violation(ViolationCategory::Spam, 0.95, "clear");
+        assert!(!c.should_escalate(&decisive, true));
+        // Lower-confidence violation with images escalates.
+        let borderline = Verdict::violation(ViolationCategory::Spam, 0.5, "maybe");
+        assert!(c.should_escalate(&borderline, true));
+        // Permitted with no confidence + no images does not escalate.
+        let permitted = Verdict::permitted("ok");
+        assert!(!c.should_escalate(&permitted, false));
+        // Uncertainty-band confidence without images escalates.
+        let uncertain = Verdict::permitted_with_confidence("hmm", 0.6);
+        assert!(c.should_escalate(&uncertain, false));
+    }
+
+    #[tokio::test]
+    async fn tiered_accessors_and_detailed_methods() {
+        let primary = Arc::new(MockClassifier::new(Verdict::permitted("ok")));
+        let fallback = Arc::new(MockClassifier::new(Verdict::permitted("fb")));
+        let certainty = CertaintyConfig::default();
+        let tiered = TieredClassifier::new(primary, fallback, certainty);
+
+        let _ = tiered.primary();
+        let _ = tiered.fallback();
+        let _ = tiered.certainty();
+        let _ = tiered.stats();
+        assert_eq!(tiered.model_name(), "tiered");
+
+        let i = Interaction::mock_test_candidate("did:plc:a", "did:plc:t", "hi");
+        assert!(tiered.classify(&i).await.is_ok());
+        assert!(tiered.classify_with_rubric(&i, None).await.is_ok());
+        assert!(tiered.classify_detailed(&i).await.is_ok());
+        assert!(tiered.classify_detailed_with_rubric(&i, None).await.is_ok());
+        assert!(tiered.classify_detailed_with_stats(&i, false).await.is_ok());
+        assert!(tiered
+            .classify_detailed_with_stats_and_rubric(&i, None, false)
+            .await
+            .is_ok());
+        let _ = tiered.evaluate_tiered(&i, false).await;
+        tiered.set_rubric(RuleRubric::default());
+    }
 }
