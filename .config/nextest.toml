@@ -8,3 +8,10 @@ retries = 2
 
 # Fail the test run immediately if any test fails (fail-fast behavior)
 fail-fast = true
+
+# Microsecond-SLA latency benchmarks are sensitive to CPU contention. Reserve
+# the whole machine for them so they run serialized and deterministic under CI
+# load, while ordinary tests continue to run in parallel.
+[[profile.default.overrides]]
+filter = 'test(/latency|benchmark/)'
+threads-required = "num-cpus"
