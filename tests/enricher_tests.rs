@@ -355,3 +355,69 @@ async fn test_appview_fetch_follows_paginates() {
     let follows = enricher.fetch_follows("did:plc:alice", 100).await;
     assert_eq!(follows, vec!["did:plc:first", "did:plc:second"]);
 }
+
+#[tokio::test]
+async fn test_appview_enricher_accessors_and_defaults() {
+    let e = AppViewContextEnricher::new();
+    assert_eq!(e.appview_url(), "https://public.api.bsky.app");
+    assert_eq!(e.cdn_url(), "https://cdn.bsky.app");
+    // Default delegates to new().
+    let d = AppViewContextEnricher::default();
+    assert_eq!(d.appview_url(), "https://public.api.bsky.app");
+    // from_endpoint uses the default CDN.
+    let ep = AppViewContextEnricher::with_endpoint("https://custom.example");
+    assert_eq!(ep.appview_url(), "https://custom.example");
+    assert_eq!(ep.cdn_url(), "https://cdn.bsky.app");
+}
+
+#[tokio::test]
+async fn test_appview_fetch_image_sanitizes_and_handles_non_success() {
+    let mock_server = MockServer::start().await;
+    // A 404 on the sanitized URL returns None.
+    Mock::given(method("GET"))
+        .and(path(
+            "/img/feed_thumbnail/plain/did:plc:bob/bafymissing@jpeg",
+        ))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock_server)
+        .await;
+
+    let enricher = AppViewContextEnricher::with_endpoints(mock_server.uri(), mock_server.uri());
+    assert!(enricher
+        .fetch_image_base64("did:plc:bob", "bafymissing")
+        .await
+        .is_none());
+
+    // Non-alphanumeric characters are stripped from the DID/CID; if fully stripped, None.
+    assert!(enricher.fetch_image_base64("!!!", "???").await.is_none());
+
+    // Batch of none-fetchable images yields an empty vec.
+    let batch = enricher
+        .fetch_images_base64("did:plc:bob", &["bafymissing".to_string()])
+        .await;
+    assert!(batch.is_empty());
+}
+
+#[tokio::test]
+async fn test_mock_enricher_handle_resolution_and_did() {
+    let enricher = MockContextEnricher::new();
+    enricher.set_handle("alice.bsky.social", "did:plc:alice");
+    assert_eq!(
+        enricher.resolve_handle("@alice.bsky.social").await,
+        Some("did:plc:alice".to_string())
+    );
+    // DID passthrough.
+    assert_eq!(
+        enricher.resolve_handle("did:plc:existing").await,
+        Some("did:plc:existing".to_string())
+    );
+    // Unknown handle -> None.
+    assert_eq!(enricher.resolve_handle("nobody.bsky.social").await, None);
+
+    // resolve_did via the handle map reverse lookup.
+    assert_eq!(
+        enricher.resolve_did("did:plc:alice").await,
+        Some("alice.bsky.social".to_string())
+    );
+    assert_eq!(enricher.resolve_did("did:plc:unknown").await, None);
+}
