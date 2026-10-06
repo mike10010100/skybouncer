@@ -410,6 +410,41 @@ mod tests {
     }
 
     #[test]
+    fn test_update_session_and_empty_web_session_did() {
+        let registry = test_registry();
+        let dpop = DPoPKey::generate();
+        let session = OAuthSession::new(
+            "did:plc:upd",
+            "at-token-1",
+            Some("rt-1".to_string()),
+            "DPoP",
+            None,
+            None,
+            dpop,
+            Some("https://pds.example".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        registry
+            .register_or_update(&Tenant::new("did:plc:upd").with_session(session.clone()))
+            .unwrap();
+
+        // update_session on an existing tenant returns true and evicts any cached client.
+        assert!(registry.update_session("did:plc:upd", &session).unwrap());
+        // update_session on an unknown tenant returns false.
+        assert!(!registry
+            .update_session("did:plc:missing", &session)
+            .unwrap());
+
+        // Empty DID for a web session is a config error.
+        assert!(registry
+            .create_web_session("   ", Duration::from_secs(60))
+            .is_err());
+        assert!(registry.oauth_client().is_none());
+    }
+
+    #[test]
     pub(super) fn test_web_session_lifecycle() {
         let registry = test_registry();
         let did = "did:plc:alice";

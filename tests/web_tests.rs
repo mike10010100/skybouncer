@@ -2767,3 +2767,101 @@ async fn test_api_allowlist_handler_branches() {
         .unwrap();
     assert_eq!(del.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_api_me_and_toggle_branches() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+
+    // Anonymous /api/me -> authenticated=false.
+    let anon = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), StatusCode::OK);
+    let anon_body = axum::body::to_bytes(anon.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let anon_user: skybouncer::web::UserSessionResponse =
+        serde_json::from_slice(&anon_body).unwrap();
+    assert!(!anon_user.authenticated);
+
+    // Admin (protected) /api/me -> authenticated with admin flag.
+    let admin_token = create_test_session(&engine, "did:plc:alice");
+    let me = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let me_body = axum::body::to_bytes(me.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let user: skybouncer::web::UserSessionResponse = serde_json::from_slice(&me_body).unwrap();
+    assert!(user.authenticated);
+    assert_eq!(user.did.as_deref(), Some("did:plc:alice"));
+
+    // Toggle: anonymous -> 401.
+    let toggle_anon = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/toggle")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"did": null, "is_active": null})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_anon.status(), StatusCode::UNAUTHORIZED);
+
+    // Toggle own status (non-admin) with explicit false.
+    let toggle = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/toggle")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"did": null, "is_active": false})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle.status(), StatusCode::OK);
+
+    // Toggle another user's status as a non-admin -> 403.
+    let bob_token = create_test_session(&engine, "did:plc:bob");
+    let toggle_forbidden = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/toggle")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"did": "did:plc:alice", "is_active": true}))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_forbidden.status(), StatusCode::FORBIDDEN);
+}
