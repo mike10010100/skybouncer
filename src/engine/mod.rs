@@ -1641,6 +1641,45 @@ mod tests {
     }
 
     #[test]
+    fn builder_configured_pds_client_branch() {
+        // Non-dry-run with an explicit endpoint + token takes the configured branch.
+        let classifier = Arc::new(crate::classifier::MockClassifier::new(
+            crate::classifier::Verdict::permitted("ok"),
+        ));
+        let cfg = SkybouncerConfig::new(["did:plc:a"], RuleRubric::default())
+            .with_pds_endpoint("https://pds.example.com")
+            .with_pds_access_token("token-abc");
+        let engine = SkybouncerEngine::builder(cfg)
+            .with_classifier(classifier)
+            .build()
+            .expect("configured pds client builds");
+        assert_eq!(engine.pds_client().did(), "did:plc:a");
+    }
+
+    #[test]
+    fn builder_seeds_bypass_flags_from_tenants() {
+        let registry = Arc::new(TenantRegistry::open_in_memory().unwrap());
+        // Enroll a tenant with a rubric that opts out of incoming-follower bypass.
+        let rubric = RuleRubric {
+            bypass_incoming_followers: false,
+            ..RuleRubric::default()
+        };
+        registry
+            .register_or_update(&crate::tenant::Tenant::new("did:plc:tenant").with_rubric(rubric))
+            .unwrap();
+        let classifier = Arc::new(crate::classifier::MockClassifier::new(
+            crate::classifier::Verdict::permitted("ok"),
+        ));
+        let cfg = SkybouncerConfig::new(["did:plc:a"], RuleRubric::default());
+        let engine = SkybouncerEngine::builder(cfg)
+            .with_tenant_registry(registry)
+            .with_classifier(classifier)
+            .build()
+            .expect("engine builds");
+        assert!(!engine.bypass_incoming_followers("did:plc:tenant"));
+    }
+
+    #[test]
     fn process_commit_result_helpers() {
         let outcome = InteractionOutcome::Permitted {
             author_did: "a".to_string(),

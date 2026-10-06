@@ -260,3 +260,45 @@ async fn dispatch_daemon_bare_flag_form_cancels() {
     let a = args(&["skybouncer", "--dry-run", "--did", "did:plc:d1"]);
     let _ = dispatch(&a, cancel).await;
 }
+
+#[tokio::test]
+async fn run_cli_simulate_offline_with_jev_config_uses_local_engine() {
+    // Point the Jev classifier at a mock so the offline dry-run engine builds,
+    // and the daemon URL at an unreachable port to force the offline path.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "violates": false,
+            "confidence": 0.1,
+            "category": null,
+            "reason": "benign"
+        })))
+        .mount(&server)
+        .await;
+
+    // Save & set env for the classifier + a DB path.
+    let saved: Vec<(&str, Option<String>)> = ["JEV_API_BASE_URL", "SKYBOUNCER_DB_PATH", "DRY_RUN"]
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
+    std::env::set_var("JEV_API_BASE_URL", format!("{}/v1/classify", server.uri()));
+    std::env::remove_var("SKYBOUNCER_DB_PATH");
+    std::env::remove_var("DRY_RUN");
+
+    let a = args(&[
+        "a benign offline message",
+        "--url",
+        "http://127.0.0.1:1",
+        "--offline",
+    ]);
+    // The offline path builds an in-memory dry-run engine and runs the simulation.
+    run_cli_simulate(&a).await.expect("offline simulate");
+
+    for (k, v) in saved {
+        match v {
+            Some(val) => std::env::set_var(k, val),
+            None => std::env::remove_var(k),
+        }
+    }
+}
