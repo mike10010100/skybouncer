@@ -188,6 +188,7 @@ use skybouncer::engine::{
 use skybouncer::matcher::{FollowGraph, NonFollowedGate};
 use skybouncer::modlist::{DeduplicationCache, ModListManager};
 use skybouncer::stream::StreamConfig;
+use skybouncer::tenant::Tenant;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -452,4 +453,101 @@ async fn test_process_commit_queued_sovereign_config_sync() {
 
     // Ensure evaluation queue was NOT polluted with non-post candidates
     assert!(eval_rx.try_recv().is_err());
+}
+
+// =============================================================================
+// Engine-level sovereign config sync/publish (src/engine/tenant_ops.rs)
+// =============================================================================
+
+#[tokio::test]
+async fn test_engine_sync_sovereign_config_updates_registry_and_gate() {
+    use wiremock::matchers::query_param;
+
+    let protected_did = "did:plc:protected_sync";
+    let (engine, server) = setup_sovereign_test_engine(protected_did).await;
+
+    // Enroll the protected DID so the sync path also updates the registry.
+    engine
+        .enroll_tenant(Tenant::new(protected_did))
+        .expect("enroll");
+
+    let remote_rubric = RuleRubric::new(
+        "Remote sovereign rules: block drainers and slurs",
+        Sensitivity::High,
+    )
+    .with_bypass_incoming_followers(false);
+    let record = SovereignConfigRecord::from_rubric(&remote_rubric);
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .and(query_param("repo", protected_did))
+        .and(query_param("collection", SOVEREIGN_CONFIG_COLLECTION))
+        .and(query_param("rkey", SOVEREIGN_CONFIG_RKEY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uri": format!("at://{protected_did}/{SOVEREIGN_CONFIG_COLLECTION}/{SOVEREIGN_CONFIG_RKEY}"),
+            "cid": "bafysync",
+            "value": record
+        })))
+        .mount(&server)
+        .await;
+
+    // The protected DID owns the default PDS client, so resolution returns it directly.
+    let fetched = engine
+        .sync_sovereign_config(protected_did)
+        .await
+        .expect("sync ok");
+    assert!(fetched.is_some());
+    let fetched = fetched.unwrap();
+    assert_eq!(fetched.prompt, remote_rubric.prompt);
+
+    // Registry and engine rubric were updated.
+    let tenant = engine
+        .tenant_registry()
+        .get(protected_did)
+        .unwrap()
+        .unwrap();
+    assert_eq!(tenant.rubric.unwrap().prompt, remote_rubric.prompt);
+    assert_eq!(engine.rubric().prompt, remote_rubric.prompt);
+}
+
+#[tokio::test]
+async fn test_engine_sync_sovereign_config_missing_record_returns_none() {
+    let protected_did = "did:plc:protected_sync_empty";
+    let (engine, server) = setup_sovereign_test_engine(protected_did).await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "RecordNotFound",
+            "message": "no config yet"
+        })))
+        .mount(&server)
+        .await;
+
+    let fetched = engine
+        .sync_sovereign_config(protected_did)
+        .await
+        .expect("sync ok");
+    assert!(fetched.is_none());
+}
+
+#[tokio::test]
+async fn test_engine_publish_sovereign_config_roundtrips_active_rubric() {
+    let protected_did = "did:plc:protected_publish";
+    let (engine, server) = setup_sovereign_test_engine(protected_did).await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.repo.putRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uri": format!("at://{protected_did}/{SOVEREIGN_CONFIG_COLLECTION}/{SOVEREIGN_CONFIG_RKEY}"),
+            "cid": "bafypublish"
+        })))
+        .mount(&server)
+        .await;
+
+    let uri = engine
+        .publish_sovereign_config(protected_did)
+        .await
+        .expect("publish ok");
+    assert!(uri.contains(SOVEREIGN_CONFIG_COLLECTION));
 }
