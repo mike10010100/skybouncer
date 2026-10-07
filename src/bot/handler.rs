@@ -29,9 +29,10 @@ impl BotCommandHandler {
     /// Creates a new [`BotCommandHandler`] bound to an engine instance and bot DID.
     #[must_use]
     pub fn new(engine: Arc<SkybouncerEngine>, bot_did: impl Into<String>) -> Self {
-        let public_url = std::env::var("PUBLIC_URL")
-            .or_else(|_| std::env::var("SKYBOUNCER_PUBLIC_URL"))
-            .unwrap_or_else(|_| "https://skybouncer.mike10010100.com".to_string());
+        let public_url = crate::env::var_or(
+            &["PUBLIC_URL", "SKYBOUNCER_PUBLIC_URL"],
+            "https://skybouncer.mike10010100.com",
+        );
         Self {
             engine,
             bot_did: bot_did.into(),
@@ -90,57 +91,61 @@ impl BotCommandHandler {
             return Ok(self.cmd_onboarding(sender_did));
         }
 
+        // `help`/`?` and onboarding remain available to unauthorized senders; every
+        // privileged command below is gated on a single authorization probe.
+        let authorized = self.is_authorized_sender(sender_did);
+
         if trimmed.eq_ignore_ascii_case("pause") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok(self.cmd_pause(sender_did));
         }
 
         if trimmed.eq_ignore_ascii_case("resume") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok(self.cmd_resume(sender_did));
         }
 
         if trimmed.eq_ignore_ascii_case("rules") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok(self.cmd_rules(sender_did));
         }
 
         if trimmed.eq_ignore_ascii_case("set rules") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return self.cmd_set_rules(sender_did, "");
         }
 
         if let Some(prompt) = strip_prefix_ci(trimmed, "set rules ") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return self.cmd_set_rules(sender_did, prompt);
         }
 
         if trimmed.eq_ignore_ascii_case("sensitivity") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok("Usage: `sensitivity <low|medium|high>`".to_string());
         }
 
         if let Some(sens) = strip_prefix_ci(trimmed, "sensitivity ") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return self.cmd_set_sensitivity(sender_did, sens.trim());
         }
 
         if trimmed.eq_ignore_ascii_case("duration") || trimmed.eq_ignore_ascii_case("timeout") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok("Usage: `duration <permanent|24h|7d|30d>`".to_string());
@@ -151,28 +156,28 @@ impl BotCommandHandler {
             .or_else(|| strip_prefix_ci(trimmed, "set duration "))
             .or_else(|| strip_prefix_ci(trimmed, "set timeout "))
         {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return self.cmd_set_duration(sender_did, dur.trim());
         }
 
         if trimmed.eq_ignore_ascii_case("recent") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return self.cmd_recent(sender_did);
         }
 
         if trimmed.eq_ignore_ascii_case("allowlist") || trimmed.eq_ignore_ascii_case("allow list") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return self.cmd_allowlist(sender_did);
         }
 
         if trimmed.eq_ignore_ascii_case("allow") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok(
@@ -181,14 +186,14 @@ impl BotCommandHandler {
         }
 
         if let Some(target) = strip_prefix_ci(trimmed, "allow ") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return self.cmd_allow(sender_did, target.trim()).await;
         }
 
         if trimmed.eq_ignore_ascii_case("unallow") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok(
@@ -197,14 +202,14 @@ impl BotCommandHandler {
         }
 
         if let Some(target) = strip_prefix_ci(trimmed, "unallow ") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return self.cmd_unallow(sender_did, target.trim()).await;
         }
 
         if trimmed.eq_ignore_ascii_case("pardon") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok(
@@ -213,14 +218,14 @@ impl BotCommandHandler {
         }
 
         if let Some(target) = strip_prefix_ci(trimmed, "pardon and allow ") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return self.cmd_pardon_and_allow(sender_did, target.trim()).await;
         }
 
         if let Some(target) = strip_prefix_ci(trimmed, "pardon ") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             if let Some(immunized_target) = strip_prefix_ci(target.trim(), "and allow ") {
@@ -232,21 +237,21 @@ impl BotCommandHandler {
         }
 
         if trimmed.eq_ignore_ascii_case("status") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok(self.cmd_status(sender_did));
         }
 
         if trimmed.eq_ignore_ascii_case("test") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok("Usage: `test <text>` (dry-run evaluation on sample text)".to_string());
         }
 
         if let Some(sample) = strip_prefix_ci(trimmed, "test ") {
-            if !self.is_authorized_sender(sender_did) {
+            if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return self.cmd_test(sender_did, sample.trim()).await;
@@ -510,43 +515,24 @@ impl BotCommandHandler {
             return Ok("Usage: `pardon <did|@handle>` (e.g. `pardon did:plc:...` or `pardon @alice.bsky.social`)".to_string());
         }
 
-        let clean = raw_target.trim_start_matches('@');
-        let (resolved_did, was_handle) = if clean.starts_with("did:") {
-            (clean.to_string(), false)
-        } else {
-            match self.engine.resolve_handle(clean).await {
-                Some(did) => (did, true),
-                None => {
-                    return Ok(format!(
-                        "❌ Could not resolve handle `@{clean}` to a DID. Please verify the handle or provide the account's DID directly (e.g. `pardon did:plc:...`)."
-                    ));
-                }
-            }
+        let (resolved_did, handle_prefix) = match self
+            .resolve_dm_target(raw_target, " (e.g. `pardon did:plc:...`)")
+            .await
+        {
+            Ok(v) => v,
+            Err(msg) => return Ok(msg),
         };
 
         // Sender is strictly the protected user whose modlist is being updated
-        let protected_did = if self.engine.is_protected(sender_did)
-            || self.engine.is_enrolled(sender_did)
-            || self.engine.is_admin(sender_did)
-        {
-            sender_did.to_string()
-        } else {
-            return Ok(
-                "❌ You do not have permission to pardon users on this moderation list."
-                    .to_string(),
-            );
-        };
-
-        let handle_prefix = if was_handle {
-            format!("Resolved `@{clean}` to `{resolved_did}`.\n")
-        } else {
-            String::new()
+        let protected_did = match self.authorized_protected(sender_did) {
+            Ok(did) => did,
+            Err(msg) => return Ok(msg),
         };
 
         match self.engine.pardon_user(&protected_did, &resolved_did).await {
             Ok(true) => Ok(format!(
                 "{handle_prefix}✅ Account `{resolved_did}` has been pardoned and removed from your moderation list.\n\n\
-                 💡 Tip: To permanently immunize this account against future bounces, use `pardon and allow {clean}` or `allow {clean}`."
+                 💡 Tip: To permanently immunize this account against future bounces, use `pardon and allow {resolved_did}` or `allow {resolved_did}`."
             )),
             Ok(false) => Ok(format!(
                 "{handle_prefix}ℹ️ Account `{resolved_did}` was not found in your bounced list."
@@ -565,36 +551,14 @@ impl BotCommandHandler {
             return Ok("Usage: `pardon and allow <did|@handle>`".to_string());
         }
 
-        let clean = raw_target.trim_start_matches('@');
-        let (resolved_did, was_handle) = if clean.starts_with("did:") {
-            (clean.to_string(), false)
-        } else {
-            match self.engine.resolve_handle(clean).await {
-                Some(did) => (did, true),
-                None => {
-                    return Ok(format!(
-                        "❌ Could not resolve handle `@{clean}` to a DID. Please verify the handle or provide the account's DID directly."
-                    ));
-                }
-            }
+        let (resolved_did, handle_prefix) = match self.resolve_dm_target(raw_target, "").await {
+            Ok(v) => v,
+            Err(msg) => return Ok(msg),
         };
 
-        let protected_did = if self.engine.is_protected(sender_did)
-            || self.engine.is_enrolled(sender_did)
-            || self.engine.is_admin(sender_did)
-        {
-            sender_did.to_string()
-        } else {
-            return Ok(
-                "❌ You do not have permission to pardon users on this moderation list."
-                    .to_string(),
-            );
-        };
-
-        let handle_prefix = if was_handle {
-            format!("Resolved `@{clean}` to `{resolved_did}`.\n")
-        } else {
-            String::new()
+        let protected_did = match self.authorized_protected(sender_did) {
+            Ok(did) => did,
+            Err(msg) => return Ok(msg),
         };
 
         match self
@@ -629,24 +593,9 @@ impl BotCommandHandler {
             );
         }
 
-        let clean = raw_target.trim_start_matches('@');
-        let (resolved_did, was_handle) = if clean.starts_with("did:") {
-            (clean.to_string(), false)
-        } else {
-            match self.engine.resolve_handle(clean).await {
-                Some(did) => (did, true),
-                None => {
-                    return Ok(format!(
-                        "❌ Could not resolve handle `@{clean}` to a DID. Please verify the handle or provide the account's DID directly."
-                    ));
-                }
-            }
-        };
-
-        let handle_prefix = if was_handle {
-            format!("Resolved `@{clean}` to `{resolved_did}`.\n")
-        } else {
-            String::new()
+        let (resolved_did, handle_prefix) = match self.resolve_dm_target(raw_target, "").await {
+            Ok(v) => v,
+            Err(msg) => return Ok(msg),
         };
 
         match self
@@ -673,24 +622,9 @@ impl BotCommandHandler {
             );
         }
 
-        let clean = raw_target.trim_start_matches('@');
-        let (resolved_did, was_handle) = if clean.starts_with("did:") {
-            (clean.to_string(), false)
-        } else {
-            match self.engine.resolve_handle(clean).await {
-                Some(did) => (did, true),
-                None => {
-                    return Ok(format!(
-                        "❌ Could not resolve handle `@{clean}` to a DID. Please verify the handle or provide the account's DID directly."
-                    ));
-                }
-            }
-        };
-
-        let handle_prefix = if was_handle {
-            format!("Resolved `@{clean}` to `{resolved_did}`.\n")
-        } else {
-            String::new()
+        let (resolved_did, handle_prefix) = match self.resolve_dm_target(raw_target, "").await {
+            Ok(v) => v,
+            Err(msg) => return Ok(msg),
         };
 
         match self.engine.remove_from_allowlist(sender_did, &resolved_did) {
@@ -826,21 +760,15 @@ impl BotCommandHandler {
 
     async fn cmd_test(&self, sender_did: &str, text: &str) -> Result<String, SkybouncerError> {
         let sender_rubric = self.engine.rubric_for(sender_did);
-        let synthetic_interaction = Interaction {
-            author_did: "did:plc:test-author-sample".to_string(),
-            target_did: sender_did.to_string(),
-            post_uri: "at://did:plc:test/app.bsky.feed.post/test1234".to_string(),
-            post_cid: Some("bafytest1234".to_string()),
-            text: text.to_string(),
-            interaction_type: crate::matcher::InteractionType::DirectReply,
-            parent_uri: None,
-            root_uri: None,
-            created_at_us: 0,
-            image_cids: Vec::new(),
-            image_alts: Vec::new(),
-            enriched_context: None,
-            rubric: Some(sender_rubric),
-        };
+        let synthetic_interaction = Interaction::synthetic(
+            "did:plc:test-author-sample",
+            sender_did,
+            text,
+            crate::matcher::InteractionType::DirectReply,
+        )
+        .with_post_uri("at://did:plc:test/app.bsky.feed.post/test1234")
+        .with_post_cid("bafytest1234")
+        .with_rubric(sender_rubric);
 
         // Evaluate using heuristic first, then model
         let verdict = self
@@ -887,6 +815,41 @@ impl BotCommandHandler {
         self.engine.is_admin(sender_did)
             || self.engine.is_enrolled(sender_did)
             || self.engine.is_protected(sender_did)
+    }
+
+    /// Resolves a DM command target (`did:...` or `@handle`) to a DID.
+    ///
+    /// Returns `(resolved_did, handle_prefix)` where `handle_prefix` is a one-line
+    /// "Resolved @handle to did" note for handle inputs (empty for DID inputs). On
+    /// failure, returns the user-facing error message to display instead.
+    async fn resolve_dm_target(
+        &self,
+        raw_target: &str,
+        hint_suffix: &str,
+    ) -> Result<(String, String), String> {
+        let clean = crate::util::normalize_handle(raw_target);
+        if clean.starts_with("did:") {
+            return Ok((clean.to_string(), String::new()));
+        }
+        match self.engine.resolve_handle(clean).await {
+            Some(did) => { let prefix = format!("Resolved `@{clean}` to `{did}`.\n"); Ok((did, prefix)) }
+            None => Err(format!(
+                "❌ Could not resolve handle `@{clean}` to a DID. Please verify the handle or provide the account's DID directly{hint_suffix}."
+            )),
+        }
+    }
+
+    /// Returns the sender DID if they are authorized to mutate a protected user's
+    /// moderation list, or the permission-denied message otherwise.
+    fn authorized_protected(&self, sender_did: &str) -> Result<String, String> {
+        if self.is_authorized_sender(sender_did) {
+            Ok(sender_did.to_string())
+        } else {
+            Err(
+                "❌ You do not have permission to pardon users on this moderation list."
+                    .to_string(),
+            )
+        }
     }
 
     /// Generates an onboarding response for unauthorized senders.

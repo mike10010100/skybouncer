@@ -24,6 +24,8 @@ use common::*;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use skyauth::client::OAuthClientMetadata;
 use skybouncer::classifier::{BounceDuration, RuleRubric, Sensitivity, Verdict};
@@ -2493,4 +2495,972 @@ async fn test_api_bounces_and_allowlist_handle_enrichment() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].subject_did, trusted_did);
     assert_eq!(entries[0].handle.as_deref(), Some(trusted_handle));
+}
+
+// =============================================================================
+// API Auth/Forbidden/Empty-Input Branch Coverage
+// =============================================================================
+
+#[tokio::test]
+async fn test_api_bounces_auth_and_scoping_branches() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+
+    // Unauthenticated -> 401.
+    let anon = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/bounces")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+
+    // Non-admin requesting another user's bounces -> 403.
+    let bob_token = create_test_session(&engine, "did:plc:bob");
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/bounces?user_did=did:plc:alice")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // Non-admin requesting own bounces -> 200.
+    let own = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/bounces?user_did=did:plc:bob")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(own.status(), StatusCode::OK);
+
+    // Admin requesting fleet-wide (no user_did) -> 200.
+    let admin_token = create_test_session(&engine, "did:plc:alice");
+    let admin = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/bounces")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_api_pardon_validation_and_allowlist_branch() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let alice_token = create_test_session(&engine, "did:plc:alice");
+
+    // Unauthenticated -> 401.
+    let anon = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/pardon")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject_did": "did:plc:x",
+                        "protected_did": null,
+                        "allowlist": false,
+                        "reason": null
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+
+    // Empty subject -> 400.
+    let empty = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/pardon")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject_did": "   ",
+                        "protected_did": null,
+                        "allowlist": false,
+                        "reason": null
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+    // Non-admin pardoning under a different protected DID -> 403.
+    let bob_token = create_test_session(&engine, "did:plc:bob");
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/pardon")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject_did": "did:plc:target",
+                        "protected_did": "did:plc:alice",
+                        "allowlist": false,
+                        "reason": null
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // Admin pardon+allowlist branch -> 200 with allowlisted true.
+    let allowlisted = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/pardon")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject_did": "did:plc:target",
+                        "protected_did": null,
+                        "allowlist": true,
+                        "reason": null
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(allowlisted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_api_allowlist_handler_branches() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let alice_token = create_test_session(&engine, "did:plc:alice");
+
+    // Anonymous GET allowlist -> 401.
+    let anon = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/allowlist")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+
+    // Non-admin GET another user's allowlist -> 403.
+    let bob_token = create_test_session(&engine, "did:plc:bob");
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/allowlist?user_did=did:plc:alice")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // Admin add empty subject -> 400.
+    let empty = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/allowlist")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject": "  ",
+                        "protected_did": null,
+                        "reason": null
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+    // Add a DID directly (no resolution needed), then GET shows it, then DELETE removes it.
+    let add = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/allowlist")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject": "did:plc:friend",
+                        "protected_did": null,
+                        "reason": "test"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(add.status(), StatusCode::OK);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/allowlist")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+
+    // Remove the added account via the did path param.
+    let del = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/allowlist/did:plc:friend")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_api_me_and_toggle_branches() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+
+    // Anonymous /api/me -> authenticated=false.
+    let anon = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), StatusCode::OK);
+    let anon_body = axum::body::to_bytes(anon.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let anon_user: skybouncer::web::UserSessionResponse =
+        serde_json::from_slice(&anon_body).unwrap();
+    assert!(!anon_user.authenticated);
+
+    // Admin (protected) /api/me -> authenticated with admin flag.
+    let admin_token = create_test_session(&engine, "did:plc:alice");
+    let me = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let me_body = axum::body::to_bytes(me.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let user: skybouncer::web::UserSessionResponse = serde_json::from_slice(&me_body).unwrap();
+    assert!(user.authenticated);
+    assert_eq!(user.did.as_deref(), Some("did:plc:alice"));
+
+    // Toggle: anonymous -> 401.
+    let toggle_anon = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/toggle")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"did": null, "is_active": null})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_anon.status(), StatusCode::UNAUTHORIZED);
+
+    // Toggle own status (non-admin) with explicit false.
+    let toggle = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/toggle")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"did": null, "is_active": false})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle.status(), StatusCode::OK);
+
+    // Toggle another user's status as a non-admin -> 403.
+    let bob_token = create_test_session(&engine, "did:plc:bob");
+    let toggle_forbidden = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/toggle")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"did": "did:plc:alice", "is_active": true}))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_forbidden.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_api_admin_tenants_and_evaluations_filters() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+
+    // Enroll a tenant so the admin-tenants summary loop runs.
+    engine
+        .enroll_tenant(
+            skybouncer::tenant::Tenant::new("did:plc:tenant1").with_handle("tenant1.bsky.social"),
+        )
+        .expect("enroll");
+
+    let admin_token = create_test_session(&engine, "did:plc:alice");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/tenants")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let tenants: skybouncer::web::AdminTenantsResponse = serde_json::from_slice(&body).unwrap();
+    assert!(tenants.total >= 1);
+    assert!(tenants.tenants.iter().any(|t| t.did == "did:plc:tenant1"));
+
+    // Evaluations with an admin target_did filter (admin path).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/evaluations?target_did=did:plc:tenant1")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Non-admin evaluations -> only their own.
+    let bob_token = create_test_session(&engine, "did:plc:bob");
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/evaluations")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_oauth_login_and_callback_with_configured_client() {
+    use skyauth::client::{AtprotoOAuthClient, OAuthClientMetadata};
+
+    let (engine, _cache, _pds, _app) = setup_test_web_environment("did:plc:alice").await;
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    )
+    .with_client_name("Skybouncer Test Dashboard");
+    let client = std::sync::Arc::new(
+        AtprotoOAuthClient::builder()
+            .client_metadata(metadata.clone())
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+    let app = create_web_router(std::sync::Arc::clone(&engine), Some(client), metadata);
+
+    // Login with a handle configured but an unresolvable/closed PDS -> BAD_GATEWAY.
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/login?handle=does-not-exist.invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Either the discovery fails (bad gateway) — the important part is the handler ran
+    // past the earlier guards (client present, handle present) without panicking.
+    assert!(
+        login.status() == StatusCode::BAD_GATEWAY
+            || login.status() == StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    // Callback with an OAuth error query -> redirects to /?auth=error (params error branch).
+    let cb = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?error=access_denied&error_description=denied")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(cb.status().is_redirection());
+    let loc = cb
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(loc.contains("auth=error"), "loc={loc}");
+
+    // Callback with code+state but no client-side state -> error redirect.
+    let cb2 = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=abc&state=unknown")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(cb2.status().is_redirection());
+}
+
+#[tokio::test]
+async fn test_api_allowlist_target_did_and_not_found_branches() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let admin_token = create_test_session(&engine, "did:plc:alice");
+    let bob_token = create_test_session(&engine, "did:plc:bob");
+
+    // Admin adds to a target user's allowlist (protected_did set).
+    let add = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/allowlist")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject": "did:plc:friend2",
+                        "protected_did": "did:plc:bob",
+                        "reason": "target"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(add.status(), StatusCode::OK);
+
+    // Bob removes it (own allowlist, not found after removal second time).
+    let del1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/allowlist/did:plc:friend2")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del1.status(), StatusCode::OK);
+
+    // Removing again yields the "not found" message.
+    let del2 = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/allowlist/did:plc:friend2")
+                .header("cookie", format!("skybouncer_session={bob_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del2.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(del2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let resp: skybouncer::web::RemoveAllowlistResponse = serde_json::from_slice(&body).unwrap();
+    assert!(!resp.removed);
+}
+
+#[tokio::test]
+async fn test_oauth_login_missing_handle_with_client_and_callback_error_query() {
+    use skyauth::client::{AtprotoOAuthClient, OAuthClientMetadata};
+
+    let (engine, _cache, _pds, _app) = setup_test_web_environment("did:plc:alice").await;
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let client = std::sync::Arc::new(
+        AtprotoOAuthClient::builder()
+            .client_metadata(metadata.clone())
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+    let app = create_web_router(std::sync::Arc::clone(&engine), Some(client), metadata);
+
+    // Login without a handle (client present) -> 400.
+    let login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::BAD_REQUEST);
+
+    // Callback with an OAuth error query -> error redirect (to_callback_params Err path).
+    let cb = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?error=invalid_scope&error_description=nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(cb.status().is_redirection());
+    let loc = cb
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(loc.starts_with("/?auth=error"), "loc={loc}");
+}
+
+#[tokio::test]
+async fn test_oauth_callback_success_seeds_session_cookie() {
+    use skyauth::client::{AtprotoOAuthClient, OAuthClientMetadata, StoredStateEntry};
+    use skyauth::dpop::DPoPKey;
+    use skyauth::store::OAuthStateStore;
+
+    let (engine, _cache, _pds, _app) = setup_test_web_environment("did:plc:alice").await;
+
+    // Mock token endpoint returning a valid session.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("dpop-nonce", "test-nonce-1")
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "access_token": "at-issued-token",
+                    "token_type": "DPoP",
+                    "expires_in": 3600,
+                    "refresh_token": "rt-issued-token",
+                    "scope": "atproto",
+                    "sub": "did:plc:newuser"
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let issuer = server.uri();
+    let token_endpoint = format!("{issuer}/oauth/token");
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let state_store = std::sync::Arc::new(OAuthStateStore::new(Duration::from_secs(300)));
+    let client = std::sync::Arc::new(
+        AtprotoOAuthClient::builder()
+            .client_metadata(metadata.clone())
+            .state_store(std::sync::Arc::clone(&state_store))
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+
+    // Seed a state entry the callback will consume.
+    let entry = StoredStateEntry {
+        state: "state-success".to_string(),
+        client_id: "http://127.0.0.1:3000/oauth/client-metadata.json".to_string(),
+        code_verifier: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~ab"
+            .to_string(),
+        dpop_key: DPoPKey::generate(),
+        issuer: issuer.clone(),
+        did: Some("did:plc:newuser".to_string()),
+        handle: Some("newuser.bsky.social".to_string()),
+        redirect_uri: "http://127.0.0.1:3000/oauth/callback".to_string(),
+        pds_endpoint: issuer.clone(),
+        token_endpoint: token_endpoint.clone(),
+        scopes: "atproto".to_string(),
+        created_at: std::time::SystemTime::now(),
+        expires_in_secs: 300,
+    };
+    state_store
+        .insert_state_sync("state-success".to_string(), entry, Duration::from_secs(300))
+        .expect("seed state");
+
+    let app = create_web_router(std::sync::Arc::clone(&engine), Some(client), metadata);
+
+    let cb = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/oauth/callback?code=auth-code&state=state-success&iss={}",
+                    issuer
+                        .replace("http://", "http%3A%2F%2F")
+                        .replace(':', "%3A")
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(cb.status().is_redirection());
+    let loc = cb
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let cookie = cb
+        .headers()
+        .get(axum::http::header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        loc.contains("auth=success"),
+        "expected success redirect, got {loc}"
+    );
+    assert!(
+        cookie.contains("skybouncer_session="),
+        "expected session cookie, got {cookie}"
+    );
+}
+
+async fn setup_web_with_mock_enricher(
+    protected_did: &str,
+) -> (Arc<SkybouncerEngine>, axum::Router) {
+    use skybouncer::enricher::MockContextEnricher;
+    let pds = MockPdsServer::start().await;
+    let cache = Arc::new(DeduplicationCache::open_in_memory().expect("cache"));
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let pds_client = Arc::new(pds.pds_client(protected_did));
+    let classifier = Arc::new(skybouncer::classifier::MockClassifier::new(
+        Verdict::permitted("ok"),
+    ));
+    let enricher = Arc::new(MockContextEnricher::new());
+    enricher.set_handle("friend.bsky.social", "did:plc:friend-resolved");
+
+    let mut dids = HashSet::new();
+    dids.insert(protected_did.to_string());
+    let config = SkybouncerConfig::new(dids, rubric).with_admin_did(protected_did);
+    let engine = Arc::new(
+        SkybouncerEngine::builder(config)
+            .with_classifier(classifier)
+            .with_cache(Arc::clone(&cache))
+            .with_modlist_manager(modlist)
+            .with_pds_client(pds_client)
+            .with_follow_graph(follow_graph)
+            .with_gate(gate)
+            .with_enricher(enricher)
+            .build()
+            .expect("engine"),
+    );
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let router = create_web_router(Arc::clone(&engine), None, metadata);
+    (engine, router)
+}
+
+#[tokio::test]
+async fn test_api_allowlist_add_by_handle_resolves_and_removes_by_handle() {
+    let (engine, app) = setup_web_with_mock_enricher("did:plc:alice").await;
+    let token = create_test_session(&engine, "did:plc:alice");
+
+    // Add by @handle -> the handler resolves via the enricher and stores the DID.
+    let add = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/allowlist")
+                .header("cookie", format!("skybouncer_session={token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject": "@friend.bsky.social",
+                        "protected_did": null,
+                        "reason": null
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(add.status(), StatusCode::OK);
+    assert!(engine.is_allowlisted("did:plc:alice", "did:plc:friend-resolved"));
+
+    // Remove by @handle -> resolves and removes.
+    let del = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/allowlist/@friend.bsky.social")
+                .header("cookie", format!("skybouncer_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_api_me_protected_non_enrolled_user_gets_global_rubric() {
+    // Protected DID with a valid session but no tenant enrollment -> hits the
+    // `is_protected` fallback branch (returns the global engine rubric).
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:admin123").await;
+    engine.add_protected_did("did:plc:protected-extra");
+    let token = create_test_session(&engine, "did:plc:protected-extra");
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .header("cookie", format!("skybouncer_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let me: skybouncer::web::UserSessionResponse = serde_json::from_slice(&bytes).unwrap();
+    assert!(me.authenticated);
+    assert_eq!(me.did.as_deref(), Some("did:plc:protected-extra"));
+    assert!(!me.is_admin);
+    assert!(me.rubric.is_some());
+}
+
+#[tokio::test]
+async fn test_api_admin_tenants_counts_paused_and_uses_cached_handle() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:admin123").await;
+    let admin_token = create_test_session(&engine, "did:plc:admin123");
+
+    // Enrolled tenant WITHOUT a handle -> exercises the cached-handle fallback.
+    engine
+        .tenant_registry()
+        .register_or_update(&skybouncer::tenant::Tenant::new("did:plc:no-handle"))
+        .unwrap();
+    // Enrolled tenant that we immediately pause -> paused_count branch.
+    engine
+        .tenant_registry()
+        .register_or_update(&skybouncer::tenant::Tenant::new("did:plc:paused-one"))
+        .unwrap();
+    engine
+        .tenant_registry()
+        .set_active("did:plc:paused-one", false)
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/tenants")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let fleet: skybouncer::web::AdminTenantsResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(fleet.total, 2);
+    assert_eq!(fleet.paused_count, 1);
+    assert_eq!(fleet.active_count, 1);
+}
+
+#[tokio::test]
+async fn test_api_evaluations_non_admin_cross_did_forbidden() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:admin123").await;
+    let alice = create_test_session(&engine, "did:plc:alice");
+    engine
+        .tenant_registry()
+        .register_or_update(&skybouncer::tenant::Tenant::new("did:plc:alice"))
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/evaluations?target_did=did:plc:someone-else")
+                .header("cookie", format!("skybouncer_session={alice}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Anonymous -> 401.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/evaluations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_api_admin_bounces_and_pardon_with_explicit_protected_did() {
+    let (engine, cache, _pds, app) = setup_test_web_environment("did:plc:admin123").await;
+    let admin_token = create_test_session(&engine, "did:plc:admin123");
+
+    let target = "did:plc:tenant-under-admin";
+    cache
+        .record_bounce(&BouncedUser {
+            subject_did: "did:plc:spammer-under-admin".to_string(),
+            protected_did: target.to_string(),
+            listitem_uri: format!("at://{target}/app.bsky.graph.listitem/rk1"),
+            listitem_rkey: "rk1".to_string(),
+            listitem_cid: "bafyadmin".to_string(),
+            category: "Spam".to_string(),
+            confidence: 0.8,
+            reason: "spam".to_string(),
+            post_uri: "at://spammer/post".to_string(),
+            post_text: "spam".to_string(),
+            bounced_at: 1_720_000_000_000_000,
+            expires_at: None,
+        })
+        .unwrap();
+
+    // Admin views another user's bounce list explicitly (admin filter branch).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/bounces?user_did={target}"))
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let s1 = resp.status();
+    let b1 = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(s1, StatusCode::OK, "body={}", String::from_utf8_lossy(&b1));
+
+    // Admin pardons using an explicit protected_did (admin explicit branch).
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/pardon")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject_did": "did:plc:never-bounced",
+                        "protected_did": "did:plc:admin123"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

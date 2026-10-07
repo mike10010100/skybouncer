@@ -106,6 +106,49 @@ impl Interaction {
         self
     }
 
+    /// Overrides the candidate post AT-URI.
+    #[must_use]
+    pub fn with_post_uri(mut self, uri: impl Into<String>) -> Self {
+        self.post_uri = uri.into();
+        self
+    }
+
+    /// Overrides the candidate post CID.
+    #[must_use]
+    pub fn with_post_cid(mut self, cid: impl Into<String>) -> Self {
+        self.post_cid = Some(cid.into());
+        self
+    }
+
+    /// Creates a synthetic, zero-timestamp interaction for dry-run simulation and
+    /// command previews (CLI, bot `test` command, and web simulate endpoint).
+    ///
+    /// The post URI/CID are seeded with placeholder values derived from `author_did`;
+    /// call [`Self::with_post_uri`] / [`Self::with_post_cid`] to override them.
+    #[must_use]
+    pub fn synthetic(
+        author_did: &str,
+        target_did: &str,
+        text: &str,
+        interaction_type: InteractionType,
+    ) -> Self {
+        Self {
+            post_uri: format!("at://{author_did}/app.bsky.feed.post/synthetic"),
+            post_cid: Some("bafysynthetic".to_string()),
+            author_did: author_did.to_string(),
+            target_did: target_did.to_string(),
+            text: text.to_string(),
+            interaction_type,
+            parent_uri: None,
+            root_uri: None,
+            created_at_us: 0,
+            image_cids: Vec::new(),
+            image_alts: Vec::new(),
+            enriched_context: None,
+            rubric: None,
+        }
+    }
+
     /// Sets the root post AT-URI.
     #[must_use]
     pub fn with_root_uri(mut self, uri: impl Into<String>) -> Self {
@@ -137,6 +180,16 @@ impl Interaction {
     #[must_use]
     pub fn with_enriched_context(mut self, ctx: crate::enricher::EnrichedContext) -> Self {
         self.enriched_context = Some(ctx);
+        self
+    }
+
+    /// Attaches optional enriched context to this interaction.
+    #[must_use]
+    pub fn with_enriched_context_opt(
+        mut self,
+        ctx: Option<crate::enricher::EnrichedContext>,
+    ) -> Self {
+        self.enriched_context = ctx;
         self
     }
 
@@ -204,21 +257,22 @@ pub fn extract_did_from_at_uri(uri: &str) -> Option<&str> {
 /// ```
 #[must_use]
 pub fn extract_did_for_collection<'a>(uri: &'a str, expected_collection: &str) -> Option<&'a str> {
-    let stripped = uri.strip_prefix("at://")?;
-    let mut parts = stripped.split('/');
-    let did = parts.next()?;
-    if !did.starts_with("did:") {
-        return None;
-    }
-    let collection = parts.next()?;
-    if collection != expected_collection {
-        return None;
-    }
-    let rkey = parts.next()?;
-    if rkey.is_empty() {
+    let (did, collection, rkey) = split_at_uri(uri)?;
+    if !did.starts_with("did:") || collection != expected_collection || rkey.is_empty() {
         return None;
     }
     Some(did)
+}
+
+/// Splits the `at://` scheme off a URI and returns its `(authority, rest)` components.
+#[must_use]
+fn split_at_uri(uri: &str) -> Option<(&str, &str, &str)> {
+    let stripped = uri.strip_prefix("at://")?;
+    let mut parts = stripped.split('/');
+    let authority = parts.next()?;
+    let collection = parts.next()?;
+    let rkey = parts.next()?;
+    Some((authority, collection, rkey))
 }
 
 #[cfg(test)]

@@ -961,3 +961,35 @@ async fn test_tiered_classifier_integration_decisive_violation_bypass() {
 
 // Property tests for the heuristic classifier now live in the canonical
 // `tests/property_tests.rs` (see `rust-best-practices` blueprint).
+
+#[tokio::test]
+async fn test_heuristic_empty_default_and_trait_impls() {
+    use skybouncer::classifier::{Classifier, HeuristicClassifier, ViolationCategory};
+
+    // Empty classifier has no rules and permits everything.
+    let empty = HeuristicClassifier::empty();
+    assert_eq!(empty.rule_count(), 0);
+    let interaction = skybouncer::matcher::Interaction::mock_test_candidate(
+        "did:plc:a",
+        "did:plc:t",
+        "free airdrop connect wallet telegram t.me",
+    );
+    assert!(!empty.evaluate(&interaction).is_violation());
+
+    // Default builds the full default rule set.
+    let default = HeuristicClassifier::default();
+    assert!(default.rule_count() >= 3);
+
+    // Invalid custom regex is rejected.
+    let mut c = HeuristicClassifier::new().unwrap();
+    let before = c.rule_count();
+    assert!(c
+        .add_rule("(unclosed", ViolationCategory::Spam, "bad")
+        .is_err());
+    assert_eq!(c.rule_count(), before, "invalid rule must not be added");
+
+    // Trait impls delegate to evaluate.
+    assert!(!empty.classify(&interaction).await.unwrap().is_violation());
+    assert!(empty.classify_with_rubric(&interaction, None).await.is_ok());
+    assert_eq!(empty.model_name(), "heuristic_regex");
+}

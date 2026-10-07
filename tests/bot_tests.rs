@@ -1879,3 +1879,557 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
     // Verify added to allowlist in both memory and db
     assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:violator_to_immunize"));
 }
+
+// =============================================================================
+// Command Branch Matrix: admin vs protected vs enrolled vs stranger,
+// plus pause/resume/status/sensitivity/duration/allow/unallow branches.
+// =============================================================================
+
+#[tokio::test]
+async fn test_command_branch_matrix_admin_and_stranger() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    // Enroll an extra tenant so is_single_tenant becomes false.
+    engine
+        .enroll_tenant(skybouncer::tenant::Tenant::new("did:plc:enrolled"))
+        .expect("enroll");
+
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let admin = "did:plc:admin";
+    let protected = "did:plc:protected1";
+    let enrolled = "did:plc:enrolled";
+    let stranger = "did:plc:stranger";
+
+    // pause/resume: admin + single-tenant protected allowed; stranger denied.
+    assert!(handler
+        .handle_command(admin, "pause")
+        .await
+        .unwrap()
+        .contains("paused"));
+    assert!(handler
+        .handle_command(admin, "resume")
+        .await
+        .unwrap()
+        .contains("resumed"));
+    assert!(handler
+        .handle_command(stranger, "pause")
+        .await
+        .unwrap()
+        .contains("active bouncer session"));
+
+    // status: admin fleet view vs per-account view.
+    assert!(handler
+        .handle_command(admin, "status")
+        .await
+        .unwrap()
+        .contains("Admin Fleet View"));
+    assert!(handler
+        .handle_command(protected, "status")
+        .await
+        .unwrap()
+        .contains("Status for Your Account"));
+
+    // sensitivity: usage, admin set, enrolled set, stranger denied.
+    assert!(handler
+        .handle_command(protected, "sensitivity")
+        .await
+        .unwrap()
+        .contains("Usage"));
+    assert!(handler
+        .handle_command(admin, "sensitivity high")
+        .await
+        .unwrap()
+        .contains("Sensitivity threshold updated"));
+    // Strangers are stopped at the authorization gate before command dispatch.
+    assert!(handler
+        .handle_command(stranger, "sensitivity low")
+        .await
+        .unwrap()
+        .contains("active bouncer session"));
+
+    // duration: usage, admin set, invalid.
+    assert!(handler
+        .handle_command(protected, "duration")
+        .await
+        .unwrap()
+        .contains("Usage"));
+    assert!(handler
+        .handle_command(admin, "duration 24h")
+        .await
+        .unwrap()
+        .contains("duration updated"));
+    assert!(handler
+        .handle_command(admin, "duration nonsense")
+        .await
+        .unwrap()
+        .contains("Invalid duration"));
+
+    // allow/unallow usage forms + enrollment.
+    assert!(handler
+        .handle_command(protected, "allow")
+        .await
+        .unwrap()
+        .contains("Usage"));
+    assert!(handler
+        .handle_command(protected, "unallow")
+        .await
+        .unwrap()
+        .contains("Usage"));
+    assert!(handler
+        .handle_command(protected, "pardon")
+        .await
+        .unwrap()
+        .contains("Usage"));
+
+    // Enrolled tenant can pause/resume via registry path.
+    assert!(handler
+        .handle_command(enrolled, "pause")
+        .await
+        .unwrap()
+        .contains("paused"));
+    assert!(handler
+        .handle_command(enrolled, "resume")
+        .await
+        .unwrap()
+        .contains("resumed"));
+}
+
+#[tokio::test]
+async fn test_command_allowlist_lifecycle_via_bot() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let protected = "did:plc:protected1";
+
+    // Empty allowlist view.
+    assert!(handler
+        .handle_command(protected, "allowlist")
+        .await
+        .unwrap()
+        .contains("allowlist"));
+
+    // Add (DID form), then view, then remove.
+    let add = handler
+        .handle_command(protected, "allow did:plc:friend")
+        .await
+        .unwrap();
+    assert!(add.contains("added to your moderation allowlist"));
+
+    let view = handler
+        .handle_command(protected, "allow list")
+        .await
+        .unwrap();
+    assert!(view.contains("did:plc:friend"));
+
+    let remove = handler
+        .handle_command(protected, "unallow did:plc:friend")
+        .await
+        .unwrap();
+    assert!(remove.contains("removed from your moderation allowlist"));
+
+    // Removing again reports not found.
+    let remove_again = handler
+        .handle_command(protected, "unallow did:plc:friend")
+        .await
+        .unwrap();
+    assert!(remove_again.contains("was not found"));
+}
+
+#[tokio::test]
+async fn test_command_test_allowlist_status_variants() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let protected = "did:plc:protected1";
+    let admin = "did:plc:admin";
+
+    // `test` command: heuristic-only path (permitted verdict from MockClassifier).
+    let t = handler
+        .handle_command(protected, "test A perfectly benign message")
+        .await
+        .unwrap();
+    assert!(t.contains("Test Evaluation"));
+
+    // `test` usage form.
+    assert!(handler
+        .handle_command(protected, "test")
+        .await
+        .unwrap()
+        .contains("Usage"));
+
+    // allowlist view with an entry (populated branch + pluralization).
+    handler
+        .handle_command(protected, "allow did:plc:friend1")
+        .await
+        .unwrap();
+    let view = handler
+        .handle_command(protected, "allowlist")
+        .await
+        .unwrap();
+    assert!(view.contains("Allowlist (1 account)"));
+
+    // Non-admin `status` shows the per-account view; admin shows the fleet view.
+    assert!(handler
+        .handle_command(protected, "status")
+        .await
+        .unwrap()
+        .contains("Status for Your Account"));
+    assert!(handler
+        .handle_command(admin, "status")
+        .await
+        .unwrap()
+        .contains("Admin Fleet View"));
+
+    // `pardon and allow <did>` alias resolves to the pardon+allowlist handler.
+    let pa = handler
+        .handle_command(protected, "pardon and allow did:plc:someuser")
+        .await
+        .unwrap();
+    assert!(!pa.is_empty());
+}
+
+#[tokio::test]
+async fn test_command_enrolled_tenant_update_branches() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    // Enroll a tenant so the registry-update branches are exercised.
+    engine
+        .enroll_tenant(skybouncer::tenant::Tenant::new("did:plc:enrolled"))
+        .expect("enroll");
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let enrolled = "did:plc:enrolled";
+
+    // set rules (enrolled) -> registry update path.
+    let r = handler
+        .handle_command(enrolled, "set rules Block all spam now")
+        .await
+        .unwrap();
+    assert!(r.contains("Moderation rubric updated successfully"));
+
+    // sensitivity (enrolled) -> registry update path.
+    let s = handler
+        .handle_command(enrolled, "sensitivity high")
+        .await
+        .unwrap();
+    assert!(s.contains("Sensitivity threshold updated"));
+
+    // duration (enrolled) -> registry update path (both usage + set forms).
+    assert!(handler
+        .handle_command(enrolled, "duration")
+        .await
+        .unwrap()
+        .contains("Usage"));
+    let d = handler
+        .handle_command(enrolled, "duration 7d")
+        .await
+        .unwrap();
+    assert!(d.contains("Moderation duration updated"));
+
+    // recent (enrolled) -> empty-list branch.
+    let rec = handler.handle_command(enrolled, "recent").await.unwrap();
+    assert!(rec.contains("No accounts have been bounced"));
+}
+
+#[tokio::test]
+async fn test_command_all_privileged_denied_for_stranger() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let stranger = "did:plc:stranger";
+
+    // Every privileged command form must be denied with the unauthorized response,
+    // exercising each inline auth branch.
+    let commands = [
+        "pause",
+        "resume",
+        "rules",
+        "set rules",
+        "set rules Block spam",
+        "sensitivity",
+        "sensitivity high",
+        "duration",
+        "duration 24h",
+        "timeout 7d",
+        "set duration 30d",
+        "set timeout 24h",
+        "recent",
+        "allowlist",
+        "allow list",
+        "allow",
+        "allow did:plc:x",
+        "unallow",
+        "unallow did:plc:x",
+        "pardon",
+        "pardon and allow did:plc:x",
+        "pardon did:plc:x",
+        "pardon did:plc:x and allow did:plc:x",
+        "status",
+        "test",
+        "test some text",
+    ];
+    for cmd in commands {
+        let reply = handler.handle_command(stranger, cmd).await.expect("handle");
+        assert!(
+            reply.contains("active bouncer session"),
+            "command '{cmd}' must be denied for a stranger, got: {reply}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_command_unknown_and_nested_pardon_and_allow() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let protected = "did:plc:protected1";
+
+    // Unknown command for an authorized (protected) user -> tip variant.
+    let unknown = handler
+        .handle_command(protected, "frobnicate")
+        .await
+        .unwrap();
+    assert!(unknown.contains("Unknown command"));
+
+    // `pardon <target> and allow <target2>` nested form.
+    let nested = handler
+        .handle_command(protected, "pardon did:plc:a and allow did:plc:b")
+        .await
+        .unwrap();
+    assert!(!nested.is_empty());
+}
+
+#[tokio::test]
+async fn test_command_pardon_allow_usage_and_resolution_failures() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let protected = "did:plc:protected1";
+
+    // Unresolvable handles exercise the Err(msg) branches of resolve_dm_target.
+    assert!(handler
+        .handle_command(protected, "pardon @ghost.invalid.handle")
+        .await
+        .unwrap()
+        .contains("Could not resolve handle"));
+    assert!(handler
+        .handle_command(protected, "pardon and allow @ghost.invalid.handle")
+        .await
+        .unwrap()
+        .contains("Could not resolve handle"));
+    assert!(handler
+        .handle_command(protected, "allow @ghost.invalid.handle")
+        .await
+        .unwrap()
+        .contains("Could not resolve handle"));
+    assert!(handler
+        .handle_command(protected, "unallow @ghost.invalid.handle")
+        .await
+        .unwrap()
+        .contains("Could not resolve handle"));
+}
+
+#[tokio::test]
+async fn test_command_status_dry_run_variants() {
+    // Build an engine in dry-run mode to hit the shadow-mode status strings.
+    let pds = MockPdsServer::start().await;
+    let cache = Arc::new(DeduplicationCache::open_in_memory().expect("cache"));
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let pds_client = Arc::new(pds.pds_client("did:plc:protected1"));
+    let classifier = Arc::new(skybouncer::classifier::MockClassifier::new(
+        Verdict::permitted("ok"),
+    ));
+    let mut dids = HashSet::new();
+    dids.insert("did:plc:protected1".to_string());
+    let config = SkybouncerConfig::new(dids, rubric)
+        .with_admin_did("did:plc:admin")
+        .with_dry_run(true);
+    let engine = Arc::new(SkybouncerEngine::new(
+        config,
+        follow_graph,
+        gate,
+        classifier,
+        modlist,
+        pds_client,
+    ));
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+
+    // Admin status in dry-run -> "Yes (shadow)".
+    let admin = handler
+        .handle_command("did:plc:admin", "status")
+        .await
+        .unwrap();
+    assert!(admin.contains("shadow") || admin.contains("Yes"));
+    // Non-admin status in dry-run -> "Dry-Run (simulated)".
+    let user = handler
+        .handle_command("did:plc:protected1", "status")
+        .await
+        .unwrap();
+    assert!(user.contains("Dry-Run") || user.contains("simulated"));
+}
+
+#[tokio::test]
+async fn test_command_sensitivity_medium_and_stranger_unknown_tip() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+
+    // `sensitivity medium` exercises the "medium" match arm.
+    let m = handler
+        .handle_command("did:plc:protected1", "sensitivity medium")
+        .await
+        .unwrap();
+    assert!(m.contains("Sensitivity threshold updated"));
+
+    // Unknown command from an unauthorized sender includes the activation tip.
+    let tip = handler
+        .handle_command("did:plc:stranger", "totally-unknown-cmd")
+        .await
+        .unwrap();
+    assert!(tip.contains("Unknown command"));
+    assert!(tip.contains("not yet protected") || tip.contains("activate"));
+}
+
+#[tokio::test]
+async fn test_run_bot_poller_multiple_unread_fetches_history_and_handles_failures() {
+    let server = MockServer::start().await;
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let bot_did = "did:plc:skybouncer-bot";
+    let handler = BotCommandHandler::new(engine, bot_did);
+
+    let list_called = Arc::new(AtomicUsize::new(0));
+    let lc = Arc::clone(&list_called);
+    let get_called = Arc::new(AtomicUsize::new(0));
+    let gc = Arc::clone(&get_called);
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .respond_with(move |_: &wiremock::Request| {
+            // First tick: convo with multiple unread messages; later ticks: none.
+            if lc.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "convos": [{
+                        "id": "convo_multi",
+                        "rev": "rev_1",
+                        "unreadCount": 2,
+                        "members": [
+                            {"did": "did:plc:protected1"},
+                            {"did": "did:plc:skybouncer-bot"}
+                        ],
+                        "lastMessage": {
+                            "id": "msg_newest",
+                            "rev": "rev_1",
+                            "text": "help",
+                            "sender": {"did": "did:plc:protected1"},
+                            "sentAt": "2026-10-02T03:00:00Z"
+                        }
+                    }],
+                    "cursor": null
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({"convos": [], "cursor": null}))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    // getMessages returns newest-first; includes a self-authored message (skipped) + a real one.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.getMessages"))
+        .respond_with(move |_: &wiremock::Request| {
+            gc.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "messages": [
+                    {
+                        "id": "msg_real",
+                        "rev": "rev_b",
+                        "text": "help",
+                        "sender": {"did": "did:plc:protected1"},
+                        "sentAt": "2026-10-02T03:00:00Z"
+                    },
+                    {
+                        "id": "msg_self",
+                        "rev": "rev_a",
+                        "text": "welcome",
+                        "sender": {"did": "did:plc:skybouncer-bot"},
+                        "sentAt": "2026-10-02T02:59:00Z"
+                    }
+                ]
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_reply",
+            "rev": "rev_r",
+            "text": "reply",
+            "sender": {"did": "did:plc:skybouncer-bot"},
+            "sentAt": "2026-10-02T03:00:01Z"
+        })))
+        .mount(&server)
+        .await;
+
+    // updateRead fails -> warn branch.
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.updateRead"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&server)
+        .await;
+
+    // listConvoRequests fails -> debug branch.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvoRequests"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("nope"))
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "test_token").expect("client");
+    let cancel = CancellationToken::new();
+    let cancel_poller = cancel.clone();
+
+    let poller_task = tokio::spawn(async move {
+        run_bot_poller(client, handler, Duration::from_millis(20), cancel_poller).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancel.cancel();
+
+    let res = tokio::time::timeout(Duration::from_millis(500), poller_task)
+        .await
+        .expect("poller shutdown within timeout")
+        .expect("join task");
+    assert!(res.is_ok());
+    assert!(get_called.load(Ordering::SeqCst) >= 1);
+}
+
+#[tokio::test]
+async fn test_command_handler_second_protected_user_cannot_mutate_rules_sensitivity_or_duration() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    // Adding a second protected DID makes this a multi-tenant engine, so a protected
+    // (authorized) but unenrolled sender hits the "own enrolled account only" reject.
+    engine.add_protected_did("did:plc:protected2");
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let sender = "did:plc:protected2";
+
+    let r1 = handler
+        .handle_command(sender, "set rules Block everything")
+        .await
+        .unwrap();
+    assert!(
+        r1.contains("You can only update rules for your own enrolled account"),
+        "r1={r1}"
+    );
+
+    let r2 = handler
+        .handle_command(sender, "sensitivity high")
+        .await
+        .unwrap();
+    assert!(
+        r2.contains("You can only update sensitivity for your own enrolled account"),
+        "r2={r2}"
+    );
+
+    let r3 = handler.handle_command(sender, "duration 7d").await.unwrap();
+    assert!(
+        r3.contains("You can only update duration for your own enrolled account"),
+        "r3={r3}"
+    );
+}

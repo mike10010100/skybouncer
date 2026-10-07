@@ -7,9 +7,9 @@
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::bot::client::ChatClient;
 use crate::engine::BounceNotification;
 use crate::error::SkybouncerError;
+use skybase::chat::ChatClient;
 
 /// Formats a proactive ATProto direct message alert for a bounced violator.
 #[must_use]

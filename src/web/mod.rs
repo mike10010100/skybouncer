@@ -124,27 +124,19 @@ impl WebServerConfig {
     /// Loads web server configuration from environment variables with fallback defaults.
     #[must_use]
     pub fn from_env() -> Self {
-        let host = std::env::var("HOST")
-            .or_else(|_| std::env::var("SKYBOUNCER_HOST"))
-            .unwrap_or_else(|_| DEFAULT_WEB_HOST.to_string());
+        let host = crate::env::var_or(&["HOST", "SKYBOUNCER_HOST"], DEFAULT_WEB_HOST);
 
-        let port = std::env::var("PORT")
-            .or_else(|_| std::env::var("SKYBOUNCER_PORT"))
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(DEFAULT_WEB_PORT);
+        let port = crate::env::parsed_or(&["PORT", "SKYBOUNCER_PORT"], DEFAULT_WEB_PORT);
 
-        let public_url = std::env::var("PUBLIC_URL")
-            .or_else(|_| std::env::var("SKYBOUNCER_PUBLIC_URL"))
-            .unwrap_or_else(|_| format!("http://{host}:{port}"));
+        let public_url = crate::env::var_or(
+            &["PUBLIC_URL", "SKYBOUNCER_PUBLIC_URL"],
+            &format!("http://{host}:{port}"),
+        );
 
-        let client_id = std::env::var("OAUTH_CLIENT_ID")
-            .or_else(|_| std::env::var("SKYBOUNCER_OAUTH_CLIENT_ID"))
-            .ok();
+        let client_id = crate::env::var(&["OAUTH_CLIENT_ID", "SKYBOUNCER_OAUTH_CLIENT_ID"]);
 
-        let redirect_uri = std::env::var("OAUTH_REDIRECT_URI")
-            .or_else(|_| std::env::var("SKYBOUNCER_OAUTH_REDIRECT_URI"))
-            .ok();
+        let redirect_uri =
+            crate::env::var(&["OAUTH_REDIRECT_URI", "SKYBOUNCER_OAUTH_REDIRECT_URI"]);
 
         Self {
             host,
@@ -336,4 +328,64 @@ pub async fn run_web_server(
         .map_err(|e| SkybouncerError::Config(format!("Web server failure: {e}")))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_server_config_default_new_and_accessors() {
+        let d = WebServerConfig::default();
+        assert_eq!(d.host, DEFAULT_WEB_HOST);
+        assert_eq!(d.port, DEFAULT_WEB_PORT);
+        assert!(d.client_id().ends_with("/oauth/client-metadata.json"));
+        assert!(d.redirect_uri().ends_with("/oauth/callback"));
+
+        let c = WebServerConfig::new("0.0.0.0", 8080)
+            .with_public_url("https://example.com/")
+            .with_oauth_endpoints("https://example.com/cid.json", "https://example.com/cb");
+        assert_eq!(c.host, "0.0.0.0");
+        assert_eq!(c.port, 8080);
+        assert_eq!(c.public_url, "https://example.com");
+        assert_eq!(c.client_id(), "https://example.com/cid.json");
+        assert_eq!(c.redirect_uri(), "https://example.com/cb");
+    }
+
+    #[test]
+    fn web_server_config_resolves_redirect_from_public_url() {
+        let c = WebServerConfig::new("127.0.0.1", 3000).with_public_url("https://sky.example");
+        assert_eq!(c.redirect_uri(), "https://sky.example/oauth/callback");
+        // An explicit redirect override wins.
+        let c2 = c.with_oauth_endpoints("id", "https://custom/cb");
+        assert_eq!(c2.redirect_uri(), "https://custom/cb");
+    }
+
+    #[test]
+    fn web_server_config_from_env_uses_defaults_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for k in [
+            "HOST",
+            "SKYBOUNCER_HOST",
+            "PORT",
+            "SKYBOUNCER_PORT",
+            "PUBLIC_URL",
+            "SKYBOUNCER_PUBLIC_URL",
+        ] {
+            std::env::remove_var(k);
+        }
+        let c = WebServerConfig::from_env();
+        assert_eq!(c.host, DEFAULT_WEB_HOST);
+        assert_eq!(c.port, DEFAULT_WEB_PORT);
+    }
+
+    #[test]
+    fn build_oauth_client_returns_metadata_always() {
+        let cfg = WebServerConfig::new("127.0.0.1", 3000);
+        let (_client, metadata) = build_oauth_client(&cfg);
+        assert!(metadata.client_id.contains("client-metadata.json"));
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

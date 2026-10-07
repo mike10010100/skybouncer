@@ -1,7 +1,6 @@
 //! Sovereign ATProto moderation list manager coordinating cache-first provisioning,
 //! violator bouncing, and pardons across SQLite cache and PDS repository client.
 
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,6 +12,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::classifier::{RuleRubric, ViolationCategory};
 use crate::error::SkybouncerError;
 use crate::modlist::cache::{BouncedUser, DeduplicationCache, ModListConfig};
+use crate::time::current_time_us;
 use crate::types::{
     now_iso8601, ListBlockRecord, ListItemRecord, ListRecordsResponse, ModListRecord,
 };
@@ -56,17 +56,78 @@ impl StripedAsyncLocks {
     /// Selects the [`tokio::sync::Mutex`] shard corresponding to the given key.
     #[must_use]
     pub fn shard_for(&self, key: &str) -> &tokio::sync::Mutex<()> {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
-        let idx = (hash as usize) % NUM_LOCK_SHARDS;
-        &self.shards[idx]
+        &self.shards[crate::util::shard_index(key, NUM_LOCK_SHARDS)]
     }
 }
 
 impl Default for StripedAsyncLocks {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Description of a single violation to bounce, grouping the offending account,
+/// classification, and post evidence into one request value.
+///
+/// The optional [`post_text`](Self::post_text) and [`expires_at`](Self::expires_at)
+/// fields are populated when the interaction body is available or a bounce duration
+/// override applies; otherwise they default to an empty body and the rubric-derived
+/// expiry.
+#[derive(Debug, Clone)]
+pub struct BounceRequest<'a> {
+    /// DID of the protected user whose moderation list receives the entry.
+    pub protected_did: &'a str,
+    /// DID of the violating account being bounced.
+    pub candidate_did: &'a str,
+    /// Classified violation category driving the threshold check.
+    pub category: &'a ViolationCategory,
+    /// Model/heuristic confidence score in `[0.0, 1.0]`.
+    pub confidence: f64,
+    /// Human-readable reason recorded alongside the bounce.
+    pub reason: &'a str,
+    /// Canonical AT-URI of the offending post.
+    pub post_uri: &'a str,
+    /// Plaintext body of the offending post, if available.
+    pub post_text: &'a str,
+    /// Explicit expiry (microseconds since Unix epoch); falls back to the rubric duration.
+    pub expires_at: Option<u64>,
+}
+
+impl<'a> BounceRequest<'a> {
+    /// Creates a bounce request with no post text and the rubric-derived expiry.
+    #[must_use]
+    pub fn new(
+        protected_did: &'a str,
+        candidate_did: &'a str,
+        category: &'a ViolationCategory,
+        confidence: f64,
+        reason: &'a str,
+        post_uri: &'a str,
+    ) -> Self {
+        Self {
+            protected_did,
+            candidate_did,
+            category,
+            confidence,
+            reason,
+            post_uri,
+            post_text: "",
+            expires_at: None,
+        }
+    }
+
+    /// Attaches the offending post body.
+    #[must_use]
+    pub fn with_post_text(mut self, post_text: &'a str) -> Self {
+        self.post_text = post_text;
+        self
+    }
+
+    /// Attaches an explicit bounce expiry (microseconds since Unix epoch).
+    #[must_use]
+    pub fn with_expires_at(mut self, expires_at: Option<u64>) -> Self {
+        self.expires_at = expires_at;
+        self
     }
 }
 
@@ -422,16 +483,16 @@ impl ModListManager {
         Ok(())
     }
 
-    /// Bounces a violating account by adding an `app.bsky.graph.listitem` to the protected user's
-    /// moderation list on their sovereign PDS and recording it in the deduplication cache.
+    /// Bounces a violating account on the sovereign PDS, recording the offending post URI and post
+    /// text in the deduplication cache.
     ///
     /// # Pipeline & Concurrency Architecture
     /// 1. **Rubric Threshold Check**: If a rubric is configured and the confidence score falls
     ///    below the required sensitivity threshold, drops the candidate and returns `Ok(None)`.
     /// 2. **Fast Deduplication Check (unlocked)**: Checks the SQLite cache to see if the user is
     ///    already bounced. If so, returns `Ok(None)` immediately ($0 cost, 0 network mutations).
-    /// 3. **Striped Async Lock**: Synchronizes on the shard for `candidate_did` to serialize
-    ///    in-flight mutations targeting the same violator.
+    /// 3. **Striped Async Lock**: Synchronizes on the shard for the composite
+    ///    `(protected_did, candidate_did)` key to serialize in-flight mutations.
     /// 4. **Double-Check Deduplication (under lock)**: Re-checks if the candidate was bounced by
     ///    a concurrent task while waiting for the lock. If so, short-circuits to `Ok(None)` with
     ///    zero additional PDS writes.
@@ -444,62 +505,30 @@ impl ModListManager {
     /// Returns [`SkybouncerError::Repo`] if PDS mutation fails, or [`SkybouncerError::Database`]
     /// if cache access fails.
     #[instrument(
-        skip(self, pds_client),
+        skip(self, pds_client, request),
         fields(
-            protected_did = %protected_did,
-            candidate_did = %candidate_did,
-            category = %category,
-            confidence = %confidence
+            protected_did = %request.protected_did,
+            candidate_did = %request.candidate_did,
+            category = %request.category,
+            confidence = %request.confidence
         )
     )]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn bounce_user(
+    pub async fn bounce(
         &self,
         pds_client: &PdsRepoClient,
-        protected_did: &str,
-        candidate_did: &str,
-        category: &ViolationCategory,
-        confidence: f64,
-        reason: &str,
-        post_uri: &str,
+        request: BounceRequest<'_>,
     ) -> Result<Option<String>, SkybouncerError> {
-        self.bounce_user_with_text(
-            pds_client,
+        let BounceRequest {
             protected_did,
             candidate_did,
             category,
             confidence,
             reason,
             post_uri,
-            "",
-            None,
-        )
-        .await
-    }
+            post_text,
+            expires_at,
+        } = request;
 
-    /// Bounces a violating user on the sovereign PDS, recording the offending post URI and post text in the cache.
-    #[instrument(
-        skip(self, pds_client),
-        fields(
-            protected_did = %protected_did,
-            candidate_did = %candidate_did,
-            category = %category,
-            confidence = %confidence
-        )
-    )]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn bounce_user_with_text(
-        &self,
-        pds_client: &PdsRepoClient,
-        protected_did: &str,
-        candidate_did: &str,
-        category: &ViolationCategory,
-        confidence: f64,
-        reason: &str,
-        post_uri: &str,
-        post_text: &str,
-        expires_at: Option<u64>,
-    ) -> Result<Option<String>, SkybouncerError> {
         // 1. Check rubric threshold if rubric is configured
         if let Some(ref rubric) = *self.rubric.read() {
             if !rubric.meets_threshold(category, confidence) {
@@ -802,11 +831,4 @@ impl ModListManager {
         let parsed: ListRecordsResponse<T> = resp.json().await?;
         Ok(parsed)
     }
-}
-
-/// Computes clock-warp safe microsecond timestamp since Unix epoch.
-fn current_time_us() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or_default())
 }

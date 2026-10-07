@@ -11,10 +11,10 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::bot::client::ChatClient;
 use crate::bot::handler::BotCommandHandler;
-use crate::bot::types::{ConvoView, MessageView};
 use crate::error::SkybouncerError;
+use skybase::chat::ChatClient;
+use skybase::chat::{ConvoView, MessageView};
 
 /// Default polling interval for checking unread direct messages (3 seconds).
 pub const DEFAULT_BOT_POLL_INTERVAL: Duration = Duration::from_secs(3);

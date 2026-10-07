@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.21] - 2026-10-06
+
+### Changed
+
+- **DRY Cleanup, Dependency Hygiene & Structural Refactor** (see `docs/CLEANUP.md`):
+  - Dependency hygiene: removed unused `http` and direct `ring` dependencies, moved `tower` to dev-dependencies, and feature-gated `web`/`stream`/`bot`/`telemetry` with a lean-core CI gate.
+  - Dead code / lints: removed the never-read `stateless_mode` config; replaced `too_many_arguments` allows with a unified `BounceRequest` + `ModListManager::bounce` (23 call sites); renamed `matcher/matcher.rs` to `matcher/target.rs`.
+  - Internal dedup: new `env`, `time`, and `util` helper modules; shared row mappers, parsers, builders, and test fixtures.
+  - Structural splits: `engine`, `modlist::cache`, `web::api`, and `tenant::registry` split into focused submodules; dashboard HTML externalized to `assets/dashboard.html`.
+  - Pipeline dedup: extracted `dispatch_commit`, `fast_path`, and `SkybouncerEngine::run_simulation`; deduped the `FollowGraph` reverse index.
+
+### Removed
+
+- **Sibling-Crate Deduplication** (requires `skybase` and `skyauth` releases carrying the pulled-up modules):
+  - Removed the in-crate ATProto Chat client and chat/lexicon models (~1,800 LOC); now re-exported from `skybase::chat` / `skybase::lexicon`.
+  - `SessionCipher` now delegates to `skyauth::sealed::SealedBox`; SSRF image fetch uses `skyauth::ssrf::SsrfFilter`; the Jetstream streamer uses `skybase::ingest` primitives.
+
 ## [0.1.20] - 2026-10-05
 
 ### Changed

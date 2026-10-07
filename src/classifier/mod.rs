@@ -16,7 +16,9 @@ pub mod tiered;
 pub use heuristic::{HeuristicClassifier, HeuristicRule};
 pub use jev::{JevClassifier, JevConfig, JevEndpointKind};
 pub use mock::MockClassifier;
-pub use rubric::{BounceDuration, RuleRubric, Sensitivity};
+pub use rubric::{
+    bounce_duration_from_db, sensitivity_from_db, BounceDuration, RuleRubric, Sensitivity,
+};
 pub use tiered::{
     CertaintyConfig, TieredClassifier, TieredClassifierStats, TieredEvaluationResult,
     TieredStatsSnapshot,
@@ -432,5 +434,138 @@ impl<T: Classifier + ?Sized> Classifier for Box<T> {
 
     fn set_rubric(&self, rubric: RuleRubric) {
         (**self).set_rubric(rubric);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn violation_category_slug_and_display() {
+        assert_eq!(
+            ViolationCategory::from_slug("spam"),
+            ViolationCategory::Spam
+        );
+        assert_eq!(
+            ViolationCategory::from_slug("crypto"),
+            ViolationCategory::CryptoSpam
+        );
+        assert_eq!(
+            ViolationCategory::from_slug("CRYPTO_SPAM"),
+            ViolationCategory::CryptoSpam
+        );
+        assert_eq!(
+            ViolationCategory::from_slug("harassment"),
+            ViolationCategory::Harassment
+        );
+        assert_eq!(
+            ViolationCategory::from_slug("sealioning"),
+            ViolationCategory::SeaLioning
+        );
+        assert_eq!(
+            ViolationCategory::from_slug("phishing"),
+            ViolationCategory::Phishing
+        );
+        assert_eq!(
+            ViolationCategory::from_slug("hate_speech"),
+            ViolationCategory::HateSpeech
+        );
+        match ViolationCategory::from_slug("novel") {
+            ViolationCategory::Custom(s) => assert_eq!(s, "novel"),
+            other => panic!("expected Custom, got {other}"),
+        }
+
+        // Display mirrors as_str.
+        assert_eq!(ViolationCategory::Spam.to_string(), "spam");
+        assert_eq!(
+            ViolationCategory::CryptoSpam.to_string(),
+            ViolationCategory::CryptoSpam.as_str()
+        );
+
+        // FromStr never fails.
+        assert_eq!(
+            "phishing".parse::<ViolationCategory>().unwrap(),
+            ViolationCategory::Phishing
+        );
+    }
+
+    #[test]
+    fn violation_category_serde_roundtrip() {
+        let c = ViolationCategory::Harassment;
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(json, "\"harassment\"");
+        let back: ViolationCategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, c);
+
+        let custom: ViolationCategory = serde_json::from_str("\"weird\"").unwrap();
+        assert!(matches!(custom, ViolationCategory::Custom(_)));
+    }
+
+    #[test]
+    fn verdict_helpers() {
+        let v = Verdict::violation(ViolationCategory::Spam, 0.9, "spammy");
+        assert!(v.is_violation());
+        assert_eq!(v.category(), Some(&ViolationCategory::Spam));
+        assert_eq!(v.confidence(), Some(0.9));
+        assert_eq!(v.reason(), "spammy");
+
+        let p = Verdict::permitted("ok");
+        assert!(!p.is_violation());
+        assert!(p.category().is_none());
+        assert!(p.confidence().is_none());
+
+        let pc = Verdict::permitted_with_confidence("ok", 0.4);
+        assert_eq!(pc.confidence(), Some(0.4));
+    }
+
+    #[tokio::test]
+    async fn arc_and_box_classifier_forwarding() {
+        let mock = MockClassifier::new(Verdict::permitted("ok"));
+        let arc: std::sync::Arc<MockClassifier> = std::sync::Arc::new(mock);
+        let boxed: Box<MockClassifier> = Box::new(MockClassifier::new(Verdict::permitted("ok2")));
+
+        let i = Interaction::mock_test_candidate("did:plc:a", "did:plc:t", "hi");
+        assert!(arc.classify(&i).await.is_ok());
+        assert!(boxed.classify(&i).await.is_ok());
+        assert!(!arc.model_name().is_empty());
+
+        // Trait default classify_detailed wraps a single-tier result.
+        let detailed = arc.classify_detailed(&i).await.unwrap();
+        assert!(!detailed.escalated);
+        assert!(detailed.escalation_reason.is_some());
+        assert!(detailed.fallback_verdict.is_none());
+
+        // set_rubric default is a no-op and must not panic.
+        arc.set_rubric(RuleRubric::default());
+
+        // Box forwarding for every detailed variant.
+        assert!(boxed.classify_with_rubric(&i, None).await.is_ok());
+        assert!(boxed.classify_detailed(&i).await.is_ok());
+        assert!(boxed.classify_detailed_with_rubric(&i, None).await.is_ok());
+        assert!(boxed.classify_detailed_with_stats(&i, false).await.is_ok());
+        assert!(boxed
+            .classify_detailed_with_stats_and_rubric(&i, None, false)
+            .await
+            .is_ok());
+        boxed.set_rubric(RuleRubric::default());
+
+        // Arc forwarding for the remaining detailed variants.
+        assert!(arc.classify_detailed_with_stats(&i, false).await.is_ok());
+        assert!(arc
+            .classify_detailed_with_stats_and_rubric(&i, None, false)
+            .await
+            .is_ok());
+
+        // Verdict sanitization clamps out-of-range confidence.
+        assert_eq!(
+            Verdict::violation(ViolationCategory::Spam, 5.0, "x").confidence(),
+            Some(1.0)
+        );
+        assert_eq!(
+            Verdict::violation(ViolationCategory::Spam, f64::NAN, "x").confidence(),
+            Some(0.0)
+        );
     }
 }

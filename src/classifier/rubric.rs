@@ -2,6 +2,7 @@
 
 use crate::classifier::Verdict;
 use crate::error::SkybouncerError;
+use crate::types::default_true;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
@@ -79,6 +80,15 @@ impl FromStr for Sensitivity {
             ))),
         }
     }
+}
+
+/// Parses a persisted sensitivity string, defaulting to [`Sensitivity::Medium`] when
+/// the value is absent or unrecognized (legacy database compatibility).
+#[must_use]
+pub fn sensitivity_from_db(value: Option<&str>) -> Sensitivity {
+    value
+        .and_then(|s| s.parse::<Sensitivity>().ok())
+        .unwrap_or(Sensitivity::Medium)
 }
 
 /// Configurable duration for moderation list entries (permanent vs temporary timeout).
@@ -286,9 +296,13 @@ impl fmt::Display for BounceDuration {
     }
 }
 
-/// Returns `true`, used as the serde default for opt-out moderation bypass flags.
-fn default_true() -> bool {
-    true
+/// Parses a persisted bounce-duration string, defaulting to [`BounceDuration::default`]
+/// when the value is absent or unrecognized.
+#[must_use]
+pub fn bounce_duration_from_db(value: Option<&str>) -> BounceDuration {
+    value
+        .and_then(|s| s.parse::<BounceDuration>().ok())
+        .unwrap_or_default()
 }
 
 /// Configured house rules and sensitivity rubric for moderation evaluation.
@@ -610,5 +624,149 @@ mod tests {
         let rubric7d = RuleRubric::parse("No harassment\ntimeout: 7d").unwrap();
         assert_eq!(rubric7d.prompt, "No harassment");
         assert_eq!(rubric7d.bounce_duration, BounceDuration::Timeout7d);
+    }
+
+    #[test]
+    fn test_bounce_duration_numeric_and_object_edges() {
+        // Exact numeric encodings map to named variants.
+        assert_eq!(
+            serde_json::from_str::<BounceDuration>("86400").unwrap(),
+            BounceDuration::Cooldown24h
+        );
+        assert_eq!(
+            serde_json::from_str::<BounceDuration>("604800").unwrap(),
+            BounceDuration::Timeout7d
+        );
+        assert_eq!(
+            serde_json::from_str::<BounceDuration>("2592000").unwrap(),
+            BounceDuration::Timeout30d
+        );
+        // Negative i64 -> Permanent; positive i64 -> mapped/custom.
+        assert_eq!(
+            serde_json::from_str::<BounceDuration>("-5").unwrap(),
+            BounceDuration::Permanent
+        );
+        assert_eq!(
+            serde_json::from_str::<BounceDuration>("120").unwrap(),
+            BounceDuration::Custom(120)
+        );
+        // Custom object form round-trips.
+        let custom = BounceDuration::Custom(999);
+        let ser = serde_json::to_string(&custom).unwrap();
+        assert_eq!(ser, r#"{"custom":999}"#);
+        assert_eq!(
+            serde_json::from_str::<BounceDuration>(&ser).unwrap(),
+            custom
+        );
+        // Malformed object rejected.
+        assert!(serde_json::from_str::<BounceDuration>(r#"{"nope":1}"#).is_err());
+    }
+
+    #[test]
+    fn test_bounce_duration_display_and_helpers() {
+        let d = BounceDuration::Custom(3600);
+        assert!(!d.to_db_string().is_empty());
+        assert!(d.expires_at_us(1_000_000).is_some());
+        assert!(BounceDuration::Permanent.expires_at_us(1_000_000).is_none());
+    }
+
+    #[test]
+    fn test_rubric_builder_methods() {
+        let r = RuleRubric::with_default_sensitivity("Block spam")
+            .with_bounce_duration(BounceDuration::Cooldown24h);
+        assert_eq!(r.prompt, "Block spam");
+        assert_eq!(r.sensitivity, Sensitivity::Medium);
+        assert_eq!(r.bounce_duration, BounceDuration::Cooldown24h);
+    }
+
+    #[test]
+    fn test_rubric_parse_directive_forms() {
+        // `sensitivity =` (bracket) form.
+        let r = RuleRubric::parse("[sensitivity = \"high\"]\nBlock spam").unwrap();
+        assert_eq!(r.sensitivity, Sensitivity::High);
+        // `duration =` form.
+        let r = RuleRubric::parse("[duration = \"7d\"]\nBlock spam").unwrap();
+        assert_eq!(r.bounce_duration, BounceDuration::Timeout7d);
+        // `timeout =` form.
+        let r = RuleRubric::parse("[timeout = \"30d\"]\nBlock spam").unwrap();
+        assert_eq!(r.bounce_duration, BounceDuration::Timeout30d);
+        // `bypass_followers =` form.
+        let r = RuleRubric::parse("[bypass_followers = \"false\"]\nBlock spam").unwrap();
+        assert!(!r.bypass_incoming_followers);
+        // Inline trailing directive with prompt text preserved.
+        let r = RuleRubric::parse("Block spam [duration: 24h]").unwrap();
+        assert_eq!(r.bounce_duration, BounceDuration::Cooldown24h);
+        assert_eq!(r.prompt, "Block spam");
+        // Inline trailing sensitivity directive.
+        let r = RuleRubric::parse("Block spam [sensitivity: low]").unwrap();
+        assert_eq!(r.sensitivity, Sensitivity::Low);
+        // Invalid sensitivity surfaces a config error.
+        assert!(RuleRubric::parse("[sensitivity: bogus]\nBlock").is_err());
+        // Invalid bypass flag surfaces a config error.
+        assert!(RuleRubric::parse("[bypass_followers: maybe]\nBlock").is_err());
+        // Empty prompt after directive rejected.
+        assert!(RuleRubric::parse("[sensitivity: high]").is_err());
+    }
+
+    #[test]
+    fn test_sensitivity_deserialize_and_thresholds() {
+        assert_eq!(
+            serde_json::from_str::<Sensitivity>("\"high\"").unwrap(),
+            Sensitivity::High
+        );
+        assert!(serde_json::from_str::<Sensitivity>("\"bogus\"").is_err());
+        // Low sensitivity is the strictest (highest confidence bar).
+        assert!(Sensitivity::Low.threshold() > Sensitivity::Medium.threshold());
+    }
+
+    #[test]
+    fn test_rubric_parse_inline_trailing_directives() {
+        // Inline `duration:` with no preceding prompt text leaves only the directive line.
+        let r = RuleRubric::parse("Block spam\n[duration: 30d]").unwrap();
+        assert_eq!(r.bounce_duration, BounceDuration::Timeout30d);
+        assert_eq!(r.prompt, "Block spam");
+
+        // Inline `timeout:` form.
+        let r = RuleRubric::parse("Block spam [timeout: 24h]").unwrap();
+        assert_eq!(r.bounce_duration, BounceDuration::Cooldown24h);
+        assert_eq!(r.prompt, "Block spam");
+
+        // Inline `sensitivity:` form.
+        let r = RuleRubric::parse("Block spam [sensitivity: high]").unwrap();
+        assert_eq!(r.sensitivity, Sensitivity::High);
+
+        // A bracketed token that is NOT a recognized directive is kept as prompt text.
+        let r = RuleRubric::parse("Block spam [note]").unwrap();
+        assert!(r.prompt.contains("[note]"));
+
+        // An unbalanced bracket keeps the raw line as prompt text.
+        let r = RuleRubric::parse("Block spam [unclosed").unwrap();
+        assert!(r.prompt.contains("[unclosed"));
+
+        // `bypass_followers:` colon form.
+        let r = RuleRubric::parse("[bypass_followers: false]\nBlock spam").unwrap();
+        assert!(!r.bypass_incoming_followers);
+    }
+
+    #[test]
+    fn test_bounce_duration_from_str_paths() {
+        assert_eq!(
+            "cooldown_24h".parse::<BounceDuration>().unwrap(),
+            BounceDuration::Cooldown24h
+        );
+        assert_eq!(
+            "1w".parse::<BounceDuration>().unwrap(),
+            BounceDuration::Timeout7d
+        );
+        assert_eq!(
+            "1m".parse::<BounceDuration>().unwrap(),
+            BounceDuration::Timeout30d
+        );
+        assert_eq!(
+            "3600".parse::<BounceDuration>().unwrap(),
+            BounceDuration::Custom(3600)
+        );
+        assert!("nonsense".parse::<BounceDuration>().is_err());
+        assert!(Sensitivity::Medium.threshold() > Sensitivity::High.threshold());
     }
 }

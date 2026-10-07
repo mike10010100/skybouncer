@@ -8,7 +8,6 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::matcher::Interaction;
 
@@ -187,7 +186,7 @@ impl MockContextEnricher {
 
     /// Registers a mock handle-to-DID resolution mapping.
     pub fn set_handle(&self, handle: impl Into<String>, did: impl Into<String>) {
-        let clean = handle.into().trim().trim_start_matches('@').to_string();
+        let clean = crate::util::normalize_handle(&handle.into()).to_string();
         self.handles.write().insert(clean, did.into());
     }
 
@@ -231,7 +230,7 @@ impl ContextEnricher for MockContextEnricher {
     }
 
     async fn resolve_handle(&self, handle: &str) -> Option<String> {
-        let clean = handle.trim().trim_start_matches('@');
+        let clean = crate::util::normalize_handle(handle);
         if clean.starts_with("did:") {
             return Some(clean.to_string());
         }
@@ -242,7 +241,7 @@ impl ContextEnricher for MockContextEnricher {
         let clean = did.trim();
         if let Some(author) = self.authors.read().get(clean) {
             if let Some(ref h) = author.handle {
-                let trimmed = h.trim().trim_start_matches('@').to_string();
+                let trimmed = crate::util::normalize_handle(h).to_string();
                 if !trimmed.is_empty() {
                     return Some(trimmed);
                 }
@@ -265,11 +264,13 @@ impl ContextEnricher for MockContextEnricher {
 }
 
 /// AppView HTTP client resolving author profiles and parent posts via public XRPC endpoints.
+///
+/// Delegates all XRPC reads and cursor pagination to [`skybase::appview::AppViewClient`];
+/// this type layers skybouncer's interaction-level enrichment (parallel author/parent/image
+/// fetch) and PLC-directory fallback on top.
 #[derive(Debug, Clone)]
 pub struct AppViewContextEnricher {
-    appview_url: String,
-    cdn_url: String,
-    http_client: reqwest::Client,
+    client: skybase::appview::AppViewClient,
 }
 
 impl AppViewContextEnricher {
@@ -285,219 +286,75 @@ impl AppViewContextEnricher {
         Self::with_endpoints(endpoint, DEFAULT_CDN_ENDPOINT)
     }
 
+    /// Creates an enricher using the AppView endpoint from `APPVIEW_ENDPOINT` /
+    /// `SKYBOUNCER_APPVIEW_ENDPOINT`, falling back to [`DEFAULT_APPVIEW_ENDPOINT`].
+    #[must_use]
+    pub fn from_env() -> Self {
+        let endpoint = crate::env::var_or(
+            &["APPVIEW_ENDPOINT", "SKYBOUNCER_APPVIEW_ENDPOINT"],
+            DEFAULT_APPVIEW_ENDPOINT,
+        );
+        Self::with_endpoint(endpoint)
+    }
+
     /// Creates a new [`AppViewContextEnricher`] with custom AppView and CDN endpoints.
     #[must_use]
     pub fn with_endpoints(
         appview_endpoint: impl Into<String>,
         cdn_endpoint: impl Into<String>,
     ) -> Self {
-        let client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .timeout(Duration::from_millis(DEFAULT_ENRICHER_TIMEOUT_MS))
-            .build()
-            .unwrap_or_else(|_| {
-                reqwest::Client::builder()
-                    .timeout(Duration::from_millis(DEFAULT_ENRICHER_TIMEOUT_MS))
-                    .build()
-                    .unwrap_or_default()
-            });
-
         Self {
-            appview_url: appview_endpoint.into().trim_end_matches('/').to_string(),
-            cdn_url: cdn_endpoint.into().trim_end_matches('/').to_string(),
-            http_client: client,
+            client: skybase::appview::AppViewClient::with_endpoints(appview_endpoint, cdn_endpoint),
         }
+    }
+
+    /// Returns the configured AppView base URL.
+    #[must_use]
+    pub fn appview_url(&self) -> &str {
+        self.client.appview_url()
+    }
+
+    /// Returns the configured CDN base URL.
+    #[must_use]
+    pub fn cdn_url(&self) -> &str {
+        self.client.cdn_url()
     }
 
     /// Fetches author profile metadata from the AppView.
     async fn fetch_author_profile(&self, did: &str) -> Option<AuthorContext> {
-        let url = format!("{}/xrpc/app.bsky.actor.getProfile", self.appview_url);
-        let resp = self
-            .http_client
-            .get(&url)
-            .query(&[("actor", did)])
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-
-        #[derive(Deserialize)]
-        struct RawProfile {
-            handle: Option<String>,
-            #[serde(rename = "displayName")]
-            display_name: Option<String>,
-            description: Option<String>,
-            #[serde(rename = "followersCount")]
-            followers_count: Option<u64>,
-            #[serde(rename = "followsCount")]
-            follows_count: Option<u64>,
-            #[serde(rename = "createdAt")]
-            created_at: Option<String>,
-        }
-
-        let raw: RawProfile = resp.json().await.ok()?;
+        let profile = self.client.fetch_profile(did).await?;
         Some(AuthorContext {
-            handle: raw.handle,
-            display_name: raw.display_name,
-            description: raw.description,
-            followers_count: raw.followers_count,
-            follows_count: raw.follows_count,
-            created_at: raw.created_at,
+            handle: profile.handle,
+            display_name: profile.display_name,
+            description: profile.description,
+            followers_count: profile.followers_count,
+            follows_count: profile.follows_count,
+            created_at: profile.created_at,
         })
     }
 
     /// Fetches parent post text content from the AppView.
     async fn fetch_parent_post(&self, uri: &str) -> Option<ParentPostContext> {
-        let url = format!("{}/xrpc/app.bsky.feed.getPosts", self.appview_url);
-        let resp = self
-            .http_client
-            .get(&url)
-            .query(&[("uris", uri)])
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-
-        #[derive(Deserialize)]
-        struct RawRecord {
-            text: Option<String>,
-        }
-
-        #[derive(Deserialize)]
-        struct RawAuthor {
-            did: String,
-        }
-
-        #[derive(Deserialize)]
-        struct RawPostView {
-            author: RawAuthor,
-            record: serde_json::Value,
-            cid: Option<String>,
-        }
-
-        #[derive(Deserialize)]
-        struct RawPostsResponse {
-            posts: Vec<RawPostView>,
-        }
-
-        let raw: RawPostsResponse = resp.json().await.ok()?;
-        let first = raw.posts.into_iter().next()?;
-        let text = serde_json::from_value::<RawRecord>(first.record)
-            .ok()
-            .and_then(|r| r.text)
-            .unwrap_or_default();
-
+        let post = self.client.fetch_post(uri).await?;
         Some(ParentPostContext {
-            author_did: first.author.did,
-            text,
-            cid: first.cid,
+            author_did: post.author_did,
+            text: post.text,
+            cid: post.cid,
         })
     }
 
     /// Fetches initial followed DIDs for an actor from the public AppView (XRPC `app.bsky.graph.getFollows`).
     ///
     /// Used for zero-credential cold-start hydration of the local follow graph.
-    /// Paginates through follow records up to 10,000 follows to ensure complete coverage.
     pub async fn fetch_follows(&self, actor: &str, limit: u8) -> Vec<String> {
-        let mut all_follows = Vec::new();
-        let mut cursor: Option<String> = None;
-        let page_limit = limit.clamp(1, 100);
-
-        for _ in 0..100 {
-            let url = format!("{}/xrpc/app.bsky.graph.getFollows", self.appview_url);
-            let mut req = self
-                .http_client
-                .get(&url)
-                .query(&[("actor", actor), ("limit", &page_limit.to_string())]);
-            if let Some(ref c) = cursor {
-                req = req.query(&[("cursor", c)]);
-            }
-
-            let resp = match req.send().await {
-                Ok(r) if r.status().is_success() => r,
-                _ => break,
-            };
-
-            #[derive(Deserialize)]
-            struct FollowProfile {
-                did: String,
-            }
-
-            #[derive(Deserialize)]
-            struct GetFollowsResponse {
-                follows: Vec<FollowProfile>,
-                cursor: Option<String>,
-            }
-
-            match resp.json::<GetFollowsResponse>().await {
-                Ok(body) => {
-                    let count = body.follows.len();
-                    all_follows.extend(body.follows.into_iter().map(|f| f.did));
-                    if count == 0 || body.cursor.is_none() {
-                        break;
-                    }
-                    cursor = body.cursor;
-                }
-                Err(_) => break,
-            }
-        }
-
-        all_follows
+        self.client.fetch_follows(actor, limit).await
     }
 
     /// Fetches initial incoming follower DIDs for an actor from the public AppView (XRPC `app.bsky.graph.getFollowers`).
     ///
     /// Used for zero-credential cold-start hydration of the local incoming follower graph.
-    /// Paginates through follower records up to 10,000 followers to ensure complete coverage.
     pub async fn fetch_followers(&self, actor: &str, limit: u8) -> Vec<String> {
-        let mut all_followers = Vec::new();
-        let mut cursor: Option<String> = None;
-        let page_limit = limit.clamp(1, 100);
-
-        for _ in 0..100 {
-            let url = format!("{}/xrpc/app.bsky.graph.getFollowers", self.appview_url);
-            let mut req = self
-                .http_client
-                .get(&url)
-                .query(&[("actor", actor), ("limit", &page_limit.to_string())]);
-            if let Some(ref c) = cursor {
-                req = req.query(&[("cursor", c)]);
-            }
-
-            let resp = match req.send().await {
-                Ok(r) if r.status().is_success() => r,
-                _ => break,
-            };
-
-            #[derive(Deserialize)]
-            struct FollowerProfile {
-                did: String,
-            }
-
-            #[derive(Deserialize)]
-            struct GetFollowersResponse {
-                followers: Vec<FollowerProfile>,
-                cursor: Option<String>,
-            }
-
-            match resp.json::<GetFollowersResponse>().await {
-                Ok(body) => {
-                    let count = body.followers.len();
-                    all_followers.extend(body.followers.into_iter().map(|f| f.did));
-                    if count == 0 || body.cursor.is_none() {
-                        break;
-                    }
-                    cursor = body.cursor;
-                }
-                Err(_) => break,
-            }
-        }
-
-        all_followers
+        self.client.fetch_followers(actor, limit).await
     }
 
     /// Fetches follow records `(rkey, followed_did)` for an actor via `com.atproto.repo.listRecords`.
@@ -505,97 +362,12 @@ impl AppViewContextEnricher {
     /// Used for cold-start hydration of the local follow graph with real repository rkeys,
     /// enabling real-time unfollow reconciliation when `CommitOperation::Delete` arrives.
     pub async fn fetch_follow_records(&self, actor: &str, limit: u8) -> Vec<(String, String)> {
-        let mut all_records = Vec::new();
-        let mut cursor: Option<String> = None;
-        let page_limit = limit.clamp(1, 100);
-
-        for _ in 0..100 {
-            let url = format!("{}/xrpc/com.atproto.repo.listRecords", self.appview_url);
-            let mut req = self.http_client.get(&url).query(&[
-                ("repo", actor),
-                ("collection", "app.bsky.graph.follow"),
-                ("limit", &page_limit.to_string()),
-            ]);
-            if let Some(ref c) = cursor {
-                req = req.query(&[("cursor", c)]);
-            }
-
-            let resp = match req.send().await {
-                Ok(r) if r.status().is_success() => r,
-                _ => break,
-            };
-
-            #[derive(Deserialize)]
-            struct FollowValue {
-                subject: Option<String>,
-            }
-
-            #[derive(Deserialize)]
-            struct RecordItem {
-                uri: String,
-                value: FollowValue,
-            }
-
-            #[derive(Deserialize)]
-            struct ListRecordsResp {
-                records: Vec<RecordItem>,
-                cursor: Option<String>,
-            }
-
-            match resp.json::<ListRecordsResp>().await {
-                Ok(body) => {
-                    let count = body.records.len();
-                    for rec in body.records {
-                        if let Some(subject) = rec.value.subject {
-                            let rkey = rec.uri.rsplit('/').next().unwrap_or_default().to_string();
-                            if !rkey.is_empty() && !subject.is_empty() {
-                                all_records.push((rkey, subject));
-                            }
-                        }
-                    }
-                    if count == 0 || body.cursor.is_none() {
-                        break;
-                    }
-                    cursor = body.cursor;
-                }
-                Err(_) => break,
-            }
-        }
-
-        all_records
+        self.client.fetch_follow_records(actor, limit).await
     }
 
     /// Resolves an ATProto handle to a DID via XRPC `com.atproto.identity.resolveHandle`.
     pub async fn resolve_handle(&self, handle: &str) -> Option<String> {
-        let clean = handle.trim().trim_start_matches('@');
-        if clean.starts_with("did:") {
-            return Some(clean.to_string());
-        }
-
-        let url = format!(
-            "{}/xrpc/com.atproto.identity.resolveHandle",
-            self.appview_url
-        );
-        let resp = self
-            .http_client
-            .get(&url)
-            .query(&[("handle", clean)])
-            .send()
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-
-        #[derive(Deserialize)]
-        struct ResolveHandleResponse {
-            did: String,
-        }
-
-        resp.json::<ResolveHandleResponse>()
-            .await
-            .ok()
-            .map(|r| r.did)
+        self.client.resolve_handle(handle).await
     }
 
     /// Fetches an image thumbnail from the Bluesky CDN and encodes it as base64.
@@ -612,11 +384,8 @@ impl AppViewContextEnricher {
             return None;
         }
 
-        let url = format!(
-            "{}/img/feed_thumbnail/plain/{clean_did}/{clean_cid}@jpeg",
-            self.cdn_url
-        );
-        let resp = self.http_client.get(&url).send().await.ok()?;
+        let url = self.client.thumbnail_url(&clean_did, &clean_cid);
+        let resp = self.client.http_client().get(&url).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -657,7 +426,7 @@ impl AppViewContextEnricher {
         // 1. Try AppView actor profile
         if let Some(profile) = self.fetch_author_profile(clean).await {
             if let Some(h) = profile.handle {
-                let trimmed = h.trim().trim_start_matches('@').to_string();
+                let trimmed = crate::util::normalize_handle(&h).to_string();
                 if !trimmed.is_empty() {
                     return Some(trimmed);
                 }
@@ -671,7 +440,7 @@ impl AppViewContextEnricher {
                 .filter(|c| c.is_alphanumeric() || *c == ':')
                 .collect();
             let plc_url = format!("https://plc.directory/{clean_plc}");
-            if let Ok(resp) = self.http_client.get(&plc_url).send().await {
+            if let Ok(resp) = self.client.http_client().get(&plc_url).send().await {
                 if resp.status().is_success() {
                     #[derive(Deserialize)]
                     struct PlcDoc {
@@ -681,7 +450,7 @@ impl AppViewContextEnricher {
                     if let Ok(doc) = resp.json::<PlcDoc>().await {
                         for alias in doc.also_known_as {
                             if let Some(handle) = alias.strip_prefix("at://") {
-                                let trimmed = handle.trim().trim_start_matches('@').to_string();
+                                let trimmed = crate::util::normalize_handle(handle).to_string();
                                 if !trimmed.is_empty() {
                                     return Some(trimmed);
                                 }

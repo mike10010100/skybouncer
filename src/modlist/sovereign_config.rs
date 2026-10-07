@@ -7,8 +7,9 @@
 use serde::{Deserialize, Serialize};
 use skybase::repo::PdsRepoClient;
 
-use crate::classifier::{RuleRubric, Sensitivity};
+use crate::classifier::{bounce_duration_from_db, sensitivity_from_db, RuleRubric};
 use crate::error::SkybouncerError;
+use crate::types::{default_true, is_true};
 
 /// The canonical ATProto NSID collection for sovereign skybouncer configuration.
 pub const SOVEREIGN_CONFIG_COLLECTION: &str = "social.skybouncer.config";
@@ -39,16 +40,6 @@ pub struct SovereignConfigRecord {
     pub updated_at: String,
 }
 
-/// Returns `true`, used as the serde default for opt-out bypass flags.
-fn default_true() -> bool {
-    true
-}
-
-/// Returns whether the flag is `true`, used to omit the default value during serialization.
-fn is_true(value: &bool) -> bool {
-    *value
-}
-
 impl SovereignConfigRecord {
     /// Creates a new [`SovereignConfigRecord`] from a [`RuleRubric`].
     #[must_use]
@@ -66,16 +57,8 @@ impl SovereignConfigRecord {
     /// Converts this record into a domain [`RuleRubric`].
     #[must_use]
     pub fn to_rubric(&self) -> RuleRubric {
-        let sensitivity = match self.sensitivity.to_lowercase().as_str() {
-            "low" => Sensitivity::Low,
-            "high" => Sensitivity::High,
-            _ => Sensitivity::Medium,
-        };
-        let bounce_duration = self
-            .bounce_duration
-            .as_deref()
-            .and_then(|s| s.parse::<crate::classifier::BounceDuration>().ok())
-            .unwrap_or_default();
+        let sensitivity = sensitivity_from_db(Some(&self.sensitivity));
+        let bounce_duration = bounce_duration_from_db(self.bounce_duration.as_deref());
         RuleRubric {
             prompt: self.rules.clone(),
             sensitivity,
@@ -132,16 +115,8 @@ pub fn extract_rubric_from_list_description(description: &str) -> Option<RuleRub
     let json_str = &description[start_idx..end_idx];
 
     let meta: ListMetadata = serde_json::from_str(json_str).ok()?;
-    let sensitivity = match meta.sensitivity.to_lowercase().as_str() {
-        "low" => Sensitivity::Low,
-        "high" => Sensitivity::High,
-        _ => Sensitivity::Medium,
-    };
-    let bounce_duration = meta
-        .bounce_duration
-        .as_deref()
-        .and_then(|s| s.parse::<crate::classifier::BounceDuration>().ok())
-        .unwrap_or_default();
+    let sensitivity = sensitivity_from_db(Some(&meta.sensitivity));
+    let bounce_duration = bounce_duration_from_db(meta.bounce_duration.as_deref());
 
     Some(RuleRubric {
         prompt: meta.rules,

@@ -19,23 +19,40 @@
     rust_2018_idioms
 )]
 
+#[cfg(feature = "web")]
+pub mod app;
+#[cfg(feature = "bot")]
 pub mod bot;
 pub mod classifier;
+pub mod cli;
 pub mod crypto;
+#[cfg(all(
+    feature = "web",
+    feature = "stream",
+    feature = "bot",
+    feature = "telemetry"
+))]
+pub mod daemon;
 pub mod engine;
 pub mod enricher;
+pub mod env;
 pub mod error;
 pub mod limiter;
 pub mod matcher;
 pub mod modlist;
+#[cfg(feature = "stream")]
 pub mod stream;
 pub mod tenant;
+pub mod time;
 pub mod types;
+pub mod util;
+#[cfg(feature = "web")]
 pub mod web;
 
 pub use crypto::SessionCipher;
 pub use tenant::{Tenant, TenantRegistry, DEFAULT_HANDLE_TTL};
 
+#[cfg(feature = "bot")]
 pub use bot::{
     extract_link_facets, format_bounce_alert, run_bot_poller, run_bounce_alert_dispatcher,
     AcceptConvoRequest, AcceptConvoResponse, BotCommandHandler, ChatClient, ConvoMember, ConvoView,
@@ -51,7 +68,9 @@ pub use limiter::{
     EvaluationRateLimiter, RateLimiterConfig, DEFAULT_MAX_EVALUATIONS_PER_WINDOW,
     DEFAULT_RATE_LIMIT_WINDOW,
 };
+#[cfg(feature = "stream")]
 pub use stream::{run_jetstream_streamer, StreamConfig, DEFAULT_JETSTREAM_ENDPOINT};
+#[cfg(feature = "web")]
 pub use web::{
     create_web_router, get_prometheus_metrics, run_web_server, AddAllowlistRequest,
     AddAllowlistResponse, AllowlistQuery, ApiState, BouncedUserWithHandle, BouncesQuery,
@@ -66,6 +85,7 @@ pub use classifier::{
     MockClassifier, RuleRubric, Sensitivity, Verdict, ViolationCategory,
 };
 pub use engine::{
+    simulate::{SimulateTierStage, SimulationInputs, SimulationResult},
     BounceNotification, EngineStats, EngineStatsSnapshot, InteractionOutcome, ProcessCommitResult,
     ProcessOutcome, SkybouncerConfig, SkybouncerEngine, SkybouncerEngineBuilder,
     SovereignConfigSyncEvent, DEFAULT_ENGINE_CHANNEL_CAPACITY, DEFAULT_EVALUATION_CACHE_TTL,
@@ -79,8 +99,8 @@ pub use matcher::{
 };
 pub use modlist::{
     extract_rubric_from_list_description, fetch_sovereign_config,
-    format_list_description_with_rubric, publish_sovereign_config, AllowlistEntry, BouncedUser,
-    DeduplicationCache, ModListConfig, ModListManager, SovereignConfigRecord,
+    format_list_description_with_rubric, publish_sovereign_config, AllowlistEntry, BounceRequest,
+    BouncedUser, DeduplicationCache, ModListConfig, ModListManager, SovereignConfigRecord,
     DEFAULT_MOD_LIST_DESCRIPTION, DEFAULT_MOD_LIST_NAME, SOVEREIGN_CONFIG_COLLECTION,
     SOVEREIGN_CONFIG_RKEY,
 };
