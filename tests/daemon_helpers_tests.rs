@@ -214,3 +214,46 @@ async fn resolve_bot_client_app_password_login_failure_returns_none() {
     .await;
     assert!(r.is_none());
 }
+
+#[tokio::test]
+async fn hydrate_cold_start_falls_back_to_follows_and_skips_empty() {
+    let appview = MockServer::start().await;
+    let pds = MockPdsServer::start().await;
+    let protected = "did:plc:alice";
+
+    // No listRecords -> empty, forcing the getFollows fallback.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.listRecords"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "records": [],
+            "cursor": null
+        })))
+        .mount(&appview)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.graph.getFollows"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "follows": [{"did": "did:plc:followed-via-fallback"}],
+            "cursor": null
+        })))
+        .mount(&appview)
+        .await;
+    // Empty followers -> skip branch.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.graph.getFollowers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "followers": [],
+            "cursor": null
+        })))
+        .mount(&appview)
+        .await;
+
+    let engine = build_engine(protected, &pds, true).await;
+    let enricher = AppViewContextEnricher::with_endpoint(appview.uri());
+    let mut dids = HashSet::new();
+    dids.insert(protected.to_string());
+
+    let hydrated = skybouncer::daemon::hydrate_cold_start(&engine, &enricher, &dids).await;
+    assert_eq!(hydrated, 1, "only the fallback follow is hydrated");
+    assert!(engine.is_following(protected, "did:plc:followed-via-fallback"));
+}

@@ -1498,6 +1498,84 @@ mod tests {
         assert!(err.is_err(), "no classifier/jev config must fail");
     }
 
+    #[test]
+    fn builder_dry_run_with_cache_path_and_credentials_builds_shadow_engine() {
+        let dir = std::env::temp_dir().join(format!(
+            "skybouncer_builder_{}",
+            crate::time::current_time_us()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("state.db");
+
+        let classifier = Arc::new(crate::classifier::MockClassifier::new(
+            crate::classifier::Verdict::permitted("ok"),
+        ));
+        // dry_run + cache_path exercises the shadow DB filename rewrite; dry_run also
+        // exercises the credential-seeded shadow PDS client branch.
+        let cfg = SkybouncerConfig::new(["did:plc:shadowy"], RuleRubric::default())
+            .with_dry_run(true)
+            .with_pds_endpoint("https://pds.example")
+            .with_pds_access_token("shadow-token")
+            .with_cache_path(&db)
+            .with_admin_did("did:plc:shadowy");
+        let engine = SkybouncerEngine::builder(cfg)
+            .with_classifier(classifier)
+            .build()
+            .expect("shadow engine builds");
+        assert!(engine.is_dry_run());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builder_with_configured_pds_credentials_builds_live_engine() {
+        let classifier = Arc::new(crate::classifier::MockClassifier::new(
+            crate::classifier::Verdict::permitted("ok"),
+        ));
+        // Non-dry-run with explicit endpoint+token exercises the configured PDS client arm.
+        let cfg = SkybouncerConfig::new(["did:plc:live"], RuleRubric::default())
+            .with_pds_endpoint("https://pds.example")
+            .with_pds_access_token("live-token")
+            .with_admin_did("did:plc:live");
+        let engine = SkybouncerEngine::builder(cfg)
+            .with_classifier(classifier)
+            .build()
+            .expect("live engine builds");
+        assert!(!engine.is_dry_run());
+    }
+
+    #[test]
+    fn builder_hydrates_allowlists_and_active_tenants_from_shared_cache() {
+        let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+        cache
+            .add_to_allowlist("did:plc:owner", "did:plc:friend", Some("buddy"))
+            .unwrap();
+
+        let registry = Arc::new(TenantRegistry::open_in_memory().unwrap());
+        registry
+            .register_or_update(
+                &crate::tenant::Tenant::new("did:plc:enrolled")
+                    .with_rubric(RuleRubric::default().with_bypass_incoming_followers(false)),
+            )
+            .unwrap();
+
+        let classifier = Arc::new(crate::classifier::MockClassifier::new(
+            crate::classifier::Verdict::permitted("ok"),
+        ));
+        let cfg = SkybouncerConfig::new(["did:plc:owner"], RuleRubric::default())
+            .with_admin_did("did:plc:owner");
+        let engine = SkybouncerEngine::builder(cfg)
+            .with_classifier(classifier)
+            .with_cache(Arc::clone(&cache))
+            .with_tenant_registry(Arc::clone(&registry))
+            .build()
+            .expect("engine builds with hydrated allowlist/tenants");
+
+        assert!(engine.is_allowlisted("did:plc:owner", "did:plc:friend"));
+        assert!(engine.is_enrolled("did:plc:enrolled"));
+        assert!(engine.is_protected("did:plc:enrolled"));
+    }
+
     fn all_outcomes() -> Vec<InteractionOutcome> {
         let a = "did:plc:author".to_string();
         let t = "did:plc:target".to_string();
