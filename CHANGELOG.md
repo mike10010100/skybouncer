@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.22] - 2026-10-07
+
+### Changed
+
+- **Publishable sibling dependencies**: pinned `skybase` to `0.1.1` and
+  `skyauth` to `0.3.3`, which now ship the modules `skybouncer` consumes
+  (`skybase::appview`, `skybase::chat`, `skybase::lexicon`, `skyauth::sealed`).
+  This makes `cargo publish` resolve the sibling crates from crates.io instead
+  of failing on path-only dependencies. No source changes.
+
 ## [0.1.21] - 2026-10-06
 
 ### Changed
