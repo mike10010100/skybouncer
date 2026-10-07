@@ -2399,3 +2399,37 @@ async fn test_run_bot_poller_multiple_unread_fetches_history_and_handles_failure
     assert!(res.is_ok());
     assert!(get_called.load(Ordering::SeqCst) >= 1);
 }
+
+#[tokio::test]
+async fn test_command_handler_second_protected_user_cannot_mutate_rules_sensitivity_or_duration() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    // Adding a second protected DID makes this a multi-tenant engine, so a protected
+    // (authorized) but unenrolled sender hits the "own enrolled account only" reject.
+    engine.add_protected_did("did:plc:protected2");
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+    let sender = "did:plc:protected2";
+
+    let r1 = handler
+        .handle_command(sender, "set rules Block everything")
+        .await
+        .unwrap();
+    assert!(
+        r1.contains("You can only update rules for your own enrolled account"),
+        "r1={r1}"
+    );
+
+    let r2 = handler
+        .handle_command(sender, "sensitivity high")
+        .await
+        .unwrap();
+    assert!(
+        r2.contains("You can only update sensitivity for your own enrolled account"),
+        "r2={r2}"
+    );
+
+    let r3 = handler.handle_command(sender, "duration 7d").await.unwrap();
+    assert!(
+        r3.contains("You can only update duration for your own enrolled account"),
+        "r3={r3}"
+    );
+}

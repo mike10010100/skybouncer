@@ -3297,3 +3297,170 @@ async fn test_api_allowlist_add_by_handle_resolves_and_removes_by_handle() {
         .unwrap();
     assert_eq!(del.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_api_me_protected_non_enrolled_user_gets_global_rubric() {
+    // Protected DID with a valid session but no tenant enrollment -> hits the
+    // `is_protected` fallback branch (returns the global engine rubric).
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:admin123").await;
+    engine.add_protected_did("did:plc:protected-extra");
+    let token = create_test_session(&engine, "did:plc:protected-extra");
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .header("cookie", format!("skybouncer_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let me: skybouncer::web::UserSessionResponse = serde_json::from_slice(&bytes).unwrap();
+    assert!(me.authenticated);
+    assert_eq!(me.did.as_deref(), Some("did:plc:protected-extra"));
+    assert!(!me.is_admin);
+    assert!(me.rubric.is_some());
+}
+
+#[tokio::test]
+async fn test_api_admin_tenants_counts_paused_and_uses_cached_handle() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:admin123").await;
+    let admin_token = create_test_session(&engine, "did:plc:admin123");
+
+    // Enrolled tenant WITHOUT a handle -> exercises the cached-handle fallback.
+    engine
+        .tenant_registry()
+        .register_or_update(&skybouncer::tenant::Tenant::new("did:plc:no-handle"))
+        .unwrap();
+    // Enrolled tenant that we immediately pause -> paused_count branch.
+    engine
+        .tenant_registry()
+        .register_or_update(&skybouncer::tenant::Tenant::new("did:plc:paused-one"))
+        .unwrap();
+    engine
+        .tenant_registry()
+        .set_active("did:plc:paused-one", false)
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/tenants")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let fleet: skybouncer::web::AdminTenantsResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(fleet.total, 2);
+    assert_eq!(fleet.paused_count, 1);
+    assert_eq!(fleet.active_count, 1);
+}
+
+#[tokio::test]
+async fn test_api_evaluations_non_admin_cross_did_forbidden() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:admin123").await;
+    let alice = create_test_session(&engine, "did:plc:alice");
+    engine
+        .tenant_registry()
+        .register_or_update(&skybouncer::tenant::Tenant::new("did:plc:alice"))
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/evaluations?target_did=did:plc:someone-else")
+                .header("cookie", format!("skybouncer_session={alice}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Anonymous -> 401.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/evaluations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_api_admin_bounces_and_pardon_with_explicit_protected_did() {
+    let (engine, cache, _pds, app) = setup_test_web_environment("did:plc:admin123").await;
+    let admin_token = create_test_session(&engine, "did:plc:admin123");
+
+    let target = "did:plc:tenant-under-admin";
+    cache
+        .record_bounce(&BouncedUser {
+            subject_did: "did:plc:spammer-under-admin".to_string(),
+            protected_did: target.to_string(),
+            listitem_uri: format!("at://{target}/app.bsky.graph.listitem/rk1"),
+            listitem_rkey: "rk1".to_string(),
+            listitem_cid: "bafyadmin".to_string(),
+            category: "Spam".to_string(),
+            confidence: 0.8,
+            reason: "spam".to_string(),
+            post_uri: "at://spammer/post".to_string(),
+            post_text: "spam".to_string(),
+            bounced_at: 1_720_000_000_000_000,
+            expires_at: None,
+        })
+        .unwrap();
+
+    // Admin views another user's bounce list explicitly (admin filter branch).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/bounces?user_did={target}"))
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let s1 = resp.status();
+    let b1 = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(s1, StatusCode::OK, "body={}", String::from_utf8_lossy(&b1));
+
+    // Admin pardons using an explicit protected_did (admin explicit branch).
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/pardon")
+                .header("cookie", format!("skybouncer_session={admin_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "subject_did": "did:plc:never-bounced",
+                        "protected_did": "did:plc:admin123"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
