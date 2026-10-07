@@ -7,12 +7,17 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
 
+pub mod dynamic;
 pub mod heuristic;
 pub mod jev;
 pub mod mock;
 pub mod rubric;
 pub mod tiered;
 
+pub use dynamic::{
+    DynamicModelPolicy, DynamicPrimaryClassifier, DynamicPrimaryStats, DynamicPrimaryStatsSnapshot,
+    DEFAULT_MULTIMODAL_PRIMARY_MODEL, DEFAULT_TEXT_ONLY_PRIMARY_MODEL,
+};
 pub use heuristic::{HeuristicClassifier, HeuristicRule};
 pub use jev::{JevClassifier, JevConfig, JevEndpointKind};
 pub use mock::MockClassifier;
@@ -21,7 +26,7 @@ pub use rubric::{
 };
 pub use tiered::{
     CertaintyConfig, TieredClassifier, TieredClassifierStats, TieredEvaluationResult,
-    TieredStatsSnapshot,
+    TieredStatsSnapshot, DEFAULT_UNCERTAINTY_MAX_CONFIDENCE,
 };
 
 /// Category classification for house rule violations.

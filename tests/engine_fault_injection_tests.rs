@@ -99,6 +99,7 @@ impl FaultInjectableJevServer {
             model: "jev-system1-mod-v1".to_string(),
             timeout: Duration::from_millis(1500),
             max_retries,
+            supports_images: false,
         }
     }
 
@@ -320,6 +321,7 @@ async fn test_jev_socket_drop_exhaustion_counted_in_engine_stats_and_loop_surviv
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(500),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = Arc::new(JevClassifier::new(jev_config, rubric.clone()).unwrap());
 

@@ -101,6 +101,7 @@ impl StressMockJevServer {
             model: "jev-stress-model".to_string(),
             timeout: Duration::from_millis(3000),
             max_retries: 2,
+            supports_images: false,
         }
     }
 

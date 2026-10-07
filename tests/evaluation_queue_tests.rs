@@ -90,6 +90,7 @@ impl ConcurrencyTrackingServer {
             model: "jev-test".to_string(),
             timeout: Duration::from_secs(5),
             max_retries: 0,
+            supports_images: false,
         }
     }
 }

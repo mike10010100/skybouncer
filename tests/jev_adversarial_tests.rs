@@ -67,6 +67,7 @@ async fn test_adversarial_malformed_json_syntax() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Check this link");
@@ -102,6 +103,7 @@ async fn test_adversarial_missing_required_fields() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Check this link");
@@ -139,6 +141,7 @@ async fn test_adversarial_invalid_field_types() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Check this link");
@@ -183,6 +186,7 @@ async fn test_adversarial_unexpected_unknown_keys_forward_compatibility() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Bot spam");
@@ -215,6 +219,7 @@ async fn test_adversarial_empty_response_body() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -252,6 +257,7 @@ async fn test_adversarial_non_utf8_binary_body_on_200() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -289,6 +295,7 @@ async fn test_adversarial_non_utf8_binary_body_on_error_status() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -326,6 +333,7 @@ async fn test_adversarial_unknown_violation_category_maps_to_custom() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Personal info leak");
@@ -362,6 +370,7 @@ async fn test_adversarial_null_category_maps_to_unspecified() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Offensive comment");
@@ -397,6 +406,7 @@ async fn test_adversarial_confidence_out_of_bounds_clamping() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Massive spam");
@@ -428,6 +438,7 @@ async fn test_adversarial_400_bad_request_strictly_no_retry() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 3, // Even with max_retries = 3, 400 must NEVER retry
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -453,6 +464,7 @@ async fn test_adversarial_403_forbidden_strictly_no_retry() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 3,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -478,6 +490,7 @@ async fn test_adversarial_404_not_found_strictly_no_retry() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 3,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -503,6 +516,7 @@ async fn test_adversarial_422_unprocessable_entity_strictly_no_retry() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 3,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -528,6 +542,7 @@ async fn test_adversarial_429_too_many_requests_strictly_no_retry() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 3,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -557,6 +572,7 @@ async fn test_adversarial_502_bad_gateway_exhaustion() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -585,6 +601,7 @@ async fn test_adversarial_503_retry_backoff_timing_assertion() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 2,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -641,6 +658,7 @@ async fn test_adversarial_504_gateway_timeout_recovery_on_second_retry() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 2,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Crypto link");
@@ -699,6 +717,7 @@ async fn test_adversarial_socket_drop_recovery_on_retry() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(2000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Spam link");
@@ -732,6 +751,7 @@ async fn test_adversarial_socket_drop_exhaustion() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -755,6 +775,7 @@ async fn test_adversarial_unreachable_network_endpoint() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(500),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -791,6 +812,7 @@ async fn test_adversarial_50_concurrent_requests_shared_client() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(5000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = Arc::new(JevClassifier::new(config, RuleRubric::default()).unwrap());
 
@@ -868,6 +890,7 @@ async fn test_adversarial_high_concurrency_mixed_outcomes() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(5000),
         max_retries: 2,
+        supports_images: false,
     };
     let classifier = Arc::new(JevClassifier::new(config, RuleRubric::default()).unwrap());
 
@@ -938,6 +961,7 @@ async fn test_adversarial_max_retries_zero_no_retry_on_500() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 0,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -976,6 +1000,7 @@ async fn test_adversarial_massive_unicode_and_zalgo_payload() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(2000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction(&large_text);
@@ -1093,6 +1118,7 @@ async fn test_adversarial_empty_vs_bearer_auth_headers() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let classifier = JevClassifier::new(config, RuleRubric::default()).unwrap();
     let interaction = sample_interaction("Hello");
@@ -1121,6 +1147,7 @@ fn classifier_for_url(base_url: &str) -> JevClassifier {
             model: "m".to_string(),
             timeout: Duration::from_millis(500),
             max_retries: 0,
+            supports_images: false,
         },
         RuleRubric::default(),
     )
@@ -1248,6 +1275,7 @@ fn classifier_for(base_url: String, model: &str) -> JevClassifier {
             model: model.to_string(),
             timeout: Duration::from_millis(500),
             max_retries: 0,
+            supports_images: false,
         },
         RuleRubric::default(),
     )
@@ -1519,6 +1547,7 @@ fn test_jev_endpoint_url_construction_variants() {
             model: "m".to_string(),
             timeout: Duration::from_millis(100),
             max_retries: 0,
+            supports_images: false,
         },
         RuleRubric::default(),
     )
@@ -1533,6 +1562,7 @@ fn test_jev_endpoint_url_construction_variants() {
             model: "m".to_string(),
             timeout: Duration::from_millis(100),
             max_retries: 0,
+            supports_images: false,
         },
         RuleRubric::default(),
     )
@@ -1547,6 +1577,7 @@ fn test_jev_endpoint_url_construction_variants() {
             model: "m".to_string(),
             timeout: Duration::from_millis(100),
             max_retries: 0,
+            supports_images: false,
         },
         RuleRubric::default(),
     )
