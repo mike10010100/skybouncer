@@ -54,11 +54,12 @@ pub use tenant::{Tenant, TenantRegistry, DEFAULT_HANDLE_TTL};
 
 #[cfg(feature = "bot")]
 pub use bot::{
-    extract_link_facets, format_bounce_alert, run_bot_poller, run_bounce_alert_dispatcher,
-    AcceptConvoRequest, AcceptConvoResponse, BotCommandHandler, ChatClient, ConvoMember, ConvoView,
-    FacetIndex, GetMessagesResponse, ListConvoRequestsResponse, ListConvosResponse, MessageSender,
-    MessageView, SendMessagePayload, SendMessageRequest, UpdateReadRequest,
-    DEFAULT_BOT_POLL_INTERVAL, DEFAULT_CHAT_ENDPOINT,
+    account_label, account_label_with_url, bsky_post_url, bsky_post_url_from_at_uri,
+    bsky_profile_url, command_target, extract_link_facets, format_bounce_alert, run_bot_poller,
+    run_bounce_alert_dispatcher, AcceptConvoRequest, AcceptConvoResponse, BotCommandHandler,
+    ChatClient, ConvoMember, ConvoView, FacetIndex, GetMessagesResponse, ListConvoRequestsResponse,
+    ListConvosResponse, MessageSender, MessageView, SendMessagePayload, SendMessageRequest,
+    UpdateReadRequest, BSKY_WEB_ORIGIN, DEFAULT_BOT_POLL_INTERVAL, DEFAULT_CHAT_ENDPOINT,
 };
 pub use enricher::{
     AppViewContextEnricher, AuthorContext, ContextEnricher, EnrichedContext, MockContextEnricher,

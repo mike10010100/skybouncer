@@ -7,6 +7,9 @@
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::bot::render::{
+    account_label, bsky_post_url_from_at_uri, bsky_profile_url, command_target,
+};
 use crate::engine::BounceNotification;
 use crate::error::SkybouncerError;
 use skybase::chat::ChatClient;
@@ -15,25 +18,46 @@ use skybase::chat::ChatClient;
 #[must_use]
 pub fn format_bounce_alert(notification: &BounceNotification) -> String {
     let pct = notification.confidence * 100.0;
+
+    let violator = account_label(
+        &notification.violator_did,
+        notification.violator_handle.as_deref(),
+    );
+    let profile_url = bsky_profile_url(
+        notification
+            .violator_handle
+            .as_deref()
+            .unwrap_or(&notification.violator_did),
+    );
+    let post_url = bsky_post_url_from_at_uri(&notification.post_uri)
+        .unwrap_or_else(|| notification.post_uri.clone());
+
     let snippet_section = if notification.post_snippet.trim().is_empty() {
         String::new()
     } else {
-        format!("\n📝 Snippet: \"{}\"", notification.post_snippet.trim())
+        format!("\nSnippet: \"{}\"", notification.post_snippet.trim())
+    };
+
+    let profile_section = if profile_url.is_empty() {
+        String::new()
+    } else {
+        format!("\nProfile: {profile_url}")
     };
 
     format!(
         "🛡️ Skybouncer Action Alert:\n\n\
-         Bounced violator: `{}`\n\
+         Bounced violator: {violator}\n\
          Violation: **{}** ({pct:.0}% confidence)\n\
-         Reason: {}{snippet_section}\n\
-         Post: {}\n\n\
+         Reason: {}{snippet_section}{profile_section}\n\
+         Post: {post_url}\n\n\
          To undo, reply with:\n\
          pardon {}",
-        notification.violator_did,
         notification.category,
         notification.reason,
-        notification.post_uri,
-        notification.violator_did
+        command_target(
+            &notification.violator_did,
+            notification.violator_handle.as_deref()
+        ),
     )
 }
 

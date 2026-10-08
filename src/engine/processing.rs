@@ -682,10 +682,20 @@ impl SkybouncerEngine {
                             "Bounced violator on sovereign PDS"
                         );
 
+                        // Prefer the enriched author handle; fall back to any cached mapping
+                        // so proactive alerts can render `@handle` instead of a raw DID.
+                        let violator_handle = interaction
+                            .enriched_context
+                            .as_ref()
+                            .and_then(|c| c.author.as_ref())
+                            .and_then(|a| a.handle.clone())
+                            .or_else(|| self.cached_handle_for_did(&author_did));
+
                         // Emit proactive bounce notification for alert dispatchers
                         let _ = self.bounce_notifier.send(BounceNotification {
                             target_did: target_did.clone(),
                             violator_did: author_did.clone(),
+                            violator_handle,
                             category: category.clone(),
                             confidence,
                             reason: reason.clone(),

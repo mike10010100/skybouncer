@@ -1652,7 +1652,9 @@ async fn test_command_handler_pardon_with_handle_resolution() {
         .await
         .expect("handle");
     assert!(reply.contains("Resolved `@alice.bsky.social` to `did:plc:alice123`"));
-    assert!(reply.contains("Account `did:plc:alice123` has been pardoned"));
+    assert!(reply.contains("Account @alice.bsky.social"));
+    assert!(reply.contains("has been pardoned"));
+    assert!(reply.contains("https://bsky.app/profile/alice.bsky.social"));
     assert_eq!(pds.deleted_records.lock().len(), 1);
     assert!(cache
         .get_bounced_user("did:plc:alice123")
@@ -1708,7 +1710,12 @@ async fn test_chat_client_get_convo_for_members_and_find_or_create() {
 #[tokio::test]
 async fn test_run_bounce_alert_dispatcher() {
     let server = MockServer::start().await;
-    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let (engine, cache, _) = setup_test_engine("did:plc:protected1").await;
+
+    // Pre-cache a handle for the violator so the alert renders @handle + hotlinks.
+    cache
+        .set_handle_for_did("did:plc:bad_actor", "badactor.bsky.social")
+        .expect("set handle");
 
     let send_called = Arc::new(AtomicUsize::new(0));
     let last_sent_body = Arc::new(parking_lot::Mutex::new(String::new()));
@@ -1788,9 +1795,11 @@ async fn test_run_bounce_alert_dispatcher() {
     assert_eq!(send_called.load(Ordering::SeqCst), 1);
     let sent_text = last_sent_body.lock().clone();
     assert!(sent_text.contains("🛡️ Skybouncer Action Alert:"));
-    assert!(sent_text.contains("Bounced violator: `did:plc:bad_actor`"));
+    assert!(sent_text.contains("Bounced violator: @badactor.bsky.social"));
     assert!(sent_text.contains("Violation: **crypto_spam**"));
-    assert!(sent_text.contains("pardon did:plc:bad_actor"));
+    assert!(sent_text.contains("https://bsky.app/profile/badactor.bsky.social"));
+    assert!(sent_text.contains("Post: https://bsky.app/profile/did:plc:bad_actor/post/rep_alert_1"));
+    assert!(sent_text.contains("pardon badactor.bsky.social"));
 }
 
 #[tokio::test]
@@ -1810,7 +1819,8 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
         .handle_command("did:plc:protected1", "allow did:plc:friend1")
         .await
         .expect("handle");
-    assert!(res.contains("Account `did:plc:friend1` has been added to your moderation allowlist"));
+    assert!(res.contains("Account did:plc:friend1"));
+    assert!(res.contains("has been added to your moderation allowlist"));
     assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:friend1"));
 
     // 3. Allowlist now shows friend
@@ -1827,7 +1837,8 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
         .await
         .expect("handle");
     assert!(
-        res.contains("Account `did:plc:friend1` has been removed from your moderation allowlist")
+        res.contains("Account did:plc:friend1")
+            && res.contains("has been removed from your moderation allowlist")
     );
     assert!(!engine.is_allowlisted("did:plc:protected1", "did:plc:friend1"));
 

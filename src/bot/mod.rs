@@ -9,10 +9,15 @@
 pub mod dispatcher;
 pub mod handler;
 pub mod poller;
+pub mod render;
 
 pub use dispatcher::{format_bounce_alert, run_bounce_alert_dispatcher};
 pub use handler::BotCommandHandler;
 pub use poller::{run_bot_poller, DEFAULT_BOT_POLL_INTERVAL};
+pub use render::{
+    account_label, account_label_with_url, bsky_post_url, bsky_post_url_from_at_uri,
+    bsky_profile_url, command_target, BSKY_WEB_ORIGIN,
+};
 
 // The ATProto Chat client and its data models now live in `skybase::chat`.
 pub use skybase::chat::{
