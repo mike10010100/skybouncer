@@ -80,6 +80,7 @@ async fn test_jev_classifier_violation_success() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let rubric = RuleRubric::new("Block crypto scams", Sensitivity::Medium);
     let classifier = JevClassifier::new(config, rubric).unwrap();
@@ -123,6 +124,7 @@ async fn test_jev_classifier_permitted_success() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let rubric = RuleRubric::new("Block crypto scams", Sensitivity::Medium);
     let classifier = JevClassifier::new(config, rubric).unwrap();
@@ -162,6 +164,7 @@ async fn test_jev_classifier_confidence_below_threshold_downgrades_to_permitted(
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let rubric = RuleRubric::new("Block harassment", Sensitivity::Medium);
     let classifier = JevClassifier::new(config, rubric).unwrap();
@@ -206,6 +209,7 @@ async fn test_jev_classifier_single_retry_on_500() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
     let classifier = JevClassifier::new(config, rubric).unwrap();
@@ -234,6 +238,7 @@ async fn test_jev_classifier_never_retries_401_client_error() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
     let classifier = JevClassifier::new(config, rubric).unwrap();
@@ -261,6 +266,7 @@ async fn test_jev_classifier_exhausts_retries_on_persistent_503() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
     let classifier = JevClassifier::new(config, rubric).unwrap();
@@ -287,6 +293,7 @@ async fn test_jev_classifier_timeout() {
         model: "jev-system1-mod-v1".to_string(),
         timeout: Duration::from_millis(50), // 50ms timeout
         max_retries: 0,
+        supports_images: false,
     };
     let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
     let classifier = JevClassifier::new(config, rubric).unwrap();
@@ -395,6 +402,7 @@ async fn test_jev_classifier_ollama_dialect_success() {
         model: "tev1:latest".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let rubric = RuleRubric::new("Block crypto scams", Sensitivity::Medium);
     let classifier = JevClassifier::new(config, rubric).unwrap();
@@ -438,6 +446,7 @@ async fn test_jev_classifier_systemone_dialect_success() {
         model: "tev1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let rubric = RuleRubric::new("Block crypto scams", Sensitivity::Medium);
     let classifier = JevClassifier::new(config, rubric).unwrap();
@@ -808,6 +817,7 @@ async fn test_jev_classifier_multimodal_images_injected_standard_jev() {
         model: "jev-multimodal-v1".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let rubric = RuleRubric::new("Block crypto scams", Sensitivity::Medium);
     let classifier = JevClassifier::new(config, rubric).unwrap();
@@ -850,6 +860,7 @@ async fn test_jev_classifier_multimodal_images_injected_ollama() {
         model: "gemma4:12b".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
+        supports_images: false,
     };
     let rubric = RuleRubric::new("Block harassment", Sensitivity::Medium);
     let classifier = JevClassifier::new(config, rubric).unwrap();

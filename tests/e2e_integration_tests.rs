@@ -109,6 +109,7 @@ impl MockJevServer {
             model: "jev-system1-mod-v1".to_string(),
             timeout: Duration::from_millis(1500),
             max_retries: 1,
+            supports_images: false,
         }
     }
 

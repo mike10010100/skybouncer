@@ -29,8 +29,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
 use crate::classifier::{
-    CertaintyConfig, Classifier, HeuristicClassifier, JevClassifier, JevConfig, RuleRubric,
-    Sensitivity, TieredClassifier, Verdict, ViolationCategory,
+    CertaintyConfig, Classifier, DynamicModelPolicy, DynamicPrimaryClassifier, HeuristicClassifier,
+    JevClassifier, JevConfig, RuleRubric, Sensitivity, TieredClassifier, Verdict,
+    ViolationCategory,
 };
 use crate::enricher::{ContextEnricher, NoopContextEnricher};
 use crate::error::SkybouncerError;
@@ -113,6 +114,12 @@ pub struct SkybouncerConfig {
     pub jev_config: Option<JevConfig>,
     /// Fallback multimodal classification client configuration (e.g. gemma4:12b, llama3.2-vision via Ollama).
     pub fallback_jev_config: Option<JevConfig>,
+    /// Optional multimodal primary model configuration enabling dynamic Tier-1 routing.
+    ///
+    /// When set, interactions carrying images are routed to this multimodal model at
+    /// Tier-1 (instead of the text-only [`SkybouncerConfig::jev_config`] model), so
+    /// image-borne violations are inspected without invoking the heavier Tier-2 fallback.
+    pub multimodal_jev_config: Option<JevConfig>,
     /// Certainty threshold configuration governing when evaluations escalate to the fallback model.
     pub certainty_config: CertaintyConfig,
     /// Title assigned to provisioned moderation lists.
@@ -155,6 +162,7 @@ impl Default for SkybouncerConfig {
             evaluation_concurrency: DEFAULT_EVALUATION_CONCURRENCY,
             jev_config: None,
             fallback_jev_config: None,
+            multimodal_jev_config: None,
             certainty_config: CertaintyConfig::default(),
             list_name: DEFAULT_MOD_LIST_NAME.to_string(),
             list_description: None,
@@ -353,6 +361,7 @@ impl SkybouncerConfig {
                 model: fb_model,
                 timeout: Duration::from_millis(fb_timeout_ms),
                 max_retries: fb_max_retries,
+                supports_images: false,
             })
         } else {
             None
@@ -375,6 +384,39 @@ impl SkybouncerConfig {
 
         let certainty_config =
             CertaintyConfig::new(uncertainty_min, uncertainty_max, escalate_on_images);
+
+        // Optional dynamic Tier-1 multimodal primary: route image-bearing interactions
+        // to a multimodal model before falling back to the heavyweight System-2 tier.
+        let multimodal_jev_config = crate::env::var(&[
+            "MULTIMODAL_PRIMARY_MODEL",
+            "SKYBOUNCER_MULTIMODAL_PRIMARY_MODEL",
+        ])
+        .map(|mm_model| {
+            let mm_base = crate::env::var_or(
+                &["MULTIMODAL_API_BASE_URL", "SKYBOUNCER_MULTIMODAL_BASE_URL"],
+                &crate::env::var_or(
+                    &["JEV_API_BASE_URL"],
+                    crate::classifier::jev::DEFAULT_JEV_BASE_URL,
+                ),
+            );
+            JevConfig {
+                base_url: mm_base,
+                api_key: crate::env::var(&["MULTIMODAL_API_KEY", "SKYBOUNCER_MULTIMODAL_API_KEY"]),
+                model: mm_model,
+                timeout: Duration::from_millis(crate::env::parsed_or(
+                    &["MULTIMODAL_TIMEOUT_MS", "SKYBOUNCER_MULTIMODAL_TIMEOUT_MS"],
+                    60000_u64,
+                )),
+                max_retries: crate::env::parsed_or(
+                    &[
+                        "MULTIMODAL_MAX_RETRIES",
+                        "SKYBOUNCER_MULTIMODAL_MAX_RETRIES",
+                    ],
+                    1_usize,
+                ),
+                supports_images: true,
+            }
+        });
 
         let rate_limiter_config = RateLimiterConfig::from_env();
 
@@ -413,6 +455,7 @@ impl SkybouncerConfig {
             evaluation_concurrency,
             jev_config,
             fallback_jev_config,
+            multimodal_jev_config,
             certainty_config,
             list_name: DEFAULT_MOD_LIST_NAME.to_string(),
             list_description: None,
@@ -993,6 +1036,7 @@ pub struct SkybouncerEngineBuilder {
     heuristic_classifier: Option<HeuristicClassifier>,
     classifier: Option<Arc<dyn Classifier>>,
     fallback_classifier: Option<Arc<dyn Classifier>>,
+    multimodal_classifier: Option<Arc<dyn Classifier>>,
     modlist_manager: Option<Arc<ModListManager>>,
     cache: Option<Arc<DeduplicationCache>>,
     pds_client: Option<Arc<PdsRepoClient>>,
@@ -1013,6 +1057,7 @@ impl SkybouncerEngineBuilder {
             heuristic_classifier: None,
             classifier: None,
             fallback_classifier: None,
+            multimodal_classifier: None,
             modlist_manager: None,
             cache: None,
             pds_client: None,
@@ -1069,6 +1114,16 @@ impl SkybouncerEngineBuilder {
     #[must_use]
     pub fn with_fallback_classifier(mut self, classifier: Arc<dyn Classifier>) -> Self {
         self.fallback_classifier = Some(classifier);
+        self
+    }
+
+    /// Configures an explicit multimodal primary classifier used for dynamic Tier-1 routing.
+    ///
+    /// When set, image-bearing interactions are routed to this classifier at Tier-1;
+    /// text-only interactions continue to use the primary classifier.
+    #[must_use]
+    pub fn with_multimodal_classifier(mut self, classifier: Arc<dyn Classifier>) -> Self {
+        self.multimodal_classifier = Some(classifier);
         self
     }
 
@@ -1197,6 +1252,33 @@ impl SkybouncerEngineBuilder {
             }
         };
 
+        // Resolve optional multimodal Tier-1 classifier for dynamic primary routing.
+        let multimodal_classifier: Option<Arc<dyn Classifier>> = match self.multimodal_classifier {
+            Some(c) => Some(c),
+            None => {
+                if let Some(ref mm_cfg) = self.config.multimodal_jev_config {
+                    Some(Arc::new(JevClassifier::new(
+                        mm_cfg.clone(),
+                        self.config.rubric.clone(),
+                    )?))
+                } else {
+                    None
+                }
+            }
+        };
+        let has_multimodal_primary = multimodal_classifier.is_some();
+
+        // When a multimodal Tier-1 classifier is configured, wrap the primary in a
+        // DynamicPrimaryClassifier that routes image-bearing interactions to it.
+        let primary_classifier: Arc<dyn Classifier> = match multimodal_classifier {
+            Some(multimodal) => Arc::new(DynamicPrimaryClassifier::new(
+                primary_classifier,
+                multimodal,
+                DynamicModelPolicy::default(),
+            )),
+            None => primary_classifier,
+        };
+
         // Resolve optional secondary fallback classifier and wrap in TieredClassifier if present
         let fallback_classifier: Option<Arc<dyn Classifier>> = match self.fallback_classifier {
             Some(c) => Some(c),
@@ -1212,11 +1294,25 @@ impl SkybouncerEngineBuilder {
             }
         };
 
+        // Resolve the effective certainty config: when the Tier-1 primary is multimodal,
+        // images are already inspected at Tier-1, so image-triggered Tier-2 escalation is
+        // disabled to avoid a redundant heavyweight model call. Uncertainty-band
+        // escalation still applies.
+        let effective_certainty = if has_multimodal_primary {
+            CertaintyConfig::new(
+                self.config.certainty_config.min_confidence,
+                self.config.certainty_config.max_confidence,
+                false,
+            )
+        } else {
+            self.config.certainty_config
+        };
+
         let classifier: Arc<dyn Classifier> = match fallback_classifier {
             Some(fallback) => Arc::new(TieredClassifier::new(
                 primary_classifier,
                 fallback,
-                self.config.certainty_config,
+                effective_certainty,
             )),
             None => primary_classifier,
         };
@@ -1545,6 +1641,36 @@ mod tests {
     }
 
     #[test]
+    fn config_from_env_parses_multimodal_primary() {
+        // Serialize against other env-mutating tests in this binary.
+        let key = "MULTIMODAL_PRIMARY_MODEL";
+        let base_key = "MULTIMODAL_API_BASE_URL";
+        let prev_key = std::env::var(key).ok();
+        let prev_base = std::env::var(base_key).ok();
+
+        std::env::set_var(key, "clef-flash");
+        std::env::remove_var(base_key);
+
+        let cfg = SkybouncerConfig::from_env().expect("from_env");
+        let mm = cfg
+            .multimodal_jev_config
+            .expect("multimodal config populated");
+        assert_eq!(mm.model, "clef-flash");
+        assert!(mm.supports_images, "multimodal primary must accept images");
+        assert_eq!(mm.timeout, Duration::from_millis(60000));
+
+        // Restore prior env state.
+        match prev_key {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        match prev_base {
+            Some(v) => std::env::set_var(base_key, v),
+            None => std::env::remove_var(base_key),
+        }
+    }
+
+    #[test]
     fn builder_hydrates_allowlists_and_active_tenants_from_shared_cache() {
         let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
         cache
@@ -1692,6 +1818,7 @@ mod tests {
             model: "test-model".to_string(),
             timeout: Duration::from_millis(500),
             max_retries: 0,
+            supports_images: false,
         };
         let cfg = SkybouncerConfig::new(["did:plc:a"], RuleRubric::default())
             .with_jev_config(jev.clone())

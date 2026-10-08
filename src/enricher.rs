@@ -20,6 +20,21 @@ pub const DEFAULT_CDN_ENDPOINT: &str = "https://cdn.bsky.app";
 /// Default timeout in milliseconds for AppView profile and post enrichment queries.
 pub const DEFAULT_ENRICHER_TIMEOUT_MS: u64 = 1500;
 
+/// Maximum number of ancestor posts rendered into a classifier prompt.
+pub const MAX_RENDERED_THREAD_ANCESTORS: usize = 8;
+
+/// Per-post character cap applied to each rendered thread ancestor.
+pub const THREAD_ANCESTOR_CHAR_CAP: usize = 300;
+
+/// A single ancestor post resolved from the conversation thread above the candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct ThreadPost {
+    /// DID of the ancestor post author.
+    pub author_did: String,
+    /// Plaintext content of the ancestor post.
+    pub text: String,
+}
+
 /// Profile metadata describing the author of an interaction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct AuthorContext {
@@ -55,6 +70,11 @@ pub struct EnrichedContext {
     pub author: Option<AuthorContext>,
     /// Resolved parent post content and author.
     pub parent_post: Option<ParentPostContext>,
+    /// Ordered ancestor posts from oldest (thread root) to newest (immediate parent).
+    ///
+    /// Populated only when thread-context enrichment is enabled; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thread_ancestors: Vec<ThreadPost>,
     /// Base64-encoded image payloads fetched from CDN for attached images.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images_base64: Vec<String>,
@@ -67,10 +87,13 @@ impl EnrichedContext {
         Self::default()
     }
 
-    /// Returns `true` if neither author, parent post, nor image context was resolved.
+    /// Returns `true` if no author, parent post, thread ancestor, or image context was resolved.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.author.is_none() && self.parent_post.is_none() && self.images_base64.is_empty()
+        self.author.is_none()
+            && self.parent_post.is_none()
+            && self.thread_ancestors.is_empty()
+            && self.images_base64.is_empty()
     }
 
     /// Formats the enriched context into a concise string block for classifier prompt injection.
@@ -98,11 +121,35 @@ impl EnrichedContext {
             }
         }
 
-        if let Some(ref parent) = self.parent_post {
-            let text_snippet: String = parent.text.chars().take(200).collect();
+        if self.thread_ancestors.is_empty() {
+            if let Some(ref parent) = self.parent_post {
+                let text_snippet: String = parent.text.chars().take(200).collect();
+                sections.push(format!(
+                    "In Reply To (by {}): \"{}\"",
+                    parent.author_did, text_snippet
+                ));
+            }
+        } else {
+            let start = self
+                .thread_ancestors
+                .len()
+                .saturating_sub(MAX_RENDERED_THREAD_ANCESTORS);
+            let mut rendered = Vec::new();
+            for (offset, ancestor) in self.thread_ancestors[start..].iter().enumerate() {
+                let depth = start + offset + 1;
+                let snippet: String = ancestor
+                    .text
+                    .chars()
+                    .take(THREAD_ANCESTOR_CHAR_CAP)
+                    .collect();
+                rendered.push(format!(
+                    "[{depth}] {}: \"{}\"",
+                    ancestor.author_did, snippet
+                ));
+            }
             sections.push(format!(
-                "In Reply To (by {}): \"{}\"",
-                parent.author_did, text_snippet
+                "Conversation Thread (oldest → newest):\n{}",
+                rendered.join("\n")
             ));
         }
 
@@ -225,6 +272,7 @@ impl ContextEnricher for MockContextEnricher {
         EnrichedContext {
             author,
             parent_post,
+            thread_ancestors: Vec::new(),
             images_base64,
         }
     }
@@ -271,6 +319,7 @@ impl ContextEnricher for MockContextEnricher {
 #[derive(Debug, Clone)]
 pub struct AppViewContextEnricher {
     client: skybase::appview::AppViewClient,
+    thread_context: bool,
 }
 
 impl AppViewContextEnricher {
@@ -305,7 +354,26 @@ impl AppViewContextEnricher {
     ) -> Self {
         Self {
             client: skybase::appview::AppViewClient::with_endpoints(appview_endpoint, cdn_endpoint),
+            thread_context: false,
         }
+    }
+
+    /// Enables or disables full conversation-thread ancestor resolution during [`ContextEnricher::enrich`].
+    ///
+    /// When enabled, [`ContextEnricher::enrich`] additionally walks the ancestor chain via
+    /// `app.bsky.feed.getPostThread`, attaching oldest-first [`EnrichedContext::thread_ancestors`]
+    /// so classifiers can reason over multi-post conversation context. Disabled by default to
+    /// preserve the sub-10ms enrichment budget.
+    #[must_use]
+    pub fn with_thread_context(mut self, enabled: bool) -> Self {
+        self.thread_context = enabled;
+        self
+    }
+
+    /// Returns whether conversation-thread ancestor resolution is enabled.
+    #[must_use]
+    pub fn thread_context_enabled(&self) -> bool {
+        self.thread_context
     }
 
     /// Returns the configured AppView base URL.
@@ -341,6 +409,64 @@ impl AppViewContextEnricher {
             text: post.text,
             cid: post.cid,
         })
+    }
+
+    /// Resolves the full ancestor chain above `uri` via `app.bsky.feed.getPostThread`
+    /// with `depth = 0`, returning posts ordered oldest (thread root) to newest
+    /// (immediate parent). Caps the chain at [`MAX_RENDERED_THREAD_ANCESTORS`].
+    ///
+    /// Returns an empty vector on any AppView failure.
+    pub async fn fetch_thread_ancestors(&self, uri: &str) -> Vec<ThreadPost> {
+        #[derive(Deserialize)]
+        struct RawAuthor {
+            did: String,
+        }
+        #[derive(Deserialize)]
+        struct RawRecord {
+            #[serde(default)]
+            text: String,
+        }
+        #[derive(Deserialize)]
+        struct RawPost {
+            author: RawAuthor,
+            record: RawRecord,
+        }
+        #[derive(Deserialize)]
+        struct RawThreadNode {
+            #[serde(default)]
+            parent: Option<Box<RawThreadNode>>,
+            post: Option<RawPost>,
+        }
+        #[derive(Deserialize)]
+        struct RawThreadResponse {
+            thread: RawThreadNode,
+        }
+
+        let resp = self
+            .client
+            .get::<RawThreadResponse>("app.bsky.feed.getPostThread", &[("uri", uri.to_string())])
+            .await;
+
+        let thread = match resp {
+            Ok(r) => r.thread,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut chain = Vec::new();
+        let mut cursor = thread.parent;
+        while let Some(node) = cursor {
+            if let Some(post) = node.post {
+                chain.push(ThreadPost {
+                    author_did: post.author.did,
+                    text: post.record.text,
+                });
+            }
+            cursor = node.parent;
+        }
+        // Walk yields newest-first; reverse to oldest-first.
+        chain.reverse();
+        let start = chain.len().saturating_sub(MAX_RENDERED_THREAD_ANCESTORS);
+        chain.split_off(start)
     }
 
     /// Fetches initial followed DIDs for an actor from the public AppView (XRPC `app.bsky.graph.getFollows`).
@@ -490,12 +616,20 @@ impl ContextEnricher for AppViewContextEnricher {
                 Vec::new()
             }
         };
+        let thread_fut = async {
+            match (self.thread_context, interaction.parent_uri.as_ref()) {
+                (true, Some(uri)) => self.fetch_thread_ancestors(uri).await,
+                _ => Vec::new(),
+            }
+        };
 
-        let (author, parent_post, images_base64) = tokio::join!(author_fut, parent_fut, images_fut);
+        let (author, parent_post, images_base64, thread_ancestors) =
+            tokio::join!(author_fut, parent_fut, images_fut, thread_fut);
 
         EnrichedContext {
             author,
             parent_post,
+            thread_ancestors,
             images_base64,
         }
     }

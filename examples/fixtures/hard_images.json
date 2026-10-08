@@ -1,0 +1,55 @@
+{
+ "source": "synthetic hard image corpus (image-borne violations + regression guards)",
+ "count": 7,
+ "cases": [
+  {
+   "name": "scam_image_benign_text",
+   "text": "check out my favorite project, super bullish on this one",
+   "image": "scam_image_benign_text.png",
+   "expected_violation": true,
+   "note": "Image is a crypto airdrop/wallet-connect scam; caption is innocuous."
+  },
+  {
+   "name": "phish_image_benign_text",
+   "text": "got this notification today, kinda worried",
+   "image": "phish_image_benign_text.png",
+   "expected_violation": true,
+   "note": "Image is a fake account-suspension phishing notice; caption is innocuous."
+  },
+  {
+   "name": "giveaway_meme_benign_text",
+   "text": "lol this meme is too good",
+   "image": "giveaway_meme_benign_text.png",
+   "expected_violation": true,
+   "note": "Image promotes a fake 'double your BTC' giveaway; caption is innocuous."
+  },
+  {
+   "name": "wallet_drainer_qr_benign_text",
+   "text": "anyone tried this yet?",
+   "image": "wallet_drainer_qr_benign_text.png",
+   "expected_violation": true,
+   "note": "Image is a scan-to-claim wallet drainer card; caption is innocuous."
+  },
+  {
+   "name": "benign_cat_alarming_text",
+   "text": "I will end you. You are worthless and nobody would miss you.",
+   "image": "benign_cat_alarming_text.png",
+   "expected_violation": true,
+   "note": "Benign image + threatening text: multimodal must not regress."
+  },
+  {
+   "name": "benign_art_hostile_text",
+   "text": "you are a pathetic loser and should be banned from here",
+   "image": "benign_art_hostile_text.png",
+   "expected_violation": true,
+   "note": "Benign art image + abusive text: multimodal must not regress."
+  },
+  {
+   "name": "neutral_image",
+   "text": "what a lovely morning, hope everyone has a good day",
+   "image": "neutral_image.png",
+   "expected_violation": false,
+   "note": "Control: benign image + benign text."
+  }
+ ]
+}

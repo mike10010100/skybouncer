@@ -103,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model: primary_model.clone(),
         timeout: std::time::Duration::from_secs(20),
         max_retries: 1,
+        supports_images: false,
     };
 
     let fallback_jev_config = JevConfig {
@@ -111,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model: fallback_model.clone(),
         timeout: std::time::Duration::from_secs(25),
         max_retries: 1,
+        supports_images: false,
     };
 
     let primary_jev = Arc::new(JevClassifier::new(primary_jev_config, rubric.clone())?);

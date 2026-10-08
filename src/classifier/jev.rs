@@ -39,6 +39,12 @@ pub struct JevConfig {
     pub timeout: Duration,
     /// Maximum number of retries on transient errors (5xx or connection drops).
     pub max_retries: usize,
+    /// Whether the configured model accepts base64 image inputs.
+    ///
+    /// System-One decision models reject image payloads with HTTP 400 when they are
+    /// text-only (e.g. `nimble`, `tev1`), so images are only attached to System-One
+    /// requests when this flag is `true` (e.g. for multimodal models like `clef-flash`).
+    pub supports_images: bool,
 }
 
 impl Default for JevConfig {
@@ -49,6 +55,7 @@ impl Default for JevConfig {
             model: DEFAULT_JEV_MODEL.to_string(),
             timeout: Duration::from_millis(DEFAULT_JEV_TIMEOUT_MS),
             max_retries: DEFAULT_JEV_MAX_RETRIES,
+            supports_images: false,
         }
     }
 }
@@ -72,6 +79,10 @@ impl JevConfig {
 
         let model = crate::env::var_or(&["JEV_MODEL"], DEFAULT_JEV_MODEL);
 
+        let supports_images = crate::env::var(&["JEV_SUPPORTS_IMAGES"])
+            .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
+            .unwrap_or(false);
+
         let timeout_ms = match crate::env::var(&["JEV_TIMEOUT_MS"]) {
             Some(val) => val.parse::<u64>().map_err(|e| {
                 SkybouncerError::Config(format!("Invalid JEV_TIMEOUT_MS '{val}': {e}"))
@@ -92,6 +103,7 @@ impl JevConfig {
             model,
             timeout: Duration::from_millis(timeout_ms),
             max_retries,
+            supports_images,
         })
     }
 }
@@ -220,6 +232,9 @@ pub struct SystemOneRequest {
     pub state: String,
     /// Dictionary of typed decision questions.
     pub questions: std::collections::BTreeMap<String, SystemOneQuestion>,
+    /// Optional base64-encoded visual image attachments for multimodal decision models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
 }
 
 /// Evaluated answer returned by the System-One Decision Gateway.
@@ -554,6 +569,13 @@ impl JevClassifier {
                         model: Some(self.config.model.clone()),
                         state: build_candidate_prompt(interaction, &capped_text, &enrichment_str),
                         questions,
+                        // Text-only System-One decision models reject image payloads with HTTP 400,
+                        // so images are forwarded only when the configured model supports them.
+                        images: if self.config.supports_images {
+                            images
+                        } else {
+                            None
+                        },
                     };
                     request_builder.json(&payload).send().await
                 }

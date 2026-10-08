@@ -1,0 +1,212 @@
+{
+ "source": "synthetic hard thread corpus authored for context experiment",
+ "count": 12,
+ "cases": [
+  {
+   "name": "sealioning_repeat_question",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "Here is the peer-reviewed study (doi:10.1/xyz) on vaccine safety, including the methodology and the full dataset."
+    },
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "I already answered this directly above - the study's sample size is discussed in section 3 and the confidence intervals are in table 2."
+    },
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "I've now linked the data three times and summarized the methods twice."
+    }
+   ],
+   "candidate_text": "You still haven't actually answered my question though. Why do you keep avoiding it? I'll keep asking until you address it properly.",
+   "expected_violation": true,
+   "note": "Bad-faith sea-lioning: question answered repeatedly; candidate refuses to engage."
+  },
+  {
+   "name": "coordinated_dogpile",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:otheruser",
+     "text": "This person is a fraud, everyone pile on and ratio them into oblivion."
+    },
+    {
+     "author_did": "did:plc:otheruser",
+     "text": "Yeah what a clown, nobody should listen to a word they say."
+    },
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "I've explained my position honestly and I'm still happy to discuss this in good faith."
+    }
+   ],
+   "candidate_text": "Exactly. Everyone here sees straight through you. You're the only one pathetic enough not to notice.",
+   "expected_violation": true,
+   "note": "Coordinated pile-on; candidate joins harassment of a user trying to disengage."
+  },
+  {
+   "name": "concern_trolling",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "I'm proud of my transition and honestly doing better than ever, thanks for asking."
+    },
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "It's been a year now and my mental health has never been this stable."
+    }
+   ],
+   "candidate_text": "I'm genuinely worried about you. People who make choices like yours always end up miserable and alone eventually. Just being brutally honest with you.",
+   "expected_violation": true,
+   "note": "Concern-trolling / veiled hostility targeting a vulnerable trait."
+  },
+  {
+   "name": "implied_threat_context",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:candidate",
+     "text": "You have been warned. Take this down before you regret it."
+    },
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "I'm not going to be intimidated by you."
+    },
+    {
+     "author_did": "did:plc:candidate",
+     "text": "Suit yourself. Remember I know where you post and who you talk to."
+    }
+   ],
+   "candidate_text": "This is your final warning. You know exactly what happened to the last person who didn't listen to me. Think very carefully about your next post.",
+   "expected_violation": true,
+   "note": "Escalating implied threat only legible with prior messages."
+  },
+  {
+   "name": "belittling_in_thread",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "Sharing my art for the first time! Nervous but excited to finally put this out there."
+    },
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "I spent six months on this piece and I'm proud I finished it."
+    }
+   ],
+   "candidate_text": "Wow. This is... certainly something. I mean I guess someone had to make it. Not you though, right? Surely you didn't actually think you made this.",
+   "expected_violation": true,
+   "note": "Targeted belittling of someone sharing vulnerable creative work."
+  },
+  {
+   "name": "affectionate_banter",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "Happy birthday!! Can't believe we've been friends for ten years. Love you tons."
+    },
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "Remember when we got lost in Portland for four hours? Best disaster ever."
+    }
+   ],
+   "candidate_text": "You absolute menace. I hate you so much. Never change, love you too.",
+   "expected_violation": false,
+   "note": "Close-friend banter; 'I hate you' is affectionate here."
+  },
+  {
+   "name": "criticizing_heinous_post",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "Honestly some groups just deserve what happens to them and I'm tired of pretending otherwise."
+    }
+   ],
+   "candidate_text": "That is a disgusting thing to say and you should be ashamed of yourself for posting it.",
+   "expected_violation": false,
+   "note": "Legitimate strong criticism of a harmful post, not personal harassment."
+  },
+  {
+   "name": "condemn_quote",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "Anyone who supports that policy is subhuman trash who doesn't deserve to vote."
+    }
+   ],
+   "candidate_text": "Look at this garbage. Calling people 'subhuman trash' over a policy disagreement is exactly the kind of rhetoric ruining this place.",
+   "expected_violation": false,
+   "note": "Quoting and condemning a slur, not directing it at anyone."
+  },
+  {
+   "name": "defending_target_dogpile",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:otheruser",
+     "text": "ratio + you're pathetic and everyone hates you"
+    },
+    {
+     "author_did": "did:plc:otheruser",
+     "text": "nobody here likes you, just log off permanently"
+    },
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "I think I'm going to log off for a while."
+    }
+   ],
+   "candidate_text": "Leave them alone, you cowards. Piling on someone like this says everything about you and nothing about them.",
+   "expected_violation": false,
+   "note": "Defending a target from a dogpile; hostile words aimed at the abusers."
+  },
+  {
+   "name": "playful_sarcasm",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "I finally beat your high score on the leaderboard. Get absolutely wrecked."
+    },
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "Screenshot attached for the non-believers."
+    }
+   ],
+   "candidate_text": "Cheating. You absolutely cheated. I demand a full investigation and an immediate rematch, you fraud.",
+   "expected_violation": false,
+   "note": "Playful competitive banter between acquaintances."
+  },
+  {
+   "name": "control_obvious_spam",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [],
+   "candidate_text": "Claim your FREE crypto airdrop now! Connect your wallet at http://claim-scam.xyz and get 10 ETH instantly.",
+   "expected_violation": true,
+   "note": "Control: unambiguous spam regardless of context."
+  },
+  {
+   "name": "control_benign_standalone",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [],
+   "candidate_text": "Great point, I hadn't considered that angle before. Thanks for laying it out so clearly.",
+   "expected_violation": false,
+   "note": "Control: benign regardless of context."
+  }
+ ]
+}

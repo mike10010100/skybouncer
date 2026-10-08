@@ -172,8 +172,8 @@ pub struct TieredStatsSnapshot {
 /// with an escalating multimodal System-2 fallback classifier.
 #[derive(Clone)]
 pub struct TieredClassifier {
-    primary: Arc<dyn Classifier>,
-    fallback: Arc<dyn Classifier>,
+    primary: Arc<dyn Classifier + Send + Sync>,
+    fallback: Arc<dyn Classifier + Send + Sync>,
     certainty: CertaintyConfig,
     stats: Arc<TieredClassifierStats>,
 }
@@ -182,8 +182,8 @@ impl TieredClassifier {
     /// Creates a new [`TieredClassifier`] pairing a primary and fallback classifier.
     #[must_use]
     pub fn new(
-        primary: Arc<dyn Classifier>,
-        fallback: Arc<dyn Classifier>,
+        primary: Arc<dyn Classifier + Send + Sync>,
+        fallback: Arc<dyn Classifier + Send + Sync>,
         certainty: CertaintyConfig,
     ) -> Self {
         Self {
@@ -196,13 +196,13 @@ impl TieredClassifier {
 
     /// Returns a reference to the primary classifier.
     #[must_use]
-    pub fn primary(&self) -> &Arc<dyn Classifier> {
+    pub fn primary(&self) -> &Arc<dyn Classifier + Send + Sync> {
         &self.primary
     }
 
     /// Returns a reference to the fallback classifier.
     #[must_use]
-    pub fn fallback(&self) -> &Arc<dyn Classifier> {
+    pub fn fallback(&self) -> &Arc<dyn Classifier + Send + Sync> {
         &self.fallback
     }
 

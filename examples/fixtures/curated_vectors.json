@@ -1,0 +1,165 @@
+{
+ "source": "curated from examples/live_dry_run.rs proven vectors",
+ "count": 18,
+ "vectors": [
+  {
+   "name": "benign_inktober_art",
+   "author_did": "did:plc:l4emr3rlhykszhwwvbz2tz2z",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:l4emr3rlhykszhwwvbz2tz2z/app.bsky.feed.post/3mwrh63heyc2o",
+   "text": "INKTOBER 2026\nDay 1 - Apple\n\n#Inktober #Inktober2026 #Sketch #ink #Art #Day1 #Apple",
+   "image_cids": [
+    "bafkreidcrbwmnnv67sufydeyresmzrknrs6x4bjbsi3ylnckqaa2gh2fje"
+   ],
+   "expected_violation": false
+  },
+  {
+   "name": "benign_onion_satire",
+   "author_did": "did:plc:a4pqq234yw7fqbddawjo7y35",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:a4pqq234yw7fqbddawjo7y35/app.bsky.feed.post/3mwvql6ks5425",
+   "text": "‘Digger’ Prosthetic Artist Recalls Grueling Process Of Having Tom Cruise Sit Still",
+   "image_cids": [
+    "bafkreihb6s3lyx7bgtdxvtguavaco46w247qejq2phegah3rv6kdjkmdvu"
+   ],
+   "expected_violation": false
+  },
+  {
+   "name": "benign_tom_cruise_meme",
+   "author_did": "did:plc:ahcborosqrfchi3iiyhoixch",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:ahcborosqrfchi3iiyhoixch/app.bsky.feed.post/3lx5ohwumzc2n",
+   "text": "When did Tom Cruise turn into Norm Macdonald",
+   "image_cids": [
+    "bafkreidozklfkhqyt7i3nosjwz4cxbstkncaqqekkoydpjbk633dbtznti"
+   ],
+   "expected_violation": false
+  },
+  {
+   "name": "scam_airdrop_1",
+   "author_did": "did:plc:v6bodcfx5hwfmxyorkp2kbmw",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:v6bodcfx5hwfmxyorkp2kbmw/app.bsky.feed.post/3mwsvmcxvd22x",
+   "text": "Quip Network ~ New Early Alpha Backed by Portal Ventures & Orange DAO with Confirmed Airdrop 🐡\n🟣 Start your journey here : https://da.gd/D8Py9O\n➖ Connect with your EVM Wallet.",
+   "image_cids": [
+    "bafkreietnoe2egfqgg7vmjzxct4zznguta45fgx73beqclatd26tn55vvi"
+   ],
+   "expected_violation": true
+  },
+  {
+   "name": "scam_airdrop_2",
+   "author_did": "did:plc:v6bodcfx5hwfmxyorkp2kbmw",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:v6bodcfx5hwfmxyorkp2kbmw/app.bsky.feed.post/3mwljkqrfl22u",
+   "text": "Amadeus Protocol ~ The Foundation is Already Live! & The Airdrop Still Ongoing! 👀\n🟡 Register here : https://da.gd/RzWsC\n➖ Connect your EVM wallet.",
+   "image_cids": [
+    "bafkreigp44mdjihwr2jbvkrji45nosfidangvmgr4ni2zhotikkef2h7d4"
+   ],
+   "expected_violation": true
+  },
+  {
+   "name": "political_bribery_accusation",
+   "author_did": "did:plc:ztcyp3tdiporixbena4hog2l",
+   "target_did": "did:plc:gkgmduxh722ocstroyi75gbg",
+   "post_uri": "at://did:plc:ztcyp3tdiporixbena4hog2l/app.bsky.feed.post/3mwychcqhn22e",
+   "text": "So this blatant bribery for their votes...illegal as all get out, and nothing will be done. As usual.",
+   "expected_violation": false
+  },
+  {
+   "name": "partisan_rhetoric",
+   "author_did": "did:plc:zhignjohgoryalfpgum4p6dl",
+   "target_did": "did:plc:gkgmduxh722ocstroyi75gbg",
+   "post_uri": "at://did:plc:zhignjohgoryalfpgum4p6dl/app.bsky.feed.post/3mwycarnhdc2x",
+   "text": "Make it 10 grand and I still won't vote for any Republican.",
+   "expected_violation": false
+  },
+  {
+   "name": "medicare_policy_critique",
+   "author_did": "did:plc:xnfuootbvsjfusgfonrnkf2u",
+   "target_did": "did:plc:gkgmduxh722ocstroyi75gbg",
+   "post_uri": "at://did:plc:xnfuootbvsjfusgfonrnkf2u/app.bsky.feed.post/3mwycqso2f224",
+   "text": "Finding yet another way to try to bankrupt Medicare. $2B thrown away to try to bribe a few senile MAGAs... #MedicareForAll",
+   "expected_violation": false
+  },
+  {
+   "name": "direct_hostile_attack",
+   "author_did": "did:plc:pvpvu47y3dcx7ufwil6wfacy",
+   "target_did": "did:plc:zwpu5frtr4ieumbbxwt2l2cr",
+   "post_uri": "at://did:plc:pvpvu47y3dcx7ufwil6wfacy/app.bsky.feed.post/3mwwi7xgu622y",
+   "text": "Your bigotry 'Only woman can ever be victims' Your dumbass 'I meant my bigotry to sound like everyone else's' Me: 'You're a dumbass. Now fuck off idiot.' Accuracy is important dumbass.",
+   "expected_violation": true
+  },
+  {
+   "name": "retik_token_spam",
+   "author_did": "did:plc:j6e4fasbotyd47igvri32w4m",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:j6e4fasbotyd47igvri32w4m/app.bsky.feed.post/3mwvi4essppvv",
+   "text": "Retik Finance has a total supply of 100 million tokens. The distribution strategy includes a public sale, a presale, and an airdrop of pre-mined tokens. https://t.me/simpledb",
+   "expected_violation": true
+  },
+  {
+   "name": "bonk_wallet_drainer",
+   "author_did": "did:plc:c76k5igcucs5dmqzcr76l4uo",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:c76k5igcucs5dmqzcr76l4uo/app.bsky.feed.post/3mufmzl5tc52g",
+   "text": "Stop scrolling. Start claiming! 🪂✨ Claim your free #$BONK Airdrop before snapshot. 🚀 Open site 🔗 http://dropsol.solstudio.cc Connect wallet & claim! Repost = +100 luck 🔁 #Airdrop #Crypto #Web3",
+   "expected_violation": true
+  },
+  {
+   "name": "discord_quiz_airdrop",
+   "author_did": "did:plc:abbgh6wiuz6aad32mdzjbllx",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:abbgh6wiuz6aad32mdzjbllx/app.bsky.feed.post/3mww6wjp4722q",
+   "text": "Join ACI Airdrop Quiz💲 Explore: https://discord.gg/PSs8QzM7JU ➞ Accept Invite ➞ Unverified ➞( Verify )",
+   "expected_violation": true
+  },
+  {
+   "name": "whatsapp_funnel_lure",
+   "author_did": "did:plc:ti6i4s7vumeom5jf7mfqfaam",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:ti6i4s7vumeom5jf7mfqfaam/app.bsky.feed.post/3mfqq3adtbk26",
+   "text": "Please let them know that they can get free advice from me in my WhatApp community https://chat.whatsapp.com/... and free resources through this link https://wa.me/+441634479932?text=resource",
+   "expected_violation": true
+  },
+  {
+   "name": "mass_mention_livestream",
+   "author_did": "did:plc:jn3dh5dtzbjjeppzjy4zeiam",
+   "target_did": "did:plc:4llrhdclvdlmmynkwsmg5tdc",
+   "post_uri": "at://did:plc:jn3dh5dtzbjjeppzjy4zeiam/app.bsky.feed.post/3mwvyjumdkc27",
+   "text": "https://www.youtube.com/live/4R5WH95ceQo ❤️💙💛 @halsparks.com @mariamilito.bsky.social @bostonbrian.com @mrtommycampbell.bsky.social @aoc.bsky.social @atrupar.com @adamkinzinger.substack.com",
+   "expected_violation": true
+  },
+  {
+   "name": "military_airdrop_homonym",
+   "author_did": "did:plc:e3adubyxy7pfj44s3dyyrv5x",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:e3adubyxy7pfj44s3dyyrv5x/app.bsky.feed.post/3mwvyojctz22g",
+   "text": "The airdrop was carried out from 600 m. Upon landing, the UGVs began executing combat training missions, including delivering ammunition and supplies, evacuating the wounded...",
+   "expected_violation": false
+  },
+  {
+   "name": "apple_airdrop_homonym",
+   "author_did": "did:plc:fd4sw7sbdl7vdkdgynujpmgx",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:fd4sw7sbdl7vdkdgynujpmgx/app.bsky.feed.post/3mwvqrjck5ucb",
+   "text": "It would be nice to be able to configure the secure link defaults. It already takes so many taps to airdrop a secure link, it would be great to reduce it a bit.",
+   "expected_violation": false
+  },
+  {
+   "name": "linux_mint_discussion",
+   "author_did": "did:plc:73suvu2txuufcjgpj747lhgi",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:73suvu2txuufcjgpj747lhgi/app.bsky.feed.post/3mwwji77hx226",
+   "text": "everything is so slow. going back to Win 10 straight from Linux Mint its like molasses.",
+   "expected_violation": false
+  },
+  {
+   "name": "connect_wallet_critique",
+   "author_did": "did:plc:mgb3easmxdv452quq7rr2cib",
+   "target_did": "did:plc:alice_protected",
+   "post_uri": "at://did:plc:mgb3easmxdv452quq7rr2cib/app.bsky.feed.post/3mwuwpwzvdg2e",
+   "text": "\"Connect wallet\" asks for two things: the one you wanted, and the one you did not. Paste an address instead. We read the public key, and that is the whole of what we can do.",
+   "expected_violation": false
+  }
+ ]
+}

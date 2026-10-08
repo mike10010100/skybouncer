@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-10-07
+
+### Added
+
+- **Dynamic Tier-1 multimodal primary routing**: image-bearing interactions can
+  be routed to a multimodal System-1 model at Tier-1 instead of escalating every
+  image to the heavyweight System-2 fallback. Enabled via `MULTIMODAL_PRIMARY_MODEL`
+  (plus `MULTIMODAL_API_BASE_URL` / `MULTIMODAL_API_KEY` / `MULTIMODAL_TIMEOUT_MS` /
+  `MULTIMODAL_MAX_RETRIES`). When enabled, image-triggered Tier-2 escalation is
+  disabled automatically; uncertainty-band escalation still applies. The default
+  (flag unset) path is unchanged.
+  - New `DynamicPrimaryClassifier` + `DynamicModelPolicy` selecting a text-only or
+    multimodal Tier-1 model per interaction, with bypass-on-decisive-text-violation
+    and routing telemetry.
+  - New `JevConfig::supports_images` (`JEV_SUPPORTS_IMAGES`): System-One decision
+    models reject image payloads with HTTP 400, so images are only attached when
+    the model supports them.
+- **Optional conversation-thread context**: `EnrichedContext::thread_ancestors`
+  and `AppViewContextEnricher::fetch_thread_ancestors` (`app.bsky.feed.getPostThread`,
+  oldest-first, capped), opt-in via `with_thread_context(true)`.
+- Benchmark example (`examples/thread_context_benchmark.rs`) and fixtures replaying
+  curated/proven vectors, captured live logs, and a synthetic hard corpus.
+
+### Changed
+
+- `TieredClassifier` and `DynamicPrimaryClassifier` now store
+  `Arc<dyn Classifier + Send + Sync>` so they can wrap `dyn Classifier` trait objects.
+
 ## [0.1.22] - 2026-10-07
 
 ### Changed
