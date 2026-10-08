@@ -778,6 +778,9 @@ pub struct BounceNotification {
     pub target_did: String,
     /// DID of the offending author who was bounced.
     pub violator_did: String,
+    /// Resolved ATProto handle of the bounced violator, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub violator_handle: Option<String>,
     /// Violation category.
     pub category: ViolationCategory,
     /// Classification confidence score (0.0..=1.0).

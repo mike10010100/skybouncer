@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use crate::bot::render::{account_label_with_url, bsky_post_url_from_at_uri, command_target};
 use crate::classifier::{RuleRubric, Sensitivity, Verdict};
 use crate::engine::SkybouncerEngine;
 use crate::error::SkybouncerError;
@@ -493,9 +494,14 @@ impl BotCommandHandler {
         let mut out = String::from("🚫 Recently Bounced Accounts from Your Replies (last 5):\n\n");
         for (idx, b) in bounces.iter().enumerate() {
             let num = idx.saturating_add(1);
+            let handle = self.engine.cached_handle_for_did(&b.subject_did);
+            let label = account_label_with_url(&b.subject_did, handle.as_deref());
+            let post_link = bsky_post_url_from_at_uri(&b.post_uri)
+                .map(|url| format!("\n   Post: {url}"))
+                .unwrap_or_default();
+
             out.push_str(&format!(
-                "{num}. `{}` — **{}** ({:.0}% confidence)\n   Reason: {}\n",
-                b.subject_did,
+                "{num}. {label} — **{}** ({:.0}% confidence){post_link}\n   Reason: {}\n",
                 b.category,
                 b.confidence * 100.0,
                 b.reason
@@ -515,7 +521,7 @@ impl BotCommandHandler {
             return Ok("Usage: `pardon <did|@handle>` (e.g. `pardon did:plc:...` or `pardon @alice.bsky.social`)".to_string());
         }
 
-        let (resolved_did, handle_prefix) = match self
+        let (resolved_did, resolved_handle, handle_prefix) = match self
             .resolve_dm_target(raw_target, " (e.g. `pardon did:plc:...`)")
             .await
         {
@@ -529,13 +535,16 @@ impl BotCommandHandler {
             Err(msg) => return Ok(msg),
         };
 
+        let label = account_label_with_url(&resolved_did, resolved_handle.as_deref());
+        let target = command_target(&resolved_did, resolved_handle.as_deref());
+
         match self.engine.pardon_user(&protected_did, &resolved_did).await {
             Ok(true) => Ok(format!(
-                "{handle_prefix}✅ Account `{resolved_did}` has been pardoned and removed from your moderation list.\n\n\
-                 💡 Tip: To permanently immunize this account against future bounces, use `pardon and allow {resolved_did}` or `allow {resolved_did}`."
+                "{handle_prefix}✅ Account {label} has been pardoned and removed from your moderation list.\n\n\
+                 💡 Tip: To permanently immunize this account against future bounces, use `pardon and allow {target}` or `allow {target}`."
             )),
             Ok(false) => Ok(format!(
-                "{handle_prefix}ℹ️ Account `{resolved_did}` was not found in your bounced list."
+                "{handle_prefix}ℹ️ Account {label} was not found in your bounced list."
             )),
             Err(e) => Ok(format!("{handle_prefix}❌ Failed to pardon account: {e}")),
         }
@@ -551,15 +560,18 @@ impl BotCommandHandler {
             return Ok("Usage: `pardon and allow <did|@handle>`".to_string());
         }
 
-        let (resolved_did, handle_prefix) = match self.resolve_dm_target(raw_target, "").await {
-            Ok(v) => v,
-            Err(msg) => return Ok(msg),
-        };
+        let (resolved_did, resolved_handle, handle_prefix) =
+            match self.resolve_dm_target(raw_target, "").await {
+                Ok(v) => v,
+                Err(msg) => return Ok(msg),
+            };
 
         let protected_did = match self.authorized_protected(sender_did) {
             Ok(did) => did,
             Err(msg) => return Ok(msg),
         };
+
+        let label = account_label_with_url(&resolved_did, resolved_handle.as_deref());
 
         match self
             .engine
@@ -571,11 +583,11 @@ impl BotCommandHandler {
             .await
         {
             Ok(true) => Ok(format!(
-                "{handle_prefix}✅ Account `{resolved_did}` has been pardoned and added to your allowlist!\n\
+                "{handle_prefix}✅ Account {label} has been pardoned and added to your allowlist!\n\
                  They are now permanently immunized against future automatic bounces."
             )),
             Ok(false) => Ok(format!(
-                "{handle_prefix}ℹ️ Account `{resolved_did}` was not on your list, but has been added to your allowlist for future immunization."
+                "{handle_prefix}ℹ️ Account {label} was not on your list, but has been added to your allowlist for future immunization."
             )),
             Err(e) => Ok(format!("{handle_prefix}❌ Failed to pardon and allowlist account: {e}")),
         }
@@ -593,20 +605,25 @@ impl BotCommandHandler {
             );
         }
 
-        let (resolved_did, handle_prefix) = match self.resolve_dm_target(raw_target, "").await {
-            Ok(v) => v,
-            Err(msg) => return Ok(msg),
-        };
+        let (resolved_did, resolved_handle, handle_prefix) =
+            match self.resolve_dm_target(raw_target, "").await {
+                Ok(v) => v,
+                Err(msg) => return Ok(msg),
+            };
+
+        let label = account_label_with_url(&resolved_did, resolved_handle.as_deref());
 
         match self
             .engine
             .add_to_allowlist(sender_did, &resolved_did, Some("Added via DM bot"))
         {
             Ok(()) => Ok(format!(
-                "{handle_prefix}✅ Account `{resolved_did}` has been added to your moderation allowlist.\n\
+                "{handle_prefix}✅ Account {label} has been added to your moderation allowlist.\n\
                  Their interactions will now bypass all moderation checks at zero cost."
             )),
-            Err(e) => Ok(format!("{handle_prefix}❌ Failed to allowlist account: {e}")),
+            Err(e) => Ok(format!(
+                "{handle_prefix}❌ Failed to allowlist account: {e}"
+            )),
         }
     }
 
@@ -622,19 +639,24 @@ impl BotCommandHandler {
             );
         }
 
-        let (resolved_did, handle_prefix) = match self.resolve_dm_target(raw_target, "").await {
-            Ok(v) => v,
-            Err(msg) => return Ok(msg),
-        };
+        let (resolved_did, resolved_handle, handle_prefix) =
+            match self.resolve_dm_target(raw_target, "").await {
+                Ok(v) => v,
+                Err(msg) => return Ok(msg),
+            };
+
+        let label = account_label_with_url(&resolved_did, resolved_handle.as_deref());
 
         match self.engine.remove_from_allowlist(sender_did, &resolved_did) {
             Ok(true) => Ok(format!(
-                "{handle_prefix}✅ Account `{resolved_did}` has been removed from your moderation allowlist."
+                "{handle_prefix}✅ Account {label} has been removed from your moderation allowlist."
             )),
             Ok(false) => Ok(format!(
-                "{handle_prefix}ℹ️ Account `{resolved_did}` was not found on your moderation allowlist."
+                "{handle_prefix}ℹ️ Account {label} was not found on your moderation allowlist."
             )),
-            Err(e) => Ok(format!("{handle_prefix}❌ Failed to remove account from allowlist: {e}")),
+            Err(e) => Ok(format!(
+                "{handle_prefix}❌ Failed to remove account from allowlist: {e}"
+            )),
         }
     }
 
@@ -652,9 +674,10 @@ impl BotCommandHandler {
         for (idx, entry) in entries.iter().enumerate() {
             let num = idx.saturating_add(1);
             let reason_str = entry.reason.as_deref().unwrap_or("No reason provided");
+            let label = account_label_with_url(&entry.subject_did, entry.handle.as_deref());
             out.push_str(&format!(
-                "{num}. `{}`\n   Reason: {} | Added: {}\n",
-                entry.subject_did, reason_str, entry.created_at
+                "{num}. {label}\n   Reason: {} | Added: {}\n",
+                reason_str, entry.created_at
             ));
         }
 
@@ -817,22 +840,25 @@ impl BotCommandHandler {
             || self.engine.is_protected(sender_did)
     }
 
-    /// Resolves a DM command target (`did:...` or `@handle`) to a DID.
+    /// Resolves a DM command target (`did:...` or `@handle`) to a DID and handle.
     ///
-    /// Returns `(resolved_did, handle_prefix)` where `handle_prefix` is a one-line
-    /// "Resolved @handle to did" note for handle inputs (empty for DID inputs). On
-    /// failure, returns the user-facing error message to display instead.
+    /// Returns `(resolved_did, resolved_handle, handle_prefix)` where `handle_prefix`
+    /// is a one-line "Resolved @handle to did" note for handle inputs (empty for DID
+    /// inputs). On failure, returns the user-facing error message to display instead.
     async fn resolve_dm_target(
         &self,
         raw_target: &str,
         hint_suffix: &str,
-    ) -> Result<(String, String), String> {
+    ) -> Result<(String, Option<String>, String), String> {
         let clean = crate::util::normalize_handle(raw_target);
         if clean.starts_with("did:") {
-            return Ok((clean.to_string(), String::new()));
+            return Ok((clean.to_string(), None, String::new()));
         }
         match self.engine.resolve_handle(clean).await {
-            Some(did) => { let prefix = format!("Resolved `@{clean}` to `{did}`.\n"); Ok((did, prefix)) }
+            Some(did) => {
+                let prefix = format!("Resolved `@{clean}` to `{did}`.\n");
+                Ok((did, Some(clean.to_string()), prefix))
+            }
             None => Err(format!(
                 "❌ Could not resolve handle `@{clean}` to a DID. Please verify the handle or provide the account's DID directly{hint_suffix}."
             )),

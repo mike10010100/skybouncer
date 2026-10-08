@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-08
+
+### Changed
+
+- **Human-friendly, hotlinkable DM output**: bot DMs now reference accounts by
+  resolved `@handle` (falling back to DID only when unresolvable) and embed literal
+  `https://bsky.app/profile/...` / `.../post/...` URLs so Chat auto-links them.
+  - New shared `bot::render` helpers (`bsky_profile_url`, `bsky_post_url`,
+    `bsky_post_url_from_at_uri`, `account_label`, `account_label_with_url`,
+    `command_target`).
+  - `BounceNotification` gains an optional `violator_handle`, populated from the
+    enriched author context (or the handle cache) at bounce time.
+  - Proactive bounce alerts, `recent`, `allowlist`, `pardon`, `pardon and allow`,
+    `allow`, and `unallow` replies now render handles, profile links, clickable post
+    links, and handle-based follow-up commands.
+
 ## [0.2.0] - 2026-10-07
 
 ### Added
