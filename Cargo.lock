@@ -1812,7 +1812,7 @@ dependencies = [
 
 [[package]]
 name = "skyauth"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1840,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "skybase"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures-util",
  "parking_lot",
@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "skybouncer"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "axum",
