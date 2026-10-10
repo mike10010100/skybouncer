@@ -26,7 +26,7 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - name: Checkout repository with full history
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -42,19 +42,19 @@ jobs:
 
     steps:
       - name: Checkout skybouncer
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: skybouncer
 
       - name: Checkout sibling dependency (skybase)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: mike10010100/skybase
           ref: refactor/appview-client
           path: skybase
 
       - name: Checkout sibling dependency (skyauth)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: mike10010100/skyauth
           ref: refactor/sealed-box
@@ -126,19 +126,19 @@ jobs:
       checks: read
     steps:
       - name: Checkout skybouncer
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: skybouncer
           persist-credentials: false
 
       - name: Checkout sibling dependency (skybase)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: mike10010100/skybase
           path: skybase
 
       - name: Checkout sibling dependency (skyauth)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: mike10010100/skyauth
           path: skyauth
