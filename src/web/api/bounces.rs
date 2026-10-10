@@ -42,7 +42,21 @@ pub async fn get_bounces(
         .into_iter()
         .map(|b| {
             let handle = state.engine.cached_handle_for_did(&b.subject_did);
-            BouncedUserWithHandle { user: b, handle }
+            let protected_handle = if b.protected_did.trim().is_empty() {
+                None
+            } else {
+                let th = state.engine.target_handle(&b.protected_did);
+                if !th.is_empty() {
+                    Some(th)
+                } else {
+                    state.engine.cached_handle_for_did(&b.protected_did)
+                }
+            };
+            BouncedUserWithHandle {
+                user: b,
+                handle,
+                protected_handle,
+            }
         })
         .collect();
     Ok(Json(enriched))

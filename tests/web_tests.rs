@@ -2425,6 +2425,9 @@ async fn test_api_bounces_and_allowlist_handle_enrichment() {
             expires_at: None,
         })
         .expect("record bounce");
+    cache
+        .set_handle_for_did(protected_did, "alice.bsky.social")
+        .expect("cache handle");
 
     // Fetch bounces with authentication
     let req = Request::builder()
@@ -2444,6 +2447,10 @@ async fn test_api_bounces_and_allowlist_handle_enrichment() {
     assert_eq!(enriched.len(), 1);
     assert_eq!(enriched[0].user.subject_did, violator_did);
     assert_eq!(enriched[0].handle.as_deref(), Some(violator_handle));
+    assert_eq!(
+        enriched[0].protected_handle.as_deref(),
+        Some("alice.bsky.social")
+    );
 
     let standard: Vec<BouncedUser> = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(standard.len(), 1);

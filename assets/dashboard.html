@@ -617,9 +617,23 @@
 
     <!-- Live Audit Feed -->
     <section class="card">
-      <div class="card-header">
-        <div class="card-title">🚫 Recently Bounced Violators</div>
-        <button class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="loadBounces()">🔄 Refresh</button>
+      <div class="card-header" style="flex-wrap: wrap; gap: 0.75rem;">
+        <div>
+          <div class="card-title" id="bounces-card-title">🚫 Recently Bounced Violators</div>
+          <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.2rem;" id="bounces-card-subtitle">
+            Recently moderated accounts added to your block list
+          </div>
+        </div>
+        <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+          <div id="bounces-admin-scope-container" style="display: none; align-items: center; gap: 0.35rem;">
+            <label for="bounces-scope-select" style="font-size: 0.75rem; color: var(--text-muted); margin-bottom: 0;">Scope:</label>
+            <select id="bounces-scope-select" class="form-input" style="padding: 0.25rem 0.5rem; font-size: 0.8rem; width: auto; margin-bottom: 0;" onchange="onBouncesScopeChange()">
+              <option value="mine">My Bounces Only</option>
+              <option value="all">Fleet-Wide (All Tenants)</option>
+            </select>
+          </div>
+          <button class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="loadBounces()">🔄 Refresh</button>
+        </div>
       </div>
       <div style="margin-bottom: 0.75rem;">
         <input type="text" id="bounces-search-input" class="form-input" placeholder="🔍 Search bounces by handle, DID, or keyword..." oninput="filterBounces()" style="width: 100%; font-size: 0.85rem;">
@@ -629,6 +643,7 @@
           <thead>
             <tr>
               <th>Violator Account</th>
+              <th id="bounces-target-header" style="display: none;">Target Account</th>
               <th>Offending Post</th>
               <th>Category</th>
               <th>Confidence</th>
@@ -1423,6 +1438,27 @@
 
     let allBounces = [];
 
+    function onBouncesScopeChange() {
+      const scopeSelect = document.getElementById("bounces-scope-select");
+      const scope = scopeSelect ? scopeSelect.value : "mine";
+      const titleEl = document.getElementById("bounces-card-title");
+      const subEl = document.getElementById("bounces-card-subtitle");
+      if (titleEl && subEl) {
+        if (scope === "all") {
+          titleEl.innerText = "🚫 Recently Bounced Violators (Fleet-Wide)";
+          subEl.innerText = "Moderation bounces executed across all enrolled tenant accounts";
+        } else if (scope === "mine") {
+          titleEl.innerText = "🚫 Recently Bounced Violators";
+          subEl.innerText = "Recently moderated accounts added to your block list";
+        } else {
+          const selectedText = scopeSelect.options[scopeSelect.selectedIndex]?.text || scope;
+          titleEl.innerText = `🚫 Bounced Violators (${selectedText})`;
+          subEl.innerText = "Moderation bounces executed for selected tenant";
+        }
+      }
+      loadBounces();
+    }
+
     function filterBounces() {
       const query = (document.getElementById("bounces-search-input")?.value || "").toLowerCase().trim();
       if (!query) {
@@ -1431,8 +1467,11 @@
       }
       const filtered = allBounces.filter(b => {
         const handle = b.handle || didHandleCache.get(b.subject_did) || "";
+        const targetHandle = b.protected_handle || didHandleCache.get(b.protected_did) || "";
         return (b.subject_did && b.subject_did.toLowerCase().includes(query)) ||
                (handle && handle.toLowerCase().includes(query)) ||
+               (b.protected_did && b.protected_did.toLowerCase().includes(query)) ||
+               (targetHandle && targetHandle.toLowerCase().includes(query)) ||
                (b.category && b.category.toLowerCase().includes(query)) ||
                (b.reason && b.reason.toLowerCase().includes(query)) ||
                (b.post_text && b.post_text.toLowerCase().includes(query));
@@ -1444,8 +1483,12 @@
       const tbody = document.getElementById("bounces-table");
       if (!tbody) return;
 
+      const scopeSelect = document.getElementById("bounces-scope-select");
+      const isFleetScope = scopeSelect && scopeSelect.value === "all";
+      const colSpan = isFleetScope ? 7 : 6;
+
       if (bounces.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 2rem;">No matching bounced accounts found.</td></tr>';
+        tbody.innerHTML = `<tr><td colspan="${colSpan}" style="text-align: center; color: var(--text-muted); padding: 2rem;">No matching bounced accounts found.</td></tr>`;
         return;
       }
 
@@ -1453,21 +1496,29 @@
         if (b.subject_did && b.handle) {
           didHandleCache.set(b.subject_did, b.handle.replace(/^@/, ""));
         }
+        if (b.protected_did && b.protected_handle) {
+          didHandleCache.set(b.protected_did, b.protected_handle.replace(/^@/, ""));
+        }
         const postLinkHtml = formatPostLink(b.post_uri, b.post_text);
         const ttlBadge = b.expires_at ?
           `<span class="status-badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; font-size: 0.7rem; margin-left: 0.35rem;" title="Expires at ${escapeHtml(formatFullDate(b.expires_at) || formatDate(b.expires_at))}">⏳ TTL</span>` :
           `<span class="status-badge" style="background: rgba(148, 163, 184, 0.15); color: var(--text-muted); font-size: 0.7rem; margin-left: 0.35rem;">Permanent</span>`;
         const bouncedTitle = b.bounced_at ? ` title="Bounced: ${escapeHtml(formatFullDate(b.bounced_at))}"` : '';
+        const targetCellHtml = isFleetScope
+          ? `<td>${formatAccountCell(b.protected_did, b.protected_handle)}</td>`
+          : '';
+
         return `
         <tr>
           <td>${formatAccountCell(b.subject_did, b.handle)}</td>
+          ${targetCellHtml}
           <td>${postLinkHtml}</td>
           <td><span class="status-badge" style="background: var(--danger-bg); color: var(--danger); font-size: 0.75rem;"${bouncedTitle}>${escapeHtml(b.category)}</span>${ttlBadge}</td>
           <td><strong>${Math.round(b.confidence * 100)}%</strong></td>
           <td><span style="font-size: 0.82rem;" title="${escapeHtml(b.reason)}">${escapeHtml(b.reason)}</span></td>
           <td style="white-space: nowrap;">
-            <button class="btn btn-danger btn-pardon" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" data-did="${escapeHtml(b.subject_did)}" title="Remove from moderation list">Pardon</button>
-            <button class="btn btn-secondary btn-pardon-allow" style="padding: 0.25rem 0.65rem; font-size: 0.75rem; margin-left: 0.25rem;" data-did="${escapeHtml(b.subject_did)}" title="Pardon and add to allowlist to immunize against future bounces">Pardon &amp; Allow</button>
+            <button class="btn btn-danger btn-pardon" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" data-did="${escapeHtml(b.subject_did)}" data-protected-did="${escapeHtml(b.protected_did || '')}" title="Remove from moderation list">Pardon</button>
+            <button class="btn btn-secondary btn-pardon-allow" style="padding: 0.25rem 0.65rem; font-size: 0.75rem; margin-left: 0.25rem;" data-did="${escapeHtml(b.subject_did)}" data-protected-did="${escapeHtml(b.protected_did || '')}" title="Pardon and add to allowlist to immunize against future bounces">Pardon &amp; Allow</button>
           </td>
         </tr>
       `;
@@ -1478,12 +1529,49 @@
 
     async function loadBounces() {
       try {
-        const res = await fetch("/api/bounces?limit=50", { credentials: "same-origin" });
-        if (!res.ok) return;
+        const scopeSelect = document.getElementById("bounces-scope-select");
+        const scope = scopeSelect ? scopeSelect.value : "mine";
+        let url = "/api/bounces?limit=50";
+
+        if (currentUser && currentUser.did) {
+          if (currentUser.is_admin) {
+            if (scope === "mine") {
+              url += `&user_did=${encodeURIComponent(currentUser.did)}`;
+            } else if (scope === "all") {
+              // fleet-wide; no user_did parameter
+            } else {
+              // specific tenant DID
+              url += `&user_did=${encodeURIComponent(scope)}`;
+            }
+          } else {
+            url += `&user_did=${encodeURIComponent(currentUser.did)}`;
+          }
+        }
+
+        const isFleetScope = (scope === "all");
+        const targetHeader = document.getElementById("bounces-target-header");
+        if (targetHeader) {
+          targetHeader.style.display = isFleetScope ? "" : "none";
+        }
+
+        const res = await fetch(url, { credentials: "same-origin" });
+        if (!res.ok) {
+          if (res.status === 401) {
+            const tbody = document.getElementById("bounces-table");
+            if (tbody) {
+              const colSpan = isFleetScope ? 7 : 6;
+              tbody.innerHTML = `<tr><td colspan="${colSpan}" style="text-align: center; color: var(--text-muted); padding: 2rem;">Please sign in with Bluesky to view bounced accounts.</td></tr>`;
+            }
+          }
+          return;
+        }
         allBounces = await res.json();
         allBounces.forEach(b => {
           if (b.subject_did && b.handle) {
             didHandleCache.set(b.subject_did, b.handle.replace(/^@/, ""));
+          }
+          if (b.protected_did && b.protected_handle) {
+            didHandleCache.set(b.protected_did, b.protected_handle.replace(/^@/, ""));
           }
         });
         filterBounces();
@@ -1494,12 +1582,12 @@
           tbody.addEventListener("click", (e) => {
             const btnPardon = e.target.closest(".btn-pardon");
             if (btnPardon && btnPardon.dataset.did) {
-              pardonUser(btnPardon.dataset.did, false);
+              pardonUser(btnPardon.dataset.did, btnPardon.dataset.protectedDid, false);
               return;
             }
             const btnPardonAllow = e.target.closest(".btn-pardon-allow");
             if (btnPardonAllow && btnPardonAllow.dataset.did) {
-              pardonUser(btnPardonAllow.dataset.did, true);
+              pardonUser(btnPardonAllow.dataset.did, btnPardonAllow.dataset.protectedDid, true);
             }
           });
         }
@@ -1508,12 +1596,21 @@
       }
     }
 
-    async function pardonUser(did, allowlist = false) {
+    async function pardonUser(did, protectedDid, allowlist = false) {
+      if (typeof protectedDid === "boolean") {
+        allowlist = protectedDid;
+        protectedDid = null;
+      }
       const cachedHandle = didHandleCache.get(did);
       const displayLabel = cachedHandle ? `@${cachedHandle} (${formatDid(did)})` : did;
+      let targetLabel = "";
+      if (protectedDid && currentUser && protectedDid !== currentUser.did) {
+        const cachedTarget = didHandleCache.get(protectedDid);
+        targetLabel = cachedTarget ? ` on @${cachedTarget}'s list` : ` on tenant ${formatDid(protectedDid)}'s list`;
+      }
       const confirmMsg = allowlist
-        ? `Are you sure you want to pardon ${displayLabel} AND add them to your allowlist (immunize)?`
-        : `Are you sure you want to pardon ${displayLabel} and remove them from your moderation list?`;
+        ? `Are you sure you want to pardon ${displayLabel}${targetLabel} AND add them to the allowlist (immunize)?`
+        : `Are you sure you want to pardon ${displayLabel}${targetLabel} and remove them from the moderation list?`;
       if (!confirm(confirmMsg)) return;
 
       try {
@@ -1523,6 +1620,7 @@
           credentials: "same-origin",
           body: JSON.stringify({
             subject_did: did,
+            protected_did: protectedDid || (currentUser ? currentUser.did : undefined),
             allowlist: !!allowlist,
             reason: allowlist ? "Pardoned & allowlisted via Web Dashboard" : undefined
           })
@@ -1752,6 +1850,12 @@
             const adminCard = document.getElementById("admin-fleet-card");
             if (adminCard) adminCard.style.display = "none";
           }
+
+          const bouncesScope = document.getElementById("bounces-admin-scope-container");
+          if (bouncesScope) {
+            bouncesScope.style.display = data.is_admin ? "inline-flex" : "none";
+          }
+          loadBounces();
         } else {
           currentUser = null;
           renderUnauthenticated();
@@ -1869,6 +1973,10 @@
       if (evalCard) evalCard.style.display = "none";
       const monCard = document.getElementById("kpi-monitored-card");
       if (monCard) monCard.style.display = "none";
+      const bouncesScope = document.getElementById("bounces-admin-scope-container");
+      if (bouncesScope) bouncesScope.style.display = "none";
+      const targetHeader = document.getElementById("bounces-target-header");
+      if (targetHeader) targetHeader.style.display = "none";
       renderRulesUnauthenticated();
     }
 
@@ -1882,6 +1990,7 @@
       currentUser = null;
       renderUnauthenticated();
       renderRulesUnauthenticated();
+      loadBounces();
       showToast("👋 Signed out successfully");
     }
 
@@ -1930,6 +2039,20 @@
               didHandleCache.set(t.did, t.handle.replace(/^@/, ""));
             }
           });
+
+          const scopeSelect = document.getElementById("bounces-scope-select");
+          if (scopeSelect) {
+            const currentVal = scopeSelect.value;
+            let opts = '<option value="mine">My Bounces Only</option><option value="all">Fleet-Wide (All Tenants)</option>';
+            data.tenants.forEach(t => {
+              const label = t.handle ? `@${t.handle.replace(/^@/, '')}` : (t.did.substring(0, 16) + '...');
+              opts += `<option value="${escapeHtml(t.did)}">Tenant: ${escapeHtml(label)}</option>`;
+            });
+            scopeSelect.innerHTML = opts;
+            if (Array.from(scopeSelect.options).some(o => o.value === currentVal)) {
+              scopeSelect.value = currentVal;
+            }
+          }
         }
         const totalEl = document.getElementById("admin-total-tenants");
         if (totalEl) totalEl.innerText = data.total;
