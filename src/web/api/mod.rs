@@ -247,6 +247,9 @@ pub struct BouncedUserWithHandle {
     /// Resolved ATProto handle of the bounced violator, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
+    /// Resolved ATProto handle of the protected user whose moderation list the violator was added to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_handle: Option<String>,
 }
 
 /// Query parameter for session-aware endpoints.

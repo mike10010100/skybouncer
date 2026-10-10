@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-10-10
+
+### Added
+
+- **Tenant-Scoped Bounces & Fleet Scope Selector**:
+  - The dashboard "Recently Bounced Violators" feed now defaults to scoping directly to the authenticated user's account (`user_did=<did>`), preventing other tenants' moderation events from cluttering the user's view.
+  - Authenticated administrators now have a **Scope selector** (`bounces-scope-select`) to seamlessly toggle between "My Bounces Only", "Fleet-Wide (All Tenants)", and individual enrolled tenants.
+  - Added dynamic "Target Account" column in the dashboard table when viewing fleet-wide bounces to clearly show which tenant's post received the offending interaction.
+  - Enriched `BouncedUserWithHandle` and `GET /api/bounces` with `protected_handle` to display human-readable handles for protected targets.
+  - Updated dashboard "Pardon" and "Pardon & Allow" actions to pass `protected_did`, ensuring pardons execute against the correct tenant's moderation list.
+
 ## [0.2.2] - 2026-10-10
 
 ### Changed
