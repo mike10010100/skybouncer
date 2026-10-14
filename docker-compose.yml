@@ -6,8 +6,8 @@
 services:
   skybouncer:
     build:
-      context: ..
-      dockerfile: skybouncer/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     image: skybouncer:${IMAGE_TAG:-latest}
     container_name: skybouncer
     restart: unless-stopped
