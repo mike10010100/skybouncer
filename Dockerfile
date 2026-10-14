@@ -10,16 +10,16 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /build
 
-# Copy sibling workspace crates required by skybouncer
-COPY skybase /build/skybase
-COPY skyauth /build/skyauth
-COPY skybouncer /build/skybouncer
+# Copy manifests; sibling crates (skybase, skyauth) are fetched from crates.io.
+COPY Cargo.toml Cargo.lock ./
 
-WORKDIR /build/skybouncer
+# Copy application source and embedded assets
+COPY src ./src
+COPY assets ./assets
 
 # Build optimized production binary and strip debug symbols
 RUN cargo build --release --bin skybouncer && \
-    strip /build/skybouncer/target/release/skybouncer
+    strip /build/target/release/skybouncer
 
 # ------------------------------------------------------------------------------
 # Stage 2: Minimal Hardened Runtime Image
@@ -42,7 +42,7 @@ RUN mkdir -p /app /data && \
 WORKDIR /app
 
 # Copy stripped binary from builder
-COPY --from=builder /build/skybouncer/target/release/skybouncer /usr/local/bin/skybouncer
+COPY --from=builder /build/target/release/skybouncer /usr/local/bin/skybouncer
 
 # Run as non-root user
 USER appuser:appgroup

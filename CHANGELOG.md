@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-10-14
+
+### Fixed
+
+- **Container build / deployment**: The production `Dockerfile` no longer compiles the sibling `skybase` and `skyauth` crates from local `path = "../..."` checkouts. Those local checkouts drift behind the versions that `skybouncer` expects, which caused release builds from `main` to fail (stale `skybase` used `rusqlite 0.32` / `libsqlite3-sys 0.30`, conflicting with `skybouncer`'s `rusqlite 0.39` / `libsqlite3-sys 0.37` over the `links = "sqlite3"` native library). `skybase` and `skyauth` are now consumed from crates.io, matching `for-your-consideration`, and the Compose build context is narrowed to the `skybouncer` repository.
+
 ## [0.2.5] - 2026-10-14
 
 ### Changed
