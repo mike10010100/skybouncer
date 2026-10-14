@@ -176,7 +176,7 @@ pub fn create_web_router(
             get(api::get_allowlist).post(api::add_to_allowlist),
         )
         .route(
-            "/allowlist/:did",
+            "/allowlist/{did}",
             axum::routing::delete(api::remove_from_allowlist),
         )
         .route("/simulate", post(api::simulate_interaction))

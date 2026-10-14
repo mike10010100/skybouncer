@@ -232,7 +232,7 @@ impl TenantRegistry {
         let encrypted = self
             .cipher
             .encrypt_with_aad(serialized.as_bytes(), did.as_bytes())?;
-        let now_us = current_time_us();
+        let now_us = us_to_i64(current_time_us());
         let conn = self.conn.lock();
         let rows = conn
             .execute(

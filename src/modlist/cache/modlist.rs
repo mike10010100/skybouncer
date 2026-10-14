@@ -84,7 +84,7 @@ impl DeduplicationCache {
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if the SQLite execution fails.
     pub fn set_list_blocked(&self, user_did: &str, list_uri: &str) -> Result<(), SkybouncerError> {
-        let now_us = current_time_us();
+        let now_us = us_to_i64(current_time_us());
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "INSERT INTO listblock_cache (user_did, list_uri, blocked_at)
