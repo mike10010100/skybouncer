@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "skybouncer"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "axum",
