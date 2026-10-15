@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7] - 2026-10-15
+
+### Changed
+
+- **Classifier Fallback Model**: Upgraded default System-2 multimodal fallback model from `gemma4:12b` to `gemma4:26b` across environment configurations (`.env.example`, `skybouncer.env.example`), dashboard simulation UI, benchmarks, and deployment documentation.
+- **Dependencies**: Updated `rustls` to `0.23.46` to resolve security advisories RUSTSEC-2026-0347, RUSTSEC-2026-0348, and RUSTSEC-2026-0349.
+
 ## [0.2.6] - 2026-10-14
 
 ### Fixed

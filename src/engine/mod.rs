@@ -112,7 +112,7 @@ pub struct SkybouncerConfig {
     pub evaluation_concurrency: usize,
     /// Jev classification client configuration, if Jev is used as the primary model.
     pub jev_config: Option<JevConfig>,
-    /// Fallback multimodal classification client configuration (e.g. gemma4:12b, llama3.2-vision via Ollama).
+    /// Fallback multimodal classification client configuration (e.g. gemma4:26b, llama3.2-vision via Ollama).
     pub fallback_jev_config: Option<JevConfig>,
     /// Optional multimodal primary model configuration enabling dynamic Tier-1 routing.
     ///

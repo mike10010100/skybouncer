@@ -1,7 +1,7 @@
 //! Two-tier hierarchical moderation classifier with multimodal vision fallback.
 //!
 //! Coordinates a fast, lightweight System-1 primary classifier (e.g. Jev or local 1B/3B text model)
-//! with an escalating multimodal System-2 fallback classifier (e.g. `gemma4:12b`, `llama3.2-vision`,
+//! with an escalating multimodal System-2 fallback classifier (e.g. `gemma4:26b`, `llama3.2-vision`,
 //! or `qwen2.5-vl`).
 //!
 //! # Escalation Invariants

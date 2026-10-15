@@ -528,7 +528,7 @@
                   <span style="font-size: 0.85rem; font-weight: 700;">👁️ Tier 2: System-2 (Fallback)</span>
                   <span id="sim-tier2-badge" class="chip" style="font-weight: 700; font-size: 0.65rem; padding: 0.2rem 0.5rem;">Bypassed</span>
                 </div>
-                <div style="font-size: 0.7rem; color: var(--text-muted);" id="sim-tier2-model">Model: gemma4:12b</div>
+                <div style="font-size: 0.7rem; color: var(--text-muted);" id="sim-tier2-model">Model: gemma4:26b</div>
                 <div id="sim-tier2-metrics">
                   <div style="display: flex; justify-content: space-between; font-size: 0.75rem; margin-bottom: 0.2rem;">
                     <span id="sim-tier2-cat">Category: None</span>
@@ -1181,7 +1181,7 @@
           // Tier 2 Box
           const t2 = data.tier2;
           const t2Model = document.getElementById("sim-tier2-model");
-          if (t2Model) t2Model.innerText = `Model: ${t2.model || 'gemma4:12b'}`;
+          if (t2Model) t2Model.innerText = `Model: ${t2.model || 'gemma4:26b'}`;
           const t2Metrics = document.getElementById("sim-tier2-metrics");
           const t2Badge = document.getElementById("sim-tier2-badge");
           const t2Box = document.getElementById("sim-tier2-box");

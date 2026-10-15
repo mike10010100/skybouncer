@@ -230,7 +230,7 @@ impl crate::engine::SkybouncerEngine {
                 )),
                 tier2: Some(bypassed(
                     "Tier 2 • System-2 Fallback",
-                    "gemma4:12b",
+                    "gemma4:26b",
                     "Bypassed: Heuristic regex pre-filter matched instantly (0ms)",
                 )),
                 fetched_url_image,

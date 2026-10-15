@@ -843,7 +843,7 @@ async fn test_jev_classifier_multimodal_images_injected_ollama() {
         .and(path("/api/chat"))
         .and(body_string_contains("b2xsYW1hX3Zpc2lvbl9pbWFnZQ=="))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "model": "gemma4:12b",
+            "model": "gemma4:26b",
             "message": {
                 "role": "assistant",
                 "content": "{\"violates\": true, \"category\": \"harassment\", \"confidence\": 0.94, \"reason\": \"Abusive visual meme detected\"}"
@@ -857,7 +857,7 @@ async fn test_jev_classifier_multimodal_images_injected_ollama() {
     let config = JevConfig {
         base_url: format!("{}/api/chat", server.uri()),
         api_key: None,
-        model: "gemma4:12b".to_string(),
+        model: "gemma4:26b".to_string(),
         timeout: Duration::from_millis(1000),
         max_retries: 1,
         supports_images: false,
@@ -885,7 +885,7 @@ async fn test_tiered_classifier_integration_escalation() {
         "Borderline text",
         0.60,
     )));
-    // Fallback classifier (e.g. gemma4:12b) returns confident violation
+    // Fallback classifier (e.g. gemma4:26b) returns confident violation
     let fallback = Arc::new(MockClassifier::new(Verdict::violation(
         ViolationCategory::Harassment,
         0.92,
