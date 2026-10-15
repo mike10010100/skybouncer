@@ -177,7 +177,7 @@ pub struct SimulateRequest {
 pub struct TierStageDetail {
     /// Stage title (e.g. "Tier 1 • System-1 Primary (Text)").
     pub stage_name: String,
-    /// Model identifier (e.g. "nimble" or "gemma4:12b").
+    /// Model identifier (e.g. "nimble" or "gemma4:26b").
     pub model: String,
     /// Execution status ("resolved", "escalated", or "bypassed").
     pub status: String,

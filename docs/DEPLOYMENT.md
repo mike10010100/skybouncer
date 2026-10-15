@@ -91,12 +91,12 @@ Containerized deployment is the fastest way to run Skybouncer with zero host-lev
 
 ### Self-Contained Local AI Deployment (Ollama Multimodal)
 
-To run Skybouncer completely self-contained with a local multimodal vision model (e.g. `gemma4:12b` or `llava`) for Tier 2 fallback evaluations:
+To run Skybouncer completely self-contained with a local multimodal vision model (e.g. `gemma4:26b` or `llava`) for Tier 2 fallback evaluations:
 
 1. Configure `.env`:
    ```env
    FALLBACK_JEV_API_BASE_URL=http://ollama:11434/api/chat
-   FALLBACK_JEV_MODEL=gemma4:12b
+   FALLBACK_JEV_MODEL=gemma4:26b
    CERTAINTY_MIN=0.40
    CERTAINTY_MAX=0.85
    ```
@@ -108,7 +108,7 @@ To run Skybouncer completely self-contained with a local multimodal vision model
 
 3. Pull your desired vision model inside the Ollama container:
    ```bash
-   docker compose exec ollama ollama pull gemma4:12b
+   docker compose exec ollama ollama pull gemma4:26b
    ```
 
 ---
@@ -190,7 +190,7 @@ sudo systemctl reload nginx
 | `JEV_API_BASE_URL` | `https://api.jev.ai` | Primary Decision Gateway / Jev classification endpoint. |
 | `JEV_MODEL` | `nimble` | Primary classifier model name. |
 | `FALLBACK_JEV_API_BASE_URL` | — | Optional secondary multimodal fallback endpoint (e.g. Ollama chat). |
-| `FALLBACK_JEV_MODEL` | — | Multimodal fallback model (e.g. `gemma4:12b`, `llava`). |
+| `FALLBACK_JEV_MODEL` | — | Multimodal fallback model (e.g. `gemma4:26b`, `llava`). |
 | `CERTAINTY_MIN` | `0.40` | Lower bound of uncertainty escalation band. |
 | `CERTAINTY_MAX` | `0.85` | Upper bound of uncertainty escalation band. |
 | `BOT_DID` | — | Bot account DID for ATProto direct-messaging interface. |

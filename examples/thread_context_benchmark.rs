@@ -10,7 +10,7 @@
 //! against the full conversation thread.
 //!
 //! Part 2 (dynamic primary): for image-bearing vectors, compares the production
-//! tiered path (`nimble` text primary + `gemma4:12b` vision fallback) with a
+//! tiered path (`nimble` text primary + `gemma4:26b` vision fallback) with a
 //! `clef-flash` multimodal Tier-1 primary.
 //!
 //! Run with live endpoints (default) or replay-only via `EXPERIMENT_OFFLINE=1`.
@@ -216,7 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Hard image corpus: image-borne violations with innocuous captions, plus
 /// regression guards (benign images with alarming text, benign/benign control).
 /// Compares text-only L1 (`nimble`, images invisible) against multimodal L1
-/// (`clef-flash`) and the heavyweight L2 fallback (`gemma4:12b`).
+/// (`clef-flash`) and the heavyweight L2 fallback (`gemma4:26b`).
 async fn run_hard_image_experiment(
     hard: &HardImages,
     rubric: &RuleRubric,
@@ -229,7 +229,7 @@ async fn run_hard_image_experiment(
     let mm_model = std::env::var("MULTIMODAL_MODEL").unwrap_or_else(|_| "clef-flash".to_string());
     let mm_l1 = JevClassifier::new(multimodal_config(&mm_model), rubric.clone())?;
     let l2_model =
-        std::env::var("EXPERIMENT_L2_MODEL").unwrap_or_else(|_| "gemma4:12b".to_string());
+        std::env::var("EXPERIMENT_L2_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string());
     let l2 = JevClassifier::new(ollama_config(&l2_model), rubric.clone())?;
 
     println!("  Text-only L1: nimble | Multimodal L1: {mm_model} | L2: {l2_model}");
@@ -339,7 +339,7 @@ async fn run_hard_thread_l2_experiment(
     println!("PART 3  LEVEL-2 SYSTEM-2 (reasoning LLM): no-context vs parent-only vs full chain");
     println!("{:=<80}", "");
 
-    let model = std::env::var("EXPERIMENT_L2_MODEL").unwrap_or_else(|_| "gemma4:12b".to_string());
+    let model = std::env::var("EXPERIMENT_L2_MODEL").unwrap_or_else(|_| "gemma4:26b".to_string());
     println!("  Level-2 model: {model} (Ollama chat)");
     let classifier = JevClassifier::new(ollama_config(&model), rubric.clone())?;
 
@@ -675,7 +675,7 @@ async fn run_dynamic_primary_experiment(
             rubric.clone(),
         )?),
         Arc::new(JevClassifier::new(
-            ollama_config(&std::env::var("FALLBACK_MODEL").unwrap_or_else(|_| "gemma4:12b".into())),
+            ollama_config(&std::env::var("FALLBACK_MODEL").unwrap_or_else(|_| "gemma4:26b".into())),
             rubric.clone(),
         )?),
         CertaintyConfig::default(),

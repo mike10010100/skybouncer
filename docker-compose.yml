@@ -70,7 +70,7 @@ services:
       - skybouncer_net
 
   # ----------------------------------------------------------------------------
-  # Optional Local AI Engine: Ollama with Multimodal Vision (Gemma 4:12B, LLaVA)
+  # Optional Local AI Engine: Ollama with Multimodal Vision (Gemma 4:26B, LLaVA)
   # Activated via: docker compose --profile local-ai up -d
   # ----------------------------------------------------------------------------
   ollama:
