@@ -63,18 +63,28 @@ Both crate roots enforce the strict compiler lint safety guard:
 
 ## ⚡ Mandatory Pre-Completion Checklist
 
-Before reporting any work as complete, you **must execute and pass every step** of this verification pipeline:
+Before reporting any work as complete or opening a Pull Request, you **must execute and pass every step** of this verification pipeline (mirroring [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
 ```bash
-# 1. Check code formatting
+# 1. Verify Semantic Version bump in Cargo.toml & matching entry in CHANGELOG.md (required on PR branches)
+./scripts/check_version_bump.sh
+
+# 2. Check code formatting
 cargo fmt --all -- --check
 
-# 2. Check strict clippy rules (must have 0 warnings with -D warnings)
+# 3. Check strict clippy rules across all targets and lean core build (must have 0 warnings with -D warnings)
 cargo clippy --all-targets -- -D warnings
+cargo clippy --lib --no-default-features -- -D warnings
 
-# 3. Run all unit and integration test suites
+# 4. Run all unit, integration, and doc test suites
 cargo test --all-targets
+cargo test --doc
 
-# 4. Dependency security & policy scan
+# 5. Enforce >= 92% line test coverage (ensure all new branches/error paths are tested)
+cargo llvm-cov --all-targets --fail-under-lines 92 --summary-only
+
+# 6. Dependency security, advisory & policy scans
 cargo deny check
+cargo audit
 ```
+
