@@ -557,4 +557,68 @@ async fn run_cli_pardon_forwards_token_and_allowlist() {
     run_cli_pardon(&a)
         .await
         .expect("pardon with token and allowlist ok");
+
+    // Also exercise status and simulate with --token, plus pardon 401 unauthorized tip branch.
+    Mock::given(method("GET"))
+        .and(path("/api/status"))
+        .and(header("authorization", "Bearer test-cli-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "stats": serde_json::to_value(skybouncer::engine::EngineStatsSnapshot::default()).unwrap(),
+            "protected_dids": [],
+            "rubric": {
+                "prompt": "Block spam",
+                "sensitivity": "medium",
+                "threshold": 0.75,
+                "bounce_duration": "permanent",
+                "bypass_incoming_followers": true
+            },
+            "dry_run": false,
+            "version": "0.2.8"
+        })))
+        .mount(&server)
+        .await;
+    run_cli_status(&args(&[
+        "--url",
+        &server.uri(),
+        "--token",
+        "test-cli-secret",
+    ]))
+    .await
+    .expect("status with token ok");
+
+    Mock::given(method("POST"))
+        .and(path("/api/simulate"))
+        .and(header("authorization", "Bearer test-cli-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "violates": false,
+            "category": null,
+            "confidence": 0.1,
+            "reason": "benign",
+            "evaluator": "primary_classifier",
+            "meets_threshold": false,
+            "threshold": 0.75,
+            "images_evaluated": 0
+        })))
+        .mount(&server)
+        .await;
+    run_cli_simulate(&args(&[
+        "hello world",
+        "--url",
+        &server.uri(),
+        "--token",
+        "test-cli-secret",
+    ]))
+    .await
+    .expect("simulate with token ok");
+
+    let unauth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/pardon"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+        .mount(&unauth_server)
+        .await;
+    let err401 = run_cli_pardon(&args(&["did:plc:friend", "--url", &unauth_server.uri()]))
+        .await
+        .expect_err("401 pardon must error");
+    assert!(matches!(err401, skybouncer::SkybouncerError::Config(_)));
 }

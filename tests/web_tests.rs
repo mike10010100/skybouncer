@@ -3529,4 +3529,32 @@ async fn test_api_update_rules_preserves_existing_settings_when_omitted() {
     assert_eq!(updated.sensitivity, Sensitivity::High);
     assert_eq!(updated.bounce_duration, BounceDuration::Timeout7d);
     assert!(!updated.bypass_incoming_followers);
+
+    // 3. Verify operator CLI/API bearer token (SKYBOUNCER_API_TOKEN) authenticates against /api/status and /api/rules
+    std::env::set_var("SKYBOUNCER_API_TOKEN", "operator-secret-token-123");
+    let resp3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/rules")
+                .header("authorization", "Bearer operator-secret-token-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let s3 = resp3.status();
+    let resp_wrong = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/rules")
+                .header("authorization", "Bearer did:plc:spoof")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    std::env::remove_var("SKYBOUNCER_API_TOKEN");
+    assert_eq!(s3, StatusCode::OK);
+    assert_eq!(resp_wrong.status(), StatusCode::UNAUTHORIZED);
 }

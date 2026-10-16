@@ -2446,6 +2446,15 @@ async fn test_command_handler_second_protected_user_cannot_mutate_rules_sensitiv
         r3.contains("You can only update duration for your own enrolled account"),
         "r3={r3}"
     );
+
+    let r4 = handler
+        .handle_command(sender, "trust followers off")
+        .await
+        .unwrap();
+    assert!(
+        r4.contains("You can only update follower bypass for your own enrolled account"),
+        "r4={r4}"
+    );
 }
 
 #[tokio::test]
@@ -2453,6 +2462,18 @@ async fn test_set_rules_preserves_sensitivity_duration_and_follower_bypass() {
     let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
     let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
     let user = "did:plc:protected1";
+
+    // Usage and invalid argument branches for trust followers / bypass followers.
+    let usage = handler
+        .handle_command(user, "trust followers")
+        .await
+        .unwrap();
+    assert!(usage.contains("Usage: `trust followers <on|off>`"));
+    let invalid = handler
+        .handle_command(user, "trust followers maybe")
+        .await
+        .unwrap();
+    assert!(invalid.contains("Invalid value"));
 
     // Customize sensitivity, duration, and follower bypass first.
     handler
@@ -2483,6 +2504,23 @@ async fn test_set_rules_preserves_sensitivity_duration_and_follower_bypass() {
     assert!(rules_view.contains("Sensitivity: high"));
     assert!(rules_view.contains("Duration: 7-Day Timeout"));
     assert!(rules_view.contains("Follower Bypass: Disabled"));
+
+    // Re-enable via `bypass followers on` and verify enrolled tenant path as well.
+    let tf_on = handler
+        .handle_command(user, "bypass followers on")
+        .await
+        .unwrap();
+    assert!(tf_on.contains("Incoming follower bypass **enabled**"));
+    assert!(engine.bypass_incoming_followers(user));
+
+    engine
+        .enroll_tenant(skybouncer::tenant::Tenant::new("did:plc:enrolled_tf"))
+        .expect("enroll");
+    let enrolled_tf = handler
+        .handle_command("did:plc:enrolled_tf", "trust followers off")
+        .await
+        .unwrap();
+    assert!(enrolled_tf.contains("Incoming follower bypass **disabled**"));
 }
 
 #[tokio::test]
