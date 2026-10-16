@@ -412,15 +412,28 @@ impl RuleRubric {
         }
     }
 
-    /// Parses a rubric from a raw configuration or prompt string.
+    /// Parses a rubric from a raw configuration or prompt string, defaulting unset
+    /// fields (`sensitivity`, `bounce_duration`, `bypass_incoming_followers`) to
+    /// [`RuleRubric::default`].
     ///
-    /// Supports optional sensitivity headers (e.g. `sensitivity: high\n<prompt>`
-    /// or `[sensitivity: low]\n<prompt>`). If omitted, defaults to [`Sensitivity::Medium`].
+    /// Supports optional directives (e.g. `sensitivity: high\n<prompt>`,
+    /// `[duration: 24h]`, or `bypass_followers: false`).
     ///
     /// # Errors
     ///
-    /// Returns [`SkybouncerError::Config`] if the sensitivity string is invalid or prompt is empty.
+    /// Returns [`SkybouncerError::Config`] if a directive value is invalid or the prompt is empty.
     pub fn parse(raw: &str) -> Result<Self, SkybouncerError> {
+        Self::default().parse_updating(raw)
+    }
+
+    /// Parses a prompt string while preserving `self`'s existing `sensitivity`,
+    /// `bounce_duration`, and `bypass_incoming_followers` settings unless explicitly
+    /// overridden by directives in `raw`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SkybouncerError::Config`] if a directive value is invalid or the prompt is empty.
+    pub fn parse_updating(&self, raw: &str) -> Result<Self, SkybouncerError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Err(SkybouncerError::Config(
@@ -428,9 +441,9 @@ impl RuleRubric {
             ));
         }
 
-        let mut sensitivity = Sensitivity::Medium;
-        let mut bounce_duration = BounceDuration::Permanent;
-        let mut bypass_incoming_followers = true;
+        let mut sensitivity = self.sensitivity;
+        let mut bounce_duration = self.bounce_duration;
+        let mut bypass_incoming_followers = self.bypass_incoming_followers;
         let mut prompt_lines = Vec::new();
 
         for line in trimmed.lines() {

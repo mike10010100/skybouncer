@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use crate::bot::render::{account_label_with_url, bsky_post_url_from_at_uri, command_target};
-use crate::classifier::{RuleRubric, Sensitivity, Verdict};
+use crate::classifier::{Sensitivity, Verdict};
 use crate::engine::SkybouncerEngine;
 use crate::error::SkybouncerError;
 use crate::matcher::Interaction;
@@ -163,6 +163,27 @@ impl BotCommandHandler {
             return self.cmd_set_duration(sender_did, dur.trim());
         }
 
+        if trimmed.eq_ignore_ascii_case("trust followers")
+            || trimmed.eq_ignore_ascii_case("bypass followers")
+        {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return Ok(
+                "Usage: `trust followers <on|off>` (toggle zero-cost bypass for accounts that follow you)"
+                    .to_string(),
+            );
+        }
+
+        if let Some(flag_str) = strip_prefix_ci(trimmed, "trust followers ")
+            .or_else(|| strip_prefix_ci(trimmed, "bypass followers "))
+        {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_set_follower_bypass(sender_did, flag_str.trim());
+        }
+
         if trimmed.eq_ignore_ascii_case("recent") {
             if !authorized {
                 return Ok(self.unauthorized_response());
@@ -274,6 +295,7 @@ impl BotCommandHandler {
              • `set rules <prompt>` — Update your moderation prompt\n\
              • `sensitivity <low|medium|high>` — Adjust detection sensitivity\n\
              • `duration <permanent|24h|7d|30d>` — Set timeout/cooldown duration\n\
+             • `trust followers <on|off>` — Toggle zero-cost bypass for incoming followers\n\
              • `pause` — Temporarily suspend automated moderation\n\
              • `resume` — Reactivate automated moderation\n\
              • `recent` — List the 5 most recently bounced accounts\n\
@@ -329,15 +351,22 @@ impl BotCommandHandler {
 
     fn cmd_rules(&self, sender_did: &str) -> String {
         let rubric = self.engine.rubric_for(sender_did);
+        let follower_status = if rubric.bypass_incoming_followers {
+            "Enabled (incoming followers trusted)"
+        } else {
+            "Disabled (evaluate incoming followers)"
+        };
         format!(
             "📋 Current Moderation Rubric:\n\n\
              Prompt: \"{}\"\n\
              Sensitivity: {} (threshold: {:.2})\n\
-             Duration: {}",
+             Duration: {}\n\
+             Follower Bypass: {}",
             rubric.prompt,
             rubric.sensitivity,
             rubric.sensitivity.threshold(),
-            rubric.bounce_duration.display_label()
+            rubric.bounce_duration.display_label(),
+            follower_status
         )
     }
 
@@ -347,7 +376,10 @@ impl BotCommandHandler {
             return Ok("Please provide a moderation prompt. Example: `set rules Block crypto spam and bots.`".to_string());
         }
 
-        let parsed = RuleRubric::parse(prompt)?;
+        let current = self.engine.rubric_for(sender_did);
+        let parsed = current.parse_updating(prompt)?;
+        self.engine
+            .set_bypass_incoming_followers(sender_did, parsed.bypass_incoming_followers);
         if self.engine.is_enrolled(sender_did) {
             if let Err(e) = self
                 .engine
@@ -383,6 +415,62 @@ impl BotCommandHandler {
             parsed.sensitivity,
             parsed.bounce_duration.display_label()
         ))
+    }
+
+    fn cmd_set_follower_bypass(
+        &self,
+        sender_did: &str,
+        flag_str: &str,
+    ) -> Result<String, SkybouncerError> {
+        let bypass = match flag_str.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" | "enable" | "enabled" | "yes" | "1" => true,
+            "off" | "false" | "disable" | "disabled" | "no" | "0" => false,
+            _ => {
+                return Ok(
+                    "Invalid value. Please use `trust followers on` or `trust followers off`."
+                        .to_string(),
+                );
+            }
+        };
+
+        let mut rubric = self.engine.rubric_for(sender_did);
+        rubric.bypass_incoming_followers = bypass;
+        self.engine
+            .set_bypass_incoming_followers(sender_did, bypass);
+
+        if self.engine.is_enrolled(sender_did) {
+            if let Err(e) = self
+                .engine
+                .tenant_registry()
+                .update_rubric(sender_did, &rubric)
+            {
+                tracing::warn!(error = %e, sender_did, "Failed to update tenant follower bypass in registry");
+                return Ok(format!("❌ Failed to update follower bypass: {e}"));
+            }
+        } else if self.engine.is_admin(sender_did)
+            || (self.engine.is_single_tenant() && self.engine.is_protected(sender_did))
+        {
+            self.engine.set_rubric(rubric);
+        } else {
+            return Ok(
+                "❌ You can only update follower bypass for your own enrolled account.".to_string(),
+            );
+        }
+
+        // Asynchronously persist to sender's sovereign PDS repo
+        let eng = self.engine.clone();
+        let did = sender_did.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = eng.publish_sovereign_config(&did).await {
+                tracing::warn!(error = %e, did = %did, "Failed to publish sovereign config to PDS");
+            }
+        });
+
+        if bypass {
+            Ok("✅ Incoming follower bypass **enabled**: accounts that follow you will bypass moderation checks at zero cost.".to_string())
+        } else {
+            Ok("✅ Incoming follower bypass **disabled**: accounts that follow you (unless you also follow them back) will be evaluated against your moderation rules.".to_string())
+        }
     }
 
     fn cmd_set_sensitivity(
@@ -791,7 +879,7 @@ impl BotCommandHandler {
         )
         .with_post_uri("at://did:plc:test/app.bsky.feed.post/test1234")
         .with_post_cid("bafytest1234")
-        .with_rubric(sender_rubric);
+        .with_rubric(sender_rubric.clone());
 
         // Evaluate using heuristic first, then model
         let verdict = self
@@ -801,11 +889,20 @@ impl BotCommandHandler {
         let final_verdict = if verdict.is_violation() {
             verdict
         } else {
-            self.engine
+            match self
+                .engine
                 .primary_classifier()
                 .classify(&synthetic_interaction)
                 .await
-                .unwrap_or_else(|_| Verdict::permitted("Evaluation error or offline model"))
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(format!(
+                        "⚠️ Test Evaluation Unavailable:\n\n\
+                         • Reason: Classifier returned an error ({e})."
+                    ));
+                }
+            }
         };
 
         match final_verdict {
@@ -813,13 +910,32 @@ impl BotCommandHandler {
                 category,
                 confidence,
                 reason,
-            } => Ok(format!(
-                "🔍 Test Evaluation: **VIOLATION**\n\n\
-                 • Category: **{category}**\n\
-                 • Confidence: **{:.1}%**\n\
-                 • Reason: {reason}",
-                confidence * 100.0
-            )),
+            } => {
+                let threshold_pct = sender_rubric.sensitivity.threshold() * 100.0;
+                if sender_rubric.meets_threshold(&category, confidence) {
+                    Ok(format!(
+                        "🔍 Test Evaluation: **VIOLATION**\n\n\
+                         • Category: **{category}**\n\
+                         • Confidence: **{:.1}%** (Threshold: {:.0}% {})\n\
+                         • Action: **Would Bounce**\n\
+                         • Reason: {reason}",
+                        confidence * 100.0,
+                        threshold_pct,
+                        sender_rubric.sensitivity
+                    ))
+                } else {
+                    Ok(format!(
+                        "🔍 Test Evaluation: **PERMITTED (BELOW THRESHOLD)**\n\n\
+                         • Category: **{category}**\n\
+                         • Confidence: **{:.1}%** (below your {:.0}% {} sensitivity threshold)\n\
+                         • Action: **Permitted** (no bounce)\n\
+                         • Reason: {reason}",
+                        confidence * 100.0,
+                        threshold_pct,
+                        sender_rubric.sensitivity
+                    ))
+                }
+            }
             Verdict::Permitted { reason, confidence } => {
                 let conf_str = confidence
                     .map(|c| format!("\n• Confidence: {:.1}%", c * 100.0))

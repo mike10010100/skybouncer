@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.8] - 2026-10-16
+
+### Added
+
+- **CLI Authentication & Immunization (`--token`, `--allowlist`)**: `skybouncer status`, `skybouncer pardon`, and `skybouncer simulate` now support `--token <TOKEN>` (and `SKYBOUNCER_TOKEN` / `SKYBOUNCER_API_TOKEN` / `SKYBOUNCER_SESSION_TOKEN` / `PDS_ACCESS_TOKEN`), `skybouncer pardon --allowlist [--reason <TEXT>]`, and `skybouncer --version` (`-V`).
+- **DM Follower Bypass Command (`trust followers <on|off>`)**: Added `trust followers <on|off>` (and `bypass followers <on|off>`) to the Bluesky DM bot and surfaced `Follower Bypass:` status in `rules` and `help`.
+
+### Changed
+
+- **State-Preserving Rubric Updates (`RuleRubric::parse_updating`)**: Updating prompt text via DM `set rules <prompt>` or `POST /api/rules` now preserves existing `sensitivity`, `bounce_duration`, and `bypass_incoming_followers` settings unless explicitly overridden by inline directives.
+- **DM `test <text>` Threshold & Error Accuracy**: `test <text>` now evaluates confidence against the user's configured sensitivity threshold (`VIOLATION` vs `PERMITTED (BELOW THRESHOLD)`) and surfaces classifier errors clearly.
+- **Sovereign Web Dashboard UX**: Increased `/api/simulate` request body limit to 8 MB for base64 image uploads, added sign-in prompts and loading states on `Evaluate`, `● Unsaved Changes` dirty-state tracking in the House Rules card, friendly preset names with overwrite confirmation, automatic Sign-In modal trigger on `/auth` (`/?auth=login`), Escape/backdrop modal dismissal, dark-mode `select`/`.badge-*` styles, click-to-expand `.expandable-text`, and an unauthenticated telemetry notice banner.
+- **Strict CLI Flag Validation**: Unrecognized CLI flags or missing flag arguments now return `SkybouncerError::Config` instead of silently launching the live daemon.
+
 ## [0.2.7] - 2026-10-15
 
 ### Changed

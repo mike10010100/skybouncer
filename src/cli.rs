@@ -59,30 +59,83 @@ pub fn resolve_daemon_url(args: &[String]) -> String {
     format!("http://127.0.0.1:{}", web_config.port)
 }
 
+/// Resolves an optional authentication bearer token for CLI requests (`status`, `pardon`, `simulate`).
+///
+/// Precedence: `--token <TOKEN>` CLI flag, then `SKYBOUNCER_TOKEN` / `SKYBOUNCER_API_TOKEN` /
+/// `SKYBOUNCER_SESSION_TOKEN` / `PDS_ACCESS_TOKEN` environment variables (ignoring placeholder values).
+#[must_use]
+pub fn resolve_cli_token(args: &[String]) -> Option<String> {
+    if let Some(token) = arg_value(args, "--token") {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    crate::env::var(&[
+        "SKYBOUNCER_TOKEN",
+        "SKYBOUNCER_API_TOKEN",
+        "SKYBOUNCER_SESSION_TOKEN",
+        "PDS_ACCESS_TOKEN",
+    ])
+    .filter(|val| {
+        !matches!(
+            val.as_str(),
+            "your_access_jwt_here" | "placeholder" | "changeme"
+        )
+    })
+}
+
 /// Applies daemon CLI argument overrides (`--dry-run`, `--did`, `--admin`, `--rules`) to `config`.
 ///
 /// # Errors
-/// Returns [`SkybouncerError::Config`] if `--rules` fails to parse.
+/// Returns [`SkybouncerError::Config`] if `--rules` fails to parse, a value-taking flag is missing
+/// its value, or an unrecognized flag is passed.
 pub fn apply_daemon_overrides(
     config: &mut crate::engine::SkybouncerConfig,
     args: &[String],
 ) -> Result<(), SkybouncerError> {
-    if has_flag(args, "--dry-run") || has_flag(args, "--shadow-mode") {
-        config.dry_run = true;
-    }
     let mut i = 0;
     while i < args.len() {
-        if (args[i] == "--did" || args[i] == "--protected-did") && i + 1 < args.len() {
-            config.protected_dids.insert(args[i + 1].clone());
-            i += 1;
-        } else if (args[i] == "--admin" || args[i] == "--admin-did") && i + 1 < args.len() {
-            let admin = args[i + 1].clone();
-            config.protected_dids.insert(admin.clone());
-            config.admin_did = Some(admin);
-            i += 1;
-        } else if args[i] == "--rules" && i + 1 < args.len() {
-            config.rubric = RuleRubric::parse(&args[i + 1])?;
-            i += 1;
+        match args[i].as_str() {
+            "--dry-run" | "--shadow-mode" => {
+                config.dry_run = true;
+            }
+            "--did" | "--protected-did" => {
+                if i + 1 >= args.len() {
+                    return Err(SkybouncerError::Config(format!(
+                        "Missing value for '{}'",
+                        args[i]
+                    )));
+                }
+                config.protected_dids.insert(args[i + 1].clone());
+                i += 1;
+            }
+            "--admin" | "--admin-did" => {
+                if i + 1 >= args.len() {
+                    return Err(SkybouncerError::Config(format!(
+                        "Missing value for '{}'",
+                        args[i]
+                    )));
+                }
+                let admin = args[i + 1].clone();
+                config.protected_dids.insert(admin.clone());
+                config.admin_did = Some(admin);
+                i += 1;
+            }
+            "--rules" => {
+                if i + 1 >= args.len() {
+                    return Err(SkybouncerError::Config(
+                        "Missing value for '--rules'".to_string(),
+                    ));
+                }
+                config.rubric = RuleRubric::parse(&args[i + 1])?;
+                i += 1;
+            }
+            unknown => {
+                return Err(SkybouncerError::Config(format!(
+                    "Unknown daemon option: '{unknown}'. Run 'skybouncer --help' for usage."
+                )));
+            }
         }
         i += 1;
     }
@@ -116,7 +169,9 @@ pub fn parse_simulate_args(args: &[String]) -> Result<SimulateArgs, SkybouncerEr
 
     let mut i = 0;
     while i < args.len() {
-        if (args[i] == "--url" || args[i] == "--image") && i + 1 < args.len() {
+        if (args[i] == "--url" || args[i] == "--image" || args[i] == "--token")
+            && i + 1 < args.len()
+        {
             i += 2;
             continue;
         }
@@ -260,16 +315,21 @@ pub fn format_simulation_report(
 #[must_use]
 pub fn help_text() -> String {
     let mut out = String::new();
-    out.push_str("🛡️  Skybouncer — Sovereign ATProto Auto-Moderation & Bouncer\n\n");
+    out.push_str(&format!(
+        "🛡️  Skybouncer v{} — Sovereign ATProto Auto-Moderation & Bouncer\n\n",
+        env!("CARGO_PKG_VERSION")
+    ));
     out.push_str("USAGE:\n");
     out.push_str("  skybouncer [daemon] [OPTIONS]     Run the 24/7 firehose moderation daemon\n");
-    out.push_str("  skybouncer status [--url <URL>] [--json]\n");
+    out.push_str("  skybouncer status [--url <URL>] [--token <TOKEN>] [--json]\n");
     out.push_str(
-        "  skybouncer simulate <TEXT...> [--image <PATH_OR_URL>] [--url <URL>] [--offline]\n",
+        "  skybouncer simulate <TEXT...> [--image <PATH_OR_URL>] [--url <URL>] [--token <TOKEN>] [--offline]\n",
     );
     out.push_str(
-        "  skybouncer pardon <DID_OR_HANDLE> [--url <URL>] [--target <PROTECTED_DID>]\n\n",
+        "  skybouncer pardon <DID_OR_HANDLE> [--url <URL>] [--token <TOKEN>] [--target <PROTECTED_DID>] [--allowlist]\n",
     );
+    out.push_str("  skybouncer --version | -V         Print version information\n");
+    out.push_str("  skybouncer --help | -h            Print this help message\n\n");
     out.push_str("DAEMON OPTIONS:\n");
     out.push_str("  --did <DID>               Add a protected account DID (repeatable)\n");
     out.push_str("  --admin <DID>             Set the system administrator DID\n");
@@ -277,18 +337,22 @@ pub fn help_text() -> String {
     out.push_str("  --dry-run                 Shadow mode: evaluate but make zero PDS writes\n\n");
     out.push_str("STATUS OPTIONS:\n");
     out.push_str("  --url <URL>               Daemon base URL (default: http://127.0.0.1:3000)\n");
+    out.push_str("  --token <TOKEN>           Bearer token for authenticated fleet telemetry\n");
     out.push_str("  --json                    Output status as structured JSON\n\n");
     out.push_str("SIMULATE OPTIONS:\n");
     out.push_str(
         "  --image <PATH_OR_URL>     Attach image file or URL for multimodal evaluation\n",
     );
     out.push_str("  --url <URL>               Daemon base URL (default: http://127.0.0.1:3000)\n");
+    out.push_str("  --token <TOKEN>           Bearer token for daemon simulation API\n");
     out.push_str(
         "  --offline                 Force local offline evaluation without contacting daemon\n\n",
     );
     out.push_str("PARDON OPTIONS:\n");
     out.push_str("  --url <URL>               Daemon base URL (default: http://127.0.0.1:3000)\n");
+    out.push_str("  --token <TOKEN>           Bearer token (or set SKYBOUNCER_API_TOKEN / PDS_ACCESS_TOKEN)\n");
     out.push_str("  --target <DID>            Protected user DID whose modlist to pardon from\n");
+    out.push_str("  --allowlist               Also add the account to your permanent allowlist\n");
     out
 }
 

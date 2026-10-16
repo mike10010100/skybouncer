@@ -3471,3 +3471,90 @@ async fn test_api_admin_bounces_and_pardon_with_explicit_protected_did() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_api_update_rules_preserves_existing_settings_when_omitted() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let alice_token = create_test_session(&engine, "did:plc:alice");
+
+    // 1. Set sensitivity=high, bounce_duration=timeout7d, bypass_incoming_followers=false
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rules")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "prompt": "Initial prompt",
+                        "sensitivity": "high",
+                        "bounce_duration": "timeout7d",
+                        "bypass_incoming_followers": false
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. Now update ONLY the prompt field — sensitivity, bounce_duration, and bypass_incoming_followers must be preserved
+    let resp2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rules")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "prompt": "Updated prompt only"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let updated: RulesResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(updated.prompt, "Updated prompt only");
+    assert_eq!(updated.sensitivity, Sensitivity::High);
+    assert_eq!(updated.bounce_duration, BounceDuration::Timeout7d);
+    assert!(!updated.bypass_incoming_followers);
+
+    // 3. Verify operator CLI/API bearer token (SKYBOUNCER_API_TOKEN) authenticates against /api/status and /api/rules
+    std::env::set_var("SKYBOUNCER_API_TOKEN", "operator-secret-token-123");
+    let resp3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/rules")
+                .header("authorization", "Bearer operator-secret-token-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let s3 = resp3.status();
+    let resp_wrong = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/rules")
+                .header("authorization", "Bearer did:plc:spoof")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    std::env::remove_var("SKYBOUNCER_API_TOKEN");
+    assert_eq!(s3, StatusCode::OK);
+    assert_eq!(resp_wrong.status(), StatusCode::UNAUTHORIZED);
+}

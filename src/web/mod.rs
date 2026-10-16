@@ -179,7 +179,11 @@ pub fn create_web_router(
             "/allowlist/{did}",
             axum::routing::delete(api::remove_from_allowlist),
         )
-        .route("/simulate", post(api::simulate_interaction))
+        .route(
+            "/simulate",
+            post(api::simulate_interaction)
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
         .route("/me", get(api::get_current_user))
         .route("/admin/tenants", get(api::get_admin_tenants))
         .route("/admin/evaluations", get(api::get_admin_evaluations))

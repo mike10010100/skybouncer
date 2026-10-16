@@ -44,6 +44,11 @@ pub fn format_bounce_alert(notification: &BounceNotification) -> String {
         format!("\nProfile: {profile_url}")
     };
 
+    let target = command_target(
+        &notification.violator_did,
+        notification.violator_handle.as_deref(),
+    );
+
     format!(
         "🛡️ Skybouncer Action Alert:\n\n\
          Bounced violator: {violator}\n\
@@ -51,13 +56,10 @@ pub fn format_bounce_alert(notification: &BounceNotification) -> String {
          Reason: {}{snippet_section}{profile_section}\n\
          Post: {post_url}\n\n\
          To undo, reply with:\n\
-         pardon {}",
-        notification.category,
-        notification.reason,
-        command_target(
-            &notification.violator_did,
-            notification.violator_handle.as_deref()
-        ),
+         pardon {target}\n\n\
+         Or to undo and permanently allowlist:\n\
+         pardon and allow {target}",
+        notification.category, notification.reason,
     )
 }
 
