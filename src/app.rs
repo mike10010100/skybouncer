@@ -12,6 +12,7 @@ use crate::error::SkybouncerError;
 /// Executes the `skybouncer status` operational subcommand.
 pub async fn run_cli_status(args: &[String]) -> Result<(), SkybouncerError> {
     let daemon_url = cli::resolve_daemon_url(args);
+    let token = cli::resolve_cli_token(args);
     let json_output = args.iter().any(|a| a == "--json");
 
     let client = reqwest::Client::builder()
@@ -20,7 +21,12 @@ pub async fn run_cli_status(args: &[String]) -> Result<(), SkybouncerError> {
         .map_err(|e| SkybouncerError::Config(format!("HTTP client error: {e}")))?;
 
     let status_endpoint = format!("{daemon_url}/api/status");
-    let resp = match client.get(&status_endpoint).send().await {
+    let mut req = client.get(&status_endpoint);
+    if let Some(ref bearer) = token {
+        req = req.bearer_auth(bearer);
+    }
+
+    let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("❌ Could not connect to Skybouncer daemon at {daemon_url}: {e}");
@@ -173,19 +179,39 @@ pub async fn run_cli_status(args: &[String]) -> Result<(), SkybouncerError> {
     println!("  Moderation Prompt:          {}", status.rubric.prompt);
     println!();
 
+    if status.protected_dids.is_empty() && s.commits_received == 0 {
+        println!("  ℹ️  Note: Showing unauthenticated public status summary.");
+        println!(
+            "     Pass '--token <TOKEN>' or set SKYBOUNCER_API_TOKEN for full fleet telemetry."
+        );
+        println!();
+    }
+
     Ok(())
 }
 
 /// Executes the `skybouncer pardon` operational subcommand.
 pub async fn run_cli_pardon(args: &[String]) -> Result<(), SkybouncerError> {
     let daemon_url = cli::resolve_daemon_url(args);
+    let token = cli::resolve_cli_token(args);
     let mut subject = None;
     let protected_did = cli::arg_value(args, "--target").map(str::to_string);
+    let allowlist = cli::has_flag(args, "--allowlist") || cli::has_flag(args, "--allow");
+    let reason = cli::arg_value(args, "--reason").map(str::to_string);
 
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--url" && i + 1 < args.len() {
+        if (args[i] == "--url"
+            || args[i] == "--token"
+            || args[i] == "--target"
+            || args[i] == "--reason")
+            && i + 1 < args.len()
+        {
             i += 2;
+            continue;
+        }
+        if args[i] == "--allowlist" || args[i] == "--allow" {
+            i += 1;
             continue;
         }
         if !args[i].starts_with("--") && subject.is_none() {
@@ -199,7 +225,7 @@ pub async fn run_cli_pardon(args: &[String]) -> Result<(), SkybouncerError> {
         _ => {
             eprintln!("❌ Missing required account identifier.");
             eprintln!(
-                "   Usage: skybouncer pardon <DID_OR_HANDLE> [--url <URL>] [--target <PROTECTED_DID>]"
+                "   Usage: skybouncer pardon <DID_OR_HANDLE> [--url <URL>] [--token <TOKEN>] [--target <PROTECTED_DID>] [--allowlist]"
             );
             return Err(SkybouncerError::Config(
                 "Missing DID or handle to pardon".into(),
@@ -262,11 +288,16 @@ pub async fn run_cli_pardon(args: &[String]) -> Result<(), SkybouncerError> {
     let req_payload = crate::web::api::PardonRequest {
         subject_did: subject_did.clone(),
         protected_did,
-        allowlist: false,
-        reason: None,
+        allowlist,
+        reason,
     };
 
-    let resp = match client.post(&pardon_url).json(&req_payload).send().await {
+    let mut req = client.post(&pardon_url).json(&req_payload);
+    if let Some(ref bearer) = token {
+        req = req.bearer_auth(bearer);
+    }
+
+    let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("❌ Could not connect to Skybouncer daemon at {daemon_url}: {e}");
@@ -289,6 +320,11 @@ pub async fn run_cli_pardon(args: &[String]) -> Result<(), SkybouncerError> {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         eprintln!("❌ Pardon failed (HTTP {status}): {body}");
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            eprintln!(
+                "💡 Tip: Pass '--token <TOKEN>' or set SKYBOUNCER_API_TOKEN (or PDS_ACCESS_TOKEN) in your environment/.env to authenticate CLI requests."
+            );
+        }
         Err(SkybouncerError::Config(format!(
             "Pardon failed with HTTP {status}: {body}"
         )))
@@ -307,6 +343,7 @@ pub fn print_simulation_result(
 /// Executes the `skybouncer simulate` operational subcommand.
 pub async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
     let daemon_url = cli::resolve_daemon_url(args);
+    let token = cli::resolve_cli_token(args);
     let parsed = cli::parse_simulate_args(args)?;
     let cli::SimulateArgs {
         text,
@@ -332,7 +369,12 @@ pub async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
             image_url: image_url.clone(),
         };
 
-        if let Ok(resp) = client.post(&sim_endpoint).json(&payload).send().await {
+        let mut req = client.post(&sim_endpoint).json(&payload);
+        if let Some(ref bearer) = token {
+            req = req.bearer_auth(bearer);
+        }
+
+        if let Ok(resp) = req.send().await {
             if resp.status().is_success() {
                 if let Ok(data) = resp.json::<crate::web::api::SimulateResponse>().await {
                     print_simulation_result(&text, &data, &image_arg);
@@ -396,12 +438,13 @@ pub async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
 
 /// Dispatches a full argument vector (including the program name) to the matching subcommand.
 ///
-/// Supports `status`, `pardon`, `simulate`, `daemon` (default), and the backward-compatible
-/// bare-flag form (e.g. `skybouncer --dry-run`). The supplied [`CancellationToken`] is
-/// forwarded to the daemon so callers (and tests) can drive shutdown.
+/// Supports `status`, `pardon`, `simulate`, `daemon` (default), `version`/`--version`/`-V`,
+/// `help`/`--help`/`-h`, and the backward-compatible bare-flag form (e.g. `skybouncer --dry-run`).
+/// The supplied [`CancellationToken`] is forwarded to the daemon so callers (and tests) can drive
+/// shutdown.
 ///
 /// # Errors
-/// Returns [`SkybouncerError::Config`] for an unknown command, or any error from the
+/// Returns [`SkybouncerError::Config`] for an unknown command or option, or any error from the
 /// dispatched subcommand.
 pub async fn dispatch(
     args: &[String],
@@ -411,6 +454,11 @@ pub async fn dispatch(
 
     if args.iter().any(|a| a == "--help" || a == "-h") || subcmd == "help" {
         print!("{}", crate::cli::help_text());
+        return Ok(());
+    }
+
+    if args.iter().any(|a| a == "--version" || a == "-V") || subcmd == "version" {
+        println!("skybouncer v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
@@ -424,9 +472,16 @@ pub async fn dispatch(
             } else {
                 &args[0..0]
             };
+            let mut probe_cfg = SkybouncerConfig::default();
+            crate::cli::apply_daemon_overrides(&mut probe_cfg, daemon_args)?;
             crate::daemon::run(daemon_args, cancel).await
         }
-        arg if arg.starts_with("--") => crate::daemon::run(&args[1..], cancel).await,
+        arg if arg.starts_with('-') => {
+            let daemon_args = &args[1..];
+            let mut probe_cfg = SkybouncerConfig::default();
+            crate::cli::apply_daemon_overrides(&mut probe_cfg, daemon_args)?;
+            crate::daemon::run(daemon_args, cancel).await
+        }
         other => Err(SkybouncerError::Config(format!(
             "Unknown command: '{other}'"
         ))),

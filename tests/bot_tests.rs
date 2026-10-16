@@ -2172,6 +2172,9 @@ async fn test_command_all_privileged_denied_for_stranger() {
         "status",
         "test",
         "test some text",
+        "trust followers",
+        "trust followers off",
+        "bypass followers on",
     ];
     for cmd in commands {
         let reply = handler.handle_command(stranger, cmd).await.expect("handle");
@@ -2443,4 +2446,81 @@ async fn test_command_handler_second_protected_user_cannot_mutate_rules_sensitiv
         r3.contains("You can only update duration for your own enrolled account"),
         "r3={r3}"
     );
+}
+
+#[tokio::test]
+async fn test_set_rules_preserves_sensitivity_duration_and_follower_bypass() {
+    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
+    let user = "did:plc:protected1";
+
+    // Customize sensitivity, duration, and follower bypass first.
+    handler
+        .handle_command(user, "sensitivity high")
+        .await
+        .unwrap();
+    handler.handle_command(user, "duration 7d").await.unwrap();
+    let tf = handler
+        .handle_command(user, "trust followers off")
+        .await
+        .unwrap();
+    assert!(
+        tf.contains("Incoming follower bypass **disabled**"),
+        "tf={tf}"
+    );
+    assert!(!engine.bypass_incoming_followers(user));
+
+    // Now update prompt text without inline directives — existing settings must be preserved!
+    let updated = handler
+        .handle_command(user, "set rules Filter all bad-faith ragebait")
+        .await
+        .unwrap();
+    assert!(updated.contains("high"));
+    assert!(updated.contains("7-Day Timeout"));
+
+    let rules_view = handler.handle_command(user, "rules").await.unwrap();
+    assert!(rules_view.contains("Filter all bad-faith ragebait"));
+    assert!(rules_view.contains("Sensitivity: high"));
+    assert!(rules_view.contains("Duration: 7-Day Timeout"));
+    assert!(rules_view.contains("Follower Bypass: Disabled"));
+}
+
+#[tokio::test]
+async fn test_dm_test_command_respects_threshold_and_reports_classifier_errors() {
+    use skybouncer::classifier::ViolationCategory;
+
+    // 1. Violation below rubric threshold (0.65 < 0.90 Low sensitivity) must report PERMITTED (BELOW THRESHOLD)
+    let pds = MockPdsServer::start().await;
+    let cache = Arc::new(DeduplicationCache::open_in_memory().expect("cache"));
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Low);
+    let modlist =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let pds_client = Arc::new(pds.pds_client("did:plc:protected1"));
+    let classifier = Arc::new(skybouncer::classifier::MockClassifier::new(
+        Verdict::violation(ViolationCategory::Spam, 0.65, "mild promotional link"),
+    ));
+    let mut dids = HashSet::new();
+    dids.insert("did:plc:protected1".to_string());
+    let config = SkybouncerConfig::new(dids, rubric);
+    let engine = Arc::new(SkybouncerEngine::new(
+        config,
+        follow_graph,
+        gate,
+        classifier,
+        modlist,
+        pds_client,
+    ));
+    let handler = BotCommandHandler::new(engine, "did:plc:bot");
+
+    let below_reply = handler
+        .handle_command("did:plc:protected1", "test Check out my blog")
+        .await
+        .unwrap();
+    assert!(
+        below_reply.contains("PERMITTED (BELOW THRESHOLD)"),
+        "expected below-threshold verdict, got: {below_reply}"
+    );
+    assert!(below_reply.contains("below your 90% low sensitivity threshold"));
 }

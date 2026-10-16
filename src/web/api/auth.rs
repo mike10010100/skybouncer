@@ -7,7 +7,7 @@ pub fn extract_authenticated_caller(
     headers: &HeaderMap,
     engine: &SkybouncerEngine,
 ) -> Option<String> {
-    // 1. Check Authorization: Bearer <session_token>
+    // 1. Check Authorization: Bearer <session_token_or_api_token>
     if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
         if let Ok(s) = auth_header.to_str() {
             let trimmed = s.trim();
@@ -15,6 +15,9 @@ pub fn extract_authenticated_caller(
                 let token = token.trim();
                 if !token.is_empty() {
                     if let Ok(Some(did)) = engine.tenant_registry().validate_web_session(token) {
+                        return Some(did);
+                    }
+                    if let Some(did) = validate_configured_api_token(token, engine) {
                         return Some(did);
                     }
                 }
@@ -40,6 +43,34 @@ pub fn extract_authenticated_caller(
         }
     }
 
+    None
+}
+
+/// Validates an operator CLI/API bearer token against configured environment secrets
+/// (`SKYBOUNCER_API_TOKEN`, `SKYBOUNCER_TOKEN`, or `PDS_ACCESS_TOKEN`), resolving to the
+/// configured administrator DID or primary protected DID.
+fn validate_configured_api_token(token: &str, engine: &SkybouncerEngine) -> Option<String> {
+    if token.starts_with("did:") {
+        return None;
+    }
+    let configured = crate::env::var(&[
+        "SKYBOUNCER_API_TOKEN",
+        "SKYBOUNCER_TOKEN",
+        "PDS_ACCESS_TOKEN",
+    ])
+    .filter(|val| {
+        !matches!(
+            val.as_str(),
+            "your_access_jwt_here" | "placeholder" | "changeme" | "test_token"
+        )
+    })?;
+    if configured.len() >= 8 && configured == token {
+        if let Some(admin) = engine.config().admin_did {
+            return Some(admin);
+        }
+        let protected = engine.protected_dids();
+        return protected.into_iter().min();
+    }
     None
 }
 
@@ -133,9 +164,9 @@ pub async fn update_rules(
                 "Prompt cannot be empty".to_string(),
             ));
         }
-        let parsed = RuleRubric::parse(trimmed)
+        rubric = rubric
+            .parse_updating(trimmed)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid rubric: {e}")))?;
-        rubric.prompt = parsed.prompt;
     }
 
     if let Some(sens) = payload.sensitivity {

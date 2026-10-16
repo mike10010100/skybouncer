@@ -487,3 +487,74 @@ async fn dispatch_daemon_with_subcommand_args_reaches_daemon() {
     cancel.cancel();
     let _ = dispatch(&a, cancel).await;
 }
+
+#[tokio::test]
+async fn dispatch_version_flags_and_strict_daemon_flag_validation() {
+    use skybouncer::app::dispatch;
+    use tokio_util::sync::CancellationToken;
+
+    for flag in ["--version", "-V", "version"] {
+        let a = args(&["skybouncer", flag]);
+        dispatch(&a, CancellationToken::new())
+            .await
+            .expect("version dispatch ok");
+    }
+
+    // Unknown bare flag must error immediately with SkybouncerError::Config instead of starting daemon.
+    let bad_bare = args(&["skybouncer", "--unknown-flag"]);
+    let err = dispatch(&bad_bare, CancellationToken::new())
+        .await
+        .expect_err("unknown bare flag must fail");
+    assert!(matches!(err, skybouncer::SkybouncerError::Config(_)));
+
+    // Unknown flag under `daemon` subcommand must also error immediately.
+    let bad_daemon = args(&["skybouncer", "daemon", "--unknown-flag"]);
+    let err2 = dispatch(&bad_daemon, CancellationToken::new())
+        .await
+        .expect_err("unknown daemon flag must fail");
+    assert!(matches!(err2, skybouncer::SkybouncerError::Config(_)));
+
+    // Missing value for `--did` must error immediately.
+    let missing_val = args(&["skybouncer", "--did"]);
+    let err3 = dispatch(&missing_val, CancellationToken::new())
+        .await
+        .expect_err("missing --did value must fail");
+    assert!(matches!(err3, skybouncer::SkybouncerError::Config(_)));
+}
+
+#[tokio::test]
+async fn run_cli_pardon_forwards_token_and_allowlist() {
+    use wiremock::matchers::{body_partial_json, header};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/pardon"))
+        .and(header("authorization", "Bearer test-cli-secret"))
+        .and(body_partial_json(json!({
+            "subject_did": "did:plc:friend",
+            "allowlist": true,
+            "reason": "trusted friend"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "subject_did": "did:plc:friend",
+            "pardoned": false,
+            "allowlisted": true,
+            "message": "allowlisted"
+        })))
+        .mount(&server)
+        .await;
+
+    let a = args(&[
+        "did:plc:friend",
+        "--allowlist",
+        "--reason",
+        "trusted friend",
+        "--token",
+        "test-cli-secret",
+        "--url",
+        &server.uri(),
+    ]);
+    run_cli_pardon(&a)
+        .await
+        .expect("pardon with token and allowlist ok");
+}
