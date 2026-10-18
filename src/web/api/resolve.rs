@@ -120,41 +120,34 @@ pub async fn auth_preview(
         || skyauth::identity::IdentityResolver::new(skyauth::ssrf::SsrfFilter::default()),
         |client| client.resolver().clone(),
     );
-    let discovered = resolver.discover_oauth_endpoints(&normalized).await.ok();
+    let mut discovered = resolver.discover_oauth_endpoints(&normalized).await.ok();
+    if discovered.is_none() && !normalized.starts_with("did:") {
+        if let Some(fallback_did) = state.engine.resolve_handle(&normalized).await {
+            if let Ok(mut ep) = resolver.discover_oauth_endpoints(&fallback_did).await {
+                if ep.handle.is_none() {
+                    ep.handle = Some(normalized.clone());
+                }
+                discovered = Some(ep);
+            }
+        }
+    }
 
-    let (did, resolved_handle, pds_endpoint, pds_host, auth_server_host) =
-        if let Some(ep) = discovered {
-            let p_host = ep.pds_host().unwrap_or_else(|| "bsky.social".to_string());
-            let as_host = ep.auth_server_host().unwrap_or_else(|| p_host.clone());
-            (ep.did, ep.handle, ep.pds_endpoint, p_host, as_host)
-        } else if normalized.starts_with("did:") {
-            let Some(handle) = state.engine.resolve_did_to_handle(&normalized).await else {
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    format!("Could not resolve DID or PDS for '{normalized}'"),
-                ));
-            };
-            (
-                normalized.clone(),
-                Some(handle),
-                "https://bsky.social".to_string(),
-                "bsky.social".to_string(),
-                "bsky.social".to_string(),
-            )
-        } else if let Some(fallback_did) = state.engine.resolve_handle(&normalized).await {
-            (
-                fallback_did,
-                Some(normalized.clone()),
-                "https://bsky.social".to_string(),
-                "bsky.social".to_string(),
-                "bsky.social".to_string(),
-            )
-        } else {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                format!("Could not resolve handle or PDS for '{normalized}'"),
-            ));
-        };
+    let Some(ep) = discovered else {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Could not resolve handle or PDS for '{normalized}'"),
+        ));
+    };
+    let Some(pds_host) = ep.pds_host() else {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Could not determine PDS host for '{normalized}'"),
+        ));
+    };
+    let auth_server_host = ep.auth_server_host().unwrap_or_else(|| pds_host.clone());
+    let did = ep.did;
+    let resolved_handle = ep.handle;
+    let pds_endpoint = ep.pds_endpoint;
 
     #[derive(Deserialize)]
     struct RawProfile {
@@ -171,9 +164,15 @@ pub async fn auth_preview(
         .await
         .ok();
 
-    let canonical_handle = resolved_handle
-        .or_else(|| profile.as_ref().and_then(|p| p.handle.clone()))
-        .unwrap_or(normalized);
+    let canonical_handle = if let Some(h) = resolved_handle {
+        h
+    } else if let Some(h) = profile.as_ref().and_then(|p| p.handle.clone()) {
+        h
+    } else if let Some(h) = state.engine.resolve_did_to_handle(&did).await {
+        h
+    } else {
+        normalized
+    };
     let _ = state
         .engine
         .cache()
