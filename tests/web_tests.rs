@@ -3705,8 +3705,9 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
     assert_eq!(did_preview.handle, "skybouncertestuser9999.bsky.social");
     assert!(!did_preview.assumed_bsky_social);
 
-    // 6. Unresolvable handle returns 502 Bad Gateway
+    // 6. Unresolvable handle or DID returns 502 Bad Gateway
     let bad_preview_resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/auth/preview?handle=nonexistent.invalid")
@@ -3717,7 +3718,19 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         .unwrap();
     assert_eq!(bad_preview_resp.status(), StatusCode::BAD_GATEWAY);
 
-    // 7. With a configured AtprotoOAuthClient, /api/auth/preview discovers PDS + Auth Server endpoints
+    let bad_did_preview_resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=did:plc:nonexistent999999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_did_preview_resp.status(), StatusCode::BAD_GATEWAY);
+
+    // 7. With a configured AtprotoOAuthClient passed to create_web_router, engine.oauth_client()
+    //    is populated automatically, /api/auth/preview discovers PDS + Auth Server endpoints,
     //    and /oauth/login initiates PAR and redirects to the authorization endpoint.
     let base_url = mock_appview.uri();
     let valid_did = "did:plc:alice1234567890123456789";
@@ -3793,8 +3806,9 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
             .build()
             .expect("oauth client"),
     );
-    _engine.set_oauth_client(Arc::clone(&oauth_client));
+    assert!(_engine.oauth_client().is_none());
     let app_with_oauth = create_web_router(Arc::clone(&_engine), Some(oauth_client), metadata);
+    assert!(_engine.oauth_client().is_some());
 
     let oauth_preview_resp = app_with_oauth
         .clone()

@@ -155,6 +155,12 @@ pub fn create_web_router(
     oauth_client: Option<Arc<AtprotoOAuthClient>>,
     metadata: OAuthClientMetadata,
 ) -> Router {
+    if let Some(ref c) = oauth_client {
+        if engine.oauth_client().is_none() {
+            engine.set_oauth_client(Arc::clone(c));
+        }
+    }
+
     let api_state = ApiState {
         engine: Arc::clone(&engine),
     };

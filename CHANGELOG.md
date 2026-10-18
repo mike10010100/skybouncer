@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.10] - 2026-10-18
+
+### Fixed
+
+- **OAuth Pre-Flight Discovery & DID Validation (`GET /api/auth/preview`, `web::create_web_router`)**:
+  - `create_web_router` now attaches the provided `AtprotoOAuthClient` to `SkybouncerEngine` when `engine.oauth_client()` is unset, and `auth_preview` falls back to a default `skyauth::identity::IdentityResolver` when running without an `AtprotoOAuthClient` so custom-PDS provider host discovery works in all router configurations.
+  - `auth_preview` now validates `did:` inputs via `resolve_did_to_handle` when OAuth endpoint discovery fails, returning `502 Bad Gateway` for unresolvable DIDs instead of accepting arbitrary `did:` prefixes.
+  - Hardened the dashboard's `previewAndConfirmAccount` network error handler so raw handle entries surface a clear connection error rather than advancing to confirmation with an unverified default provider.
+
 ## [0.2.9] - 2026-10-18
 
 ### Added
