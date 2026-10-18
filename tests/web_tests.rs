@@ -3645,7 +3645,7 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         Some("Alice Skybouncer")
     );
 
-    // 3. Empty handle on /api/auth/preview returns 400 Bad Request
+    // 3. Empty handle on /api/auth/preview returns 400 Bad Request, and invalid DID when oauth_client is None returns 502
     let empty_preview = app
         .clone()
         .oneshot(
@@ -3657,6 +3657,18 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         .await
         .unwrap();
     assert_eq!(empty_preview.status(), StatusCode::BAD_REQUEST);
+
+    let no_oauth_bad_did = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=did:invalid:syntax")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_oauth_bad_did.status(), StatusCode::BAD_GATEWAY);
 
     // 4. With a configured AtprotoOAuthClient passed to create_web_router, engine.oauth_client()
     //    is populated automatically, and /api/auth/preview discovers verified PDS + Auth Server endpoints
