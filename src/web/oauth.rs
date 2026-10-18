@@ -60,7 +60,7 @@ pub async fn oauth_login(
     State(state): State<OAuthState>,
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, (StatusCode, String)> {
-    let handle = query
+    let raw_handle = query
         .handle
         .as_deref()
         .map(str::trim)
@@ -72,6 +72,8 @@ pub async fn oauth_login(
             )
         })?;
 
+    let handle = crate::util::normalize_handle_or_default(raw_handle);
+
     let client = state.oauth_client.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -81,7 +83,7 @@ pub async fn oauth_login(
 
     info!(handle = %handle, "Initiating ATProto OAuth login flow");
 
-    match client.authorize(handle).await {
+    match client.authorize(&handle).await {
         Ok(auth_req) => redirect_to_authorization(&auth_req).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

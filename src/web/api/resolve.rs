@@ -1,5 +1,13 @@
 use super::*;
 
+fn appview_client_from_env() -> skybase::appview::AppViewClient {
+    let endpoint = crate::env::var_or(
+        &["APPVIEW_ENDPOINT", "SKYBOUNCER_APPVIEW_ENDPOINT"],
+        crate::enricher::DEFAULT_APPVIEW_ENDPOINT,
+    );
+    skybase::appview::AppViewClient::with_endpoint(endpoint)
+}
+
 /// Handler for `GET /api/resolve`: resolves a DID to a handle, or a handle to a DID.
 ///
 /// Authentication is strictly required, as resolution may perform outbound AppView/PLC
@@ -39,11 +47,11 @@ pub async fn resolve_identity(
             .filter(|s| !s.trim().starts_with("did:"))
     });
     if let Some(handle) = raw_handle.filter(|s| !s.trim().is_empty()) {
-        let clean_handle = crate::util::normalize_handle(handle);
-        let did = state.engine.resolve_handle(clean_handle).await;
+        let normalized_handle = crate::util::normalize_handle_or_default(handle);
+        let did = state.engine.resolve_handle(&normalized_handle).await;
         return Ok(Json(ResolveResponse {
             did,
-            handle: Some(clean_handle.to_string()),
+            handle: Some(normalized_handle),
         }));
     }
 
@@ -51,4 +59,167 @@ pub async fn resolve_identity(
         StatusCode::BAD_REQUEST,
         "Query parameter 'did', 'handle', or 'actor' is required".to_string(),
     ))
+}
+
+/// Handler for `GET /api/auth/typeahead`: returns live actor suggestions for the Sign-In modal.
+///
+/// Queries the configured AppView's `app.bsky.actor.searchActorsTypeahead` endpoint and
+/// degrades gracefully to an empty list on transport or upstream errors.
+pub async fn auth_typeahead(
+    Query(query): Query<AuthTypeaheadQuery>,
+) -> Result<Json<AuthTypeaheadResponse>, (StatusCode, String)> {
+    let raw_q = query.q.as_deref().unwrap_or("").trim();
+    let clean_q = crate::util::normalize_handle(raw_q).trim();
+    if clean_q.len() < 2 || clean_q.len() > 128 {
+        return Ok(Json(AuthTypeaheadResponse { actors: Vec::new() }));
+    }
+
+    let limit = query.limit.unwrap_or(6).clamp(1, 15);
+    let client = appview_client_from_env();
+
+    let actors = client
+        .search_actors_typeahead(clean_q, limit)
+        .await
+        .into_iter()
+        .map(|a| AuthActorSuggestion {
+            did: a.did,
+            handle: a.handle,
+            display_name: a.display_name,
+            avatar: a.avatar,
+        })
+        .collect();
+
+    Ok(Json(AuthTypeaheadResponse { actors }))
+}
+
+/// Handler for `GET /api/auth/preview`: resolves a handle or DID prior to OAuth redirect
+/// so the user can confirm their account and see which PDS / provider host they will be
+/// redirected to ("Is this you? Continue to `<pds_host>`").
+pub async fn auth_preview(
+    State(state): State<ApiState>,
+    Query(query): Query<AuthPreviewQuery>,
+) -> Result<Json<AuthPreviewResponse>, (StatusCode, String)> {
+    let raw = query
+        .handle
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Query parameter 'handle' is required".to_string(),
+            )
+        })?;
+
+    let stripped = crate::util::normalize_handle(raw).trim();
+    if stripped.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Handle cannot be empty".to_string(),
+        ));
+    }
+
+    let normalized = crate::util::normalize_handle_or_default(stripped);
+    let assumed_bsky_social =
+        !stripped.starts_with("did:") && !stripped.contains('.') && normalized != stripped;
+
+    // 1. Try full OAuth endpoint discovery via the configured AtprotoOAuthClient (or default IdentityResolver)
+    let resolver = state
+        .engine
+        .oauth_client()
+        .map(|c| c.resolver().clone())
+        .unwrap_or_else(|| {
+            skyauth::identity::IdentityResolver::new(skyauth::ssrf::SsrfFilter::default())
+        });
+
+    let (did, mut resolved_handle, pds_endpoint, pds_host, auth_server_host) = match resolver
+        .discover_oauth_endpoints(&normalized)
+        .await
+    {
+        Ok(endpoints) => {
+            let p_host = endpoints
+                .pds_host()
+                .unwrap_or_else(|| "bsky.social".to_string());
+            let as_host = endpoints
+                .auth_server_host()
+                .unwrap_or_else(|| p_host.clone());
+            (
+                endpoints.did,
+                endpoints.handle,
+                endpoints.pds_endpoint,
+                p_host,
+                as_host,
+            )
+        }
+        Err(primary_err) => {
+            // 2. Fallback to engine handle resolution (supports offline tests & custom enricher mocks)
+            if let Some(fallback_did) = state.engine.resolve_handle(&normalized).await {
+                let fallback_handle = if normalized.starts_with("did:") {
+                    state.engine.resolve_did_to_handle(&fallback_did).await
+                } else {
+                    Some(normalized.clone())
+                };
+                (
+                    fallback_did,
+                    fallback_handle,
+                    "https://bsky.social".to_string(),
+                    "bsky.social".to_string(),
+                    "bsky.social".to_string(),
+                )
+            } else {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("Could not resolve handle or PDS for '{normalized}': {primary_err}"),
+                ));
+            }
+        }
+    };
+
+    // 3. Best-effort public profile enrichment (display name + avatar) from AppView
+    #[derive(Deserialize)]
+    struct RawProfile {
+        #[serde(default)]
+        handle: Option<String>,
+        #[serde(default, rename = "displayName")]
+        display_name: Option<String>,
+        #[serde(default)]
+        avatar: Option<String>,
+    }
+
+    let appview = appview_client_from_env();
+    let profile = appview
+        .get::<RawProfile>("app.bsky.actor.getProfile", &[("actor", did.clone())])
+        .await
+        .ok();
+
+    if resolved_handle.is_none() {
+        resolved_handle = profile
+            .as_ref()
+            .and_then(|p| p.handle.clone())
+            .or_else(|| state.engine.cached_handle_for_did(&did));
+    }
+
+    let canonical_handle = resolved_handle.unwrap_or_else(|| {
+        if normalized.starts_with("did:") {
+            did.clone()
+        } else {
+            normalized
+        }
+    });
+
+    let _ = state
+        .engine
+        .cache()
+        .set_handle_for_did(&did, &canonical_handle);
+
+    Ok(Json(AuthPreviewResponse {
+        did,
+        handle: canonical_handle,
+        display_name: profile.as_ref().and_then(|p| p.display_name.clone()),
+        avatar: profile.and_then(|p| p.avatar),
+        pds_endpoint,
+        pds_host,
+        auth_server_host,
+        assumed_bsky_social,
+    }))
 }

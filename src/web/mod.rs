@@ -22,13 +22,14 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 pub use api::{
-    get_prometheus_metrics, health_check, resolve_identity, AddAllowlistRequest,
-    AddAllowlistResponse, AdminEvaluationsQuery, AdminEvaluationsResponse, AdminTenantsResponse,
-    AllowlistQuery, ApiState, BouncedUserWithHandle, BouncesQuery, EvaluationsQuery,
-    EvaluationsResponse, HealthResponse, PardonRequest, PardonResponse, RemoveAllowlistResponse,
-    ResolveQuery, ResolveResponse, RulesResponse, SimulateRequest, SimulateResponse,
-    StatusResponse, TenantSummary, ToggleTenantRequest, ToggleTenantResponse, UpdateRulesRequest,
-    UserSessionResponse,
+    auth_preview, auth_typeahead, get_prometheus_metrics, health_check, resolve_identity,
+    AddAllowlistRequest, AddAllowlistResponse, AdminEvaluationsQuery, AdminEvaluationsResponse,
+    AdminTenantsResponse, AllowlistQuery, ApiState, AuthActorSuggestion, AuthPreviewQuery,
+    AuthPreviewResponse, AuthTypeaheadQuery, AuthTypeaheadResponse, BouncedUserWithHandle,
+    BouncesQuery, EvaluationsQuery, EvaluationsResponse, HealthResponse, PardonRequest,
+    PardonResponse, RemoveAllowlistResponse, ResolveQuery, ResolveResponse, RulesResponse,
+    SimulateRequest, SimulateResponse, StatusResponse, TenantSummary, ToggleTenantRequest,
+    ToggleTenantResponse, UpdateRulesRequest, UserSessionResponse,
 };
 pub use oauth::{LoginQuery, OAuthState};
 pub use ui::{serve_dashboard, DASHBOARD_HTML};
@@ -190,6 +191,8 @@ pub fn create_web_router(
         .route("/evaluations", get(api::get_evaluations))
         .route("/tenant/toggle", post(api::toggle_tenant))
         .route("/auth/logout", post(api::logout))
+        .route("/auth/typeahead", get(api::auth_typeahead))
+        .route("/auth/preview", get(api::auth_preview))
         .route("/resolve", get(api::resolve_identity))
         .with_state(api_state.clone());
 

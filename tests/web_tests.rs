@@ -3558,3 +3558,75 @@ async fn test_api_update_rules_preserves_existing_settings_when_omitted() {
     assert_eq!(s3, StatusCode::OK);
     assert_eq!(resp_wrong.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
+    let (_engine, cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+
+    // 1. Verify dashboard HTML includes the multi-step Atmosphere login UX views
+    assert!(DASHBOARD_HTML.contains("login-view-saved"));
+    assert!(DASHBOARD_HTML.contains("login-view-input"));
+    assert!(DASHBOARD_HTML.contains("login-view-confirm"));
+    assert!(DASHBOARD_HTML.contains("login-view-explainer"));
+    assert!(DASHBOARD_HTML.contains("How signing in works"));
+    assert!(DASHBOARD_HTML.contains("never sees your password"));
+    assert!(DASHBOARD_HTML.contains("No domain included"));
+    assert!(DASHBOARD_HTML.contains("Bluesky or AT Protocol (Atmosphere) Handle"));
+    assert!(DASHBOARD_HTML.contains("Forget account on this device"));
+
+    // 2. Short typeahead query (< 2 chars) returns empty list immediately without network I/O
+    let typeahead_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/typeahead?q=a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(typeahead_resp.status(), StatusCode::OK);
+    let typeahead_bytes = axum::body::to_bytes(typeahead_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let typeahead: skybouncer::web::AuthTypeaheadResponse =
+        serde_json::from_slice(&typeahead_bytes).unwrap();
+    assert!(typeahead.actors.is_empty());
+
+    // 3. Empty handle on /api/auth/preview returns 400 Bad Request
+    let empty_preview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=%20%20")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_preview.status(), StatusCode::BAD_REQUEST);
+
+    // 4. Bare handle ("skybouncertestuser9999" or "@skybouncertestuser9999") auto-completes to ".bsky.social" and resolves against cached handle
+    cache
+        .set_handle_for_did("did:plc:alice123", "skybouncertestuser9999.bsky.social")
+        .unwrap();
+    let preview_resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=%40skybouncertestuser9999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview_resp.status(), StatusCode::OK);
+    let preview_bytes = axum::body::to_bytes(preview_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let preview: skybouncer::web::AuthPreviewResponse =
+        serde_json::from_slice(&preview_bytes).unwrap();
+    assert_eq!(preview.did, "did:plc:alice123");
+    assert_eq!(preview.handle, "skybouncertestuser9999.bsky.social");
+    assert!(preview.assumed_bsky_social);
+    assert!(!preview.pds_host.is_empty());
+}

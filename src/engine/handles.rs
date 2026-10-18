@@ -5,12 +5,28 @@ impl SkybouncerEngine {
     /// tenant registry handle-mapping TTL caching, the persisted SQLite handle
     /// cache, and the configured context enricher.
     ///
+    /// Bare single-label handles without a domain (e.g. `"alice"` or `"@alice"`) automatically
+    /// fall back to `.bsky.social` (`"alice.bsky.social"`).
     /// If the provided handle is already a DID (starts with `did:`), it is returned directly.
     pub async fn resolve_handle(&self, handle: &str) -> Option<String> {
         let clean = crate::util::normalize_handle(handle);
+        if clean.is_empty() {
+            return None;
+        }
         if clean.starts_with("did:") {
             return Some(clean.to_string());
         }
+        if let Some(did) = self.resolve_handle_exact(clean).await {
+            return Some(did);
+        }
+        let expanded = crate::util::normalize_handle_or_default(clean);
+        if expanded != clean {
+            return self.resolve_handle_exact(&expanded).await;
+        }
+        None
+    }
+
+    async fn resolve_handle_exact(&self, clean: &str) -> Option<String> {
         let now = std::time::Instant::now();
 
         // 1. In-memory monotonic check

@@ -814,26 +814,170 @@
 
   <div class="toast" id="toast">Changes saved</div>
 
-  <!-- Bluesky OAuth Login Modal -->
-  <div id="login-modal" onclick="if (event.target === this) closeLoginModal()" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(6px); z-index: 9999; align-items: center; justify-content: center;">
-    <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius); padding: 2rem; max-width: 420px; width: 90%; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
-        <h3 style="margin: 0; font-size: 1.25rem; font-weight: 700;">Sign In with Bluesky</h3>
-        <button onclick="closeLoginModal()" style="background: none; border: none; color: var(--text-muted); font-size: 1.5rem; cursor: pointer; line-height: 1;">&times;</button>
+  <!-- Bluesky / AT Protocol OAuth Login Modal -->
+  <div id="login-modal" onclick="if (event.target === this) closeLoginModal()" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.72); backdrop-filter: blur(6px); z-index: 9999; align-items: center; justify-content: center; padding: 1rem;">
+    <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius); padding: 1.75rem; max-width: 460px; width: 100%; box-shadow: 0 24px 38px -8px rgba(0, 0, 0, 0.6); position: relative;">
+      <!-- Modal Header -->
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; gap: 0.5rem;">
+        <h3 id="login-modal-title" style="margin: 0; font-size: 1.2rem; font-weight: 700;">Sign In with Bluesky</h3>
+        <div style="display: flex; align-items: center; gap: 0.35rem;">
+          <button type="button" id="login-info-toggle-btn" onclick="toggleLoginExplainer()" title="How signing in works" aria-label="How signing in works" style="background: rgba(99, 102, 241, 0.12); border: 1px solid rgba(99, 102, 241, 0.3); color: var(--accent); border-radius: 9999px; width: 1.85rem; height: 1.85rem; display: inline-flex; align-items: center; justify-content: center; font-size: 0.85rem; font-weight: 700; cursor: pointer;">&#9432;</button>
+          <button type="button" onclick="closeLoginModal()" aria-label="Close sign in dialog" style="background: none; border: none; color: var(--text-muted); font-size: 1.5rem; cursor: pointer; line-height: 1; padding: 0 0.25rem;">&times;</button>
+        </div>
       </div>
-      <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.25rem;">
-        Authenticate with ATProto OAuth 2.0 to unlock your sovereign moderation rules, admin oversight, and personal bounce feed.
-      </p>
-      <form id="login-form" onsubmit="handleLoginSubmit(event)">
-        <div style="margin-bottom: 1.25rem;">
-          <label style="display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.4rem; color: var(--text-muted);">Bluesky Handle</label>
-          <input type="text" id="login-handle-input" class="input" placeholder="e.g. alice.bsky.social or custom domain" style="width: 100%; box-sizing: border-box;" required autocomplete="username" />
+
+      <!-- Error Banner -->
+      <div id="login-error-banner" style="display: none; background: var(--danger-bg); border: 1px solid rgba(239, 68, 68, 0.4); color: var(--danger); padding: 0.65rem 0.85rem; border-radius: 8px; font-size: 0.82rem; margin-bottom: 1rem;"></div>
+
+      <!-- View 1: Returning User Saved Accounts Picker ("Welcome back") -->
+      <div id="login-view-saved" style="display: none;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.65rem;">
+          <span style="font-size: 0.85rem; color: var(--text-muted);">Choose an account to sign in:</span>
+          <button type="button" id="login-saved-edit-btn" onclick="toggleSavedAccountsEditMode()" style="background: none; border: none; color: var(--accent); font-size: 0.8rem; font-weight: 600; cursor: pointer; padding: 0.15rem 0.35rem;">Edit</button>
         </div>
-        <div style="display: flex; gap: 0.75rem; justify-content: flex-end;">
-          <button type="button" class="btn btn-secondary" onclick="closeLoginModal()">Cancel</button>
-          <button type="submit" class="btn" id="login-submit-btn">Continue &rarr;</button>
+        <div id="login-saved-accounts-list" style="display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; max-height: 240px; overflow-y: auto;"></div>
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; padding-top: 0.5rem; border-top: 1px solid var(--border-color);">
+          <button type="button" class="btn btn-secondary" style="width: 100%; justify-content: center;" onclick="showLoginInputView()">Use another account</button>
         </div>
-      </form>
+      </div>
+
+      <!-- View 2: Handle Input + Live Typeahead + Bare Handle .bsky.social Hint -->
+      <div id="login-view-input">
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1.1rem; line-height: 1.45;">
+          Sign in with your Bluesky or AT Protocol (Atmosphere) account to manage your sovereign moderation rules and personal bounce feed.
+        </p>
+        <form id="login-form" onsubmit="handleLoginSubmit(event)">
+          <div style="margin-bottom: 1.15rem; position: relative;">
+            <label for="login-handle-input" style="display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.4rem; color: var(--text-muted);">Bluesky or AT Protocol (Atmosphere) Handle</label>
+            <input
+              type="text"
+              id="login-handle-input"
+              name="username"
+              class="input"
+              placeholder="e.g. alice or alice.bsky.social"
+              style="width: 100%; box-sizing: border-box;"
+              required
+              autocomplete="username"
+              autocorrect="off"
+              autocapitalize="none"
+              spellcheck="false"
+              inputmode="email"
+              oninput="onLoginHandleInput(event)"
+              onkeydown="onLoginHandleKeydown(event)"
+            />
+            <!-- Bare handle .bsky.social completion hint -->
+            <div id="login-bare-handle-hint" style="display: none; font-size: 0.76rem; color: var(--text-muted); margin-top: 0.4rem; padding: 0.35rem 0.6rem; background: rgba(99, 102, 241, 0.08); border-left: 2px solid var(--accent); border-radius: 4px;">
+              No domain included &mdash; <strong style="color: var(--text-main);">.bsky.social</strong> is assumed (<code id="login-bare-handle-preview" style="color: var(--accent);">@alice.bsky.social</code>).
+            </div>
+            <!-- Live Typeahead Dropdown -->
+            <div id="login-typeahead-list" role="listbox" aria-label="Matching accounts" style="display: none; position: absolute; left: 0; right: 0; top: calc(100% + 4px); background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 10px; box-shadow: 0 14px 28px rgba(0, 0, 0, 0.55); z-index: 10001; max-height: 250px; overflow-y: auto;"></div>
+          </div>
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+            <button type="button" id="login-back-to-saved-btn" onclick="showSavedAccountsView()" style="display: none; background: none; border: none; color: var(--text-muted); font-size: 0.8rem; cursor: pointer; padding: 0.25rem 0;">&larr; Saved accounts</button>
+            <div style="display: flex; gap: 0.65rem; margin-left: auto;">
+              <button type="button" class="btn btn-secondary" onclick="closeLoginModal()">Cancel</button>
+              <button type="submit" class="btn" id="login-submit-btn">Continue &rarr;</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+      <!-- View 3: Pre-Flight Identity & Provider Confirmation ("Is this you?") -->
+      <div id="login-view-confirm" style="display: none;">
+        <p id="login-confirm-subtitle" style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.9rem;">
+          Confirm your account before continuing to your provider:
+        </p>
+        <!-- Resolved Identity Card -->
+        <div style="background: rgba(0, 0, 0, 0.25); border: 1px solid var(--border-color); border-radius: 10px; padding: 0.9rem 1rem; margin-bottom: 1rem;">
+          <div style="display: flex; align-items: center; gap: 0.8rem;">
+            <img id="login-confirm-avatar" src="" alt="" style="width: 44px; height: 44px; border-radius: 9999px; object-fit: cover; display: none; border: 1px solid var(--border-color); flex-shrink: 0;" />
+            <div id="login-confirm-avatar-fallback" style="width: 44px; height: 44px; border-radius: 9999px; background: rgba(99, 102, 241, 0.2); color: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1.1rem; flex-shrink: 0;">@</div>
+            <div style="min-width: 0; flex: 1;">
+              <div id="login-confirm-display-name" style="font-weight: 700; font-size: 0.98rem; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
+              <div id="login-confirm-handle" style="font-size: 0.84rem; color: var(--accent); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
+              <div id="login-confirm-did" style="font-size: 0.72rem; color: var(--text-muted); font-family: monospace; margin-top: 0.1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
+            </div>
+          </div>
+          <div style="margin-top: 0.75rem; padding-top: 0.65rem; border-top: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; font-size: 0.78rem;">
+            <span style="color: var(--text-muted);">Provider (Host)</span>
+            <span id="login-confirm-provider" style="font-weight: 600; color: var(--text-main); font-family: monospace; background: rgba(99, 102, 241, 0.12); padding: 0.15rem 0.5rem; border-radius: 9999px; border: 1px solid rgba(99, 102, 241, 0.25);">bsky.social</span>
+          </div>
+        </div>
+
+        <!-- Stepping out status message (shown on final click) -->
+        <div id="login-stepping-out-box" style="display: none; background: rgba(99, 102, 241, 0.1); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 8px; padding: 0.75rem 0.9rem; margin-bottom: 1rem; font-size: 0.82rem; color: var(--text-main); line-height: 1.45;">
+          <strong id="login-stepping-out-title">Stepping out to bsky.social&hellip;</strong>
+          <div style="color: var(--text-muted); margin-top: 0.2rem;">Approve access there and you&rsquo;ll come straight back to Skybouncer.</div>
+        </div>
+
+        <button type="button" class="btn" id="login-confirm-continue-btn" onclick="proceedConfirmedLogin()" style="width: 100%; justify-content: center; padding: 0.65rem 1rem; font-size: 0.92rem; margin-bottom: 0.75rem;">
+          Continue to bsky.social &rarr;
+        </button>
+
+        <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.78rem; color: var(--text-muted); flex-wrap: wrap; gap: 0.5rem;">
+          <button type="button" onclick="showLoginInputView(true)" style="background: none; border: none; color: var(--accent); font-weight: 600; cursor: pointer; padding: 0; font-size: 0.8rem;">Switch account</button>
+          <span>🔒 Skybouncer never sees your password.</span>
+        </div>
+      </div>
+
+      <!-- View 4: "How signing in works" (ⓘ OAuth Explainer) -->
+      <div id="login-view-explainer" style="display: none;">
+        <p style="font-size: 0.84rem; color: var(--text-muted); margin-top: 0; margin-bottom: 0.9rem; line-height: 1.45;">
+          It works like signing in with Google: the same open standard, with your provider (host) in Google&rsquo;s place.
+        </p>
+
+        <!-- 3-Step Visual Diagram: You -> Your Provider -> Skybouncer -->
+        <div style="background: rgba(0, 0, 0, 0.25); border: 1px solid var(--border-color); border-radius: 10px; padding: 0.85rem; margin-bottom: 0.95rem;">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.35rem; text-align: center; font-size: 0.78rem; font-weight: 600;">
+            <div style="flex: 1; background: rgba(255,255,255,0.04); border: 1px solid var(--border-color); border-radius: 8px; padding: 0.5rem 0.35rem;">
+              <div style="font-size: 1.1rem; margin-bottom: 0.15rem;">👤</div>
+              <div>You</div>
+            </div>
+            <div style="color: var(--text-muted); font-size: 0.7rem; display: flex; flex-direction: column; align-items: center;">
+              <span>🔑</span>
+              <span>&rarr;</span>
+            </div>
+            <div style="flex: 1.2; background: rgba(99, 102, 241, 0.1); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 8px; padding: 0.5rem 0.35rem; color: var(--accent);">
+              <div style="font-size: 1.1rem; margin-bottom: 0.15rem;">🏠</div>
+              <div>Your Provider</div>
+            </div>
+            <div style="color: var(--text-muted); font-size: 0.7rem; display: flex; flex-direction: column; align-items: center;">
+              <span>🎟️</span>
+              <span>&rarr;</span>
+            </div>
+            <div style="flex: 1; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 8px; padding: 0.5rem 0.35rem; color: var(--success);">
+              <div style="font-size: 1.1rem; margin-bottom: 0.15rem;">🛡️</div>
+              <div>Skybouncer</div>
+            </div>
+          </div>
+          <div style="font-size: 0.76rem; color: var(--text-muted); text-align: center; margin-top: 0.65rem; line-height: 1.4;">
+            Your password only goes to your provider, on their own page. Skybouncer gets a pass you approve.
+          </div>
+        </div>
+
+        <!-- Permissions Breakdown -->
+        <div style="display: grid; grid-template-columns: 1fr; gap: 0.65rem; margin-bottom: 1rem; font-size: 0.8rem;">
+          <div style="background: rgba(16, 185, 129, 0.07); border: 1px solid rgba(16, 185, 129, 0.25); border-radius: 8px; padding: 0.65rem 0.8rem;">
+            <div style="font-weight: 700; color: var(--success); margin-bottom: 0.35rem;">With your permission, Skybouncer can:</div>
+            <ul style="margin: 0; padding-left: 1.1rem; color: var(--text-main); line-height: 1.5;">
+              <li>Verify your Bluesky / Atmosphere identity</li>
+              <li>Manage your sovereign Skybouncer moderation list &amp; rules</li>
+            </ul>
+          </div>
+          <div style="background: rgba(239, 68, 68, 0.07); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 8px; padding: 0.65rem 0.8rem;">
+            <div style="font-weight: 700; color: var(--danger); margin-bottom: 0.35rem;">It can&rsquo;t:</div>
+            <ul style="margin: 0; padding-left: 1.1rem; color: var(--text-main); line-height: 1.5;">
+              <li>See your password</li>
+              <li>Change your email or handle</li>
+              <li>Delete your account</li>
+            </ul>
+          </div>
+        </div>
+
+        <button type="button" class="btn btn-secondary" onclick="closeLoginExplainer()" style="width: 100%; justify-content: center;">
+          &larr; Back to sign in
+        </button>
+      </div>
     </div>
   </div>
 
@@ -1873,29 +2017,483 @@
       }
     }
 
+    const SAVED_ACCOUNTS_KEY = "skybouncer_saved_accounts";
+    let loginCurrentView = "input";
+    let loginPreviousViewBeforeExplainer = "input";
+    let loginSavedAccountsEditMode = false;
+    let loginPreviewData = null;
+    let loginTypeaheadTimer = null;
+    let loginTypeaheadItems = [];
+    let loginTypeaheadActiveIndex = -1;
+
+    function loadSavedAccounts() {
+      try {
+        const raw = localStorage.getItem(SAVED_ACCOUNTS_KEY);
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter(a => a && typeof a.handle === "string" && a.handle.trim().length > 0);
+      } catch (e) {
+        return [];
+      }
+    }
+
+    function saveAccountToStorage(acct) {
+      if (!acct || !acct.handle) return;
+      try {
+        const cleanHandle = String(acct.handle).trim().replace(/^@/, "").toLowerCase();
+        if (!cleanHandle) return;
+        const list = loadSavedAccounts().filter(
+          a => a.handle.toLowerCase() !== cleanHandle && (!acct.did || a.did !== acct.did)
+        );
+        list.unshift({
+          did: acct.did || "",
+          handle: cleanHandle,
+          displayName: acct.displayName || acct.display_name || "",
+          avatar: acct.avatar || "",
+          pdsHost: acct.pdsHost || acct.pds_host || "bsky.social",
+          lastUsed: Date.now()
+        });
+        localStorage.setItem(SAVED_ACCOUNTS_KEY, JSON.stringify(list.slice(0, 6)));
+      } catch (e) {
+        console.warn("Failed to persist saved account", e);
+      }
+    }
+
+    function removeSavedAccount(handleOrDid, evt) {
+      if (evt) {
+        evt.stopPropagation();
+        evt.preventDefault();
+      }
+      try {
+        const target = String(handleOrDid || "").trim().toLowerCase();
+        const remaining = loadSavedAccounts().filter(
+          a => a.handle.toLowerCase() !== target && (a.did || "").toLowerCase() !== target
+        );
+        localStorage.setItem(SAVED_ACCOUNTS_KEY, JSON.stringify(remaining));
+        if (remaining.length === 0) {
+          loginSavedAccountsEditMode = false;
+          showLoginInputView();
+        } else {
+          renderSavedAccountsList();
+        }
+      } catch (e) {
+        console.warn("Failed to remove saved account", e);
+      }
+    }
+
+    function normalizeUserHandleClient(raw) {
+      const clean = String(raw || "").trim().replace(/^@+/, "").trim();
+      if (!clean) return { normalized: "", assumedBsky: false };
+      if (clean.startsWith("did:") || clean.includes(".")) {
+        return { normalized: clean.toLowerCase(), assumedBsky: false };
+      }
+      const lower = clean.toLowerCase();
+      const reserved = ["localhost", "local", "invalid", "internal", "example", "alt", "arpa", "onion"];
+      if (reserved.includes(lower) || /^\d+$/.test(lower)) {
+        return { normalized: lower, assumedBsky: false };
+      }
+      return { normalized: `${lower}.bsky.social`, assumedBsky: true };
+    }
+
+    function setLoginError(msg) {
+      const banner = document.getElementById("login-error-banner");
+      if (!banner) return;
+      if (msg) {
+        banner.innerText = msg;
+        banner.style.display = "block";
+      } else {
+        banner.innerText = "";
+        banner.style.display = "none";
+      }
+    }
+
+    function setLoginModalView(viewName) {
+      loginCurrentView = viewName;
+      const views = ["saved", "input", "confirm", "explainer"];
+      views.forEach(v => {
+        const el = document.getElementById(`login-view-${v}`);
+        if (el) el.style.display = (v === viewName) ? "block" : "none";
+      });
+      const titleEl = document.getElementById("login-modal-title");
+      if (titleEl) {
+        if (viewName === "saved") {
+          titleEl.innerText = "Welcome back";
+        } else if (viewName === "confirm") {
+          titleEl.innerText = "Is this you?";
+        } else if (viewName === "explainer") {
+          titleEl.innerText = "How signing in works";
+        } else {
+          titleEl.innerText = "Sign In with Bluesky";
+        }
+      }
+      const backToSavedBtn = document.getElementById("login-back-to-saved-btn");
+      if (backToSavedBtn) {
+        const hasSaved = loadSavedAccounts().length > 0;
+        backToSavedBtn.style.display = (viewName === "input" && hasSaved) ? "inline-flex" : "none";
+      }
+      hideLoginTypeahead();
+    }
+
+    function renderSavedAccountsList() {
+      const container = document.getElementById("login-saved-accounts-list");
+      const editBtn = document.getElementById("login-saved-edit-btn");
+      if (!container) return;
+      const accounts = loadSavedAccounts();
+      if (editBtn) {
+        editBtn.innerText = loginSavedAccountsEditMode ? "Done" : "Edit";
+      }
+      container.innerHTML = accounts.map(acct => {
+        const handle = acct.handle.replace(/^@/, "");
+        const display = acct.displayName || `@${handle}`;
+        const sub = acct.displayName ? `@${handle}` : (acct.pdsHost || "bsky.social");
+        const initial = (handle[0] || "@").toUpperCase();
+        const avatarHtml = acct.avatar
+          ? `<img src="${escapeHtml(acct.avatar)}" alt="" style="width: 38px; height: 38px; border-radius: 9999px; object-fit: cover; border: 1px solid var(--border-color); flex-shrink: 0;" />`
+          : `<div style="width: 38px; height: 38px; border-radius: 9999px; background: rgba(99, 102, 241, 0.2); color: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.95rem; flex-shrink: 0;">${escapeHtml(initial)}</div>`;
+        const rightAction = loginSavedAccountsEditMode
+          ? `<button type="button" class="btn-forget-saved-acct" data-handle="${escapeHtml(handle)}" title="Forget account on this device" aria-label="Forget @${escapeHtml(handle)} on this device" style="background: var(--danger-bg); border: 1px solid rgba(239, 68, 68, 0.35); color: var(--danger); border-radius: 9999px; width: 1.75rem; height: 1.75rem; font-size: 0.85rem; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;">&times;</button>`
+          : `<span style="color: var(--accent); font-weight: 700; font-size: 0.95rem; flex-shrink: 0;">&rarr;</span>`;
+
+        return `
+          <div class="saved-account-row" data-handle="${escapeHtml(handle)}" role="button" tabindex="0" style="display: flex; align-items: center; gap: 0.75rem; padding: 0.65rem 0.8rem; background: rgba(0, 0, 0, 0.22); border: 1px solid var(--border-color); border-radius: 10px; cursor: pointer; transition: border-color 0.15s ease;">
+            ${avatarHtml}
+            <div style="min-width: 0; flex: 1;">
+              <div style="font-weight: 700; font-size: 0.9rem; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(display)}</div>
+              <div style="font-size: 0.78rem; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(sub)}</div>
+            </div>
+            ${rightAction}
+          </div>
+        `;
+      }).join("");
+
+      container.querySelectorAll(".saved-account-row").forEach(row => {
+        row.addEventListener("click", (evt) => {
+          const forgetBtn = evt.target.closest(".btn-forget-saved-acct");
+          if (forgetBtn) {
+            removeSavedAccount(forgetBtn.dataset.handle, evt);
+            return;
+          }
+          if (loginSavedAccountsEditMode) return;
+          const h = row.getAttribute("data-handle");
+          if (h) previewAndConfirmAccount(h);
+        });
+      });
+    }
+
+    function toggleSavedAccountsEditMode() {
+      loginSavedAccountsEditMode = !loginSavedAccountsEditMode;
+      renderSavedAccountsList();
+    }
+
+    function showSavedAccountsView() {
+      setLoginError(null);
+      loginSavedAccountsEditMode = false;
+      renderSavedAccountsList();
+      setLoginModalView("saved");
+    }
+
+    function showLoginInputView(focusInput = true) {
+      setLoginError(null);
+      const submitBtn = document.getElementById("login-submit-btn");
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = "Continue &rarr;";
+      }
+      setLoginModalView("input");
+      const input = document.getElementById("login-handle-input");
+      if (input) {
+        updateBareHandleHint(input.value);
+        if (focusInput) {
+          setTimeout(() => input.focus(), 40);
+        }
+      }
+    }
+
+    function toggleLoginExplainer() {
+      if (loginCurrentView === "explainer") {
+        closeLoginExplainer();
+      } else {
+        loginPreviousViewBeforeExplainer = loginCurrentView;
+        setLoginModalView("explainer");
+      }
+    }
+
+    function closeLoginExplainer() {
+      setLoginModalView(loginPreviousViewBeforeExplainer || "input");
+    }
+
+    function updateBareHandleHint(rawVal) {
+      const hintEl = document.getElementById("login-bare-handle-hint");
+      const previewEl = document.getElementById("login-bare-handle-preview");
+      if (!hintEl || !previewEl) return;
+      const { normalized, assumedBsky } = normalizeUserHandleClient(rawVal);
+      if (assumedBsky && normalized) {
+        previewEl.innerText = `@${normalized}`;
+        hintEl.style.display = "block";
+      } else {
+        hintEl.style.display = "none";
+      }
+    }
+
+    function hideLoginTypeahead() {
+      const listEl = document.getElementById("login-typeahead-list");
+      if (listEl) {
+        listEl.style.display = "none";
+        listEl.innerHTML = "";
+      }
+      loginTypeaheadItems = [];
+      loginTypeaheadActiveIndex = -1;
+    }
+
+    function renderLoginTypeahead(actors) {
+      const listEl = document.getElementById("login-typeahead-list");
+      if (!listEl) return;
+      loginTypeaheadItems = Array.isArray(actors) ? actors : [];
+      loginTypeaheadActiveIndex = -1;
+      if (loginTypeaheadItems.length === 0) {
+        hideLoginTypeahead();
+        return;
+      }
+
+      listEl.innerHTML = loginTypeaheadItems.map((actor, idx) => {
+        const handle = String(actor.handle || "").replace(/^@/, "");
+        const displayName = actor.display_name || actor.displayName || "";
+        const initial = (handle[0] || "@").toUpperCase();
+        const avatarHtml = actor.avatar
+          ? `<img src="${escapeHtml(actor.avatar)}" alt="" style="width: 32px; height: 32px; border-radius: 9999px; object-fit: cover; flex-shrink: 0; border: 1px solid var(--border-color);" />`
+          : `<div style="width: 32px; height: 32px; border-radius: 9999px; background: rgba(99, 102, 241, 0.2); color: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.82rem; flex-shrink: 0;">${escapeHtml(initial)}</div>`;
+        return `
+          <div class="login-typeahead-item" role="option" data-index="${idx}" data-handle="${escapeHtml(handle)}" style="display: flex; align-items: center; gap: 0.65rem; padding: 0.55rem 0.75rem; cursor: pointer; border-bottom: 1px solid rgba(255,255,255,0.05);">
+            ${avatarHtml}
+            <div style="min-width: 0; flex: 1;">
+              ${displayName ? `<div style="font-weight: 600; font-size: 0.85rem; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${escapeHtml(displayName)}</div>` : ""}
+              <div style="font-size: 0.78rem; color: var(--accent); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">@${escapeHtml(handle)}</div>
+            </div>
+          </div>
+        `;
+      }).join("");
+
+      listEl.style.display = "block";
+      listEl.querySelectorAll(".login-typeahead-item").forEach(item => {
+        item.addEventListener("mousedown", (evt) => {
+          evt.preventDefault();
+          const idx = Number(item.getAttribute("data-index"));
+          selectTypeaheadItem(idx);
+        });
+      });
+    }
+
+    function selectTypeaheadItem(idx) {
+      const actor = loginTypeaheadItems[idx];
+      if (!actor || !actor.handle) return;
+      const input = document.getElementById("login-handle-input");
+      if (input) {
+        input.value = actor.handle;
+        updateBareHandleHint(actor.handle);
+      }
+      hideLoginTypeahead();
+      previewAndConfirmAccount(actor.handle, actor);
+    }
+
+    function onLoginHandleInput(evt) {
+      const raw = evt.target.value || "";
+      setLoginError(null);
+      updateBareHandleHint(raw);
+      if (loginTypeaheadTimer) clearTimeout(loginTypeaheadTimer);
+      const clean = raw.trim().replace(/^@+/, "");
+      if (clean.length < 2 || clean.startsWith("did:")) {
+        hideLoginTypeahead();
+        return;
+      }
+      loginTypeaheadTimer = setTimeout(async () => {
+        try {
+          const res = await fetch(`/api/auth/typeahead?q=${encodeURIComponent(clean)}&limit=6`, { credentials: "same-origin" });
+          if (!res.ok) return;
+          const data = await res.json();
+          const currentInput = document.getElementById("login-handle-input");
+          if (currentInput && currentInput.value.trim().replace(/^@+/, "") === clean && loginCurrentView === "input") {
+            renderLoginTypeahead(data.actors || []);
+          }
+        } catch (e) {
+          // Typeahead is non-blocking; ignore errors
+        }
+      }, 180);
+    }
+
+    function onLoginHandleKeydown(evt) {
+      if (!loginTypeaheadItems.length) return;
+      const listEl = document.getElementById("login-typeahead-list");
+      if (!listEl || listEl.style.display === "none") return;
+
+      if (evt.key === "ArrowDown") {
+        evt.preventDefault();
+        loginTypeaheadActiveIndex = (loginTypeaheadActiveIndex + 1) % loginTypeaheadItems.length;
+        highlightTypeaheadIndex();
+      } else if (evt.key === "ArrowUp") {
+        evt.preventDefault();
+        loginTypeaheadActiveIndex = (loginTypeaheadActiveIndex - 1 + loginTypeaheadItems.length) % loginTypeaheadItems.length;
+        highlightTypeaheadIndex();
+      } else if (evt.key === "Enter" && loginTypeaheadActiveIndex >= 0) {
+        evt.preventDefault();
+        selectTypeaheadItem(loginTypeaheadActiveIndex);
+      }
+    }
+
+    function highlightTypeaheadIndex() {
+      const listEl = document.getElementById("login-typeahead-list");
+      if (!listEl) return;
+      const items = listEl.querySelectorAll(".login-typeahead-item");
+      items.forEach((el, idx) => {
+        el.style.background = (idx === loginTypeaheadActiveIndex) ? "rgba(99, 102, 241, 0.18)" : "transparent";
+      });
+    }
+
+    async function previewAndConfirmAccount(rawHandleOrDid, seedActor = null) {
+      const { normalized } = normalizeUserHandleClient(rawHandleOrDid);
+      if (!normalized) return;
+
+      setLoginError(null);
+      hideLoginTypeahead();
+      const submitBtn = document.getElementById("login-submit-btn");
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.innerText = "Looking up account...";
+      }
+
+      try {
+        const res = await fetch(`/api/auth/preview?handle=${encodeURIComponent(normalized)}`, { credentials: "same-origin" });
+        if (res.ok) {
+          const preview = await res.json();
+          showLoginConfirmationView({
+            did: preview.did || (seedActor && seedActor.did) || "",
+            handle: (preview.handle || normalized).replace(/^@/, ""),
+            displayName: preview.display_name || (seedActor && (seedActor.display_name || seedActor.displayName)) || "",
+            avatar: preview.avatar || (seedActor && seedActor.avatar) || "",
+            pdsHost: preview.pds_host || "bsky.social",
+            authServerHost: preview.auth_server_host || preview.pds_host || "bsky.social"
+          });
+          return;
+        }
+        const errText = await res.text();
+        setLoginError(errText || `Could not find account '${normalized}'. Please check the handle and try again.`);
+      } catch (e) {
+        // Fallback: if preview endpoint is unreachable, allow confirmation with default provider
+        showLoginConfirmationView({
+          did: (seedActor && seedActor.did) || "",
+          handle: normalized.replace(/^@/, ""),
+          displayName: (seedActor && (seedActor.display_name || seedActor.displayName)) || "",
+          avatar: (seedActor && seedActor.avatar) || "",
+          pdsHost: "bsky.social",
+          authServerHost: "bsky.social"
+        });
+        return;
+      } finally {
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.innerHTML = "Continue &rarr;";
+        }
+      }
+    }
+
+    function showLoginConfirmationView(info) {
+      loginPreviewData = info;
+      const avatarImg = document.getElementById("login-confirm-avatar");
+      const avatarFallback = document.getElementById("login-confirm-avatar-fallback");
+      const nameEl = document.getElementById("login-confirm-display-name");
+      const handleEl = document.getElementById("login-confirm-handle");
+      const didEl = document.getElementById("login-confirm-did");
+      const providerEl = document.getElementById("login-confirm-provider");
+      const continueBtn = document.getElementById("login-confirm-continue-btn");
+      const steppingBox = document.getElementById("login-stepping-out-box");
+
+      const cleanHandle = (info.handle || "").replace(/^@/, "");
+      const providerHost = info.pdsHost || info.authServerHost || "bsky.social";
+
+      if (avatarImg && avatarFallback) {
+        if (info.avatar) {
+          avatarImg.src = info.avatar;
+          avatarImg.style.display = "block";
+          avatarFallback.style.display = "none";
+        } else {
+          avatarImg.src = "";
+          avatarImg.style.display = "none";
+          avatarFallback.style.display = "flex";
+          avatarFallback.innerText = (cleanHandle[0] || "@").toUpperCase();
+        }
+      }
+      if (nameEl) {
+        nameEl.innerText = info.displayName || `@${cleanHandle}`;
+      }
+      if (handleEl) {
+        handleEl.innerText = `@${cleanHandle}`;
+      }
+      if (didEl) {
+        didEl.innerText = info.did || "";
+        didEl.style.display = info.did ? "block" : "none";
+      }
+      if (providerEl) {
+        providerEl.innerText = providerHost;
+      }
+      if (steppingBox) {
+        steppingBox.style.display = "none";
+      }
+      if (continueBtn) {
+        continueBtn.disabled = false;
+        continueBtn.innerHTML = `Continue to ${escapeHtml(providerHost)} &rarr;`;
+      }
+
+      setLoginModalView("confirm");
+    }
+
+    function proceedConfirmedLogin() {
+      if (!loginPreviewData || !loginPreviewData.handle) return;
+      saveAccountToStorage(loginPreviewData);
+      const providerHost = loginPreviewData.pdsHost || loginPreviewData.authServerHost || "bsky.social";
+      const steppingBox = document.getElementById("login-stepping-out-box");
+      const steppingTitle = document.getElementById("login-stepping-out-title");
+      const continueBtn = document.getElementById("login-confirm-continue-btn");
+      if (steppingTitle) {
+        steppingTitle.innerText = `Stepping out to ${providerHost}…`;
+      }
+      if (steppingBox) {
+        steppingBox.style.display = "block";
+      }
+      if (continueBtn) {
+        continueBtn.disabled = true;
+        continueBtn.innerText = `Connecting to ${providerHost}…`;
+      }
+      const targetHandle = loginPreviewData.handle.replace(/^@/, "");
+      window.location.href = `/oauth/login?handle=${encodeURIComponent(targetHandle)}`;
+    }
+
     function showLoginModal() {
       const modal = document.getElementById("login-modal");
       if (modal) {
         modal.style.display = "flex";
-        const submitBtn = document.getElementById("login-submit-btn");
-        if (submitBtn) {
-          submitBtn.disabled = false;
-          submitBtn.innerText = "Continue";
-        }
+        setLoginError(null);
         const input = document.getElementById("login-handle-input");
         if (input) {
           input.value = "";
-          setTimeout(() => input.focus(), 50);
+          updateBareHandleHint("");
+        }
+        const saved = loadSavedAccounts();
+        if (saved.length > 0) {
+          showSavedAccountsView();
+        } else {
+          showLoginInputView(true);
         }
       } else {
-        const handle = prompt("Enter your Bluesky handle to sign in via ATProto OAuth (e.g. alice.bsky.social):");
+        const handle = prompt("Enter your Bluesky or AT Protocol handle to sign in (e.g. alice or alice.bsky.social):");
         if (handle && handle.trim()) {
-          window.location.href = `/oauth/login?handle=${encodeURIComponent(handle.trim())}`;
+          const { normalized } = normalizeUserHandleClient(handle);
+          window.location.href = `/oauth/login?handle=${encodeURIComponent(normalized)}`;
         }
       }
     }
 
     function closeLoginModal() {
+      hideLoginTypeahead();
       const modal = document.getElementById("login-modal");
       if (modal) modal.style.display = "none";
     }
@@ -1904,13 +2502,7 @@
       e.preventDefault();
       const input = document.getElementById("login-handle-input");
       if (input && input.value.trim()) {
-        const submitBtn = document.getElementById("login-submit-btn");
-        if (submitBtn) {
-          submitBtn.disabled = true;
-          submitBtn.innerText = "Redirecting...";
-        }
-        const handle = input.value.trim().replace(/^@/, "");
-        window.location.href = `/oauth/login?handle=${encodeURIComponent(handle)}`;
+        previewAndConfirmAccount(input.value.trim());
       }
     }
 
@@ -1924,6 +2516,9 @@
       const expandable = e.target.closest(".expandable-text");
       if (expandable) {
         expandable.classList.toggle("expanded");
+      }
+      if (!e.target.closest("#login-form")) {
+        hideLoginTypeahead();
       }
     });
 
@@ -1968,6 +2563,13 @@
         const data = await res.json();
         if (data.authenticated) {
           currentUser = data;
+          if (data.handle) {
+            saveAccountToStorage({
+              did: data.did || "",
+              handle: data.handle,
+              pdsHost: "bsky.social"
+            });
+          }
           renderAuthenticated(data);
           renderRulesAuthenticated(data.rubric);
 

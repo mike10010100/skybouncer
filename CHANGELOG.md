@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.9] - 2026-10-18
+
+### Added
+
+- **Pre-Flight Identity & Provider Confirmation (`GET /api/auth/preview`)**: Resolves a user's handle or DID prior to OAuth redirect, returning their canonical DID, handle, display name, avatar, and hosting provider (`pds_host` / `auth_server_host`) for the *"Is this you?"* confirmation step.
+- **Live Handle Typeahead (`GET /api/auth/typeahead`)**: Proxies `app.bsky.actor.searchActorsTypeahead` so the Sign-In modal provides real-time handle autocomplete with avatars and display names while preserving password-manager autofill attributes.
+- **Bare Handle `.bsky.social` Completion (`util::normalize_handle_or_default`)**: Single-label handles entered without a domain (e.g. `alice` or `@alice`) automatically assume `.bsky.social` across `GET /oauth/login`, `GET /api/auth/preview`, and `SkybouncerEngine::resolve_handle`, with a live inline UI hint (`No domain included — .bsky.social is assumed`).
+- **Upgraded Atmosphere OAuth Sign-In Modal**:
+  - **Returning User Account Picker ("Welcome back")**: Remembers signed-in accounts locally in `localStorage` (`skybouncer_saved_accounts`) for 1-click sign-in, with an **Edit / `✕` ("Forget account on this device")** toggle and **"Use another account"**.
+  - **Pre-Flight Confirmation ("Is this you?")**: Displays the user's resolved avatar, display name, `@handle`, DID, and hosting provider with **`Continue to <provider-host> →`**, a *"Stepping out to `<provider-host>`…"* handoff message, **`Switch account`**, and *"Skybouncer never sees your password"* reassurance.
+  - **"How signing in works" (`ⓘ`) Explainer**: In-modal explainer with the `You —(🔑)→ Your Provider —(🎟️)→ Skybouncer` diagram and a clear breakdown of what Skybouncer **can** and **can't** do before redirect.
+
 ## [0.2.8] - 2026-10-16
 
 ### Added
