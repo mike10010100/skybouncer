@@ -125,7 +125,7 @@ pub async fn auth_preview(
         None => None,
     };
 
-    let (did, mut resolved_handle, pds_endpoint, pds_host, auth_server_host) =
+    let (did, resolved_handle, pds_endpoint, pds_host, auth_server_host) =
         if let Some(ep) = discovered {
             let p_host = ep.pds_host().unwrap_or_else(|| "bsky.social".to_string());
             let as_host = ep.auth_server_host().unwrap_or_else(|| p_host.clone());
@@ -165,14 +165,9 @@ pub async fn auth_preview(
         .await
         .ok();
 
-    if resolved_handle.is_none() {
-        resolved_handle = profile
-            .as_ref()
-            .and_then(|p| p.handle.clone())
-            .or_else(|| state.engine.cached_handle_for_did(&did));
-    }
-
-    let canonical_handle = resolved_handle.unwrap_or(normalized);
+    let canonical_handle = resolved_handle
+        .or_else(|| profile.as_ref().and_then(|p| p.handle.clone()))
+        .unwrap_or(normalized);
     let _ = state
         .engine
         .cache()

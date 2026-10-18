@@ -3218,6 +3218,7 @@ async fn test_oauth_callback_success_seeds_session_cookie() {
         cookie.contains("skybouncer_session="),
         "expected session cookie, got {cookie}"
     );
+    tokio::time::sleep(Duration::from_millis(25)).await;
 }
 
 async fn setup_web_with_mock_enricher(
@@ -3714,6 +3715,115 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         )
         .await
         .unwrap();
-    std::env::remove_var("SKYBOUNCER_APPVIEW_ENDPOINT");
     assert_eq!(bad_preview_resp.status(), StatusCode::BAD_GATEWAY);
+
+    // 7. With a configured AtprotoOAuthClient, /api/auth/preview discovers PDS + Auth Server endpoints
+    //    and /oauth/login initiates PAR and redirects to the authorization endpoint.
+    let base_url = mock_appview.uri();
+    let valid_did = "did:plc:alice1234567890123456789";
+    Mock::given(method("GET"))
+        .and(path(format!("/{valid_did}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": valid_did,
+            "alsoKnownAs": ["at://skybouncertestuser9999.bsky.social"],
+            "service": [
+                {
+                    "id": "#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": base_url
+                }
+            ]
+        })))
+        .mount(&mock_appview)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-protected-resource"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "resource": base_url,
+            "authorization_servers": [base_url]
+        })))
+        .mount(&mock_appview)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": base_url,
+            "authorization_endpoint": format!("{base_url}/oauth/authorize"),
+            "token_endpoint": format!("{base_url}/oauth/token"),
+            "pushed_authorization_request_endpoint": format!("{base_url}/oauth/par"),
+            "require_pushed_authorization_requests": true,
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+            "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+            "scopes_supported": ["atproto"],
+            "authorization_response_iss_parameter_supported": true,
+            "dpop_signing_alg_values_supported": ["ES256"],
+            "code_challenge_methods_supported": ["S256"],
+            "client_id_metadata_document_supported": true
+        })))
+        .mount(&mock_appview)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/par"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header("dpop-nonce", "par-nonce-1")
+                .set_body_json(json!({
+                    "request_uri": "urn:ietf:params:oauth:request_uri:test123",
+                    "expires_in": 300
+                })),
+        )
+        .mount(&mock_appview)
+        .await;
+
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let resolver = skyauth::identity::IdentityResolver::builder()
+        .allow_insecure_localhost(true)
+        .plc_directory_url(&base_url)
+        .build();
+    let oauth_client = Arc::new(
+        skyauth::client::AtprotoOAuthClient::builder()
+            .client_metadata(metadata.clone())
+            .identity_resolver(resolver)
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+    _engine.set_oauth_client(Arc::clone(&oauth_client));
+    let app_with_oauth = create_web_router(Arc::clone(&_engine), Some(oauth_client), metadata);
+
+    let oauth_preview_resp = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/auth/preview?handle={valid_did}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oauth_preview_resp.status(), StatusCode::OK);
+    let oauth_preview_bytes = axum::body::to_bytes(oauth_preview_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let oauth_preview: skybouncer::web::AuthPreviewResponse =
+        serde_json::from_slice(&oauth_preview_bytes).unwrap();
+    assert_eq!(oauth_preview.did, valid_did);
+    assert_eq!(oauth_preview.pds_endpoint, base_url);
+
+    let login_redirect_resp = app_with_oauth
+        .oneshot(
+            Request::builder()
+                .uri(format!("/oauth/login?handle={valid_did}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    std::env::remove_var("SKYBOUNCER_APPVIEW_ENDPOINT");
+    assert!(login_redirect_resp.status().is_redirection());
 }
