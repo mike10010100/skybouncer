@@ -3563,6 +3563,33 @@ async fn test_api_update_rules_preserves_existing_settings_when_omitted() {
 async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
     let (_engine, cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
 
+    let mock_appview = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.searchActorsTypeahead"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "actors": [
+                {
+                    "did": "did:plc:alice123",
+                    "handle": "skybouncertestuser9999.bsky.social",
+                    "displayName": "Alice Skybouncer",
+                    "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:alice123/cid@jpeg"
+                }
+            ]
+        })))
+        .mount(&mock_appview)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": "did:plc:alice123",
+            "handle": "skybouncertestuser9999.bsky.social",
+            "displayName": "Alice Skybouncer",
+            "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:alice123/cid@jpeg"
+        })))
+        .mount(&mock_appview)
+        .await;
+    std::env::set_var("SKYBOUNCER_APPVIEW_ENDPOINT", mock_appview.uri());
+
     // 1. Verify dashboard HTML includes the multi-step Atmosphere login UX views
     assert!(DASHBOARD_HTML.contains("login-view-saved"));
     assert!(DASHBOARD_HTML.contains("login-view-input"));
@@ -3574,7 +3601,7 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
     assert!(DASHBOARD_HTML.contains("Bluesky or AT Protocol (Atmosphere) Handle"));
     assert!(DASHBOARD_HTML.contains("Forget account on this device"));
 
-    // 2. Short typeahead query (< 2 chars) returns empty list immediately without network I/O
+    // 2a. Short typeahead query (< 2 chars) returns empty list immediately without network I/O
     let typeahead_resp = app
         .clone()
         .oneshot(
@@ -3593,6 +3620,30 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         serde_json::from_slice(&typeahead_bytes).unwrap();
     assert!(typeahead.actors.is_empty());
 
+    // 2b. Full typeahead query (>= 2 chars) queries the AppView and returns matching actors
+    let typeahead_full_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/typeahead?q=%40alice&limit=5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(typeahead_full_resp.status(), StatusCode::OK);
+    let typeahead_full_bytes = axum::body::to_bytes(typeahead_full_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let typeahead_full: skybouncer::web::AuthTypeaheadResponse =
+        serde_json::from_slice(&typeahead_full_bytes).unwrap();
+    assert_eq!(typeahead_full.actors.len(), 1);
+    assert_eq!(typeahead_full.actors[0].did, "did:plc:alice123");
+    assert_eq!(
+        typeahead_full.actors[0].display_name.as_deref(),
+        Some("Alice Skybouncer")
+    );
+
     // 3. Empty handle on /api/auth/preview returns 400 Bad Request
     let empty_preview = app
         .clone()
@@ -3606,11 +3657,12 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         .unwrap();
     assert_eq!(empty_preview.status(), StatusCode::BAD_REQUEST);
 
-    // 4. Bare handle ("skybouncertestuser9999" or "@skybouncertestuser9999") auto-completes to ".bsky.social" and resolves against cached handle
+    // 4. Bare handle ("@skybouncertestuser9999") auto-completes to ".bsky.social" and resolves against cached handle + AppView profile
     cache
         .set_handle_for_did("did:plc:alice123", "skybouncertestuser9999.bsky.social")
         .unwrap();
     let preview_resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/auth/preview?handle=%40skybouncertestuser9999")
@@ -3627,6 +3679,41 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         serde_json::from_slice(&preview_bytes).unwrap();
     assert_eq!(preview.did, "did:plc:alice123");
     assert_eq!(preview.handle, "skybouncertestuser9999.bsky.social");
+    assert_eq!(preview.display_name.as_deref(), Some("Alice Skybouncer"));
     assert!(preview.assumed_bsky_social);
     assert!(!preview.pds_host.is_empty());
+
+    // 5. DID input ("did:plc:alice123") resolves handle and profile without assumed_bsky_social
+    let did_preview_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=did:plc:alice123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(did_preview_resp.status(), StatusCode::OK);
+    let did_preview_bytes = axum::body::to_bytes(did_preview_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let did_preview: skybouncer::web::AuthPreviewResponse =
+        serde_json::from_slice(&did_preview_bytes).unwrap();
+    assert_eq!(did_preview.did, "did:plc:alice123");
+    assert_eq!(did_preview.handle, "skybouncertestuser9999.bsky.social");
+    assert!(!did_preview.assumed_bsky_social);
+
+    // 6. Unresolvable handle returns 502 Bad Gateway
+    let bad_preview_resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=nonexistent.invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    std::env::remove_var("SKYBOUNCER_APPVIEW_ENDPOINT");
+    assert_eq!(bad_preview_resp.status(), StatusCode::BAD_GATEWAY);
 }
