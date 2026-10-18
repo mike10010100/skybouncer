@@ -133,12 +133,7 @@ pub async fn auth_preview(
             format!("Could not resolve handle or PDS for '{normalized}'"),
         )
     })?;
-    let pds_host = ep.pds_host().ok_or_else(|| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("Could not determine PDS host for '{normalized}'"),
-        )
-    })?;
+    let pds_host = ep.pds_host().unwrap_or_default();
     let auth_server_host = ep.auth_server_host().unwrap_or_else(|| pds_host.clone());
     let did = ep.did;
     let resolved_handle = ep.handle;

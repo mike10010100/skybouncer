@@ -3817,6 +3817,18 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         .unwrap();
     assert_eq!(bad_preview_resp.status(), StatusCode::BAD_GATEWAY);
 
+    let uncached_bad_preview_resp = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=uncached-nonexistent.invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uncached_bad_preview_resp.status(), StatusCode::BAD_GATEWAY);
+
     let bad_did_preview_resp = app_with_oauth
         .clone()
         .oneshot(
@@ -3828,6 +3840,97 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         .await
         .unwrap();
     assert_eq!(bad_did_preview_resp.status(), StatusCode::BAD_GATEWAY);
+
+    // Exercise engine handle resolution edge cases (empty handle, bare handle expansion, non-DID input)
+    assert!(_engine.resolve_handle("").await.is_none());
+    assert_eq!(
+        _engine
+            .resolve_handle("@skybouncertestuser9999")
+            .await
+            .as_deref(),
+        Some(valid_did)
+    );
+    assert!(_engine.cached_handle_for_did("not-a-did").is_none());
+    assert!(_engine.resolve_did_to_handle("not-a-did").await.is_none());
+
+    // Exercise unenrolled / non-protected caller on /api/rules and empty cookie/bearer branches
+    let stranger_token = _engine
+        .tenant_registry()
+        .create_web_session("did:plc:stranger9999999999999999", Duration::from_secs(600))
+        .unwrap();
+    let stranger_rules = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/rules")
+                .header(
+                    "cookie",
+                    format!("other=1; skybouncer_session={stranger_token}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stranger_rules.status(), StatusCode::UNAUTHORIZED);
+
+    let empty_auth_rules = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/rules")
+                .header("authorization", "Bearer   ")
+                .header("cookie", "foo=bar; skybouncer_session=   ")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_auth_rules.status(), StatusCode::UNAUTHORIZED);
+
+    // Exercise /api/simulate with inline image_base64 and unresolvable DNS image_url
+    let alice_token = create_test_session(&_engine, "did:plc:alice");
+    let sim_b64_resp = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate")
+                .header("content-type", "application/json")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "text": "hello world",
+                        "image_base64": "aGVsbG8="
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sim_b64_resp.status(), StatusCode::OK);
+
+    let sim_dns_resp = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate")
+                .header("content-type", "application/json")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "text": "hello world",
+                        "image_url": "https://nonexistent-domain-999999.invalid/img.png"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sim_dns_resp.status(), StatusCode::BAD_GATEWAY);
 
     // 7. /oauth/login initiates PAR and redirects to the authorization endpoint
     let login_redirect_resp = app_with_oauth
