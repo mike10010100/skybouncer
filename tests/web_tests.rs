@@ -3218,6 +3218,7 @@ async fn test_oauth_callback_success_seeds_session_cookie() {
         cookie.contains("skybouncer_session="),
         "expected session cookie, got {cookie}"
     );
+    tokio::time::sleep(Duration::from_millis(25)).await;
 }
 
 async fn setup_web_with_mock_enricher(
@@ -3557,4 +3558,272 @@ async fn test_api_update_rules_preserves_existing_settings_when_omitted() {
     std::env::remove_var("SKYBOUNCER_API_TOKEN");
     assert_eq!(s3, StatusCode::OK);
     assert_eq!(resp_wrong.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
+    let (_engine, cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+
+    let mock_appview = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.searchActorsTypeahead"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "actors": [
+                {
+                    "did": "did:plc:alice123",
+                    "handle": "skybouncertestuser9999.bsky.social",
+                    "displayName": "Alice Skybouncer",
+                    "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:alice123/cid@jpeg"
+                }
+            ]
+        })))
+        .mount(&mock_appview)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": "did:plc:alice123",
+            "handle": "skybouncertestuser9999.bsky.social",
+            "displayName": "Alice Skybouncer",
+            "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:alice123/cid@jpeg"
+        })))
+        .mount(&mock_appview)
+        .await;
+    std::env::set_var("SKYBOUNCER_APPVIEW_ENDPOINT", mock_appview.uri());
+
+    // 1. Verify dashboard HTML includes the multi-step Atmosphere login UX views
+    assert!(DASHBOARD_HTML.contains("login-view-saved"));
+    assert!(DASHBOARD_HTML.contains("login-view-input"));
+    assert!(DASHBOARD_HTML.contains("login-view-confirm"));
+    assert!(DASHBOARD_HTML.contains("login-view-explainer"));
+    assert!(DASHBOARD_HTML.contains("How signing in works"));
+    assert!(DASHBOARD_HTML.contains("never sees your password"));
+    assert!(DASHBOARD_HTML.contains("No domain included"));
+    assert!(DASHBOARD_HTML.contains("Bluesky or AT Protocol (Atmosphere) Handle"));
+    assert!(DASHBOARD_HTML.contains("Forget account on this device"));
+
+    // 2a. Short typeahead query (< 2 chars) returns empty list immediately without network I/O
+    let typeahead_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/typeahead?q=a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(typeahead_resp.status(), StatusCode::OK);
+    let typeahead_bytes = axum::body::to_bytes(typeahead_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let typeahead: skybouncer::web::AuthTypeaheadResponse =
+        serde_json::from_slice(&typeahead_bytes).unwrap();
+    assert!(typeahead.actors.is_empty());
+
+    // 2b. Full typeahead query (>= 2 chars) queries the AppView and returns matching actors
+    let typeahead_full_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/typeahead?q=%40alice&limit=5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(typeahead_full_resp.status(), StatusCode::OK);
+    let typeahead_full_bytes = axum::body::to_bytes(typeahead_full_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let typeahead_full: skybouncer::web::AuthTypeaheadResponse =
+        serde_json::from_slice(&typeahead_full_bytes).unwrap();
+    assert_eq!(typeahead_full.actors.len(), 1);
+    assert_eq!(typeahead_full.actors[0].did, "did:plc:alice123");
+    assert_eq!(
+        typeahead_full.actors[0].display_name.as_deref(),
+        Some("Alice Skybouncer")
+    );
+
+    // 3. Empty handle on /api/auth/preview returns 400 Bad Request
+    let empty_preview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=%20%20")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_preview.status(), StatusCode::BAD_REQUEST);
+
+    // 4. Bare handle ("@skybouncertestuser9999") auto-completes to ".bsky.social" and resolves against cached handle + AppView profile
+    cache
+        .set_handle_for_did("did:plc:alice123", "skybouncertestuser9999.bsky.social")
+        .unwrap();
+    let preview_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=%40skybouncertestuser9999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview_resp.status(), StatusCode::OK);
+    let preview_bytes = axum::body::to_bytes(preview_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let preview: skybouncer::web::AuthPreviewResponse =
+        serde_json::from_slice(&preview_bytes).unwrap();
+    assert_eq!(preview.did, "did:plc:alice123");
+    assert_eq!(preview.handle, "skybouncertestuser9999.bsky.social");
+    assert_eq!(preview.display_name.as_deref(), Some("Alice Skybouncer"));
+    assert!(preview.assumed_bsky_social);
+    assert!(!preview.pds_host.is_empty());
+
+    // 5. DID input ("did:plc:alice123") resolves handle and profile without assumed_bsky_social
+    let did_preview_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=did:plc:alice123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(did_preview_resp.status(), StatusCode::OK);
+    let did_preview_bytes = axum::body::to_bytes(did_preview_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let did_preview: skybouncer::web::AuthPreviewResponse =
+        serde_json::from_slice(&did_preview_bytes).unwrap();
+    assert_eq!(did_preview.did, "did:plc:alice123");
+    assert_eq!(did_preview.handle, "skybouncertestuser9999.bsky.social");
+    assert!(!did_preview.assumed_bsky_social);
+
+    // 6. Unresolvable handle returns 502 Bad Gateway
+    let bad_preview_resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=nonexistent.invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_preview_resp.status(), StatusCode::BAD_GATEWAY);
+
+    // 7. With a configured AtprotoOAuthClient, /api/auth/preview discovers PDS + Auth Server endpoints
+    //    and /oauth/login initiates PAR and redirects to the authorization endpoint.
+    let base_url = mock_appview.uri();
+    let valid_did = "did:plc:alice1234567890123456789";
+    Mock::given(method("GET"))
+        .and(path(format!("/{valid_did}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": valid_did,
+            "alsoKnownAs": ["at://skybouncertestuser9999.bsky.social"],
+            "service": [
+                {
+                    "id": "#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": base_url
+                }
+            ]
+        })))
+        .mount(&mock_appview)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-protected-resource"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "resource": base_url,
+            "authorization_servers": [base_url]
+        })))
+        .mount(&mock_appview)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/oauth-authorization-server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": base_url,
+            "authorization_endpoint": format!("{base_url}/oauth/authorize"),
+            "token_endpoint": format!("{base_url}/oauth/token"),
+            "pushed_authorization_request_endpoint": format!("{base_url}/oauth/par"),
+            "require_pushed_authorization_requests": true,
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+            "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+            "scopes_supported": ["atproto"],
+            "authorization_response_iss_parameter_supported": true,
+            "dpop_signing_alg_values_supported": ["ES256"],
+            "code_challenge_methods_supported": ["S256"],
+            "client_id_metadata_document_supported": true
+        })))
+        .mount(&mock_appview)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/par"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header("dpop-nonce", "par-nonce-1")
+                .set_body_json(json!({
+                    "request_uri": "urn:ietf:params:oauth:request_uri:test123",
+                    "expires_in": 300
+                })),
+        )
+        .mount(&mock_appview)
+        .await;
+
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let resolver = skyauth::identity::IdentityResolver::builder()
+        .allow_insecure_localhost(true)
+        .plc_directory_url(&base_url)
+        .build();
+    let oauth_client = Arc::new(
+        skyauth::client::AtprotoOAuthClient::builder()
+            .client_metadata(metadata.clone())
+            .identity_resolver(resolver)
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+    _engine.set_oauth_client(Arc::clone(&oauth_client));
+    let app_with_oauth = create_web_router(Arc::clone(&_engine), Some(oauth_client), metadata);
+
+    let oauth_preview_resp = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/auth/preview?handle={valid_did}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oauth_preview_resp.status(), StatusCode::OK);
+    let oauth_preview_bytes = axum::body::to_bytes(oauth_preview_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let oauth_preview: skybouncer::web::AuthPreviewResponse =
+        serde_json::from_slice(&oauth_preview_bytes).unwrap();
+    assert_eq!(oauth_preview.did, valid_did);
+    assert_eq!(oauth_preview.pds_endpoint, base_url);
+
+    let login_redirect_resp = app_with_oauth
+        .oneshot(
+            Request::builder()
+                .uri(format!("/oauth/login?handle={valid_did}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    std::env::remove_var("SKYBOUNCER_APPVIEW_ENDPOINT");
+    assert!(login_redirect_resp.status().is_redirection());
 }

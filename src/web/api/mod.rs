@@ -410,6 +410,70 @@ pub struct ResolveResponse {
     pub handle: Option<String>,
 }
 
+/// Query parameters for pre-authentication handle typeahead (`GET /api/auth/typeahead`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AuthTypeaheadQuery {
+    /// Handle or display-name prefix query string.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// Maximum number of suggestions to return (defaults to 6, clamped to `1..=15`).
+    #[serde(default)]
+    pub limit: Option<u8>,
+}
+
+/// A single actor suggestion returned by `GET /api/auth/typeahead`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthActorSuggestion {
+    /// Decentralized Identifier of the actor (`did:plc:...` or `did:web:...`).
+    pub did: String,
+    /// Handle of the actor (e.g. `"alice.bsky.social"`).
+    pub handle: String,
+    /// Optional user-defined display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Optional profile avatar URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+}
+
+/// Response payload for `GET /api/auth/typeahead`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthTypeaheadResponse {
+    /// Matching actor suggestions.
+    pub actors: Vec<AuthActorSuggestion>,
+}
+
+/// Query parameters for pre-flight login identity and provider preview (`GET /api/auth/preview`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AuthPreviewQuery {
+    /// Handle or DID to preview prior to OAuth redirect.
+    #[serde(default)]
+    pub handle: Option<String>,
+}
+
+/// Pre-flight identity and provider resolution response for `GET /api/auth/preview`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthPreviewResponse {
+    /// Resolved Decentralized Identifier (`did:plc:...` or `did:web:...`).
+    pub did: String,
+    /// Canonical AT Protocol handle (e.g. `"alice.bsky.social"`).
+    pub handle: String,
+    /// Optional user-defined display name from AppView profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Optional profile avatar URL from AppView profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    /// Authoritative Personal Data Server endpoint URL.
+    pub pds_endpoint: String,
+    /// Hostname of the user's Personal Data Server (e.g. `"bsky.social"` or `"pds.example.com"`).
+    pub pds_host: String,
+    /// Hostname of the OAuth Authorization Server guarding the PDS.
+    pub auth_server_host: String,
+    /// Whether a bare handle without a domain was expanded to `.bsky.social`.
+    pub assumed_bsky_social: bool,
+}
+
 mod auth;
 mod bounces;
 mod resolve;

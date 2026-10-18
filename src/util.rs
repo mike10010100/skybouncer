@@ -11,6 +11,18 @@ pub fn normalize_handle(raw: &str) -> &str {
     raw.trim().trim_start_matches('@')
 }
 
+/// Normalizes a user-supplied handle or DID, automatically appending `.bsky.social`
+/// when the input is a bare single-label handle without a dot (e.g. `"alice"` or `"@alice"`
+/// -> `"alice.bsky.social"`).
+///
+/// Reserved single-label hostnames (`"localhost"`, `"local"`, `"invalid"`, etc.), numeric
+/// literals, and `did:` identifiers are returned without appending `.bsky.social`.
+#[must_use]
+pub fn normalize_handle_or_default(raw: &str) -> String {
+    let clean = normalize_handle(raw).trim();
+    skyauth::identity::normalize_user_handle(clean).unwrap_or_else(|_| clean.to_string())
+}
+
 /// Maps a string key to a shard index in `[0, shards)` using a stable hash.
 ///
 /// Used for lock striping and partitioned caches so that all concurrent operations
@@ -68,6 +80,22 @@ mod tests {
         // `trim_start_matches('@')` strips all leading '@' characters.
         assert_eq!(normalize_handle("@@alice"), "alice");
         assert_eq!(normalize_handle("did:plc:abc"), "did:plc:abc");
+    }
+
+    #[test]
+    fn normalize_handle_or_default_completes_bare_handles() {
+        assert_eq!(normalize_handle_or_default("alice"), "alice.bsky.social");
+        assert_eq!(
+            normalize_handle_or_default("  @Alice  "),
+            "alice.bsky.social"
+        );
+        assert_eq!(
+            normalize_handle_or_default("alice.custom.org"),
+            "alice.custom.org"
+        );
+        assert_eq!(normalize_handle_or_default("did:plc:abc"), "did:plc:abc");
+        assert_eq!(normalize_handle_or_default("localhost"), "localhost");
+        assert_eq!(normalize_handle_or_default(""), "");
     }
 
     #[test]

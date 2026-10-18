@@ -1837,9 +1837,9 @@ dependencies = [
 
 [[package]]
 name = "skyauth"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86c37a05aad73a64aa5569ea8fd09cf98ebafdf41860e3525c889cc53e994819"
+checksum = "0f2f57ef4ca83774b5348e153c64d51795a6ef56db6b0780b2374924c0dbd780"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1866,9 +1866,9 @@ dependencies = [
 
 [[package]]
 name = "skybase"
-version = "0.1.3"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "723e4da286606cee9990701c3721c1cb90686505e66ef9b6c2bc670a35bca46e"
+checksum = "3ea9a8b6a8cda4e5323246befac31bf1a3bfd438577b3bbc44bb8ec6ab282683"
 dependencies = [
  "futures-util",
  "parking_lot",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "skybouncer"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-trait",
  "axum",
