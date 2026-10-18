@@ -116,39 +116,28 @@ pub async fn auth_preview(
     let assumed_bsky_social =
         !stripped.starts_with("did:") && !stripped.contains('.') && normalized != stripped;
 
-    let discovered = match state.engine.oauth_client() {
-        Some(client) => client
-            .resolver()
-            .discover_oauth_endpoints(&normalized)
-            .await
-            .ok(),
-        None => None,
-    };
+    let resolver = state.engine.oauth_client().map_or_else(
+        || skyauth::identity::IdentityResolver::new(skyauth::ssrf::SsrfFilter::default()),
+        |client| client.resolver().clone(),
+    );
+    let mut discovered = resolver.discover_oauth_endpoints(&normalized).await.ok();
+    if discovered.is_none() && !normalized.starts_with("did:") {
+        if let Some(fallback_did) = state.engine.resolve_handle(&normalized).await {
+            discovered = resolver.discover_oauth_endpoints(&fallback_did).await.ok();
+        }
+    }
 
-    let (did, resolved_handle, pds_endpoint, pds_host, auth_server_host) =
-        if let Some(ep) = discovered {
-            let p_host = ep.pds_host().unwrap_or_else(|| "bsky.social".to_string());
-            let as_host = ep.auth_server_host().unwrap_or_else(|| p_host.clone());
-            (ep.did, ep.handle, ep.pds_endpoint, p_host, as_host)
-        } else if let Some(fallback_did) = state.engine.resolve_handle(&normalized).await {
-            let fallback_handle = if normalized.starts_with("did:") {
-                state.engine.resolve_did_to_handle(&fallback_did).await
-            } else {
-                Some(normalized.clone())
-            };
-            (
-                fallback_did,
-                fallback_handle,
-                "https://bsky.social".to_string(),
-                "bsky.social".to_string(),
-                "bsky.social".to_string(),
-            )
-        } else {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                format!("Could not resolve handle or PDS for '{normalized}'"),
-            ));
-        };
+    let ep = discovered.ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Could not resolve handle or PDS for '{normalized}'"),
+        )
+    })?;
+    let pds_host = ep.pds_host().unwrap_or_default();
+    let auth_server_host = ep.auth_server_host().unwrap_or_else(|| pds_host.clone());
+    let did = ep.did;
+    let resolved_handle = ep.handle;
+    let pds_endpoint = ep.pds_endpoint;
 
     #[derive(Deserialize)]
     struct RawProfile {

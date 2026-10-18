@@ -2176,7 +2176,8 @@
           }
           if (loginSavedAccountsEditMode) return;
           const h = row.getAttribute("data-handle");
-          if (h) previewAndConfirmAccount(h);
+          const acct = accounts.find(a => a.handle.replace(/^@/, "").toLowerCase() === (h || "").toLowerCase());
+          if (h) previewAndConfirmAccount(h, acct || null);
         });
       });
     }
@@ -2378,16 +2379,18 @@
         const errText = await res.text();
         setLoginError(errText || `Could not find account '${normalized}'. Please check the handle and try again.`);
       } catch (e) {
-        // Fallback: if preview endpoint is unreachable, allow confirmation with default provider
-        showLoginConfirmationView({
-          did: (seedActor && seedActor.did) || "",
-          handle: normalized.replace(/^@/, ""),
-          displayName: (seedActor && (seedActor.display_name || seedActor.displayName)) || "",
-          avatar: (seedActor && seedActor.avatar) || "",
-          pdsHost: "bsky.social",
-          authServerHost: "bsky.social"
-        });
-        return;
+        if (seedActor && (seedActor.did || seedActor.handle)) {
+          showLoginConfirmationView({
+            did: seedActor.did || "",
+            handle: (seedActor.handle || normalized).replace(/^@/, ""),
+            displayName: seedActor.display_name || seedActor.displayName || "",
+            avatar: seedActor.avatar || "",
+            pdsHost: seedActor.pdsHost || "bsky.social",
+            authServerHost: seedActor.authServerHost || seedActor.pdsHost || "bsky.social"
+          });
+          return;
+        }
+        setLoginError(`Could not reach server to verify '${normalized}'. Please check your connection and try again.`);
       } finally {
         if (submitBtn) {
           submitBtn.disabled = false;

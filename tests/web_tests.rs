@@ -3645,7 +3645,7 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         Some("Alice Skybouncer")
     );
 
-    // 3. Empty handle on /api/auth/preview returns 400 Bad Request
+    // 3. Empty handle on /api/auth/preview returns 400 Bad Request, and invalid DID when oauth_client is None returns 502
     let empty_preview = app
         .clone()
         .oneshot(
@@ -3658,67 +3658,21 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         .unwrap();
     assert_eq!(empty_preview.status(), StatusCode::BAD_REQUEST);
 
-    // 4. Bare handle ("@skybouncertestuser9999") auto-completes to ".bsky.social" and resolves against cached handle + AppView profile
-    cache
-        .set_handle_for_did("did:plc:alice123", "skybouncertestuser9999.bsky.social")
-        .unwrap();
-    let preview_resp = app
+    let no_oauth_bad_did = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/api/auth/preview?handle=%40skybouncertestuser9999")
+                .uri("/api/auth/preview?handle=did:invalid:syntax")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(preview_resp.status(), StatusCode::OK);
-    let preview_bytes = axum::body::to_bytes(preview_resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let preview: skybouncer::web::AuthPreviewResponse =
-        serde_json::from_slice(&preview_bytes).unwrap();
-    assert_eq!(preview.did, "did:plc:alice123");
-    assert_eq!(preview.handle, "skybouncertestuser9999.bsky.social");
-    assert_eq!(preview.display_name.as_deref(), Some("Alice Skybouncer"));
-    assert!(preview.assumed_bsky_social);
-    assert!(!preview.pds_host.is_empty());
+    assert_eq!(no_oauth_bad_did.status(), StatusCode::BAD_GATEWAY);
 
-    // 5. DID input ("did:plc:alice123") resolves handle and profile without assumed_bsky_social
-    let did_preview_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/auth/preview?handle=did:plc:alice123")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(did_preview_resp.status(), StatusCode::OK);
-    let did_preview_bytes = axum::body::to_bytes(did_preview_resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let did_preview: skybouncer::web::AuthPreviewResponse =
-        serde_json::from_slice(&did_preview_bytes).unwrap();
-    assert_eq!(did_preview.did, "did:plc:alice123");
-    assert_eq!(did_preview.handle, "skybouncertestuser9999.bsky.social");
-    assert!(!did_preview.assumed_bsky_social);
-
-    // 6. Unresolvable handle returns 502 Bad Gateway
-    let bad_preview_resp = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/auth/preview?handle=nonexistent.invalid")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(bad_preview_resp.status(), StatusCode::BAD_GATEWAY);
-
-    // 7. With a configured AtprotoOAuthClient, /api/auth/preview discovers PDS + Auth Server endpoints
-    //    and /oauth/login initiates PAR and redirects to the authorization endpoint.
+    // 4. With a configured AtprotoOAuthClient passed to create_web_router, engine.oauth_client()
+    //    is populated automatically, and /api/auth/preview discovers verified PDS + Auth Server endpoints
+    //    for both handles (including bare handles resolved via cache/AppView) and DIDs.
     let base_url = mock_appview.uri();
     let valid_did = "did:plc:alice1234567890123456789";
     Mock::given(method("GET"))
@@ -3793,10 +3747,40 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
             .build()
             .expect("oauth client"),
     );
-    _engine.set_oauth_client(Arc::clone(&oauth_client));
+    assert!(_engine.oauth_client().is_none());
     let app_with_oauth = create_web_router(Arc::clone(&_engine), Some(oauth_client), metadata);
+    assert!(_engine.oauth_client().is_some());
 
-    let oauth_preview_resp = app_with_oauth
+    // 4a. Bare handle ("@skybouncertestuser9999") auto-completes to ".bsky.social", resolves DID via cache,
+    //     and discovers verified PDS + Auth Server endpoints + AppView profile
+    cache
+        .set_handle_for_did(valid_did, "skybouncertestuser9999.bsky.social")
+        .unwrap();
+    let preview_resp = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=%40skybouncertestuser9999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview_resp.status(), StatusCode::OK);
+    let preview_bytes = axum::body::to_bytes(preview_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let preview: skybouncer::web::AuthPreviewResponse =
+        serde_json::from_slice(&preview_bytes).unwrap();
+    assert_eq!(preview.did, valid_did);
+    assert_eq!(preview.handle, "skybouncertestuser9999.bsky.social");
+    assert_eq!(preview.display_name.as_deref(), Some("Alice Skybouncer"));
+    assert!(preview.assumed_bsky_social);
+    assert_eq!(preview.pds_endpoint, base_url);
+    assert!(!preview.pds_host.is_empty());
+
+    // 5. DID input resolves handle, verified PDS endpoint, and profile without assumed_bsky_social
+    let did_preview_resp = app_with_oauth
         .clone()
         .oneshot(
             Request::builder()
@@ -3806,15 +3790,149 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         )
         .await
         .unwrap();
-    assert_eq!(oauth_preview_resp.status(), StatusCode::OK);
-    let oauth_preview_bytes = axum::body::to_bytes(oauth_preview_resp.into_body(), usize::MAX)
+    assert_eq!(did_preview_resp.status(), StatusCode::OK);
+    let did_preview_bytes = axum::body::to_bytes(did_preview_resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let oauth_preview: skybouncer::web::AuthPreviewResponse =
-        serde_json::from_slice(&oauth_preview_bytes).unwrap();
-    assert_eq!(oauth_preview.did, valid_did);
-    assert_eq!(oauth_preview.pds_endpoint, base_url);
+    let did_preview: skybouncer::web::AuthPreviewResponse =
+        serde_json::from_slice(&did_preview_bytes).unwrap();
+    assert_eq!(did_preview.did, valid_did);
+    assert_eq!(did_preview.handle, "skybouncertestuser9999.bsky.social");
+    assert_eq!(did_preview.pds_endpoint, base_url);
+    assert!(!did_preview.assumed_bsky_social);
 
+    // 6. Unresolvable handle or DID (even if present in local handle cache without a valid PDS) returns 502 Bad Gateway
+    cache
+        .set_handle_for_did("did:plc:unresolvable999999999999", "cachedonly.invalid")
+        .unwrap();
+    let bad_preview_resp = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=cachedonly.invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_preview_resp.status(), StatusCode::BAD_GATEWAY);
+
+    let uncached_bad_preview_resp = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=uncached-nonexistent.invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uncached_bad_preview_resp.status(), StatusCode::BAD_GATEWAY);
+
+    let bad_did_preview_resp = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=did:plc:unresolvable999999999999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_did_preview_resp.status(), StatusCode::BAD_GATEWAY);
+
+    // Exercise engine handle resolution edge cases (empty handle, bare handle expansion, non-DID input)
+    assert!(_engine.resolve_handle("").await.is_none());
+    assert_eq!(
+        _engine
+            .resolve_handle("@skybouncertestuser9999")
+            .await
+            .as_deref(),
+        Some(valid_did)
+    );
+    assert!(_engine.cached_handle_for_did("not-a-did").is_none());
+    assert!(_engine.resolve_did_to_handle("not-a-did").await.is_none());
+
+    // Exercise unenrolled / non-protected caller on /api/rules and empty cookie/bearer branches
+    let stranger_token = _engine
+        .tenant_registry()
+        .create_web_session("did:plc:stranger9999999999999999", Duration::from_secs(600))
+        .unwrap();
+    let stranger_rules = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/rules")
+                .header(
+                    "cookie",
+                    format!("other=1; skybouncer_session={stranger_token}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stranger_rules.status(), StatusCode::UNAUTHORIZED);
+
+    let empty_auth_rules = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/rules")
+                .header("authorization", "Bearer   ")
+                .header("cookie", "foo=bar; skybouncer_session=   ")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_auth_rules.status(), StatusCode::UNAUTHORIZED);
+
+    // Exercise /api/simulate with inline image_base64 and unresolvable DNS image_url
+    let alice_token = create_test_session(&_engine, "did:plc:alice");
+    let sim_b64_resp = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate")
+                .header("content-type", "application/json")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "text": "hello world",
+                        "image_base64": "aGVsbG8="
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sim_b64_resp.status(), StatusCode::OK);
+
+    let sim_dns_resp = app_with_oauth
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate")
+                .header("content-type", "application/json")
+                .header("cookie", format!("skybouncer_session={alice_token}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "text": "hello world",
+                        "image_url": "https://nonexistent-domain-999999.invalid/img.png"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sim_dns_resp.status(), StatusCode::BAD_GATEWAY);
+
+    // 7. /oauth/login initiates PAR and redirects to the authorization endpoint
     let login_redirect_resp = app_with_oauth
         .oneshot(
             Request::builder()
