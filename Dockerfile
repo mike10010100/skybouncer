@@ -18,7 +18,7 @@ COPY src ./src
 COPY assets ./assets
 
 # Build optimized production binary and strip debug symbols
-RUN cargo build --release --bin skybouncer && \
+RUN cargo build --release --locked --bin skybouncer && \
     strip /build/target/release/skybouncer
 
 # ------------------------------------------------------------------------------
@@ -26,9 +26,15 @@ RUN cargo build --release --bin skybouncer && \
 # ------------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
-# Install CA certificates for TLS/WSS connections and curl for container healthchecks
+# Install CA certificates for TLS/WSS connections and curl for container healthchecks,
+# and explicitly distrust the October 2026 compromised eMudhra / Comodo AAA roots in the OS store.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates curl sqlite3 && \
+    sed -i \
+      -e 's|^mozilla/emSign_ECC_Root_CA_-_G3.crt|!&|' \
+      -e 's|^mozilla/Comodo_AAA_Services_root.crt|!&|' \
+      /etc/ca-certificates.conf && \
+    update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # Dedicated non-root application user and group (UID/GID 10001)
