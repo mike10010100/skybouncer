@@ -183,6 +183,9 @@ deny = [
     { crate = "openssl", reason = "The project strictly enforces pure Rustls networking and zero C OpenSSL dependencies" },
     { crate = "openssl-sys", reason = "The project strictly enforces pure Rustls networking and zero C OpenSSL dependencies" },
     { crate = "native-tls", reason = "The project strictly enforces pure Rustls networking and zero C OpenSSL dependencies" },
+    { name = "rustls-webpki", version = "<0.103.16", reason = "Vulnerable to the October 2026 eMudhra Intermediate CA compromise; >= 0.103.16 required to distrust compromised intermediate SPKIs" },
+    { name = "webpki-roots", version = "<1.0.10", reason = "Contains compromised emSign ECC Root CA - G3 trust anchor (RUSTSEC-2026-0383); >= 1.0.10 required" },
+    { name = "webpki-root-certs", version = "<1.0.10", reason = "Contains compromised emSign ECC Root CA - G3 trust anchor (RUSTSEC-2026-0383); >= 1.0.10 required" },
 ]
 
 # List of features to allow/deny
