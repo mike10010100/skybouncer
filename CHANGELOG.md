@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.12] - 2026-10-22
+
+### Changed
+
+- **Idempotent Container Startup in `scripts/deploy.sh`**: Removed `--force-recreate` from `docker compose up -d skybouncer` so boot-time and repeat deployments only recreate the container when the built image digest or Compose configuration changes.
+
 ## [0.2.11] - 2026-10-21
 
 ### Security

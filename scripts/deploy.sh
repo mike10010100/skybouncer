@@ -51,7 +51,7 @@ if docker image inspect "skybouncer:${IMAGE_TAG}" >/dev/null 2>&1; then
 fi
 
 # Launch the stack
-${COMPOSE_CMD} up -d --force-recreate skybouncer
+${COMPOSE_CMD} up -d skybouncer
 
 # Wait for skybouncer to pass healthcheck
 echo "⏳ Waiting for Skybouncer to pass healthcheck..."
