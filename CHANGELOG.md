@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.13] - 2026-10-26
+
+### Security
+
+- **Transitive Cryptographic & Runtime Advisory Remediation** (`Cargo.toml`, `Cargo.lock`, `deny.toml`, `.github/workflows/ci.yml`):
+  - Upgraded `skyauth` to `0.3.8`, `skybase` to `0.1.6`, `crypto-bigint` to `0.7.10` (`RUSTSEC-2026-0387`), and `ctutils` to `0.4.6` (`RUSTSEC-2026-0385`).
+  - Banned vulnerable prior releases (`crypto-bigint < 0.7.6`, `ctutils < 0.4.4`, `tokio < 1.53.3`) in `deny.toml`.
+
 ## [0.2.12] - 2026-10-22
 
 ### Changed

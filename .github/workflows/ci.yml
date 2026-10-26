@@ -170,14 +170,14 @@ jobs:
       - name: Wait for Sibling Dependencies in Crates.io Index
         if: steps.check_published.outputs.published == 'false'
         run: |
-          echo "Checking if skybase 0.1.5 and skyauth 0.3.7 are available on crates.io..."
+          echo "Checking if skybase 0.1.6 and skyauth 0.3.8 are available on crates.io..."
           max_attempts=30
           attempt=1
           until [ $attempt -gt $max_attempts ]; do
-            STATUS_BASE=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: skybouncer-dep-check" "https://crates.io/api/v1/crates/skybase/0.1.5" || echo "000")
-            STATUS_AUTH=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: skybouncer-dep-check" "https://crates.io/api/v1/crates/skyauth/0.3.7" || echo "000")
+            STATUS_BASE=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: skybouncer-dep-check" "https://crates.io/api/v1/crates/skybase/0.1.6" || echo "000")
+            STATUS_AUTH=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: skybouncer-dep-check" "https://crates.io/api/v1/crates/skyauth/0.3.8" || echo "000")
             if [ "$STATUS_BASE" -eq 200 ] && [ "$STATUS_AUTH" -eq 200 ]; then
-              echo "skybase 0.1.5 and skyauth 0.3.7 are confirmed published on crates.io!"
+              echo "skybase 0.1.6 and skyauth 0.3.8 are confirmed published on crates.io!"
               break
             fi
             echo "Attempt $attempt/$max_attempts: skybase=$STATUS_BASE skyauth=$STATUS_AUTH. Waiting 15s..."
@@ -185,7 +185,7 @@ jobs:
             attempt=$((attempt + 1))
           done
           if [ $attempt -gt $max_attempts ]; then
-            echo "::error::Timed out waiting for dependencies 'skybase 0.1.5' / 'skyauth 0.3.7' on crates.io."
+            echo "::error::Timed out waiting for dependencies 'skybase 0.1.6' / 'skyauth 0.3.8' on crates.io."
             exit 1
           fi
 

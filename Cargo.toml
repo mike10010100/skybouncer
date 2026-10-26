@@ -1,6 +1,6 @@
 [package]
 name = "skybouncer"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2021"
 rust-version = "1.89"
 authors = ["Michael Paulauski <mike10010100@gmail.com>"]
@@ -35,8 +35,8 @@ telemetry = ["dep:tracing-subscriber"]
 
 [dependencies]
 # Sibling dependencies, consumed from crates.io (published by each repo's CI).
-skybase = "0.1.5"
-skyauth = "0.3.7"
+skybase = "0.1.6"
+skyauth = "0.3.8"
 
 # HTTP Web Framework & Networking
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "query", "tokio", "macros", "http1"] }

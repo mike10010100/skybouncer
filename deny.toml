@@ -186,6 +186,9 @@ deny = [
     { name = "rustls-webpki", version = "<0.103.16", reason = "Vulnerable to the October 2026 eMudhra Intermediate CA compromise; >= 0.103.16 required to distrust compromised intermediate SPKIs" },
     { name = "webpki-roots", version = "<1.0.10", reason = "Contains compromised emSign ECC Root CA - G3 trust anchor (RUSTSEC-2026-0383); >= 1.0.10 required" },
     { name = "webpki-root-certs", version = "<1.0.10", reason = "Contains compromised emSign ECC Root CA - G3 trust anchor (RUSTSEC-2026-0383); >= 1.0.10 required" },
+    { name = "crypto-bigint", version = "<0.7.6", reason = "Multiple timing variability issues in constant-time operations (RUSTSEC-2026-0387); >= 0.7.6 required" },
+    { name = "ctutils", version = "<0.4.4", reason = "Non-constant-time mask generation and u128 comparisons (RUSTSEC-2026-0385); >= 0.4.4 required" },
+    { name = "tokio", version = "<1.53.3", reason = "AsyncFd::new and related constructors violate I/O safety (RUSTSEC-2026-0386); >= 1.53.3 required" },
 ]
 
 # List of features to allow/deny
