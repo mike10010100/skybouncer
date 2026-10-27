@@ -549,18 +549,14 @@ impl FollowGraph {
                 if !self.tracks_incoming_follower(&commit.did) {
                     return FollowSyncEvent::Ignored;
                 }
+                // Only remove an incoming follower when `commit.rkey` matches a known
+                // incoming follow record key. Never fall back to removing a synthetic
+                // `hydrate_in_*` entry on an unknown `rkey`: on the global Jetstream
+                // firehose, a follower deleting an unrelated follow record (unfollowing
+                // someone else on Bluesky) also arrives as `CommitOperation::Delete` with
+                // `commit.did == follower_did` and no `subject`, which would falsely evict
+                // them from the protected user's follower set.
                 let removed = self.remove_follower_by_rkey(&commit.did, &commit.rkey);
-                let removed = removed.or_else(|| {
-                    let synthetic = self.remove_synthetic_follower_fallback(&commit.did);
-                    if synthetic.is_some() {
-                        tracing::debug!(
-                            follower = %commit.did,
-                            rkey = %commit.rkey,
-                            "Reconciled synthetic incoming-follower rkey on delete"
-                        );
-                    }
-                    synthetic
-                });
 
                 match removed {
                     Some(protected_did) => FollowSyncEvent::FollowerRemoved {

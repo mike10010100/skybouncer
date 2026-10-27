@@ -26,6 +26,13 @@ pub const MAX_RENDERED_THREAD_ANCESTORS: usize = 8;
 /// Per-post character cap applied to each rendered thread ancestor.
 pub const THREAD_ANCESTOR_CHAR_CAP: usize = 300;
 
+/// Maximum number of attached post images fetched and inspected per interaction.
+///
+/// Matches the ATProto `app.bsky.embed.gallery` lexicon protocol ceiling (`maxLength: 20`),
+/// accommodating both legacy 4-image embeds (`app.bsky.embed.images`) and multi-image
+/// gallery posts (10-item UI limit, 20-item protocol max).
+pub const MAX_POST_IMAGES: usize = 20;
+
 /// A single ancestor post resolved from the conversation thread above the candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct ThreadPost {
@@ -192,6 +199,16 @@ pub trait ContextEnricher: Send + Sync {
     async fn fetch_image_base64(&self, _author_did: &str, _cid: &str) -> Option<String> {
         None
     }
+
+    /// Queries the live follow relationship between `target_did` and `candidate_did` via
+    /// `app.bsky.graph.getRelationships`, returning `(target_follows_candidate, candidate_follows_target)`.
+    ///
+    /// Used as a lazy fallback before invoking the AI classifier so followers missed by
+    /// cold-start cursor pagination caps are discovered, cached in [`crate::matcher::FollowGraph`],
+    /// and bypassed at zero model cost. Defaults to `(false, false)`.
+    async fn check_relationship(&self, _target_did: &str, _candidate_did: &str) -> (bool, bool) {
+        (false, false)
+    }
 }
 
 /// Zero-cost no-op enricher returning empty context immediately.
@@ -205,6 +222,9 @@ impl ContextEnricher for NoopContextEnricher {
     }
 }
 
+/// Mapping of `(target_did, candidate_did)` pairs to `(target_follows_candidate, candidate_follows_target)`.
+type RelationshipMap = HashMap<(String, String), (bool, bool)>;
+
 /// Mock context enricher for deterministic hermetic testing.
 #[derive(Debug, Default, Clone)]
 pub struct MockContextEnricher {
@@ -212,6 +232,7 @@ pub struct MockContextEnricher {
     parent_posts: Arc<RwLock<HashMap<String, ParentPostContext>>>,
     handles: Arc<RwLock<HashMap<String, String>>>,
     images: Arc<RwLock<HashMap<(String, String), String>>>,
+    relationships: Arc<RwLock<RelationshipMap>>,
 }
 
 impl MockContextEnricher {
@@ -248,6 +269,21 @@ impl MockContextEnricher {
             .write()
             .insert((author_did.into(), cid.into()), base64.into());
     }
+
+    /// Injects a mock `(target_follows_candidate, candidate_follows_target)` relationship
+    /// for `(target_did, candidate_did)`.
+    pub fn set_relationship(
+        &self,
+        target_did: impl Into<String>,
+        candidate_did: impl Into<String>,
+        target_follows_candidate: bool,
+        candidate_follows_target: bool,
+    ) {
+        self.relationships.write().insert(
+            (target_did.into(), candidate_did.into()),
+            (target_follows_candidate, candidate_follows_target),
+        );
+    }
 }
 
 #[async_trait]
@@ -262,7 +298,7 @@ impl ContextEnricher for MockContextEnricher {
         let mut images_base64 = Vec::new();
         {
             let guard = self.images.read();
-            for cid in &interaction.image_cids {
+            for cid in interaction.image_cids.iter().take(MAX_POST_IMAGES) {
                 if let Some(b64) = guard.get(&(interaction.author_did.clone(), cid.clone())) {
                     images_base64.push(b64.clone());
                 }
@@ -308,6 +344,14 @@ impl ContextEnricher for MockContextEnricher {
             .read()
             .get(&(author_did.to_string(), cid.to_string()))
             .cloned()
+    }
+
+    async fn check_relationship(&self, target_did: &str, candidate_did: &str) -> (bool, bool) {
+        self.relationships
+            .read()
+            .get(&(target_did.to_string(), candidate_did.to_string()))
+            .copied()
+            .unwrap_or((false, false))
     }
 }
 
@@ -491,6 +535,48 @@ impl AppViewContextEnricher {
         self.client.fetch_follow_records(actor, limit).await
     }
 
+    /// Queries `app.bsky.graph.getRelationships` on the public AppView to check whether
+    /// `target_did` follows `candidate_did` (`following`) or `candidate_did` follows
+    /// `target_did` (`followedBy`).
+    ///
+    /// Degrades gracefully to `(false, false)` on network or decode failure.
+    pub async fn fetch_relationship(&self, target_did: &str, candidate_did: &str) -> (bool, bool) {
+        #[derive(Deserialize)]
+        struct RelationshipItem {
+            #[serde(default)]
+            following: Option<String>,
+            #[serde(default, rename = "followedBy")]
+            followed_by: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct RelationshipsResponse {
+            #[serde(default)]
+            relationships: Vec<RelationshipItem>,
+        }
+
+        let Ok(resp) = self
+            .client
+            .get::<RelationshipsResponse>(
+                "app.bsky.graph.getRelationships",
+                &[
+                    ("actor", target_did.to_string()),
+                    ("others", candidate_did.to_string()),
+                ],
+            )
+            .await
+        else {
+            return (false, false);
+        };
+
+        let Some(rel) = resp.relationships.into_iter().next() else {
+            return (false, false);
+        };
+
+        let is_following = rel.following.as_deref().is_some_and(|s| !s.is_empty());
+        let is_followed_by = rel.followed_by.as_deref().is_some_and(|s| !s.is_empty());
+        (is_following, is_followed_by)
+    }
+
     /// Resolves an ATProto handle to a DID via XRPC `com.atproto.identity.resolveHandle`.
     pub async fn resolve_handle(&self, handle: &str) -> Option<String> {
         self.client.resolve_handle(handle).await
@@ -532,9 +618,12 @@ impl AppViewContextEnricher {
     }
 
     /// Fetches base64-encoded thumbnails for a set of image CIDs from the Bluesky CDN.
+    ///
+    /// Caps retrieval at [`MAX_POST_IMAGES`] (20) to match the ATProto `app.bsky.embed.gallery`
+    /// lexicon maximum.
     pub async fn fetch_images_base64(&self, author_did: &str, cids: &[String]) -> Vec<String> {
-        let mut results = Vec::with_capacity(cids.len().min(4));
-        for cid in cids.iter().take(4) {
+        let mut results = Vec::with_capacity(cids.len().min(MAX_POST_IMAGES));
+        for cid in cids.iter().take(MAX_POST_IMAGES) {
             if let Some(b64) = self.fetch_image_base64(author_did, cid).await {
                 results.push(b64);
             }
@@ -645,6 +734,10 @@ impl ContextEnricher for AppViewContextEnricher {
     async fn fetch_image_base64(&self, author_did: &str, cid: &str) -> Option<String> {
         self.fetch_image_base64(author_did, cid).await
     }
+
+    async fn check_relationship(&self, target_did: &str, candidate_did: &str) -> (bool, bool) {
+        self.fetch_relationship(target_did, candidate_did).await
+    }
 }
 
 #[cfg(test)]
@@ -702,5 +795,63 @@ mod tests {
 
         let unknown = enricher.resolve_did("did:plc:unknown").await;
         assert_eq!(unknown, None);
+    }
+
+    #[tokio::test]
+    async fn test_mock_context_enricher_supports_up_to_max_post_images() {
+        let enricher = MockContextEnricher::new();
+        let mut cids = Vec::new();
+        for idx in 0..25 {
+            let cid = format!("bafkimg{idx}");
+            enricher.set_image_base64("did:plc:author1", &cid, format!("b64_{idx}"));
+            cids.push(cid);
+        }
+
+        let mut interaction = Interaction::mock_test_candidate(
+            "did:plc:author1",
+            "did:plc:target1",
+            "Gallery post with >4 images",
+        );
+        interaction.image_cids = cids;
+
+        let enriched = enricher.enrich(&interaction).await;
+        assert_eq!(enriched.images_base64.len(), MAX_POST_IMAGES);
+        assert_eq!(enriched.images_base64[0], "b64_0");
+        assert_eq!(enriched.images_base64[MAX_POST_IMAGES - 1], "b64_19");
+    }
+
+    #[tokio::test]
+    async fn test_appview_fetch_relationship_and_noop() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let noop = NoopContextEnricher;
+        assert_eq!(
+            noop.check_relationship("did:plc:a", "did:plc:b").await,
+            (false, false)
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.graph.getRelationships"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "actor": "did:plc:alice",
+                "relationships": [
+                    {
+                        "did": "did:plc:pelasgus",
+                        "followedBy": "at://did:plc:pelasgus/app.bsky.graph.follow/3mxuft7ygur2n"
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let enricher = AppViewContextEnricher::with_endpoint(server.uri());
+        let (following, followed_by) = enricher
+            .check_relationship("did:plc:alice", "did:plc:pelasgus")
+            .await;
+        assert!(!following);
+        assert!(followed_by);
     }
 }

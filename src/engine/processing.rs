@@ -476,6 +476,55 @@ impl SkybouncerEngine {
             });
         }
 
+        // Lazy relationship backfill: for large accounts (>7,100 followers) whose oldest
+        // followers sit beyond AppView `getFollowers` cursor pagination depth, verify the
+        // live `(target_did, author_did)` relationship via `app.bsky.graph.getRelationships`
+        // before invoking the AI classifier, caching any discovered follow/follower edge
+        // in `FollowGraph` so subsequent interactions are bypassed in <1µs at Tier 3.
+        let (target_follows_author, author_follows_target) = self
+            .enricher
+            .check_relationship(&target_did, &author_did)
+            .await;
+        if target_follows_author {
+            self.follow_graph
+                .add_follow(&target_did, format!("lazy_{author_did}"), &author_did);
+            self.stats
+                .gate_bypassed_followed
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                author = %author_did,
+                target = %target_did,
+                "Lazy relationship check confirmed protected user follows author; bypassing evaluation"
+            );
+            return Ok(InteractionOutcome::Bypassed {
+                author_did,
+                target_did,
+                reason: BypassReason::FollowedAuthor,
+            });
+        }
+        if author_follows_target {
+            self.follow_graph.add_follower(
+                &target_did,
+                &author_did,
+                format!("lazy_in_{author_did}"),
+            );
+            if self.gate.bypass_incoming_followers(&target_did) {
+                self.stats
+                    .gate_bypassed_follower
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    author = %author_did,
+                    target = %target_did,
+                    "Lazy relationship check confirmed author follows protected user; bypassing evaluation"
+                );
+                return Ok(InteractionOutcome::Bypassed {
+                    author_did,
+                    target_did,
+                    reason: BypassReason::FollowerAuthor,
+                });
+            }
+        }
+
         // Tier 4: Per-User Evaluation Rate Limiter (Anti-Denial-of-Wallet, PRD §5.2) - checked at dequeue
         if !self.rate_limiter.check_and_record(&target_did) {
             self.stats

@@ -25,8 +25,18 @@ pub async fn hydrate_cold_start(
     enricher: &crate::enricher::AppViewContextEnricher,
     protected_dids: &std::collections::HashSet<String>,
 ) -> usize {
+    let mut all_dids = protected_dids.clone();
+    all_dids.extend(engine.protected_dids());
+    if let Ok(tenants) = engine.tenant_registry().list_all() {
+        for t in tenants {
+            if t.is_active {
+                all_dids.insert(t.did);
+            }
+        }
+    }
+
     let mut hydrated: usize = 0;
-    for did in protected_dids {
+    for did in &all_dids {
         let follow_records = enricher.fetch_follow_records(did, 100).await;
         if !follow_records.is_empty() {
             hydrated = hydrated.saturating_add(engine.hydrate_follow_records(did, follow_records));

@@ -1004,3 +1004,53 @@ async fn test_heuristic_empty_default_and_trait_impls() {
     assert!(empty.classify_with_rubric(&interaction, None).await.is_ok());
     assert_eq!(empty.model_name(), "heuristic_regex");
 }
+
+#[tokio::test]
+async fn test_jev_classifier_ollama_sends_num_ctx_options() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(body_string_contains("\"num_ctx\":16384"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "gemma4:26b",
+            "message": {
+                "role": "assistant",
+                "content": "{\"violates\": false, \"category\": null, \"confidence\": 0.10, \"reason\": \"Benign post\"}"
+            },
+            "done": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = JevConfig {
+        base_url: format!("{}/api/chat", server.uri()),
+        api_key: None,
+        model: "gemma4:26b".to_string(),
+        timeout: Duration::from_millis(1000),
+        max_retries: 0,
+        supports_images: false,
+    };
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let classifier = JevClassifier::new(config.clone(), rubric.clone()).unwrap();
+    assert_eq!(
+        classifier.num_ctx(),
+        skybouncer::classifier::DEFAULT_OLLAMA_NUM_CTX
+    );
+
+    let interaction = sample_interaction("Hello there");
+    let verdict = classifier.classify(&interaction).await.unwrap();
+    assert!(!verdict.is_violation());
+
+    // Verify custom `with_num_ctx` override and minimum clamp (1024)
+    let clamped = JevClassifier::new(config.clone(), rubric.clone())
+        .unwrap()
+        .with_num_ctx(512);
+    assert_eq!(clamped.num_ctx(), 1024);
+
+    let custom = JevClassifier::new(config, rubric)
+        .unwrap()
+        .with_num_ctx(12_288);
+    assert_eq!(custom.num_ctx(), 12_288);
+}

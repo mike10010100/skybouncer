@@ -946,3 +946,247 @@ fn test_follow_graph_incoming_synthetic_follower_fallback_prunes_set() {
     );
     assert_eq!(graph.follower_count(protected), 0);
 }
+
+#[test]
+fn test_target_matcher_extracts_gallery_embed_images_up_to_cap() {
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert(PROTECTED_ALICE.to_string());
+
+    let items: Vec<serde_json::Value> = (0..25)
+        .map(|idx| {
+            serde_json::json!({
+                "$type": "app.bsky.embed.gallery#item",
+                "image": {
+                    "$type": "blob",
+                    "ref": { "$link": format!("bafkreigallery{idx}") },
+                    "mimeType": "image/jpeg",
+                    "size": 12345
+                },
+                "alt": format!("Gallery photo {idx}"),
+                "aspectRatio": { "width": 1200, "height": 800 }
+            })
+        })
+        .collect();
+
+    let commit = JetstreamCommit {
+        did: "did:plc:gallery_author".to_string(),
+        time_us: 1_700_000_000_000_000,
+        operation: CommitOperation::Create,
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "gallery_post_1".to_string(),
+        cid: Some("bafygallerypost1".to_string()),
+        record: Some(serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Check out this 10+ photo gallery!",
+            "createdAt": "2026-10-27T12:00:00Z",
+            "reply": {
+                "root": {
+                    "uri": format!("at://{PROTECTED_ALICE}/app.bsky.feed.post/root1"),
+                    "cid": "bafyroot1"
+                },
+                "parent": {
+                    "uri": format!("at://{PROTECTED_ALICE}/app.bsky.feed.post/root1"),
+                    "cid": "bafyroot1"
+                }
+            },
+            "embed": {
+                "$type": "app.bsky.embed.gallery",
+                "items": items
+            }
+        })),
+    };
+
+    let matched = TargetMatcher::match_interaction(&commit, &protected_dids)
+        .expect("gallery reply should match");
+    assert_eq!(matched.image_cids.len(), skybouncer::MAX_POST_IMAGES);
+    assert_eq!(matched.image_alts.len(), skybouncer::MAX_POST_IMAGES);
+    assert_eq!(matched.image_cids[0], "bafkreigallery0");
+    assert_eq!(matched.image_cids[19], "bafkreigallery19");
+    assert_eq!(matched.image_alts[0], "Gallery photo 0");
+
+    // Also verify `app.bsky.embed.recordWithMedia` wrapping an `app.bsky.embed.gallery`
+    let quote_gallery_commit = JetstreamCommit {
+        did: "did:plc:gallery_quoter".to_string(),
+        time_us: 1_700_000_000_000_001,
+        operation: CommitOperation::Create,
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "gallery_quote_1".to_string(),
+        cid: Some("bafygalleryquote1".to_string()),
+        record: Some(serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Quote with gallery",
+            "createdAt": "2026-10-27T12:00:00Z",
+            "embed": {
+                "$type": "app.bsky.embed.recordWithMedia",
+                "record": {
+                    "$type": "app.bsky.embed.record",
+                    "record": {
+                        "uri": format!("at://{PROTECTED_ALICE}/app.bsky.feed.post/quoted1"),
+                        "cid": "bafyquoted1"
+                    }
+                },
+                "media": {
+                    "$type": "app.bsky.embed.gallery",
+                    "items": [
+                        {
+                            "media": {
+                                "image": { "cid": "bafkreinestedgallery0" },
+                                "alt": "Nested gallery alt"
+                            }
+                        },
+                        {
+                            "cid": "bafkreinestedgallery1",
+                            "alt": "Direct cid alt"
+                        }
+                    ]
+                }
+            }
+        })),
+    };
+
+    let quote_matched = TargetMatcher::match_interaction(&quote_gallery_commit, &protected_dids)
+        .expect("quote with gallery should match");
+    assert_eq!(
+        quote_matched.image_cids,
+        vec![
+            "bafkreinestedgallery0".to_string(),
+            "bafkreinestedgallery1".to_string()
+        ]
+    );
+    assert_eq!(
+        quote_matched.image_alts,
+        vec![
+            "Nested gallery alt".to_string(),
+            "Direct cid alt".to_string()
+        ]
+    );
+}
+
+#[test]
+fn test_hydrated_follower_not_evicted_when_unfollowing_unrelated_account() {
+    let graph = Arc::new(FollowGraph::new());
+    let gate = NonFollowedGate::new(Arc::clone(&graph));
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert(PROTECTED_ALICE.to_string());
+
+    let follower = "did:plc:pelasgus";
+    graph.hydrate_followers(PROTECTED_ALICE, [follower]);
+    assert!(graph.is_followed_by(PROTECTED_ALICE, follower));
+
+    // When `follower` unfollows some unrelated account on Bluesky, a Delete commit
+    // arrives on the global firehose with `did == follower` and an unknown `rkey`.
+    // It MUST be ignored and MUST NOT evict `follower` from `PROTECTED_ALICE`'s followers!
+    let unrelated_unfollow = make_follow_delete_commit(follower, "3mxyz_unrelated_follow_rkey");
+    let event = graph.handle_commit(&unrelated_unfollow, &protected_dids);
+    assert_eq!(event, FollowSyncEvent::Ignored);
+    assert!(
+        graph.is_followed_by(PROTECTED_ALICE, follower),
+        "hydrated follower must not be evicted when deleting an unrelated follow record"
+    );
+
+    // Subsequent reply from `follower` to `PROTECTED_ALICE` must still be bypassed at Tier 3.
+    let reply_commit = make_reply_commit(
+        follower,
+        PROTECTED_ALICE,
+        "reply_after_unrelated_unfollow",
+        "root_1",
+        "Replying as a follower",
+    );
+    let interaction =
+        TargetMatcher::match_interaction(&reply_commit, &protected_dids).expect("should match");
+    let decision = gate.evaluate(interaction);
+    assert_eq!(decision.bypass_reason(), Some(BypassReason::FollowerAuthor));
+}
+
+#[tokio::test]
+async fn test_lazy_relationship_backfill_bypasses_unhydrated_follower_and_caches_in_graph() {
+    use skybouncer::classifier::MockClassifier;
+    use skybouncer::engine::{InteractionOutcome, SkybouncerConfig, SkybouncerEngine};
+    use skybouncer::enricher::MockContextEnricher;
+
+    let classifier = Arc::new(MockClassifier::permitted());
+    let enricher = Arc::new(MockContextEnricher::new());
+
+    // Simulate an older follower (`did:plc:old_follower`) beyond `getFollowers` pagination depth:
+    // not in `FollowGraph` initially, but `app.bsky.graph.getRelationships` reports `followedBy`.
+    let old_follower = "did:plc:old_follower";
+    let followed_peer = "did:plc:followed_peer";
+    enricher.set_relationship(PROTECTED_ALICE, old_follower, false, true);
+    enricher.set_relationship(PROTECTED_ALICE, followed_peer, true, false);
+
+    let config = SkybouncerConfig::new([PROTECTED_ALICE], skybouncer::RuleRubric::default())
+        .with_dry_run(true);
+    let engine = SkybouncerEngine::builder(config)
+        .with_classifier(classifier.clone())
+        .with_enricher(enricher)
+        .build()
+        .expect("engine build");
+
+    assert!(!engine
+        .follow_graph()
+        .is_followed_by(PROTECTED_ALICE, old_follower));
+
+    // First interaction triggers lazy relationship check, bypasses AI model, and caches in FollowGraph.
+    let commit1 = make_reply_commit(
+        old_follower,
+        PROTECTED_ALICE,
+        "old_f_1",
+        "root_1",
+        "Hello from an older follower beyond page 93!",
+    );
+    let mut protected = HashSet::new();
+    protected.insert(PROTECTED_ALICE.to_string());
+    let interaction1 =
+        TargetMatcher::match_interaction(&commit1, &protected).expect("should match");
+    let outcome1 = engine
+        .process_interaction(interaction1)
+        .await
+        .expect("process_interaction");
+
+    assert_eq!(
+        outcome1,
+        InteractionOutcome::Bypassed {
+            author_did: old_follower.to_string(),
+            target_did: PROTECTED_ALICE.to_string(),
+            reason: BypassReason::FollowerAuthor,
+        }
+    );
+    assert_eq!(
+        classifier.call_count(),
+        0,
+        "AI classifier must never be called for a follower when bypass_incoming_followers is enabled"
+    );
+    assert!(
+        engine
+            .follow_graph()
+            .is_followed_by(PROTECTED_ALICE, old_follower),
+        "FollowGraph must cache the discovered follower relationship for <1us subsequent checks"
+    );
+    assert_eq!(engine.stats().snapshot().gate_bypassed_follower, 1);
+
+    // Also verify lazy outgoing follow discovery (`target_follows_author == true`).
+    let commit2 = make_reply_commit(
+        followed_peer,
+        PROTECTED_ALICE,
+        "peer_1",
+        "root_1",
+        "Hello from an account Alice follows!",
+    );
+    let interaction2 =
+        TargetMatcher::match_interaction(&commit2, &protected).expect("should match");
+    let outcome2 = engine
+        .process_interaction(interaction2)
+        .await
+        .expect("process_interaction");
+    assert_eq!(
+        outcome2,
+        InteractionOutcome::Bypassed {
+            author_did: followed_peer.to_string(),
+            target_did: PROTECTED_ALICE.to_string(),
+            reason: BypassReason::FollowedAuthor,
+        }
+    );
+    assert_eq!(classifier.call_count(), 0);
+    assert!(engine.is_following(PROTECTED_ALICE, followed_peer));
+    assert_eq!(engine.stats().snapshot().gate_bypassed_followed, 1);
+}

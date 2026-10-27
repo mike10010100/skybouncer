@@ -19,7 +19,9 @@ pub use dynamic::{
     DEFAULT_MULTIMODAL_PRIMARY_MODEL, DEFAULT_TEXT_ONLY_PRIMARY_MODEL,
 };
 pub use heuristic::{HeuristicClassifier, HeuristicRule};
-pub use jev::{JevClassifier, JevConfig, JevEndpointKind};
+pub use jev::{
+    JevClassifier, JevConfig, JevEndpointKind, OllamaChatOptions, DEFAULT_OLLAMA_NUM_CTX,
+};
 pub use mock::MockClassifier;
 pub use rubric::{
     bounce_duration_from_db, sensitivity_from_db, BounceDuration, RuleRubric, Sensitivity,
