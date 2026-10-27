@@ -1061,3 +1061,132 @@ fn test_target_matcher_extracts_gallery_embed_images_up_to_cap() {
         ]
     );
 }
+
+#[test]
+fn test_hydrated_follower_not_evicted_when_unfollowing_unrelated_account() {
+    let graph = Arc::new(FollowGraph::new());
+    let gate = NonFollowedGate::new(Arc::clone(&graph));
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert(PROTECTED_ALICE.to_string());
+
+    let follower = "did:plc:pelasgus";
+    graph.hydrate_followers(PROTECTED_ALICE, [follower]);
+    assert!(graph.is_followed_by(PROTECTED_ALICE, follower));
+
+    // When `follower` unfollows some unrelated account on Bluesky, a Delete commit
+    // arrives on the global firehose with `did == follower` and an unknown `rkey`.
+    // It MUST be ignored and MUST NOT evict `follower` from `PROTECTED_ALICE`'s followers!
+    let unrelated_unfollow = make_follow_delete_commit(follower, "3mxyz_unrelated_follow_rkey");
+    let event = graph.handle_commit(&unrelated_unfollow, &protected_dids);
+    assert_eq!(event, FollowSyncEvent::Ignored);
+    assert!(
+        graph.is_followed_by(PROTECTED_ALICE, follower),
+        "hydrated follower must not be evicted when deleting an unrelated follow record"
+    );
+
+    // Subsequent reply from `follower` to `PROTECTED_ALICE` must still be bypassed at Tier 3.
+    let reply_commit = make_reply_commit(
+        follower,
+        PROTECTED_ALICE,
+        "reply_after_unrelated_unfollow",
+        "root_1",
+        "Replying as a follower",
+    );
+    let interaction =
+        TargetMatcher::match_interaction(&reply_commit, &protected_dids).expect("should match");
+    let decision = gate.evaluate(interaction);
+    assert_eq!(decision.bypass_reason(), Some(BypassReason::FollowerAuthor));
+}
+
+#[tokio::test]
+async fn test_lazy_relationship_backfill_bypasses_unhydrated_follower_and_caches_in_graph() {
+    use skybouncer::classifier::MockClassifier;
+    use skybouncer::engine::{InteractionOutcome, SkybouncerConfig, SkybouncerEngine};
+    use skybouncer::enricher::MockContextEnricher;
+
+    let classifier = Arc::new(MockClassifier::permitted());
+    let enricher = Arc::new(MockContextEnricher::new());
+
+    // Simulate an older follower (`did:plc:old_follower`) beyond `getFollowers` pagination depth:
+    // not in `FollowGraph` initially, but `app.bsky.graph.getRelationships` reports `followedBy`.
+    let old_follower = "did:plc:old_follower";
+    let followed_peer = "did:plc:followed_peer";
+    enricher.set_relationship(PROTECTED_ALICE, old_follower, false, true);
+    enricher.set_relationship(PROTECTED_ALICE, followed_peer, true, false);
+
+    let config = SkybouncerConfig::new([PROTECTED_ALICE], skybouncer::RuleRubric::default())
+        .with_dry_run(true);
+    let engine = SkybouncerEngine::builder(config)
+        .with_classifier(classifier.clone())
+        .with_enricher(enricher)
+        .build()
+        .expect("engine build");
+
+    assert!(!engine
+        .follow_graph()
+        .is_followed_by(PROTECTED_ALICE, old_follower));
+
+    // First interaction triggers lazy relationship check, bypasses AI model, and caches in FollowGraph.
+    let commit1 = make_reply_commit(
+        old_follower,
+        PROTECTED_ALICE,
+        "old_f_1",
+        "root_1",
+        "Hello from an older follower beyond page 93!",
+    );
+    let mut protected = HashSet::new();
+    protected.insert(PROTECTED_ALICE.to_string());
+    let interaction1 =
+        TargetMatcher::match_interaction(&commit1, &protected).expect("should match");
+    let outcome1 = engine
+        .process_interaction(interaction1)
+        .await
+        .expect("process_interaction");
+
+    assert_eq!(
+        outcome1,
+        InteractionOutcome::Bypassed {
+            author_did: old_follower.to_string(),
+            target_did: PROTECTED_ALICE.to_string(),
+            reason: BypassReason::FollowerAuthor,
+        }
+    );
+    assert_eq!(
+        classifier.call_count(),
+        0,
+        "AI classifier must never be called for a follower when bypass_incoming_followers is enabled"
+    );
+    assert!(
+        engine
+            .follow_graph()
+            .is_followed_by(PROTECTED_ALICE, old_follower),
+        "FollowGraph must cache the discovered follower relationship for <1us subsequent checks"
+    );
+    assert_eq!(engine.stats().snapshot().gate_bypassed_follower, 1);
+
+    // Also verify lazy outgoing follow discovery (`target_follows_author == true`).
+    let commit2 = make_reply_commit(
+        followed_peer,
+        PROTECTED_ALICE,
+        "peer_1",
+        "root_1",
+        "Hello from an account Alice follows!",
+    );
+    let interaction2 =
+        TargetMatcher::match_interaction(&commit2, &protected).expect("should match");
+    let outcome2 = engine
+        .process_interaction(interaction2)
+        .await
+        .expect("process_interaction");
+    assert_eq!(
+        outcome2,
+        InteractionOutcome::Bypassed {
+            author_did: followed_peer.to_string(),
+            target_did: PROTECTED_ALICE.to_string(),
+            reason: BypassReason::FollowedAuthor,
+        }
+    );
+    assert_eq!(classifier.call_count(), 0);
+    assert!(engine.is_following(PROTECTED_ALICE, followed_peer));
+    assert_eq!(engine.stats().snapshot().gate_bypassed_followed, 1);
+}

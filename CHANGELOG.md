@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `MAX_POST_IMAGES = 20` to `enricher`, raising image thumbnail inspection ceiling from 4 to 20 to support ATProto gallery embeds alongside legacy `app.bsky.embed.images`.
   - `TargetMatcher` now extracts image CIDs and alt texts from `app.bsky.embed.gallery` records (both direct gallery embeds and `app.bsky.embed.recordWithMedia` wrapping a gallery) up to the 20-image lexicon limit.
 
+### Fixed
+
+- **Incoming Follower Bypass Retention & Lazy Relationship Backfill** (`src/matcher/follow_graph.rs`, `src/daemon.rs`, `src/enricher.rs`, `src/engine/processing.rs`):
+  - Fixed a bug in `FollowGraph::handle_commit` where incoming `CommitOperation::Delete` follow events for untracked `rkey`s invoked `remove_synthetic_follower_fallback(&commit.did)`, falsely evicting cold-start hydrated followers whenever they unfollowed any unrelated account on Bluesky.
+  - Updated `daemon::hydrate_cold_start` to hydrate follows and followers for all active enrolled tenants in `tenant_registry` in addition to `config.protected_dids`.
+  - Added `ContextEnricher::check_relationship` (`app.bsky.graph.getRelationships`) and lazy `FollowGraph` backfill in `evaluate_candidate` so older followers beyond AppView `getFollowers` cursor pagination depth are discovered, cached in `FollowGraph`, and bypassed before invoking the AI classifier.
+
 ## [0.2.13] - 2026-10-26
 
 ### Security
