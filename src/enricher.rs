@@ -26,6 +26,13 @@ pub const MAX_RENDERED_THREAD_ANCESTORS: usize = 8;
 /// Per-post character cap applied to each rendered thread ancestor.
 pub const THREAD_ANCESTOR_CHAR_CAP: usize = 300;
 
+/// Maximum number of attached post images fetched and inspected per interaction.
+///
+/// Matches the ATProto `app.bsky.embed.gallery` lexicon protocol ceiling (`maxLength: 20`),
+/// accommodating both legacy 4-image embeds (`app.bsky.embed.images`) and multi-image
+/// gallery posts (10-item UI limit, 20-item protocol max).
+pub const MAX_POST_IMAGES: usize = 20;
+
 /// A single ancestor post resolved from the conversation thread above the candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct ThreadPost {
@@ -262,7 +269,7 @@ impl ContextEnricher for MockContextEnricher {
         let mut images_base64 = Vec::new();
         {
             let guard = self.images.read();
-            for cid in &interaction.image_cids {
+            for cid in interaction.image_cids.iter().take(MAX_POST_IMAGES) {
                 if let Some(b64) = guard.get(&(interaction.author_did.clone(), cid.clone())) {
                     images_base64.push(b64.clone());
                 }
@@ -532,9 +539,12 @@ impl AppViewContextEnricher {
     }
 
     /// Fetches base64-encoded thumbnails for a set of image CIDs from the Bluesky CDN.
+    ///
+    /// Caps retrieval at [`MAX_POST_IMAGES`] (20) to match the ATProto `app.bsky.embed.gallery`
+    /// lexicon maximum.
     pub async fn fetch_images_base64(&self, author_did: &str, cids: &[String]) -> Vec<String> {
-        let mut results = Vec::with_capacity(cids.len().min(4));
-        for cid in cids.iter().take(4) {
+        let mut results = Vec::with_capacity(cids.len().min(MAX_POST_IMAGES));
+        for cid in cids.iter().take(MAX_POST_IMAGES) {
             if let Some(b64) = self.fetch_image_base64(author_did, cid).await {
                 results.push(b64);
             }
@@ -702,5 +712,28 @@ mod tests {
 
         let unknown = enricher.resolve_did("did:plc:unknown").await;
         assert_eq!(unknown, None);
+    }
+
+    #[tokio::test]
+    async fn test_mock_context_enricher_supports_up_to_max_post_images() {
+        let enricher = MockContextEnricher::new();
+        let mut cids = Vec::new();
+        for idx in 0..25 {
+            let cid = format!("bafkimg{idx}");
+            enricher.set_image_base64("did:plc:author1", &cid, format!("b64_{idx}"));
+            cids.push(cid);
+        }
+
+        let mut interaction = Interaction::mock_test_candidate(
+            "did:plc:author1",
+            "did:plc:target1",
+            "Gallery post with >4 images",
+        );
+        interaction.image_cids = cids;
+
+        let enriched = enricher.enrich(&interaction).await;
+        assert_eq!(enriched.images_base64.len(), MAX_POST_IMAGES);
+        assert_eq!(enriched.images_base64[0], "b64_0");
+        assert_eq!(enriched.images_base64[MAX_POST_IMAGES - 1], "b64_19");
     }
 }

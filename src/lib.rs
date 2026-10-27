@@ -64,7 +64,8 @@ pub use bot::{
 pub use enricher::{
     AppViewContextEnricher, AuthorContext, ContextEnricher, EnrichedContext, MockContextEnricher,
     NoopContextEnricher, ParentPostContext, ThreadPost, DEFAULT_APPVIEW_ENDPOINT,
-    DEFAULT_ENRICHER_TIMEOUT_MS, MAX_RENDERED_THREAD_ANCESTORS, THREAD_ANCESTOR_CHAR_CAP,
+    DEFAULT_ENRICHER_TIMEOUT_MS, MAX_POST_IMAGES, MAX_RENDERED_THREAD_ANCESTORS,
+    THREAD_ANCESTOR_CHAR_CAP,
 };
 pub use limiter::{
     EvaluationRateLimiter, RateLimiterConfig, DEFAULT_MAX_EVALUATIONS_PER_WINDOW,
@@ -85,8 +86,8 @@ pub use web::{
 pub use classifier::{
     BounceDuration, Classifier, DynamicModelPolicy, DynamicPrimaryClassifier, DynamicPrimaryStats,
     DynamicPrimaryStatsSnapshot, HeuristicClassifier, HeuristicRule, JevClassifier, JevConfig,
-    MockClassifier, RuleRubric, Sensitivity, Verdict, ViolationCategory,
-    DEFAULT_MULTIMODAL_PRIMARY_MODEL, DEFAULT_TEXT_ONLY_PRIMARY_MODEL,
+    MockClassifier, OllamaChatOptions, RuleRubric, Sensitivity, Verdict, ViolationCategory,
+    DEFAULT_MULTIMODAL_PRIMARY_MODEL, DEFAULT_OLLAMA_NUM_CTX, DEFAULT_TEXT_ONLY_PRIMARY_MODEL,
 };
 pub use engine::{
     simulate::{SimulateTierStage, SimulationInputs, SimulationResult},

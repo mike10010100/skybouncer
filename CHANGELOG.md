@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.14] - 2026-10-27
+
+### Added
+
+- **Ollama Context Window Configuration (`num_ctx = 16384`)**:
+  - `JevClassifier` now sets explicit runtime inference options (`OllamaChatOptions { num_ctx }`) on all Ollama `/api/chat` requests (including `gemma4:26b`), defaulting to `16_384` tokens (`DEFAULT_OLLAMA_NUM_CTX`).
+  - Configurable via `OLLAMA_NUM_CTX` / `SKYBOUNCER_OLLAMA_NUM_CTX` / `JEV_NUM_CTX` / `FALLBACK_NUM_CTX` environment variables and `JevClassifier::with_num_ctx(num_ctx)` (clamped to a safe minimum of 1,024 tokens).
+  - Documented `OLLAMA_NUM_CTX=16384` in `.env.example` and `deploy/systemd/skybouncer.env.example`.
+- **Multi-Image Gallery Embed Support (`app.bsky.embed.gallery`)**:
+  - Added `MAX_POST_IMAGES = 20` to `enricher`, raising image thumbnail inspection ceiling from 4 to 20 to support ATProto gallery embeds alongside legacy `app.bsky.embed.images`.
+  - `TargetMatcher` now extracts image CIDs and alt texts from `app.bsky.embed.gallery` records (both direct gallery embeds and `app.bsky.embed.recordWithMedia` wrapping a gallery) up to the 20-image lexicon limit.
+
 ## [0.2.13] - 2026-10-26
 
 ### Security

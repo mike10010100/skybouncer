@@ -26,6 +26,14 @@ pub const DEFAULT_JEV_TIMEOUT_MS: u64 = 15000;
 /// Default maximum retry count on transient errors.
 pub const DEFAULT_JEV_MAX_RETRIES: usize = 1;
 
+/// Default Ollama context window size (`num_ctx`) in tokens.
+///
+/// Sized to comfortably accommodate the worst-case candidate post (4,000 chars),
+/// custom rubric, author profile, 8-post conversation thread, up to 20 gallery
+/// image thumbnails (256 tokens/image in `gemma4:26b`), and reasoning/JSON output
+/// while bounding KV-cache VRAM allocation well below the model's native 128K+ ceiling.
+pub const DEFAULT_OLLAMA_NUM_CTX: usize = 16_384;
+
 /// Configuration parameters for [`JevClassifier`].
 #[derive(Debug, Clone)]
 pub struct JevConfig {
@@ -186,6 +194,21 @@ pub struct OllamaChatMessage {
     pub images: Option<Vec<String>>,
 }
 
+/// Runtime inference options supplied to Ollama chat requests (`/api/chat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OllamaChatOptions {
+    /// Context window size (`num_ctx`) in tokens allocated for the request.
+    pub num_ctx: usize,
+}
+
+impl Default for OllamaChatOptions {
+    fn default() -> Self {
+        Self {
+            num_ctx: DEFAULT_OLLAMA_NUM_CTX,
+        }
+    }
+}
+
 /// Outbound request payload for Ollama chat classification (`/api/chat`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OllamaChatRequest {
@@ -197,6 +220,9 @@ pub struct OllamaChatRequest {
     pub format: String,
     /// Whether to stream partial tokens (always `false` for classification).
     pub stream: bool,
+    /// Runtime inference options (e.g. `num_ctx` context window size).
+    #[serde(default)]
+    pub options: OllamaChatOptions,
 }
 
 /// Inbound response payload from Ollama chat classification (`/api/chat`).
@@ -271,6 +297,7 @@ pub struct JevClassifier {
     http_client: reqwest::Client,
     classify_url: String,
     endpoint_kind: JevEndpointKind,
+    num_ctx: usize,
 }
 
 impl JevClassifier {
@@ -347,13 +374,41 @@ impl JevClassifier {
             SkybouncerError::Config(format!("Invalid Jev endpoint URL '{classify_url}': {e}"))
         })?;
 
+        let num_ctx = crate::env::parsed_or(
+            &[
+                "OLLAMA_NUM_CTX",
+                "SKYBOUNCER_OLLAMA_NUM_CTX",
+                "JEV_NUM_CTX",
+                "FALLBACK_NUM_CTX",
+            ],
+            DEFAULT_OLLAMA_NUM_CTX,
+        )
+        .max(1024);
+
         Ok(Self {
             config,
             rubric: Arc::new(RwLock::new(rubric)),
             http_client,
             classify_url,
             endpoint_kind,
+            num_ctx,
         })
+    }
+
+    /// Overrides the Ollama context window size (`num_ctx`) in tokens.
+    ///
+    /// Values below `1024` are clamped to `1024` to guarantee sufficient headroom
+    /// for system and candidate prompts.
+    #[must_use]
+    pub fn with_num_ctx(mut self, num_ctx: usize) -> Self {
+        self.num_ctx = num_ctx.max(1024);
+        self
+    }
+
+    /// Returns the configured Ollama context window size (`num_ctx`) in tokens.
+    #[must_use]
+    pub const fn num_ctx(&self) -> usize {
+        self.num_ctx
     }
 
     /// Creates a [`JevClassifier`] by loading configuration from environment variables.
@@ -523,6 +578,9 @@ impl JevClassifier {
                         ],
                         format: "json".to_string(),
                         stream: false,
+                        options: OllamaChatOptions {
+                            num_ctx: self.num_ctx,
+                        },
                     };
                     request_builder.json(&payload).send().await
                 }

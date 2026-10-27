@@ -87,19 +87,9 @@ impl TargetMatcher {
         let mut matches = Vec::new();
         let mut seen_targets = HashSet::new();
 
-        // Extract attached image CIDs and alt texts once for this post
-        let (image_cids, image_alts) = if let Some(ref embed) = post.embed {
-            let pairs = embed.extract_images();
-            let mut cids = Vec::with_capacity(pairs.len());
-            let mut alts = Vec::with_capacity(pairs.len());
-            for (c, a) in pairs {
-                cids.push(c);
-                alts.push(a);
-            }
-            (cids, alts)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        // Extract attached image CIDs and alt texts once for this post, supporting both
+        // legacy `app.bsky.embed.images` and multi-image `app.bsky.embed.gallery` embeds.
+        let (image_cids, image_alts) = extract_post_images(&post, record_val);
 
         // Vector 1: Direct Reply (parent.uri)
         if let Some(ref reply) = post.reply {
@@ -204,4 +194,77 @@ impl TargetMatcher {
 
         matches
     }
+}
+
+/// Extracts image CIDs and alt texts from a post record, supporting both legacy
+/// `app.bsky.embed.images` (via [`crate::types::Embed::extract_images`]) and
+/// multi-image `app.bsky.embed.gallery` embeds (`items` array up to [`crate::enricher::MAX_POST_IMAGES`]).
+fn extract_post_images(
+    post: &PostRecord,
+    record_val: &serde_json::Value,
+) -> (Vec<String>, Vec<String>) {
+    let mut pairs = post
+        .embed
+        .as_ref()
+        .map(crate::types::Embed::extract_images)
+        .unwrap_or_default();
+
+    if pairs.is_empty() {
+        if let Some(embed_val) = record_val.get("embed") {
+            pairs = extract_gallery_items(embed_val);
+            if pairs.is_empty() {
+                if let Some(media_val) = embed_val.get("media") {
+                    pairs = extract_gallery_items(media_val);
+                }
+            }
+        }
+    }
+
+    let cap = pairs.len().min(crate::enricher::MAX_POST_IMAGES);
+    let mut cids = Vec::with_capacity(cap);
+    let mut alts = Vec::with_capacity(cap);
+    for (c, a) in pairs.into_iter().take(crate::enricher::MAX_POST_IMAGES) {
+        cids.push(c);
+        alts.push(a);
+    }
+    (cids, alts)
+}
+
+/// Extracts `(cid, alt)` pairs from an `app.bsky.embed.gallery` (or `images`) JSON object.
+fn extract_gallery_items(val: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(items) = val
+        .get("items")
+        .or_else(|| val.get("images"))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut results = Vec::with_capacity(items.len().min(crate::enricher::MAX_POST_IMAGES));
+    for item in items.iter().take(crate::enricher::MAX_POST_IMAGES) {
+        let alt = item
+            .get("alt")
+            .or_else(|| item.get("media").and_then(|m| m.get("alt")))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let img_obj = item
+            .get("image")
+            .or_else(|| item.get("media").and_then(|m| m.get("image")));
+
+        let cid = img_obj
+            .and_then(|img| {
+                img.get("ref")
+                    .and_then(|r| r.get("$link"))
+                    .and_then(|l| l.as_str())
+                    .or_else(|| img.get("cid").and_then(|c| c.as_str()))
+            })
+            .or_else(|| item.get("cid").and_then(|c| c.as_str()));
+
+        if let Some(c) = cid.filter(|s| !s.is_empty()) {
+            results.push((c.to_string(), alt));
+        }
+    }
+    results
 }

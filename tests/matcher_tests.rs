@@ -946,3 +946,118 @@ fn test_follow_graph_incoming_synthetic_follower_fallback_prunes_set() {
     );
     assert_eq!(graph.follower_count(protected), 0);
 }
+
+#[test]
+fn test_target_matcher_extracts_gallery_embed_images_up_to_cap() {
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert(PROTECTED_ALICE.to_string());
+
+    let items: Vec<serde_json::Value> = (0..25)
+        .map(|idx| {
+            serde_json::json!({
+                "$type": "app.bsky.embed.gallery#item",
+                "image": {
+                    "$type": "blob",
+                    "ref": { "$link": format!("bafkreigallery{idx}") },
+                    "mimeType": "image/jpeg",
+                    "size": 12345
+                },
+                "alt": format!("Gallery photo {idx}"),
+                "aspectRatio": { "width": 1200, "height": 800 }
+            })
+        })
+        .collect();
+
+    let commit = JetstreamCommit {
+        did: "did:plc:gallery_author".to_string(),
+        time_us: 1_700_000_000_000_000,
+        operation: CommitOperation::Create,
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "gallery_post_1".to_string(),
+        cid: Some("bafygallerypost1".to_string()),
+        record: Some(serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Check out this 10+ photo gallery!",
+            "createdAt": "2026-10-27T12:00:00Z",
+            "reply": {
+                "root": {
+                    "uri": format!("at://{PROTECTED_ALICE}/app.bsky.feed.post/root1"),
+                    "cid": "bafyroot1"
+                },
+                "parent": {
+                    "uri": format!("at://{PROTECTED_ALICE}/app.bsky.feed.post/root1"),
+                    "cid": "bafyroot1"
+                }
+            },
+            "embed": {
+                "$type": "app.bsky.embed.gallery",
+                "items": items
+            }
+        })),
+    };
+
+    let matched = TargetMatcher::match_interaction(&commit, &protected_dids)
+        .expect("gallery reply should match");
+    assert_eq!(matched.image_cids.len(), skybouncer::MAX_POST_IMAGES);
+    assert_eq!(matched.image_alts.len(), skybouncer::MAX_POST_IMAGES);
+    assert_eq!(matched.image_cids[0], "bafkreigallery0");
+    assert_eq!(matched.image_cids[19], "bafkreigallery19");
+    assert_eq!(matched.image_alts[0], "Gallery photo 0");
+
+    // Also verify `app.bsky.embed.recordWithMedia` wrapping an `app.bsky.embed.gallery`
+    let quote_gallery_commit = JetstreamCommit {
+        did: "did:plc:gallery_quoter".to_string(),
+        time_us: 1_700_000_000_000_001,
+        operation: CommitOperation::Create,
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "gallery_quote_1".to_string(),
+        cid: Some("bafygalleryquote1".to_string()),
+        record: Some(serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Quote with gallery",
+            "createdAt": "2026-10-27T12:00:00Z",
+            "embed": {
+                "$type": "app.bsky.embed.recordWithMedia",
+                "record": {
+                    "$type": "app.bsky.embed.record",
+                    "record": {
+                        "uri": format!("at://{PROTECTED_ALICE}/app.bsky.feed.post/quoted1"),
+                        "cid": "bafyquoted1"
+                    }
+                },
+                "media": {
+                    "$type": "app.bsky.embed.gallery",
+                    "items": [
+                        {
+                            "media": {
+                                "image": { "cid": "bafkreinestedgallery0" },
+                                "alt": "Nested gallery alt"
+                            }
+                        },
+                        {
+                            "cid": "bafkreinestedgallery1",
+                            "alt": "Direct cid alt"
+                        }
+                    ]
+                }
+            }
+        })),
+    };
+
+    let quote_matched = TargetMatcher::match_interaction(&quote_gallery_commit, &protected_dids)
+        .expect("quote with gallery should match");
+    assert_eq!(
+        quote_matched.image_cids,
+        vec![
+            "bafkreinestedgallery0".to_string(),
+            "bafkreinestedgallery1".to_string()
+        ]
+    );
+    assert_eq!(
+        quote_matched.image_alts,
+        vec![
+            "Nested gallery alt".to_string(),
+            "Direct cid alt".to_string()
+        ]
+    );
+}
