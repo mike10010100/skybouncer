@@ -195,26 +195,43 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
     // Build the unified Skybouncer engine with context enricher
     let enricher = std::sync::Arc::new(crate::enricher::AppViewContextEnricher::from_env());
 
-    // Initialize Web / OAuth configuration early for background token auto-refreshes
-    let web_config = crate::web::WebServerConfig::from_env();
-    let (oauth_client, _) = crate::web::build_oauth_client(&web_config);
-
-    let mut engine_builder =
-        SkybouncerEngine::builder(config.clone()).with_enricher(enricher.clone());
-    if let Some(ref oc) = oauth_client {
-        info!(
-            "🔑 ATProto OAuth client initialized for automatic background session token refreshes"
-        );
-        engine_builder = engine_builder.with_oauth_client(std::sync::Arc::clone(oc));
-    }
-
-    let engine = match engine_builder.build() {
+    let engine = match SkybouncerEngine::builder(config.clone())
+        .with_enricher(enricher.clone())
+        .build()
+    {
         Ok(eng) => eng,
         Err(e) => {
             error!(error = %e, "Failed to initialize Skybouncer engine");
             return Err(e);
         }
     };
+
+    // Initialize Web / OAuth configuration early for background token auto-refreshes,
+    // binding a persistent ES256 confidential client key (`private_key_jwt`) stored in SQLite.
+    let web_config = crate::web::WebServerConfig::from_env();
+    let client_key = match engine.tenant_registry().load_or_create_oauth_client_key() {
+        Ok(key) => {
+            info!(
+                kid = %key.jwk_thumbprint(),
+                "🔐 Loaded persistent ES256 confidential OAuth client key (private_key_jwt)"
+            );
+            Some(key)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "Could not load persistent OAuth client key; falling back to public client mode"
+            );
+            None
+        }
+    };
+    let (oauth_client, _) = crate::web::build_oauth_client_with_key(&web_config, client_key);
+    if let Some(ref oc) = oauth_client {
+        info!(
+            "🔑 ATProto OAuth client initialized for automatic background session token refreshes"
+        );
+        engine.set_oauth_client(std::sync::Arc::clone(oc));
+    }
 
     // Background task supervision (cancellation token supplied by the caller).
     let mut join_set = JoinSet::new();
@@ -329,6 +346,7 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
     .await;
 
     if let Some((chat_client, did)) = bot_client_and_did {
+        let public_url = web_config.public_url.clone();
         let handler = crate::BotCommandHandler::new(std::sync::Arc::new(engine.clone()), did)
             .with_public_url(web_config.public_url);
         let poller_client = chat_client.clone();
@@ -350,7 +368,7 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
 
         // Spawn proactive ATProto DM bounce alert dispatcher
         let bounce_rx = engine.subscribe_bounces();
-        let alert_client = chat_client;
+        let alert_client = chat_client.clone();
         let cancel_alerts = cancel.clone();
         join_set.spawn(async move {
             if let Err(e) =
@@ -364,6 +382,30 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
             Ok(Default::default())
         });
         info!("📢 Proactive ATProto DM bounce alert dispatcher activated");
+
+        // Spawn proactive ATProto DM re-authentication alert dispatcher
+        let reauth_rx = engine.subscribe_reauth_alerts();
+        let reauth_client = chat_client;
+        let reauth_registry = std::sync::Arc::clone(engine.tenant_registry());
+        let cancel_reauth = cancel.clone();
+        join_set.spawn(async move {
+            if let Err(e) = crate::run_reauth_alert_dispatcher(
+                reauth_client,
+                reauth_registry,
+                reauth_rx,
+                public_url,
+                cancel_reauth,
+            )
+            .await
+            {
+                error!(
+                    error = %e,
+                    "ATProto DM re-authentication alert dispatcher encountered error"
+                );
+            }
+            Ok(Default::default())
+        });
+        info!("🔑 Proactive ATProto DM re-authentication alert dispatcher activated");
     } else {
         info!("ℹ️ ATProto DM bot disabled (BOT_APP_PASSWORD / CHAT_ACCESS_TOKEN not configured)");
     }

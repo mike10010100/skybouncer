@@ -1837,9 +1837,9 @@ dependencies = [
 
 [[package]]
 name = "skyauth"
-version = "0.3.8"
+version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54873b8d2e7875b26085f1921294b462daa4432ecf0af54394620927e563a099"
+checksum = "a0b63e29845137ae58f090825b51f8ce5f9a4e309203095731f93c5fe33d03c7"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1892,7 +1892,7 @@ dependencies = [
 
 [[package]]
 name = "skybouncer"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "async-trait",
  "axum",

@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.15] - 2026-10-28
+
+### Added
+
+- **Confidential OAuth Client (`private_key_jwt` / RFC 7523)**:
+  - Upgraded `skyauth` to `0.3.9` and added `TenantRegistry::load_or_create_oauth_client_key` (`oauth_client_keys` SQLite table with AES-256-GCM at-rest encryption and `OAUTH_CLIENT_PRIVATE_KEY` / `SKYBOUNCER_OAUTH_CLIENT_PRIVATE_KEY` environment override).
+  - Added `web::build_oauth_client_with_key` and updated `daemon::run` and `web::run_web_server` so `/oauth/client-metadata.json` advertises `"token_endpoint_auth_method": "private_key_jwt"`, `"token_endpoint_auth_signing_alg": "ES256"`, and the public `"jwks"` key set, lifting the 14-day public-client refresh token lifetime ceiling on Bluesky PDS authorization servers.
+- **Proactive Background OAuth Session Keep-Alive**:
+  - Added `SkybouncerEngine::refresh_expiring_tenant_sessions` and wired it into `SkybouncerEngine::run_maintenance` so active enrolled tenants' OAuth sessions are rotated ahead of expiry even during quiet periods without incoming firehose bounces.
+- **One-Shot Proactive DM Re-Authentication Alerts**:
+  - Added `ReauthNotification`, `SkybouncerEngine::subscribe_reauth_alerts`, `bot::format_reauth_alert`, and `bot::run_reauth_alert_dispatcher`.
+  - Added `reauth_required` and `reauth_notified_at` tracking columns to `tenants` (`mark_reauth_required`, `mark_reauth_notified`, `is_reauth_required`, `is_reauth_notification_pending`, `list_pending_reauth_notifications`, `is_permanent_oauth_refresh_error`) so permanent refresh failures (`invalid_grant`, `unauthorized_client`, `invalid_client`, or missing refresh token) trigger a single deduplicated Bluesky DM with a direct `/?auth=login` reconnect link, automatically resetting once the user signs in again.
+
 ## [0.2.14] - 2026-10-27
 
 ### Added

@@ -153,7 +153,9 @@ impl TenantRegistry {
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
-                handle_updated_at INTEGER
+                handle_updated_at INTEGER,
+                reauth_required INTEGER NOT NULL DEFAULT 0,
+                reauth_notified_at INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_tenants_handle
@@ -174,6 +176,12 @@ impl TenantRegistry {
 
             CREATE INDEX IF NOT EXISTS idx_web_sessions_expires
                 ON web_sessions(expires_at);
+
+            CREATE TABLE IF NOT EXISTS oauth_client_keys (
+                key_id TEXT PRIMARY KEY,
+                encrypted_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
             ",
         )
         .map_err(|e| {
@@ -188,6 +196,14 @@ impl TenantRegistry {
         );
         let _ = conn.execute(
             "ALTER TABLE tenants ADD COLUMN handle_updated_at INTEGER;",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE tenants ADD COLUMN reauth_required INTEGER NOT NULL DEFAULT 0;",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE tenants ADD COLUMN reauth_notified_at INTEGER;",
             [],
         );
         // Backfill handle freshness for rows predating the column so TTL lookups

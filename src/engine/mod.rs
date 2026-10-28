@@ -793,6 +793,17 @@ pub struct BounceNotification {
     pub post_snippet: String,
 }
 
+/// Notification payload emitted when an enrolled tenant's OAuth session permanently
+/// expires or is revoked (`invalid_grant`) and requires interactive re-authentication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReauthNotification {
+    /// DID of the enrolled tenant whose OAuth session requires re-authentication.
+    pub target_did: String,
+    /// Resolved ATProto handle of the tenant, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+}
+
 impl InteractionOutcome {
     /// Returns the author DID associated with this outcome.
     #[must_use]
@@ -1019,6 +1030,7 @@ pub struct SkybouncerEngine {
     stats: Arc<EngineStats>,
     paused: Arc<AtomicBool>,
     bounce_notifier: broadcast::Sender<BounceNotification>,
+    reauth_notifier: broadcast::Sender<ReauthNotification>,
     oauth_client: Arc<RwLock<Option<Arc<AtprotoOAuthClient>>>>,
     handle_cache: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
 }
@@ -1458,6 +1470,7 @@ impl SkybouncerEngineBuilder {
         let stats = Arc::new(load_persisted_stats(&cache));
         let paused = Arc::new(AtomicBool::new(false));
         let (bounce_notifier, _) = broadcast::channel(256);
+        let (reauth_notifier, _) = broadcast::channel(256);
         let oauth_client_arc = Arc::new(RwLock::new(self.oauth_client.clone()));
         if let Some(ref oc) = self.oauth_client {
             tenant_registry.set_oauth_client(Arc::clone(oc));
@@ -1481,6 +1494,7 @@ impl SkybouncerEngineBuilder {
             stats,
             paused,
             bounce_notifier,
+            reauth_notifier,
             oauth_client: oauth_client_arc,
             handle_cache,
         })
@@ -1986,5 +2000,87 @@ mod tests {
         assert!(!ProcessCommitResult::Ignored.is_no_match());
         assert!(ProcessCommitResult::NoMatch.is_no_match());
         assert!(!ProcessCommitResult::NoMatch.is_ignored());
+    }
+
+    #[tokio::test]
+    async fn refresh_expiring_tenant_sessions_and_reauth_notification_emission() {
+        use serde_json::json;
+        use skyauth::client::OAuthClientMetadata;
+        use skyauth::dpop::DPoPKey;
+        use skyauth::session::OAuthSession;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let token_endpoint = format!("{}/oauth/token", mock_server.uri());
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(json!({
+                        "error": "invalid_grant",
+                        "error_description": "Invalid refresh token"
+                    })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let oauth_client = Arc::new(
+            AtprotoOAuthClient::builder()
+                .client_metadata(
+                    OAuthClientMetadata::new(
+                        "https://skybouncer.example.com/client-metadata.json",
+                        "https://skybouncer.example.com/oauth/callback",
+                    )
+                    .with_client_key(DPoPKey::generate()),
+                )
+                .allow_insecure_localhost(true)
+                .build()
+                .unwrap(),
+        );
+
+        let classifier = Arc::new(crate::classifier::MockClassifier::new(
+            crate::classifier::Verdict::permitted("ok"),
+        ));
+        let engine = SkybouncerEngine::builder(SkybouncerConfig::default())
+            .with_classifier(classifier)
+            .with_oauth_client(oauth_client)
+            .build()
+            .unwrap();
+
+        let mut reauth_rx = engine.subscribe_reauth_alerts();
+        let expired_session = OAuthSession::new(
+            "did:plc:expired-bob",
+            "at-expired",
+            Some("rt-expired".to_string()),
+            "DPoP",
+            Some("atproto".to_string()),
+            Some(0),
+            DPoPKey::generate(),
+            Some("https://pds.example.com".to_string()),
+            Some(mock_server.uri()),
+            Some(token_endpoint),
+        )
+        .unwrap();
+
+        engine
+            .enroll_tenant(
+                Tenant::new("did:plc:expired-bob")
+                    .with_handle("bob.bsky.social")
+                    .with_session(expired_session),
+            )
+            .unwrap();
+
+        // First maintenance pass attempts refresh, receives invalid_grant, marks reauth_required,
+        // and emits a single ReauthNotification.
+        assert_eq!(engine.refresh_expiring_tenant_sessions().await, 0);
+        let notif = reauth_rx.try_recv().unwrap();
+        assert_eq!(notif.target_did, "did:plc:expired-bob");
+        assert_eq!(notif.handle.as_deref(), Some("bob.bsky.social"));
+
+        // Second maintenance pass skips the tenant because reauth_required is already set.
+        assert_eq!(engine.refresh_expiring_tenant_sessions().await, 0);
+        assert!(reauth_rx.try_recv().is_err());
     }
 }

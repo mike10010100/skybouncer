@@ -218,6 +218,13 @@ impl SkybouncerEngine {
                             warn!(error = %e, "Failed to prune expired bounces in maintenance task");
                         }
                     }
+                    let refreshed = self.refresh_expiring_tenant_sessions().await;
+                    if refreshed > 0 {
+                        info!(
+                            refreshed,
+                            "Proactively refreshed expiring tenant OAuth sessions in maintenance task"
+                        );
+                    }
                     let now_us = current_time_us();
                     let did_handle_cutoff = now_us.saturating_sub(
                         u64::try_from(DEFAULT_DID_HANDLE_CACHE_TTL.as_micros()).unwrap_or(u64::MAX),

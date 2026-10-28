@@ -56,7 +56,9 @@ impl TenantRegistry {
                  bypass_followers = COALESCE(excluded.bypass_followers, tenants.bypass_followers),
                  is_active = excluded.is_active,
                  updated_at = excluded.updated_at,
-                 handle_updated_at = COALESCE(excluded.handle_updated_at, tenants.handle_updated_at);",
+                 handle_updated_at = COALESCE(excluded.handle_updated_at, tenants.handle_updated_at),
+                 reauth_required = CASE WHEN excluded.session_json IS NOT NULL THEN 0 ELSE tenants.reauth_required END,
+                 reauth_notified_at = CASE WHEN excluded.session_json IS NOT NULL THEN NULL ELSE tenants.reauth_notified_at END;",
         )?;
 
         stmt.execute(params![
@@ -236,7 +238,7 @@ impl TenantRegistry {
         let conn = self.conn.lock();
         let rows = conn
             .execute(
-                "UPDATE tenants SET session_json = ?1, updated_at = ?2 WHERE did = ?3",
+                "UPDATE tenants SET session_json = ?1, updated_at = ?2, reauth_required = 0, reauth_notified_at = NULL WHERE did = ?3",
                 params![encrypted, now_us, did],
             )
             .map_err(|e| {
@@ -244,6 +246,186 @@ impl TenantRegistry {
             })?;
         self.pds_clients.write().remove(did);
         Ok(rows > 0)
+    }
+
+    /// Loads the persistent confidential-client ES256 signing key (`private_key_jwt`) from
+    /// environment or SQLite (`oauth_client_keys`), generating and encrypting a fresh key
+    /// if none is persisted yet.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if key parsing, encryption, or database persistence fails.
+    pub fn load_or_create_oauth_client_key(
+        &self,
+    ) -> Result<skyauth::dpop::DPoPKey, SkybouncerError> {
+        if let Some(raw_env) = crate::env::var(&[
+            "OAUTH_CLIENT_PRIVATE_KEY",
+            "SKYBOUNCER_OAUTH_CLIENT_PRIVATE_KEY",
+        ]) {
+            let trimmed = raw_env.trim();
+            let parsed = if trimmed.starts_with("-----BEGIN") {
+                skyauth::dpop::DPoPKey::from_pkcs8_pem(trimmed)
+            } else {
+                skyauth::dpop::DPoPKey::from_bytes_b64(trimmed)
+            };
+            return parsed.map_err(|e| {
+                SkybouncerError::Config(format!("Invalid OAUTH_CLIENT_PRIVATE_KEY: {e}"))
+            });
+        }
+
+        const PRIMARY_KEY_ID: &str = "primary";
+        const PRIMARY_KEY_AAD: &[u8] = b"oauth_client_key:primary";
+
+        let conn = self.conn.lock();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT encrypted_key FROM oauth_client_keys WHERE key_id = ?1 LIMIT 1;",
+                params![PRIMARY_KEY_ID],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if let Some(raw) = existing {
+            let decrypted = self
+                .cipher
+                .decrypt_or_passthrough_with_aad(&raw, PRIMARY_KEY_AAD)?;
+            return skyauth::dpop::DPoPKey::from_bytes_b64(decrypted.trim()).map_err(|e| {
+                SkybouncerError::Auth(format!("Failed to parse stored OAuth client key: {e}"))
+            });
+        }
+
+        let generated = skyauth::dpop::DPoPKey::generate();
+        let b64_key = generated.to_bytes_b64();
+        let encrypted = self
+            .cipher
+            .encrypt_with_aad(b64_key.as_bytes(), PRIMARY_KEY_AAD)?;
+        let now_i64 = us_to_i64(current_time_us());
+
+        conn.execute(
+            "INSERT INTO oauth_client_keys (key_id, encrypted_key, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key_id) DO NOTHING;",
+            params![PRIMARY_KEY_ID, encrypted, now_i64],
+        )?;
+
+        Ok(generated)
+    }
+
+    /// Returns `true` if a token refresh error represents a permanent credential revocation or
+    /// expiration (`invalid_grant`, `unauthorized_client`, `invalid_client`, or missing refresh token)
+    /// that requires user re-authentication, as opposed to a transient network or 5xx error.
+    #[must_use]
+    pub fn is_permanent_oauth_refresh_error(err: &skyauth::error::AtprotoOAuthError) -> bool {
+        use skyauth::error::{AtprotoOAuthError, TokenError};
+        match err {
+            AtprotoOAuthError::Token(TokenError::MissingRefreshToken) => true,
+            AtprotoOAuthError::Token(TokenError::RequestFailed { error, .. }) => matches!(
+                error.to_ascii_lowercase().as_str(),
+                "invalid_grant" | "unauthorized_client" | "invalid_client"
+            ),
+            _ => false,
+        }
+    }
+
+    /// Marks an enrolled tenant as requiring OAuth re-authentication (`reauth_required = 1`).
+    ///
+    /// Returns `Ok(true)` if the tenant is active and has not yet been sent a re-authentication DM
+    /// (`reauth_notified_at IS NULL`), or `Ok(false)` if already notified or inactive.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite update fails.
+    pub fn mark_reauth_required(&self, did: &str) -> Result<bool, SkybouncerError> {
+        let now_i64 = us_to_i64(current_time_us());
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE tenants SET reauth_required = 1, updated_at = ?1 WHERE did = ?2;",
+            params![now_i64, did],
+        )?;
+
+        let row: Option<(i64, Option<i64>)> = conn
+            .query_row(
+                "SELECT is_active, reauth_notified_at FROM tenants WHERE did = ?1 LIMIT 1;",
+                params![did],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        Ok(matches!(row, Some((active, None)) if active != 0))
+    }
+
+    /// Records that a proactive re-authentication DM alert was delivered to `did`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite update fails.
+    pub fn mark_reauth_notified(&self, did: &str) -> Result<bool, SkybouncerError> {
+        let now_i64 = us_to_i64(current_time_us());
+        let conn = self.conn.lock();
+        let rows = conn.execute(
+            "UPDATE tenants SET reauth_notified_at = ?1, updated_at = ?1
+             WHERE did = ?2 AND reauth_required = 1;",
+            params![now_i64, did],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Checks whether a tenant is currently marked as requiring OAuth re-authentication.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn is_reauth_required(&self, did: &str) -> Result<bool, SkybouncerError> {
+        let conn = self.conn.lock();
+        let flag: Option<i64> = conn
+            .query_row(
+                "SELECT reauth_required FROM tenants WHERE did = ?1 LIMIT 1;",
+                params![did],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(flag.unwrap_or(0) != 0)
+    }
+
+    /// Checks whether an active tenant requires OAuth re-authentication and has not yet been
+    /// sent a proactive DM notification (`is_active = 1 AND reauth_required = 1 AND reauth_notified_at IS NULL`).
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn is_reauth_notification_pending(&self, did: &str) -> Result<bool, SkybouncerError> {
+        let conn = self.conn.lock();
+        let pending: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM tenants
+                 WHERE did = ?1 AND is_active = 1 AND reauth_required = 1 AND reauth_notified_at IS NULL
+                 LIMIT 1;",
+                params![did],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(pending.is_some())
+    }
+
+    /// Lists all active tenants whose OAuth session requires re-authentication and who have not
+    /// yet received a proactive DM alert (`reauth_required = 1 AND reauth_notified_at IS NULL`).
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn list_pending_reauth_notifications(
+        &self,
+    ) -> Result<Vec<(String, Option<String>)>, SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT did, handle FROM tenants
+             WHERE is_active = 1 AND reauth_required = 1 AND reauth_notified_at IS NULL
+             ORDER BY created_at ASC;",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let did: String = row.get(0)?;
+            let handle: Option<String> = row.get(1)?;
+            Ok((did, handle))
+        })?;
+        let mut pending = Vec::new();
+        for row in rows {
+            pending.push(row?);
+        }
+        Ok(pending)
     }
 
     /// Creates a cryptographically secure web session token for an authenticated user.
@@ -438,6 +620,7 @@ impl TenantRegistry {
             };
 
             if session.refresh_token().is_none() {
+                let _ = self.mark_reauth_required(did);
                 self.pds_clients.write().remove(did);
                 return Err(SkybouncerError::Auth(format!(
                     "OAuth session for tenant {did} is expired and has no refresh token"
@@ -468,6 +651,9 @@ impl TenantRegistry {
                         error = %e,
                         "Failed to refresh ATProto OAuth session using refresh token"
                     );
+                    if Self::is_permanent_oauth_refresh_error(&e) {
+                        let _ = self.mark_reauth_required(did);
+                    }
                     self.pds_clients.write().remove(did);
                     return Err(SkybouncerError::Auth(format!(
                         "Failed to refresh expired OAuth session for tenant {did}: {e}"

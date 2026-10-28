@@ -835,4 +835,157 @@ mod tests {
         );
         assert!(registry.pds_clients.read().get("did:plc:no-rt").is_none());
     }
+
+    #[test]
+    fn test_load_or_create_oauth_client_key_persists_and_reloads() {
+        let registry = test_registry();
+        let k1 = registry.load_or_create_oauth_client_key().unwrap();
+        let k2 = registry.load_or_create_oauth_client_key().unwrap();
+        assert_eq!(k1.jwk_thumbprint(), k2.jwk_thumbprint());
+        assert_eq!(k1.public_jwk(), k2.public_jwk());
+    }
+
+    #[tokio::test]
+    async fn test_reauth_required_and_notified_lifecycle_and_permanent_errors() {
+        use serde_json::json;
+        use skyauth::client::OAuthClientMetadata;
+        use skyauth::error::{AtprotoOAuthError, TokenError};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        assert!(TenantRegistry::is_permanent_oauth_refresh_error(
+            &AtprotoOAuthError::Token(TokenError::MissingRefreshToken)
+        ));
+        assert!(TenantRegistry::is_permanent_oauth_refresh_error(
+            &AtprotoOAuthError::Token(TokenError::RequestFailed {
+                status: 400,
+                error: "invalid_grant".to_string(),
+                description: Some("Invalid refresh token".to_string()),
+            })
+        ));
+        assert!(!TenantRegistry::is_permanent_oauth_refresh_error(
+            &AtprotoOAuthError::Token(TokenError::RequestFailed {
+                status: 502,
+                error: "server_error".to_string(),
+                description: None,
+            })
+        ));
+        assert!(!TenantRegistry::is_permanent_oauth_refresh_error(
+            &AtprotoOAuthError::Token(TokenError::Http("connection reset".to_string()))
+        ));
+
+        let mock_server = MockServer::start().await;
+        let token_endpoint = format!("{}/oauth/token", mock_server.uri());
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(json!({
+                        "error": "invalid_grant",
+                        "error_description": "Invalid refresh token"
+                    })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let oauth_client = Arc::new(
+            AtprotoOAuthClient::builder()
+                .client_metadata(OAuthClientMetadata::new(
+                    "https://skybouncer.example.com/client-metadata.json",
+                    "https://skybouncer.example.com/oauth/callback",
+                ))
+                .allow_insecure_localhost(true)
+                .build()
+                .unwrap(),
+        );
+
+        let registry = test_registry();
+        registry.set_oauth_client(Arc::clone(&oauth_client));
+
+        let dpop_key = DPoPKey::generate();
+        let expired_session = OAuthSession::new(
+            "did:plc:expired-grant",
+            "at-expired",
+            Some("rt-revoked".to_string()),
+            "DPoP",
+            Some("atproto".to_string()),
+            Some(0),
+            dpop_key.clone(),
+            Some("https://pds.example.com".to_string()),
+            Some(mock_server.uri()),
+            Some(token_endpoint.clone()),
+        )
+        .unwrap();
+
+        let tenant = Tenant::new("did:plc:expired-grant")
+            .with_handle("expired.bsky.social")
+            .with_session(expired_session);
+        registry.register_or_update(&tenant).unwrap();
+
+        assert!(!registry
+            .is_reauth_required("did:plc:expired-grant")
+            .unwrap());
+        assert!(!registry
+            .is_reauth_notification_pending("did:plc:expired-grant")
+            .unwrap());
+
+        // Refresh fails with invalid_grant -> marks reauth_required = 1
+        let err = registry
+            .get_pds_client("did:plc:expired-grant", None)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("invalid_grant"));
+        assert!(registry
+            .is_reauth_required("did:plc:expired-grant")
+            .unwrap());
+        assert!(registry
+            .is_reauth_notification_pending("did:plc:expired-grant")
+            .unwrap());
+        let pending = registry.list_pending_reauth_notifications().unwrap();
+        assert_eq!(
+            pending,
+            vec![(
+                "did:plc:expired-grant".to_string(),
+                Some("expired.bsky.social".to_string())
+            )]
+        );
+
+        // Once mark_reauth_notified is called, it is no longer pending notification
+        assert!(registry
+            .mark_reauth_notified("did:plc:expired-grant")
+            .unwrap());
+        assert!(registry
+            .is_reauth_required("did:plc:expired-grant")
+            .unwrap());
+        assert!(!registry
+            .is_reauth_notification_pending("did:plc:expired-grant")
+            .unwrap());
+        assert!(registry
+            .list_pending_reauth_notifications()
+            .unwrap()
+            .is_empty());
+
+        // Re-authentication via update_session resets reauth_required and reauth_notified_at
+        let fresh_session = OAuthSession::new(
+            "did:plc:expired-grant",
+            "at-fresh",
+            Some("rt-fresh".to_string()),
+            "DPoP",
+            Some("atproto".to_string()),
+            Some(3600),
+            dpop_key,
+            Some("https://pds.example.com".to_string()),
+            Some(mock_server.uri()),
+            Some(token_endpoint),
+        )
+        .unwrap();
+        assert!(registry
+            .update_session("did:plc:expired-grant", &fresh_session)
+            .unwrap());
+        assert!(!registry
+            .is_reauth_required("did:plc:expired-grant")
+            .unwrap());
+    }
 }

@@ -258,17 +258,22 @@ async fn security_headers_middleware(
     resp
 }
 
-/// Constructs the [`AtprotoOAuthClient`] and [`OAuthClientMetadata`] from server configuration.
+/// Constructs the [`AtprotoOAuthClient`] and [`OAuthClientMetadata`] from server configuration,
+/// optionally attaching a confidential client ES256 signing key (`private_key_jwt`).
 #[must_use]
-pub fn build_oauth_client(
+pub fn build_oauth_client_with_key(
     config: &WebServerConfig,
+    client_key: Option<skyauth::dpop::DPoPKey>,
 ) -> (Option<Arc<AtprotoOAuthClient>>, OAuthClientMetadata) {
     let client_id = config.client_id();
     let redirect_uri = config.redirect_uri();
 
-    let metadata = OAuthClientMetadata::new(client_id, redirect_uri)
+    let mut metadata = OAuthClientMetadata::new(client_id, redirect_uri)
         .with_client_name("Skybouncer Moderation")
         .with_scope("atproto transition:generic");
+    if let Some(key) = client_key {
+        metadata = metadata.with_client_key(key);
+    }
 
     // Initialize OAuth client with a 64-shard partitioned state store
     let state_store = Arc::new(OAuthStateStore::new(Duration::from_secs(300)));
@@ -291,6 +296,26 @@ pub fn build_oauth_client(
     (oauth_client, metadata)
 }
 
+/// Constructs the [`AtprotoOAuthClient`] and [`OAuthClientMetadata`] from server configuration.
+#[must_use]
+pub fn build_oauth_client(
+    config: &WebServerConfig,
+) -> (Option<Arc<AtprotoOAuthClient>>, OAuthClientMetadata) {
+    let env_key = crate::env::var(&[
+        "OAUTH_CLIENT_PRIVATE_KEY",
+        "SKYBOUNCER_OAUTH_CLIENT_PRIVATE_KEY",
+    ])
+    .and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("-----BEGIN") {
+            skyauth::dpop::DPoPKey::from_pkcs8_pem(trimmed).ok()
+        } else {
+            skyauth::dpop::DPoPKey::from_bytes_b64(trimmed).ok()
+        }
+    });
+    build_oauth_client_with_key(config, env_key)
+}
+
 /// Runs the Axum HTTP web server until `cancel` is triggered.
 ///
 /// # Errors
@@ -301,14 +326,14 @@ pub async fn run_web_server(
     cancel: CancellationToken,
 ) -> Result<(), SkybouncerError> {
     let (oauth_client, metadata) = if let Some(client) = engine.oauth_client() {
-        let client_id = config.client_id();
-        let redirect_uri = config.redirect_uri();
-        let metadata = OAuthClientMetadata::new(client_id, redirect_uri)
-            .with_client_name("Skybouncer Moderation")
-            .with_scope("atproto transition:generic");
+        let metadata = client.metadata().clone();
         (Some(client), metadata)
     } else {
-        let (client, meta) = build_oauth_client(&config);
+        let client_key = engine
+            .tenant_registry()
+            .load_or_create_oauth_client_key()
+            .ok();
+        let (client, meta) = build_oauth_client_with_key(&config, client_key);
         if let Some(ref c) = client {
             engine.set_oauth_client(Arc::clone(c));
         }
@@ -398,6 +423,18 @@ mod tests {
         let cfg = WebServerConfig::new("127.0.0.1", 3000);
         let (_client, metadata) = build_oauth_client(&cfg);
         assert!(metadata.client_id.contains("client-metadata.json"));
+
+        let key = skyauth::dpop::DPoPKey::generate();
+        let expected_kid = key.jwk_thumbprint();
+        let cfg_https =
+            WebServerConfig::new("127.0.0.1", 3000).with_public_url("https://sky.example");
+        let (client_conf, metadata_conf) = build_oauth_client_with_key(&cfg_https, Some(key));
+        assert!(client_conf.is_some());
+        assert!(metadata_conf.is_confidential());
+        let json_val = metadata_conf.to_json_value();
+        assert_eq!(json_val["token_endpoint_auth_method"], "private_key_jwt");
+        assert_eq!(json_val["token_endpoint_auth_signing_alg"], "ES256");
+        assert_eq!(json_val["jwks"]["keys"][0]["kid"], expected_kid);
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
