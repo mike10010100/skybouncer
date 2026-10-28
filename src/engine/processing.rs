@@ -53,6 +53,7 @@ impl SkybouncerEngine {
         let stats = Arc::new(load_persisted_stats(&cache));
         let paused = Arc::new(AtomicBool::new(false));
         let (bounce_notifier, _) = broadcast::channel(256);
+        let (reauth_notifier, _) = broadcast::channel(256);
         let oauth_client = Arc::new(RwLock::new(None));
         let handle_cache = Arc::new(RwLock::new(HashMap::new()));
 
@@ -84,6 +85,7 @@ impl SkybouncerEngine {
             stats,
             paused,
             bounce_notifier,
+            reauth_notifier,
             oauth_client,
             handle_cache,
         }

@@ -114,6 +114,13 @@ impl SkybouncerEngine {
         self.bounce_notifier.subscribe()
     }
 
+    /// Subscribes to real-time re-authentication notifications emitted when an enrolled
+    /// tenant's OAuth refresh token permanently fails (`invalid_grant`) and requires re-login.
+    #[must_use]
+    pub fn subscribe_reauth_alerts(&self) -> broadcast::Receiver<ReauthNotification> {
+        self.reauth_notifier.subscribe()
+    }
+
     /// Returns a copy of the active configuration with the current live rubric.
     #[must_use]
     pub fn config(&self) -> SkybouncerConfig {

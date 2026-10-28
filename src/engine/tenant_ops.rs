@@ -83,6 +83,10 @@ impl SkybouncerEngine {
         &self,
         did: &str,
     ) -> Result<Arc<PdsRepoClient>, SkybouncerError> {
+        let was_reauth_required = self
+            .tenant_registry
+            .is_reauth_required(did)
+            .unwrap_or(false);
         let oc = self.oauth_client.read().clone();
         match self.tenant_registry.get_pds_client(did, oc.as_ref()).await {
             Ok(Some(client)) => Ok(client),
@@ -101,6 +105,23 @@ impl SkybouncerEngine {
                 }
             }
             Err(e) => {
+                if !was_reauth_required
+                    && self
+                        .tenant_registry
+                        .is_reauth_notification_pending(did)
+                        .unwrap_or(false)
+                {
+                    let handle = self
+                        .tenant_registry
+                        .get(did)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.handle);
+                    let _ = self.reauth_notifier.send(ReauthNotification {
+                        target_did: did.to_string(),
+                        handle,
+                    });
+                }
                 tracing::error!(
                     did = %did,
                     error = %e,
@@ -109,6 +130,57 @@ impl SkybouncerEngine {
                 Err(e)
             }
         }
+    }
+
+    /// Proactively refreshes OAuth sessions for active enrolled tenants whose access tokens
+    /// are expired or expiring within 60 seconds, keeping sliding refresh token grants alive
+    /// even during quiet periods without incoming firehose bounces.
+    ///
+    /// Skips tenants already flagged as requiring manual re-authentication (`reauth_required = 1`).
+    /// Returns the number of tenant sessions refreshed.
+    pub async fn refresh_expiring_tenant_sessions(&self) -> usize {
+        if self.oauth_client.read().is_none() {
+            return 0;
+        }
+        let tenants = match self.tenant_registry.list_active() {
+            Ok(list) => list,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to list active tenants for background session refresh"
+                );
+                return 0;
+            }
+        };
+
+        let mut refreshed = 0;
+        for tenant in tenants {
+            if self
+                .tenant_registry
+                .is_reauth_required(&tenant.did)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(ref session) = tenant.session else {
+                continue;
+            };
+            if session.is_expired_with_leeway(Duration::from_secs(60)) {
+                match self.resolve_pds_client_for(&tenant.did).await {
+                    Ok(_) => {
+                        refreshed += 1;
+                    }
+                    Err(e) => {
+                        warn!(
+                            did = %tenant.did,
+                            error = %e,
+                            "Proactive background OAuth session refresh failed for tenant"
+                        );
+                    }
+                }
+            }
+        }
+        refreshed
     }
 
     /// Retrieves the [`PdsRepoClient`] for a specific protected user, falling back to default engine client.
