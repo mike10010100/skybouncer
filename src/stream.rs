@@ -46,12 +46,7 @@ pub fn resolve_resume_cursor(persisted_cursor_us: u64, now_us: u64) -> Option<u6
     }
     let rewound = persisted_cursor_us.saturating_sub(CURSOR_REWIND_OVERLAP_US);
     let min_allowed = now_us.saturating_sub(MAX_JETSTREAM_REPLAY_WINDOW_US);
-    let resolved = rewound.max(min_allowed);
-    if resolved > 0 {
-        Some(resolved)
-    } else {
-        None
-    }
+    Some(rewound.max(min_allowed)).filter(|c| *c > 0)
 }
 
 /// Configuration for the Jetstream stream listener.

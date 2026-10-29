@@ -1596,7 +1596,9 @@ mod tests {
             .with_enable_heuristic_prefilter(true)
             .with_dry_run(true)
             .with_admin_did("did:plc:admin")
-            .with_handle_cache_ttl(Duration::from_secs(30));
+            .with_handle_cache_ttl(Duration::from_secs(30))
+            .with_hold_queue_on_classifier_unavailable(true)
+            .with_classifier_retry_backoff(Duration::from_millis(250));
 
         // with_admin_did also inserts the admin into protected_dids.
         assert_eq!(cfg.protected_dids.len(), 3);
@@ -1616,6 +1618,8 @@ mod tests {
         assert!(cfg.dry_run);
         assert_eq!(cfg.admin_did.as_deref(), Some("did:plc:admin"));
         assert_eq!(cfg.handle_cache_ttl, Duration::from_secs(30));
+        assert!(cfg.hold_queue_on_classifier_unavailable);
+        assert_eq!(cfg.classifier_retry_backoff, Duration::from_millis(250));
     }
 
     #[test]

@@ -628,19 +628,6 @@ impl SkybouncerEngine {
                     retry_delay = retry_delay
                         .saturating_mul(2)
                         .min(MAX_CLASSIFIER_RETRY_BACKOFF);
-                    if self.is_tenant_paused(&target_did) {
-                        return Ok(InteractionOutcome::Paused {
-                            author_did,
-                            target_did,
-                        });
-                    }
-                    if self.cache.is_bounced_for(&target_did, &author_did)? {
-                        self.stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
-                        return Ok(InteractionOutcome::AlreadyBounced {
-                            author_did,
-                            target_did,
-                        });
-                    }
                 }
             }
         };
