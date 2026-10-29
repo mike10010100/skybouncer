@@ -1224,4 +1224,31 @@ async fn test_cursor_tracking_and_queue_hold_on_classifier_outage() {
         "Expected at least 1 failed attempt + 1 recovery attempt, got {}",
         classifier.call_count()
     );
+
+    // Also verify cancellation while holding on classifier outage returns error immediately
+    classifier.set_error(Some("Jev API server error (HTTP 503): Service Unavailable"));
+    let mut commit2 = make_reply_commit(
+        "did:plc:stranger2",
+        "did:plc:alice",
+        "rep_hold_2",
+        "root_1",
+        "Second candidate during outage",
+    );
+    commit2.time_us = 1_793_207_230_000_000;
+    engine
+        .process_commit_queued(&commit2, &eval_tx)
+        .await
+        .expect("process_commit_queued 2");
+    let candidate2 = eval_rx.recv().await.expect("queued candidate 2");
+    let cancel2 = tokio_util::sync::CancellationToken::new();
+    let cancel2_trigger = cancel2.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        cancel2_trigger.cancel();
+    });
+    let err = engine
+        .evaluate_candidate_queued(candidate2, &cancel2)
+        .await
+        .expect_err("should exit when cancellation token fires");
+    assert!(err.is_transient_classifier_error());
 }

@@ -177,4 +177,31 @@ mod tests {
         let wrong = cipher.decrypt_or_passthrough_with_aad(&encrypted, b"did:plc:mallory");
         assert!(wrong.is_err());
     }
+
+    #[test]
+    fn test_session_cipher_new_default_debug_and_env_branches() {
+        let cipher = SessionCipher::new([7u8; 32]);
+        let dbg = format!("{cipher:?}");
+        assert!(dbg.contains("REDACTED"));
+
+        std::env::set_var(
+            "SKYBOUNCER_SESSION_ENCRYPTION_KEY",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        let hex_cipher = SessionCipher::default();
+        let enc = hex_cipher.encrypt(b"payload").expect("encrypt");
+        assert_eq!(
+            hex_cipher.decrypt_or_passthrough(&enc).expect("decrypt"),
+            "payload"
+        );
+
+        std::env::set_var("SKYBOUNCER_SESSION_ENCRYPTION_KEY", "short-passphrase");
+        let pass_cipher = SessionCipher::from_env();
+        let enc2 = pass_cipher.encrypt(b"payload2").expect("encrypt2");
+        assert_eq!(
+            pass_cipher.decrypt_or_passthrough(&enc2).expect("decrypt2"),
+            "payload2"
+        );
+        std::env::remove_var("SKYBOUNCER_SESSION_ENCRYPTION_KEY");
+    }
 }

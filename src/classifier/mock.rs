@@ -237,3 +237,49 @@ impl Classifier for MockClassifier {
         "mock"
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+    use crate::classifier::Sensitivity;
+    use crate::matcher::InteractionType;
+
+    #[tokio::test]
+    async fn mock_classifier_builders_and_keyword_overrides() {
+        let mock = MockClassifier::violation(ViolationCategory::Spam, 0.9, "spam")
+            .with_simulated_delay(Duration::from_micros(1));
+        mock.set_default_verdict(Verdict::permitted("default ok"));
+        mock.set_keyword_verdict(
+            "airdrop",
+            Verdict::violation(ViolationCategory::CryptoSpam, 0.95, "airdrop"),
+        );
+        assert!(mock.remove_keyword_verdict("nonexistent").is_none());
+        mock.clear_keyword_verdicts();
+
+        mock.set_rubric(RuleRubric::new("No sealioning allowed", Sensitivity::High));
+        assert!(mock.rubric().is_some());
+        mock.set_rubric_keyword_verdict(
+            "sealioning",
+            Verdict::violation(ViolationCategory::SeaLioning, 0.88, "rubric match"),
+        );
+
+        let interaction = Interaction::new(
+            "did:plc:author",
+            "did:plc:target",
+            InteractionType::DirectReply,
+            "at://did:plc:author/app.bsky.feed.post/1",
+            "bafy1",
+            "hello",
+        );
+        let verdict = mock.classify(&interaction).await.expect("classify");
+        assert!(verdict.is_violation());
+        assert!(mock.last_evaluated_rubric().is_some());
+        assert_eq!(mock.call_count(), 1);
+
+        assert!(mock.remove_rubric_keyword_verdict("sealioning").is_some());
+        mock.clear_rubric_keyword_verdicts();
+        mock.reset_call_count();
+        assert_eq!(mock.call_count(), 0);
+    }
+}

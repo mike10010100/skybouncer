@@ -988,4 +988,12 @@ mod tests {
             .is_reauth_required("did:plc:expired-grant")
             .unwrap());
     }
+
+    #[test]
+    fn test_fallback_and_cipher_accessor() {
+        let reg = TenantRegistry::fallback();
+        assert_eq!(reg.count().unwrap(), 0);
+        let enc = reg.cipher().encrypt(b"check").unwrap();
+        assert_eq!(reg.cipher().decrypt_or_passthrough(&enc).unwrap(), "check");
+    }
 }

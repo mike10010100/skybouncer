@@ -447,7 +447,6 @@ impl SkybouncerEngine {
     ///
     /// # Errors
     /// Returns [`SkybouncerError`] if classifier evaluation, cache query, or PDS mutation fails.
-    #[instrument(skip(self, interaction), fields(author = %interaction.author_did, target = %interaction.target_did, post_uri = %interaction.post_uri))]
     pub async fn evaluate_candidate(
         &self,
         interaction: Interaction,
@@ -463,7 +462,6 @@ impl SkybouncerEngine {
     ///
     /// # Errors
     /// Returns [`SkybouncerError`] if non-transient evaluation fails or cancellation interrupts retry.
-    #[instrument(skip(self, interaction, cancel), fields(author = %interaction.author_did, target = %interaction.target_did, post_uri = %interaction.post_uri))]
     pub async fn evaluate_candidate_queued(
         &self,
         interaction: Interaction,
@@ -473,6 +471,7 @@ impl SkybouncerEngine {
             .await
     }
 
+    #[instrument(skip(self, interaction, cancel), fields(author = %interaction.author_did, target = %interaction.target_did, post_uri = %interaction.post_uri))]
     async fn evaluate_candidate_inner(
         &self,
         interaction: Interaction,
