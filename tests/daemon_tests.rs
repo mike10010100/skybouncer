@@ -39,6 +39,8 @@ const ENV_KEYS: &[&str] = &[
     "BOT_APP_PASSWORD",
     "BLUESKY_APP_PASSWORD",
     "CHAT_ACCESS_TOKEN",
+    "JETSTREAM_CURSOR",
+    "SKYBOUNCER_JETSTREAM_CURSOR",
 ];
 
 /// Saves and clears the daemon-related env vars; returns the saved snapshot.
@@ -136,6 +138,7 @@ async fn daemon_enables_web_dashboard_on_port() {
 
     // A configured PORT enables the web-dashboard spawn branch.
     std::env::set_var("PORT", "0");
+    std::env::set_var("JETSTREAM_CURSOR", "1793207229000000");
 
     let cancel = CancellationToken::new();
     cancel.cancel();

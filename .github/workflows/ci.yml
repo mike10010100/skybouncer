@@ -107,7 +107,10 @@ jobs:
 
       - name: 7. Generate Code Coverage (cargo-llvm-cov, >= 92%)
         working-directory: skybouncer
-        run: cargo llvm-cov --all-targets --fail-under-lines 92 --lcov --output-path lcov.info
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --all-targets --lcov --output-path lcov.info
+          cargo llvm-cov report --fail-under-lines 92
 
       - name: 8. Mutation Testing Smoke Test (cargo-mutants)
         working-directory: skybouncer

@@ -57,45 +57,16 @@ impl TenantRegistry {
     /// Creates a fallback in-memory tenant registry with zero panics.
     #[must_use]
     pub fn fallback() -> Self {
-        if let Ok(reg) = Self::open_in_memory() {
-            return reg;
-        }
-        let conn = Connection::open_in_memory()
-            .or_else(|_| Connection::open(":memory:"))
-            .or_else(|_| Connection::open(""))
-            .or_else(|_| {
-                Connection::open(std::env::temp_dir().join(format!(
-                    "skybouncer_fallback_{}.db",
-                    current_time_us()
-                )))
-            })
-            .unwrap_or_else(|e| {
-                tracing::error!(
-                    error = %e,
-                    "Could not open SQLite connection for fallback; opening in-memory database with default flags"
-                );
-                Connection::open_with_flags(
-                    ":memory:",
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-                )
-                .unwrap_or_else(|e2| {
-                    tracing::error!(error = %e2, "Emergency: opening private temp SQLite database");
-                    Connection::open_with_flags(
-                        "",
-                        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
-                    )
-                    .unwrap_or_else(|_| std::process::exit(1))
-                })
-            });
-        Self {
-            conn: Arc::new(Mutex::new(conn)),
-            pds_clients: Arc::new(RwLock::new(HashMap::new())),
-            oauth_client: Arc::new(RwLock::new(None)),
-            cipher: SessionCipher::from_env(),
-            refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
-        }
+        Self::open_in_memory().unwrap_or_else(|_| {
+            let conn = Connection::open_in_memory().unwrap_or_else(|_| std::process::exit(1));
+            Self {
+                conn: Arc::new(Mutex::new(conn)),
+                pds_clients: Arc::new(RwLock::new(HashMap::new())),
+                oauth_client: Arc::new(RwLock::new(None)),
+                cipher: SessionCipher::from_env(),
+                refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
+            }
+        })
     }
 
     /// Initializes a `TenantRegistry` reusing an existing shared SQLite connection.

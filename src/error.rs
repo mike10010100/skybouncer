@@ -176,4 +176,21 @@ mod tests {
             "Configuration error: x"
         );
     }
+
+    #[test]
+    fn transient_classifier_error_detection_covers_all_variants() {
+        assert!(
+            SkybouncerError::Classifier("Jev API network error: timeout".into())
+                .is_transient_classifier_error()
+        );
+        assert!(
+            SkybouncerError::Classifier("Jev API server error (HTTP 502): Bad Gateway".into())
+                .is_transient_classifier_error()
+        );
+        assert!(!SkybouncerError::Classifier(
+            "Jev API client error (HTTP 400): bad request".into()
+        )
+        .is_transient_classifier_error());
+        assert!(!SkybouncerError::Config("cfg".into()).is_transient_classifier_error());
+    }
 }

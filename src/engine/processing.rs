@@ -161,6 +161,11 @@ impl SkybouncerEngine {
     /// candidate interactions awaiting per-interaction evaluation.
     pub(super) fn dispatch_commit(&self, commit: &JetstreamCommit) -> CommitDispatch {
         self.stats.commits_received.fetch_add(1, Ordering::Relaxed);
+        if commit.time_us > 0 {
+            self.stats
+                .last_cursor_us
+                .fetch_max(commit.time_us, Ordering::Relaxed);
+        }
 
         // Tier 0: Follow Collection Intercept
         if commit.collection.as_str() == "app.bsky.graph.follow" {
@@ -442,7 +447,6 @@ impl SkybouncerEngine {
     ///
     /// # Errors
     /// Returns [`SkybouncerError`] if classifier evaluation, cache query, or PDS mutation fails.
-    #[instrument(skip(self, interaction), fields(author = %interaction.author_did, target = %interaction.target_did, post_uri = %interaction.post_uri))]
     pub async fn evaluate_candidate(
         &self,
         interaction: Interaction,
@@ -458,7 +462,6 @@ impl SkybouncerEngine {
     ///
     /// # Errors
     /// Returns [`SkybouncerError`] if non-transient evaluation fails or cancellation interrupts retry.
-    #[instrument(skip(self, interaction, cancel), fields(author = %interaction.author_did, target = %interaction.target_did, post_uri = %interaction.post_uri))]
     pub async fn evaluate_candidate_queued(
         &self,
         interaction: Interaction,
@@ -468,6 +471,7 @@ impl SkybouncerEngine {
             .await
     }
 
+    #[instrument(skip(self, interaction, cancel), fields(author = %interaction.author_did, target = %interaction.target_did, post_uri = %interaction.post_uri))]
     async fn evaluate_candidate_inner(
         &self,
         interaction: Interaction,
@@ -623,19 +627,6 @@ impl SkybouncerEngine {
                     retry_delay = retry_delay
                         .saturating_mul(2)
                         .min(MAX_CLASSIFIER_RETRY_BACKOFF);
-                    if self.is_tenant_paused(&target_did) {
-                        return Ok(InteractionOutcome::Paused {
-                            author_did,
-                            target_did,
-                        });
-                    }
-                    if self.cache.is_bounced_for(&target_did, &author_did)? {
-                        self.stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
-                        return Ok(InteractionOutcome::AlreadyBounced {
-                            author_did,
-                            target_did,
-                        });
-                    }
                 }
             }
         };

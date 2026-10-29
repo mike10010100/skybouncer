@@ -841,16 +841,24 @@ fn test_gate_latency_benchmark_sub_microsecond() {
     let elapsed = start.elapsed();
     let avg_latency = elapsed / iterations as u32;
 
+    let max_allowed = if cfg!(debug_assertions) {
+        Duration::from_micros(10)
+    } else {
+        Duration::from_micros(1)
+    };
+
     println!(
-        "\n⚡ [NonFollowedGate Latency Benchmark] Total: {:?} for {} ops | Avg: {:?} (<1.0µs SLA)",
-        elapsed, iterations, avg_latency
+        "\n⚡ [NonFollowedGate Latency Benchmark] Total: {:?} for {} ops | Avg: {:?} (SLA: <{:?})",
+        elapsed, iterations, avg_latency, max_allowed
     );
 
-    // Hard assertion: Average latency MUST be strictly under 1.0 microsecond (< 1,000 nanoseconds)
+    // In release mode, average latency is strictly under 1.0 microsecond (< 1,000 nanoseconds).
+    // In unoptimized debug mode (and under LLVM coverage instrumentation), allow up to 10µs.
     assert!(
-        avg_latency < Duration::from_micros(1),
-        "Gate latency SLA violated! Average latency was {:?}, expected < 1.0µs",
-        avg_latency
+        avg_latency < max_allowed,
+        "Gate latency SLA violated! Average latency was {:?}, expected < {:?}",
+        avg_latency,
+        max_allowed
     );
 }
 

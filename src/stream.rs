@@ -30,6 +30,25 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Default idle read timeout before treating the Jetstream WebSocket as stalled (30s).
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum Jetstream replay retention window (72 hours in microseconds).
+pub const MAX_JETSTREAM_REPLAY_WINDOW_US: u64 = 72 * 3600 * 1_000_000;
+
+/// Safety overlap rewind applied when resuming from a persisted or reconnected cursor (5 seconds in microseconds).
+pub const CURSOR_REWIND_OVERLAP_US: u64 = 5_000_000;
+
+/// Resolves a safe Jetstream replay cursor from a persisted microsecond timestamp,
+/// rewinding by [`CURSOR_REWIND_OVERLAP_US`] (5s) and clamping to the maximum
+/// [`MAX_JETSTREAM_REPLAY_WINDOW_US`] (72h) retention window prior to `now_us`.
+#[must_use]
+pub fn resolve_resume_cursor(persisted_cursor_us: u64, now_us: u64) -> Option<u64> {
+    if persisted_cursor_us == 0 {
+        return None;
+    }
+    let rewound = persisted_cursor_us.saturating_sub(CURSOR_REWIND_OVERLAP_US);
+    let min_allowed = now_us.saturating_sub(MAX_JETSTREAM_REPLAY_WINDOW_US);
+    Some(rewound.max(min_allowed)).filter(|c| *c > 0)
+}
+
 /// Configuration for the Jetstream stream listener.
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
@@ -295,6 +314,26 @@ mod tests {
         assert!(
             url.contains("wantedCollections=app.bsky.feed.post"),
             "url={url}"
+        );
+    }
+
+    #[test]
+    fn resolve_resume_cursor_rewinds_and_clamps_to_retention_window() {
+        let now_us = 1_800_000_000_000_000_u64;
+        assert_eq!(resolve_resume_cursor(0, now_us), None);
+
+        // Recent cursor (10 minutes ago) rewinds by 5s
+        let recent = now_us - 600_000_000;
+        assert_eq!(
+            resolve_resume_cursor(recent, now_us),
+            Some(recent - CURSOR_REWIND_OVERLAP_US)
+        );
+
+        // Stale cursor (10 days ago) clamps to 72h before now_us
+        let stale = now_us - (10 * 24 * 3600 * 1_000_000);
+        assert_eq!(
+            resolve_resume_cursor(stale, now_us),
+            Some(now_us - MAX_JETSTREAM_REPLAY_WINDOW_US)
         );
     }
 }
