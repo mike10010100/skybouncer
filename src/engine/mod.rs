@@ -83,6 +83,7 @@ fn load_persisted_stats(cache: &DeduplicationCache) -> EngineStats {
             info!(
                 commits_received = snapshot.commits_received,
                 bounces_executed = snapshot.bounces_executed,
+                last_cursor_us = snapshot.last_cursor_us,
                 "Restored cumulative dashboard telemetry counters from persistent storage"
             );
             EngineStats::from_snapshot(&snapshot)
@@ -575,6 +576,8 @@ pub struct EngineStats {
     pub errors_encountered: AtomicU64,
     /// Total sovereign configuration hot-reload events synchronized from the firehose.
     pub sovereign_configs_synced: AtomicU64,
+    /// Last ingested Jetstream commit timestamp in microseconds (`time_us`) for replay across restarts.
+    pub last_cursor_us: AtomicU64,
 }
 
 impl EngineStats {
@@ -613,6 +616,7 @@ impl EngineStats {
             bounces_skipped_rubric: AtomicU64::new(snapshot.bounces_skipped_rubric),
             errors_encountered: AtomicU64::new(snapshot.errors_encountered),
             sovereign_configs_synced: AtomicU64::new(snapshot.sovereign_configs_synced),
+            last_cursor_us: AtomicU64::new(snapshot.last_cursor_us),
         }
     }
 
@@ -651,6 +655,7 @@ impl EngineStats {
             bounces_skipped_rubric: self.bounces_skipped_rubric.load(Ordering::Relaxed),
             errors_encountered: self.errors_encountered.load(Ordering::Relaxed),
             sovereign_configs_synced: self.sovereign_configs_synced.load(Ordering::Relaxed),
+            last_cursor_us: self.last_cursor_us.load(Ordering::Relaxed),
         }
     }
 }
@@ -723,6 +728,9 @@ pub struct EngineStatsSnapshot {
     /// Total sovereign configuration hot-reload events synchronized from the firehose.
     #[serde(default)]
     pub sovereign_configs_synced: u64,
+    /// Last ingested Jetstream commit timestamp in microseconds (`time_us`) for replay across restarts.
+    #[serde(default)]
+    pub last_cursor_us: u64,
 }
 
 /// Outcome of evaluating an interaction candidate through the moderation pipeline.

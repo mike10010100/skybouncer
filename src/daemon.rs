@@ -310,8 +310,25 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
         ],
         crate::stream::DEFAULT_READ_TIMEOUT.as_secs(),
     );
-    let stream_config =
-        StreamConfig::new(jetstream_url).with_read_timeout(Duration::from_secs(read_timeout_secs));
+    let persisted_cursor = engine
+        .stats()
+        .last_cursor_us
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let initial_cursor = crate::env::parsed_or(
+        &["JETSTREAM_CURSOR", "SKYBOUNCER_JETSTREAM_CURSOR"],
+        persisted_cursor,
+    );
+    let resume_cursor =
+        crate::stream::resolve_resume_cursor(initial_cursor, crate::time::current_time_us());
+    if let Some(c) = resume_cursor {
+        info!(
+            cursor_us = c,
+            "Resuming Jetstream firehose from persisted cursor"
+        );
+    }
+    let stream_config = StreamConfig::new(jetstream_url)
+        .with_read_timeout(Duration::from_secs(read_timeout_secs))
+        .with_cursor(resume_cursor.unwrap_or(0));
     let cancel_stream = cancel.clone();
     join_set.spawn(async move {
         if let Err(e) = run_jetstream_streamer(stream_config, tx, cancel_stream).await {

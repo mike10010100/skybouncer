@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.17] - 2026-10-29
+
+### Added
+
+- **Persistent Jetstream Cursor Tracking & Replay (`src/engine/mod.rs`, `src/engine/processing.rs`, `src/stream.rs`, `src/daemon.rs`)**:
+  - Added `last_cursor_us` to `EngineStats` and `EngineStatsSnapshot`, updated on every ingested `JetstreamCommit` (`commit.time_us`) and persisted to SQLite (`dashboard_stats`) during periodic maintenance and graceful shutdown.
+  - Added `stream::resolve_resume_cursor` (rewinding 5 seconds for overlap safety and clamping to Jetstream's 72-hour replay retention window) and wired `daemon::run` to automatically resume from the persisted cursor (or `JETSTREAM_CURSOR` / `SKYBOUNCER_JETSTREAM_CURSOR` override) across container restarts and deployments.
+
 ## [0.2.16] - 2026-10-29
 
 ### Fixed

@@ -161,6 +161,11 @@ impl SkybouncerEngine {
     /// candidate interactions awaiting per-interaction evaluation.
     pub(super) fn dispatch_commit(&self, commit: &JetstreamCommit) -> CommitDispatch {
         self.stats.commits_received.fetch_add(1, Ordering::Relaxed);
+        if commit.time_us > 0 {
+            self.stats
+                .last_cursor_us
+                .fetch_max(commit.time_us, Ordering::Relaxed);
+        }
 
         // Tier 0: Follow Collection Intercept
         if commit.collection.as_str() == "app.bsky.graph.follow" {
