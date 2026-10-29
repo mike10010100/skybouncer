@@ -1167,3 +1167,61 @@ async fn test_allowlist_bypass_latency_and_pardon_immunization_pipeline() {
     assert!(engine2.is_allowlisted("did:plc:alice", "did:plc:friend_bob"));
     assert!(engine2.is_allowlisted("did:plc:alice", "did:plc:charlie"));
 }
+
+#[tokio::test]
+async fn test_cursor_tracking_and_queue_hold_on_classifier_outage() {
+    let classifier = Arc::new(skybouncer::classifier::MockClassifier::permitted());
+    // Simulate nmo/classifier offline initially with a transient network error
+    classifier.set_error(Some("Jev API network error: connection refused"));
+
+    let config = SkybouncerConfig::new(["did:plc:alice"], RuleRubric::default())
+        .with_dry_run(true)
+        .with_hold_queue_on_classifier_unavailable(true)
+        .with_classifier_retry_backoff(std::time::Duration::from_millis(10));
+
+    let engine = Arc::new(
+        SkybouncerEngine::builder(config)
+            .with_classifier(Arc::clone(&classifier) as Arc<dyn skybouncer::classifier::Classifier>)
+            .build()
+            .expect("build engine"),
+    );
+
+    let (eval_tx, mut eval_rx) = tokio::sync::mpsc::channel(16);
+    let mut commit = make_reply_commit(
+        "did:plc:stranger",
+        "did:plc:alice",
+        "rep_hold_1",
+        "root_1",
+        "Testing hold-and-retry during classifier reboot",
+    );
+    commit.time_us = 1_793_207_229_000_000;
+
+    let dispatch_result = engine
+        .process_commit_queued(&commit, &eval_tx)
+        .await
+        .expect("process_commit_queued");
+    assert_eq!(dispatch_result.outcomes().len(), 1);
+    assert_eq!(
+        engine.stats().snapshot().last_cursor_us,
+        1_793_207_229_000_000
+    );
+
+    let candidate = eval_rx.recv().await.expect("queued candidate");
+    let classifier_recover = Arc::clone(&classifier);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        classifier_recover.set_error(None::<String>);
+    });
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let outcome = engine
+        .evaluate_candidate_queued(candidate, &cancel)
+        .await
+        .expect("should hold and retry until classifier recovers");
+    assert!(matches!(outcome, InteractionOutcome::Permitted { .. }));
+    assert!(
+        classifier.call_count() >= 2,
+        "Expected at least 1 failed attempt + 1 recovery attempt, got {}",
+        classifier.call_count()
+    );
+}

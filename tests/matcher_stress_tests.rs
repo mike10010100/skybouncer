@@ -75,14 +75,21 @@ fn test_follow_graph_latency_sla_10k_and_20k_items() {
     let elapsed_10k = start_10k.elapsed();
     let avg_10k = elapsed_10k / iterations as u32;
 
+    let max_allowed = if cfg!(debug_assertions) {
+        Duration::from_micros(10)
+    } else {
+        Duration::from_micros(1)
+    };
+
     println!(
-        "\n⚡ [FollowGraph 10k Items Benchmark] Total: {:?} for {} ops | Avg: {:?} (SLA: <1.0µs)",
-        elapsed_10k, iterations, avg_10k
+        "\n⚡ [FollowGraph 10k Items Benchmark] Total: {:?} for {} ops | Avg: {:?} (SLA: <{:?})",
+        elapsed_10k, iterations, avg_10k, max_allowed
     );
     assert!(
-        avg_10k < Duration::from_micros(1),
-        "10k items latency SLA violated! Observed: {:?}",
-        avg_10k
+        avg_10k < max_allowed,
+        "10k items latency SLA violated! Observed: {:?} (max {:?})",
+        avg_10k,
+        max_allowed
     );
 
     // 2. Expand to 20,000 items
@@ -105,13 +112,14 @@ fn test_follow_graph_latency_sla_10k_and_20k_items() {
     let avg_20k = elapsed_20k / iterations as u32;
 
     println!(
-        "⚡ [FollowGraph 20k Items Benchmark] Total: {:?} for {} ops | Avg: {:?} (SLA: <1.0µs)",
-        elapsed_20k, iterations, avg_20k
+        "⚡ [FollowGraph 20k Items Benchmark] Total: {:?} for {} ops | Avg: {:?} (SLA: <{:?})",
+        elapsed_20k, iterations, avg_20k, max_allowed
     );
     assert!(
-        avg_20k < Duration::from_micros(1),
-        "20k items latency SLA violated! Observed: {:?}",
-        avg_20k
+        avg_20k < max_allowed,
+        "20k items latency SLA violated! Observed: {:?} (max {:?})",
+        avg_20k,
+        max_allowed
     );
 }
 
@@ -152,15 +160,21 @@ fn test_follow_graph_multi_tenant_100k_total_follows_latency() {
     }
     let elapsed = start.elapsed();
     let avg_latency = elapsed / iterations as u32;
+    let max_allowed = if cfg!(debug_assertions) {
+        Duration::from_micros(10)
+    } else {
+        Duration::from_micros(1)
+    };
 
     println!(
-        "⚡ [FollowGraph Multi-Tenant 100k Items] Total: {:?} for {} ops | Avg: {:?} (SLA: <1.0µs)",
-        elapsed, iterations, avg_latency
+        "⚡ [FollowGraph Multi-Tenant 100k Items] Total: {:?} for {} ops | Avg: {:?} (SLA: <{:?})",
+        elapsed, iterations, avg_latency, max_allowed
     );
     assert!(
-        avg_latency < Duration::from_micros(1),
-        "100k multi-tenant latency SLA violated! Observed: {:?}",
-        avg_latency
+        avg_latency < max_allowed,
+        "100k multi-tenant latency SLA violated! Observed: {:?} (max {:?})",
+        avg_latency,
+        max_allowed
     );
 }
 
@@ -211,9 +225,9 @@ fn test_gate_three_branch_latency_evaluation() {
     );
 
     // In release mode, all branches execute in 100-250ns (<0.25µs, well under 1µs SLA).
-    // In unoptimized debug mode with String clones, allow up to 2µs.
+    // In unoptimized debug mode (and under LLVM coverage instrumentation), allow up to 10µs.
     let max_allowed = if cfg!(debug_assertions) {
-        Duration::from_micros(2)
+        Duration::from_micros(10)
     } else {
         Duration::from_micros(1)
     };
