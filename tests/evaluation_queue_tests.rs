@@ -410,3 +410,124 @@ async fn test_in_worker_dedup_double_check_skips_redundant_model_calls() {
     );
     assert!(stats.dedup_cache_hits >= 2);
 }
+
+#[tokio::test]
+async fn test_queue_holds_and_retries_candidates_while_classifier_offline_then_drains() {
+    let pds = MockPdsServer::start().await;
+    let server = MockServer::start().await;
+    let is_online = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let is_online_clone = Arc::clone(&is_online);
+    let total_calls = Arc::new(AtomicUsize::new(0));
+    let total_calls_clone = Arc::clone(&total_calls);
+
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .respond_with(move |_req: &wiremock::Request| {
+            total_calls_clone.fetch_add(1, Ordering::SeqCst);
+            if !is_online_clone.load(Ordering::SeqCst) {
+                ResponseTemplate::new(502).set_body_string("Bad Gateway: nmo offline")
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "violates": true,
+                    "category": "spam",
+                    "confidence": 0.95,
+                    "reason": "Evaluated after nmo came back online"
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist_manager = Arc::new(
+        ModListManager::from_shared_cache(Arc::clone(&cache))
+            .with_rubric(rubric.clone())
+            .with_dry_run(true),
+    );
+    let pds_client = Arc::new(pds.pds_client("did:plc:alice"));
+    let jev_config = JevConfig {
+        base_url: server.uri(),
+        api_key: None,
+        model: "jev-test".to_string(),
+        timeout: Duration::from_secs(2),
+        max_retries: 0,
+        supports_images: false,
+    };
+    let classifier = Arc::new(JevClassifier::new(jev_config, rubric.clone()).unwrap());
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+
+    let config = SkybouncerConfig::new(protected_dids, rubric)
+        .with_evaluation_queue_capacity(32)
+        .with_evaluation_concurrency(1)
+        .with_hold_queue_on_classifier_unavailable(true)
+        .with_classifier_retry_backoff(Duration::from_millis(50))
+        .with_dry_run(true);
+
+    let engine = SkybouncerEngine::new(
+        config,
+        follow_graph,
+        gate,
+        classifier,
+        modlist_manager,
+        pds_client,
+    );
+
+    let (commit_tx, commit_rx) = tokio::sync::mpsc::channel(100);
+    let cancel = CancellationToken::new();
+
+    let mut join_set = JoinSet::new();
+    let eng_clone = engine.clone();
+    let cancel_clone = cancel.clone();
+    join_set.spawn(async move { eng_clone.run(commit_rx, cancel_clone).await });
+
+    // Enqueue 3 distinct candidates while the classifier (nmo) is offline (502)
+    for i in 0..3 {
+        let commit = make_reply_commit(
+            &format!("did:plc:offline_spammer_{i}"),
+            "did:plc:alice",
+            &format!("offline_post_{i}"),
+            "root_1",
+            "crypto scam during outage",
+        );
+        commit_tx.send(commit).await.unwrap();
+    }
+
+    // Let the worker attempt and hold the queue while offline
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let offline_stats = engine.stats().snapshot();
+    assert_eq!(offline_stats.eval_queue_enqueued, 3);
+    assert_eq!(
+        offline_stats.eval_queue_processed, 0,
+        "No candidates should be dropped/completed while classifier is offline"
+    );
+    assert!(
+        offline_stats.errors_encountered >= 1,
+        "Transient outage errors must be recorded while retrying"
+    );
+
+    // Now bring classifier (nmo) back online!
+    is_online.store(true, Ordering::SeqCst);
+
+    // Wait for backoff retry to wake up and drain all 3 queued candidates
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    cancel.cancel();
+    SkybouncerEngine::drain_and_shutdown(&mut join_set, &cancel, Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    let final_stats = engine.stats().snapshot();
+    assert_eq!(final_stats.eval_queue_enqueued, 3);
+    assert_eq!(final_stats.eval_queue_processed, 3);
+    assert_eq!(
+        final_stats.bounces_executed, 3,
+        "All 3 queued candidates must be evaluated and bounced once classifier recovers"
+    );
+}

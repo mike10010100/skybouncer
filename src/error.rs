@@ -48,6 +48,22 @@ impl From<rusqlite::Error> for SkybouncerError {
     }
 }
 
+impl SkybouncerError {
+    /// Returns `true` if this error represents a transient classifier unavailability
+    /// (such as a network connection drop, timeout, or upstream 5xx server error)
+    /// where a queued candidate should be held and retried once the classifier recovers.
+    #[must_use]
+    pub fn is_transient_classifier_error(&self) -> bool {
+        match self {
+            Self::Http(_) => true,
+            Self::Classifier(msg) => {
+                msg.contains("network error") || msg.contains("server error (HTTP 5")
+            }
+            _ => false,
+        }
+    }
+}
+
 impl From<skybase::SkybaseError> for SkybouncerError {
     fn from(err: skybase::SkybaseError) -> Self {
         use skybase::SkybaseError;

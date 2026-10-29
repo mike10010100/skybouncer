@@ -303,7 +303,15 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
 
     // Spawn Jetstream firehose streamer
     let jetstream_url = crate::env::var_or(&["JETSTREAM_ENDPOINT"], DEFAULT_JETSTREAM_ENDPOINT);
-    let stream_config = StreamConfig::new(jetstream_url);
+    let read_timeout_secs = crate::env::parsed_or(
+        &[
+            "JETSTREAM_READ_TIMEOUT_SECS",
+            "SKYBOUNCER_JETSTREAM_READ_TIMEOUT_SECS",
+        ],
+        crate::stream::DEFAULT_READ_TIMEOUT.as_secs(),
+    );
+    let stream_config =
+        StreamConfig::new(jetstream_url).with_read_timeout(Duration::from_secs(read_timeout_secs));
     let cancel_stream = cancel.clone();
     join_set.spawn(async move {
         if let Err(e) = run_jetstream_streamer(stream_config, tx, cancel_stream).await {

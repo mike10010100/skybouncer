@@ -447,6 +447,32 @@ impl SkybouncerEngine {
         &self,
         interaction: Interaction,
     ) -> Result<InteractionOutcome, SkybouncerError> {
+        self.evaluate_candidate_inner(interaction, None).await
+    }
+
+    /// Evaluates a queued candidate interaction with optional hold-and-retry when the classifier backend is offline.
+    ///
+    /// When [`SkybouncerConfig::hold_queue_on_classifier_unavailable`] is enabled, transient classifier network
+    /// or 5xx errors cause the worker to hold its concurrency permit and retry with exponential backoff until
+    /// the classifier recovers or `cancel` is triggered.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if non-transient evaluation fails or cancellation interrupts retry.
+    #[instrument(skip(self, interaction, cancel), fields(author = %interaction.author_did, target = %interaction.target_did, post_uri = %interaction.post_uri))]
+    pub async fn evaluate_candidate_queued(
+        &self,
+        interaction: Interaction,
+        cancel: &CancellationToken,
+    ) -> Result<InteractionOutcome, SkybouncerError> {
+        self.evaluate_candidate_inner(interaction, Some(cancel))
+            .await
+    }
+
+    async fn evaluate_candidate_inner(
+        &self,
+        interaction: Interaction,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<InteractionOutcome, SkybouncerError> {
         let author_did = interaction.author_did.clone();
         let target_did = interaction.target_did.clone();
         let post_uri = interaction.post_uri.clone();
@@ -560,15 +586,59 @@ impl SkybouncerEngine {
         self.stats.tier1_evaluations.fetch_add(1, Ordering::Relaxed);
         let target_rubric = self.rubric_for(&target_did);
         let interaction = interaction.with_rubric(target_rubric.clone());
-        let detailed_eval = self
-            .classifier
-            .classify_detailed_with_stats_and_rubric(&interaction, Some(&target_rubric), true)
-            .await
-            .inspect_err(|_e| {
-                self.stats
-                    .errors_encountered
-                    .fetch_add(1, Ordering::Relaxed);
-            })?;
+        let mut retry_delay = self.config.classifier_retry_backoff;
+        let detailed_eval = loop {
+            match self
+                .classifier
+                .classify_detailed_with_stats_and_rubric(&interaction, Some(&target_rubric), true)
+                .await
+            {
+                Ok(eval) => break eval,
+                Err(e) => {
+                    self.stats
+                        .errors_encountered
+                        .fetch_add(1, Ordering::Relaxed);
+                    let Some(cancel_token) = cancel.filter(|_| {
+                        self.config.hold_queue_on_classifier_unavailable
+                            && e.is_transient_classifier_error()
+                    }) else {
+                        return Err(e);
+                    };
+                    if cancel_token.is_cancelled() {
+                        return Err(e);
+                    }
+                    warn!(
+                        error = %e,
+                        post_uri = %post_uri,
+                        backoff = ?retry_delay,
+                        "Classifier endpoint unreachable; holding evaluation queue and retrying when back online"
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => {
+                            return Err(e);
+                        }
+                        _ = tokio::time::sleep(retry_delay) => {}
+                    }
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(MAX_CLASSIFIER_RETRY_BACKOFF);
+                    if self.is_tenant_paused(&target_did) {
+                        return Ok(InteractionOutcome::Paused {
+                            author_did,
+                            target_did,
+                        });
+                    }
+                    if self.cache.is_bounced_for(&target_did, &author_did)? {
+                        self.stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
+                        return Ok(InteractionOutcome::AlreadyBounced {
+                            author_did,
+                            target_did,
+                        });
+                    }
+                }
+            }
+        };
 
         if detailed_eval.escalated {
             self.stats.tier2_evaluations.fetch_add(1, Ordering::Relaxed);

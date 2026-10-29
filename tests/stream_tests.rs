@@ -301,3 +301,73 @@ async fn streamer_ignores_malformed_and_non_commit_frames() {
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
+
+#[tokio::test]
+async fn streamer_reconnects_after_silent_read_timeout_and_still_forwards() {
+    let server = MockJetstreamServer::start().await.expect("mock server");
+    let (tx, mut rx) = mpsc::channel::<JetstreamCommit>(16);
+
+    let cancel = CancellationToken::new();
+    let config = StreamConfig::new(server.ws_url()).with_read_timeout(Duration::from_millis(120));
+    let handle = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move { run_jetstream_streamer(config, tx, cancel).await })
+    };
+
+    wait_for_connection(&server).await;
+    server
+        .emit_commit_payload(
+            "did:plc:before_stall",
+            1_700_000_010_000_000,
+            "app.bsky.feed.post",
+            "3kbefore",
+            "create",
+            None,
+            None,
+        )
+        .expect("emit initial commit");
+
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("initial commit timeout")
+        .expect("closed");
+    assert_eq!(first.did, "did:plc:before_stall");
+
+    let gen_before_stall = server.total_connections();
+
+    // Server goes completely silent without closing or disconnecting the socket.
+    // Streamer must hit read_timeout (120ms) and reconnect automatically.
+    let mut reconnected = false;
+    for _ in 0..100 {
+        if server.total_connections() > gen_before_stall {
+            reconnected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        reconnected,
+        "streamer did not reconnect after silent read timeout"
+    );
+
+    server
+        .emit_commit_payload(
+            "did:plc:after_stall",
+            1_700_000_020_000_000,
+            "app.bsky.feed.post",
+            "3kafter",
+            "create",
+            None,
+            None,
+        )
+        .expect("emit post-stall commit");
+
+    let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("post-stall commit timeout")
+        .expect("closed");
+    assert_eq!(second.did, "did:plc:after_stall");
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}

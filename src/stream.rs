@@ -27,6 +27,9 @@ pub const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 /// Maximum backoff delay cap on repeated failures (30s).
 pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Default idle read timeout before treating the Jetstream WebSocket as stalled (30s).
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Configuration for the Jetstream stream listener.
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
@@ -36,6 +39,8 @@ pub struct StreamConfig {
     pub collections: Vec<String>,
     /// Initial cursor timestamp in microseconds (`time_us`), if replaying from a point in time.
     pub cursor: Option<u64>,
+    /// Maximum idle duration between WebSocket frames before forcing a reconnect.
+    pub read_timeout: Duration,
 }
 
 impl Default for StreamConfig {
@@ -49,6 +54,7 @@ impl Default for StreamConfig {
                 "app.bsky.graph.list".to_string(),
             ],
             cursor: None,
+            read_timeout: DEFAULT_READ_TIMEOUT,
         }
     }
 }
@@ -74,6 +80,13 @@ impl StreamConfig {
     #[must_use]
     pub fn with_cursor(mut self, cursor: u64) -> Self {
         self.cursor = if cursor > 0 { Some(cursor) } else { None };
+        self
+    }
+
+    /// Sets the idle read timeout before reconnecting on a silent WebSocket stall.
+    #[must_use]
+    pub fn with_read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = timeout.max(Duration::from_millis(50));
         self
     }
 
@@ -127,9 +140,9 @@ pub async fn run_jetstream_streamer(
                             let _ = write_half.send(Message::Close(None)).await;
                             return Ok(());
                         }
-                        msg_opt = read_half.next() => {
-                            match msg_opt {
-                                Some(Ok(Message::Text(text))) => {
+                        msg_res = tokio::time::timeout(active_config.read_timeout, read_half.next()) => {
+                            match msg_res {
+                                Ok(Some(Ok(Message::Text(text)))) => {
                                     if let Some(JetstreamEvent::Commit(commit)) =
                                         parse_jetstream_frame(&text)
                                     {
@@ -141,7 +154,7 @@ pub async fn run_jetstream_streamer(
                                         }
                                     }
                                 }
-                                Some(Ok(Message::Binary(bytes))) => {
+                                Ok(Some(Ok(Message::Binary(bytes)))) => {
                                     if let Ok(text) = std::str::from_utf8(&bytes) {
                                         if let Some(JetstreamEvent::Commit(commit)) =
                                             parse_jetstream_frame(text)
@@ -156,21 +169,34 @@ pub async fn run_jetstream_streamer(
                                     }
                                 }
 
-                                Some(Ok(Message::Ping(payload))) => {
+                                Ok(Some(Ok(Message::Ping(payload)))) => {
                                     let _ = write_half.send(Message::Pong(payload)).await;
                                 }
-                                Some(Ok(Message::Pong(_))) => {}
-                                Some(Ok(Message::Close(frame))) => {
+                                Ok(Some(Ok(Message::Pong(_)))) => {}
+                                Ok(Some(Ok(Message::Close(frame)))) => {
                                     warn!(frame = ?frame, "Jetstream server sent close frame; reconnecting");
                                     break;
                                 }
-                                Some(Ok(Message::Frame(_))) => {}
-                                Some(Err(e)) => {
+                                Ok(Some(Ok(Message::Frame(_)))) => {}
+                                Ok(Some(Err(e))) => {
                                     warn!(error = %e, "WebSocket read error; reconnecting");
                                     break;
                                 }
-                                None => {
+                                Ok(None) => {
                                     warn!("Jetstream stream ended unexpectedly; reconnecting");
+                                    break;
+                                }
+                                Err(_elapsed) => {
+                                    warn!(
+                                        timeout = ?active_config.read_timeout,
+                                        cursor = ?current_cursor,
+                                        "Jetstream WebSocket read timed out (silent stall); closing and reconnecting"
+                                    );
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(1),
+                                        write_half.send(Message::Close(None)),
+                                    )
+                                    .await;
                                     break;
                                 }
                             }

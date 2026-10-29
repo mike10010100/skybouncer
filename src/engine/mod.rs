@@ -70,6 +70,12 @@ pub const DEFAULT_DID_HANDLE_CACHE_MAX_ENTRIES: usize = 50_000;
 /// Default graceful shutdown timeout (5 seconds).
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default initial backoff before retrying a queued candidate when the classifier is unreachable (2 seconds).
+pub const DEFAULT_CLASSIFIER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Maximum backoff cap between queued candidate retries when the classifier is unreachable (15 seconds).
+pub const MAX_CLASSIFIER_RETRY_BACKOFF: Duration = Duration::from_secs(15);
+
 /// Loads persisted cumulative telemetry counters, falling back to a zeroed [`EngineStats`].
 fn load_persisted_stats(cache: &DeduplicationCache) -> EngineStats {
     match cache.load_dashboard_stats::<EngineStatsSnapshot>() {
@@ -146,6 +152,11 @@ pub struct SkybouncerConfig {
     pub admin_did: Option<String>,
     /// Time-to-live duration for caching handle-to-DID resolutions.
     pub handle_cache_ttl: Duration,
+    /// Whether the background evaluation queue holds and retries candidates when the
+    /// classifier backend (e.g. `nmo` Jev / Ollama) is unreachable or returning 5xx errors.
+    pub hold_queue_on_classifier_unavailable: bool,
+    /// Initial retry backoff duration when holding the evaluation queue during classifier outages.
+    pub classifier_retry_backoff: Duration,
 }
 
 impl Default for SkybouncerConfig {
@@ -171,6 +182,8 @@ impl Default for SkybouncerConfig {
             dry_run: false,
             admin_did: None,
             handle_cache_ttl: crate::tenant::DEFAULT_HANDLE_TTL,
+            hold_queue_on_classifier_unavailable: false,
+            classifier_retry_backoff: DEFAULT_CLASSIFIER_RETRY_BACKOFF,
         }
     }
 }
@@ -311,6 +324,21 @@ impl SkybouncerConfig {
         self
     }
 
+    /// Sets whether the background evaluation queue holds and retries candidates
+    /// when the classifier backend is unreachable or returning transient 5xx errors.
+    #[must_use]
+    pub fn with_hold_queue_on_classifier_unavailable(mut self, hold: bool) -> Self {
+        self.hold_queue_on_classifier_unavailable = hold;
+        self
+    }
+
+    /// Sets the initial retry backoff duration when holding the evaluation queue during classifier outages.
+    #[must_use]
+    pub fn with_classifier_retry_backoff(mut self, backoff: Duration) -> Self {
+        self.classifier_retry_backoff = backoff.max(Duration::from_millis(10));
+        self
+    }
+
     /// Loads configuration from environment variables with fallback defaults.
     ///
     /// # Errors
@@ -443,6 +471,22 @@ impl SkybouncerConfig {
             DEFAULT_EVALUATION_CONCURRENCY,
         );
 
+        let hold_queue_on_classifier_unavailable = crate::env::bool_or(
+            &[
+                "HOLD_QUEUE_ON_CLASSIFIER_UNAVAILABLE",
+                "SKYBOUNCER_HOLD_QUEUE_ON_CLASSIFIER_UNAVAILABLE",
+            ],
+            true,
+        );
+
+        let classifier_retry_backoff_ms = crate::env::parsed_or(
+            &[
+                "CLASSIFIER_RETRY_BACKOFF_MS",
+                "SKYBOUNCER_CLASSIFIER_RETRY_BACKOFF_MS",
+            ],
+            u64::try_from(DEFAULT_CLASSIFIER_RETRY_BACKOFF.as_millis()).unwrap_or(2000),
+        );
+
         Ok(Self {
             protected_dids,
             rubric,
@@ -464,6 +508,8 @@ impl SkybouncerConfig {
             dry_run,
             admin_did,
             handle_cache_ttl: crate::tenant::DEFAULT_HANDLE_TTL,
+            hold_queue_on_classifier_unavailable,
+            classifier_retry_backoff: Duration::from_millis(classifier_retry_backoff_ms.max(10)),
         })
     }
 }

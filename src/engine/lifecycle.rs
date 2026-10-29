@@ -21,6 +21,7 @@ impl SkybouncerEngine {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
         let eval_engine = self.clone();
+        let eval_cancel = cancel.clone();
         let mut eval_tasks = JoinSet::new();
 
         // Spawn background evaluation worker
@@ -31,12 +32,14 @@ impl SkybouncerEngine {
                 match eval_rx.recv().await {
                     Some(candidate) => {
                         let eng = eval_engine.clone();
+                        let task_cancel = eval_cancel.clone();
                         active_evals.spawn(async move {
                             let _permit = permit;
+                            let res = eng.evaluate_candidate_queued(candidate, &task_cancel).await;
                             eng.stats
                                 .eval_queue_processed
                                 .fetch_add(1, Ordering::Relaxed);
-                            if let Err(e) = eng.evaluate_candidate(candidate).await {
+                            if let Err(e) = res {
                                 warn!(error = %e, "Background candidate evaluation failed");
                             }
                         });

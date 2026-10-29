@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.16] - 2026-10-29
+
+### Fixed
+
+- **Jetstream WebSocket Idle Read Timeout (`src/stream.rs`, `src/daemon.rs`)**:
+  - Added `DEFAULT_READ_TIMEOUT` (30 seconds) and `StreamConfig::with_read_timeout` (configurable via `JETSTREAM_READ_TIMEOUT_SECS` / `SKYBOUNCER_JETSTREAM_READ_TIMEOUT_SECS`) wrapping `read_half.next()` in `run_jetstream_streamer`.
+  - Prevents silent half-open TCP stalls from hanging firehose ingestion indefinitely when an upstream Jetstream server stops sending frames without a TCP `FIN`/`RST` or WebSocket `Close` frame, automatically closing the stalled socket and reconnecting with a 5-second cursor rewind.
+- **Evaluation Queue Hold & Retry During Classifier Outages (`src/engine/lifecycle.rs`, `src/engine/processing.rs`, `src/engine/mod.rs`, `src/error.rs`)**:
+  - Added `SkybouncerError::is_transient_classifier_error`, `SkybouncerConfig::hold_queue_on_classifier_unavailable` (enabled by default in `SkybouncerConfig::from_env()`), `SkybouncerConfig::classifier_retry_backoff`, and `SkybouncerEngine::evaluate_candidate_queued`.
+  - When the classifier backend (e.g. `nmo` Jev / Ollama) is unreachable or returning transient 5xx errors, the background evaluation worker now holds its concurrency permit and retries the in-flight candidate with exponential backoff (2s up to 15s) until the classifier recovers instead of draining and dropping queued candidates.
+  - Updated `queue_worker` to increment `eval_queue_processed` after candidate evaluation completes so `skybouncer_eval_queue_depth` (`Queue Backlog`) accurately reflects both waiting and in-flight evaluations.
+
 ## [0.2.15] - 2026-10-28
 
 ### Added
