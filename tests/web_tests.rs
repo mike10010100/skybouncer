@@ -36,7 +36,7 @@ use skybouncer::modlist::{AllowlistEntry, BouncedUser, DeduplicationCache, ModLi
 use skybouncer::web::{
     create_web_router, run_web_server, AddAllowlistResponse, BouncedUserWithHandle,
     EvaluationsResponse, PardonResponse, RemoveAllowlistResponse, ResolveResponse, RulesResponse,
-    SimulateResponse, StatusResponse, WebServerConfig, DASHBOARD_HTML,
+    SimulateResponse, StatusResponse, UpgradeBounceResponse, WebServerConfig, DASHBOARD_HTML,
 };
 
 // =============================================================================
@@ -693,6 +693,142 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
         .unwrap();
     let empty_bounces: Vec<BouncedUser> = serde_json::from_slice(&empty_bytes).unwrap();
     assert!(empty_bounces.is_empty());
+}
+
+#[tokio::test]
+async fn test_api_upgrade_bounce_to_permanent_lifecycle() {
+    let (engine, cache, _pds, app) = setup_test_web_environment("did:plc:protected-owner").await;
+    let owner_token = create_test_session(&engine, "did:plc:protected-owner");
+    let mallory_token = create_test_session(&engine, "did:plc:mallory");
+
+    let violator_did = "did:plc:temp-violator-777";
+    cache
+        .record_bounce(&BouncedUser {
+            subject_did: violator_did.to_string(),
+            protected_did: "did:plc:protected-owner".to_string(),
+            listitem_uri: "at://did:plc:protected-owner/app.bsky.graph.listitem/item777"
+                .to_string(),
+            listitem_rkey: "item777".to_string(),
+            listitem_cid: "bafy777".to_string(),
+            category: "Spam".to_string(),
+            confidence: 0.91,
+            reason: "Temporary cooldown".to_string(),
+            post_uri: "at://did:plc:temp-violator-777/app.bsky.feed.post/post777".to_string(),
+            post_text: "Spam reply".to_string(),
+            bounced_at: 1_720_000_000_000_000,
+            expires_at: Some(1_720_086_400_000_000),
+        })
+        .unwrap();
+
+    // 1. Unauthenticated POST /api/bounces/upgrade returns 401
+    let unauth_req = Request::builder()
+        .method("POST")
+        .uri("/api/bounces/upgrade")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "subject_did": violator_did })).unwrap(),
+        ))
+        .unwrap();
+    let unauth_resp = app.clone().oneshot(unauth_req).await.unwrap();
+    assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. Empty subject_did returns 400 Bad Request
+    let empty_req = Request::builder()
+        .method("POST")
+        .uri("/api/bounces/upgrade")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "subject_did": "   " })).unwrap(),
+        ))
+        .unwrap();
+    let empty_resp = app.clone().oneshot(empty_req).await.unwrap();
+    assert_eq!(empty_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Cross-tenant upgrade attempt by Mallory returns 403 Forbidden
+    let mallory_req = Request::builder()
+        .method("POST")
+        .uri("/api/bounces/upgrade")
+        .header("cookie", format!("skybouncer_session={mallory_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "subject_did": violator_did,
+                "protected_did": "did:plc:protected-owner"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let mallory_resp = app.clone().oneshot(mallory_req).await.unwrap();
+    assert_eq!(mallory_resp.status(), StatusCode::FORBIDDEN);
+
+    // 4. Not found subject returns upgraded: false, already_permanent: false
+    let miss_req = Request::builder()
+        .method("POST")
+        .uri("/api/bounces/upgrade")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "subject_did": "did:plc:missing" })).unwrap(),
+        ))
+        .unwrap();
+    let miss_resp = app.clone().oneshot(miss_req).await.unwrap();
+    assert_eq!(miss_resp.status(), StatusCode::OK);
+    let miss_bytes = axum::body::to_bytes(miss_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let miss_res: UpgradeBounceResponse = serde_json::from_slice(&miss_bytes).unwrap();
+    assert!(!miss_res.upgraded);
+    assert!(!miss_res.already_permanent);
+
+    // 5. Upgrade temporary bounce to permanent -> upgraded: true
+    let upg_req = Request::builder()
+        .method("POST")
+        .uri("/api/bounces/upgrade")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "subject_did": violator_did })).unwrap(),
+        ))
+        .unwrap();
+    let upg_resp = app.clone().oneshot(upg_req).await.unwrap();
+    assert_eq!(upg_resp.status(), StatusCode::OK);
+    let upg_bytes = axum::body::to_bytes(upg_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let upg_res: UpgradeBounceResponse = serde_json::from_slice(&upg_bytes).unwrap();
+    assert!(upg_res.upgraded);
+    assert!(!upg_res.already_permanent);
+    assert_eq!(upg_res.subject_did, violator_did);
+
+    let after = cache
+        .get_bounced_user_for("did:plc:protected-owner", violator_did)
+        .unwrap()
+        .unwrap();
+    assert!(after.expires_at.is_none());
+
+    // 6. Subsequent upgrade returns upgraded: false, already_permanent: true
+    let re_req = Request::builder()
+        .method("POST")
+        .uri("/api/bounces/upgrade")
+        .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "subject_did": violator_did,
+                "protected_did": "did:plc:protected-owner"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let re_resp = app.oneshot(re_req).await.unwrap();
+    assert_eq!(re_resp.status(), StatusCode::OK);
+    let re_bytes = axum::body::to_bytes(re_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let re_res: UpgradeBounceResponse = serde_json::from_slice(&re_bytes).unwrap();
+    assert!(!re_res.upgraded);
+    assert!(re_res.already_permanent);
 }
 
 // =============================================================================

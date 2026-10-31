@@ -813,6 +813,7 @@ impl SkybouncerEngine {
                             reason: reason.clone(),
                             post_uri: post_uri.clone(),
                             post_snippet: interaction.text.chars().take(200).collect(),
+                            bounce_duration: rubric.bounce_duration,
                         });
 
                         Ok(InteractionOutcome::Bounced {

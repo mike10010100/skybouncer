@@ -1173,4 +1173,78 @@ mod tests {
         let loaded: Option<serde_json::Value> = cache.load_dashboard_stats().unwrap();
         assert!(loaded.is_none());
     }
+
+    #[test]
+    fn test_make_bounce_permanent_for_scoped_and_unscoped() {
+        let cache = test_cache();
+
+        // Not found returns None
+        assert_eq!(
+            cache
+                .make_bounce_permanent_for("did:plc:alice", "did:plc:missing")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            cache
+                .make_bounce_permanent_for("", "did:plc:missing")
+                .unwrap(),
+            None
+        );
+
+        // Record a temporary bounce for Alice
+        let mut entry = bounce_fixture("did:plc:alice", "did:plc:spammer");
+        entry.expires_at = Some(1_700_000_500);
+        cache.record_bounce(&entry).unwrap();
+
+        // Record a separate temporary bounce for Bob on the same spammer
+        let mut entry_bob = bounce_fixture("did:plc:bob", "did:plc:spammer");
+        entry_bob.expires_at = Some(1_700_000_999);
+        cache.record_bounce(&entry_bob).unwrap();
+
+        // Upgrade Alice's bounce to permanent -> returns Some(true)
+        assert_eq!(
+            cache
+                .make_bounce_permanent_for("did:plc:alice", "did:plc:spammer")
+                .unwrap(),
+            Some(true)
+        );
+        let alice_fetched = cache
+            .get_bounced_user_for("did:plc:alice", "did:plc:spammer")
+            .unwrap()
+            .unwrap();
+        assert!(alice_fetched.expires_at.is_none());
+
+        // Bob's temporary bounce remains untouched
+        let bob_fetched = cache
+            .get_bounced_user_for("did:plc:bob", "did:plc:spammer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bob_fetched.expires_at, Some(1_700_000_999));
+
+        // Upgrading Alice's already-permanent bounce returns Some(false)
+        assert_eq!(
+            cache
+                .make_bounce_permanent_for("did:plc:alice", "did:plc:spammer")
+                .unwrap(),
+            Some(false)
+        );
+
+        // Unscoped upgrade on Bob's remaining temporary bounce
+        let mut entry_charlie = bounce_fixture("did:plc:charlie", "did:plc:temp_only");
+        entry_charlie.expires_at = Some(1_700_000_123);
+        cache.record_bounce(&entry_charlie).unwrap();
+        assert_eq!(
+            cache
+                .make_bounce_permanent_for("", "did:plc:temp_only")
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            cache
+                .make_bounce_permanent_for("", "did:plc:temp_only")
+                .unwrap(),
+            Some(false)
+        );
+    }
 }

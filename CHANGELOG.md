@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.18] - 2026-10-31
+
+### Added
+
+- **Temporary-to-Permanent Bounce Upgrade (`src/modlist/cache/bounces.rs`, `src/modlist/manager.rs`, `src/engine/modlist_ops.rs`, `src/bot/handler.rs`, `src/bot/dispatcher.rs`, `src/web/api/bounces.rs`, `assets/dashboard.html`)**:
+  - Added `DeduplicationCache::make_bounce_permanent_for`, `ModListManager::upgrade_bounce_to_permanent`, and `SkybouncerEngine::upgrade_bounce_to_permanent` to clear `expires_at` (`NULL`) on temporary bounces so they are never auto-pardoned by background expiration maintenance.
+  - Added DM bot command `perm <did|@handle>` (with aliases `permanent`, `upgrade`, `make permanent`, `perm block`) to upgrade a temporary block to permanent via ATProto Direct Messages.
+  - Included `bounce_duration` in `BounceNotification` and updated `bot::format_bounce_alert` so proactive DM alerts for temporary blocks display the active duration and remind the user of `perm <target>` alongside the existing `pardon <target>` and `pardon and allow <target>` instructions.
+  - Added `POST /api/bounces/upgrade` (`UpgradeBounceRequest` / `UpgradeBounceResponse`) and a one-click **Make Perm** button on temporary (`⏳ TTL`) bounce rows in the web dashboard.
+
 ## [0.2.17] - 2026-10-29
 
 ### Added

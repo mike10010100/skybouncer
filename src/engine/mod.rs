@@ -845,6 +845,9 @@ pub struct BounceNotification {
     pub post_uri: String,
     /// Text snippet of the offending post.
     pub post_snippet: String,
+    /// Configured bounce duration applied to this bounce (e.g. permanent vs temporary timeout).
+    #[serde(default)]
+    pub bounce_duration: crate::classifier::BounceDuration,
 }
 
 /// Notification payload emitted when an enrolled tenant's OAuth session permanently

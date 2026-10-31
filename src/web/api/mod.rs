@@ -110,6 +110,30 @@ pub struct PardonResponse {
     pub message: String,
 }
 
+/// Request payload to upgrade a temporary bounce on the moderation list to permanent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradeBounceRequest {
+    /// Decentralized identifier (DID) of the bounced violator to upgrade to permanent.
+    pub subject_did: String,
+    /// Optional protected DID whose list entry should be upgraded.
+    #[serde(default)]
+    pub protected_did: Option<String>,
+}
+
+/// Response payload following a bounce-to-permanent upgrade execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradeBounceResponse {
+    /// Whether a temporary bounce was found and upgraded to permanent.
+    pub upgraded: bool,
+    /// Whether a bounce record existed and was already permanent.
+    #[serde(default)]
+    pub already_permanent: bool,
+    /// The subject DID that was processed.
+    pub subject_did: String,
+    /// Status description message.
+    pub message: String,
+}
+
 /// Query parameters for listing allowlisted accounts.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct AllowlistQuery {

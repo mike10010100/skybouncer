@@ -151,6 +151,75 @@ pub async fn pardon_user(
     }
 }
 
+/// Handler for `POST /api/bounces/upgrade`: upgrades a temporary bounce to permanent (`expires_at = NULL`).
+///
+/// Authentication is strictly required. Non-admin callers may only upgrade bounces
+/// on their own sovereign moderation list.
+pub async fn upgrade_bounce(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpgradeBounceRequest>,
+) -> Result<Json<UpgradeBounceResponse>, (StatusCode, String)> {
+    let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Authentication required to upgrade bounces. Please sign in with Bluesky.".to_string(),
+        )
+    })?;
+
+    let subject_did = payload.subject_did.trim().to_string();
+    if subject_did.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "subject_did cannot be empty".to_string(),
+        ));
+    }
+
+    let is_admin = state.engine.is_admin(&caller_did);
+    let protected_did = if let Some(ref pd) = payload.protected_did {
+        let requested = pd.trim();
+        if requested != caller_did && !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Access denied: you may only upgrade bounces on your own moderation list."
+                    .to_string(),
+            ));
+        }
+        requested.to_string()
+    } else {
+        caller_did.clone()
+    };
+
+    match state
+        .engine
+        .upgrade_bounce_to_permanent(&protected_did, &subject_did)
+        .await
+    {
+        Ok(Some(true)) => Ok(Json(UpgradeBounceResponse {
+            upgraded: true,
+            already_permanent: false,
+            subject_did: subject_did.clone(),
+            message: format!("Temporary block for {subject_did} was upgraded to permanent."),
+        })),
+        Ok(Some(false)) => Ok(Json(UpgradeBounceResponse {
+            upgraded: false,
+            already_permanent: true,
+            subject_did: subject_did.clone(),
+            message: format!("Account {subject_did} is already permanently blocked."),
+        })),
+        Ok(None) => Ok(Json(UpgradeBounceResponse {
+            upgraded: false,
+            already_permanent: false,
+            subject_did: subject_did.clone(),
+            message: format!("Account {subject_did} was not found in the bounced cache."),
+        })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to upgrade bounce: {e}"),
+        )),
+    }
+}
+
 /// Handler for `GET /api/allowlist`: lists allowlisted accounts for the authenticated user or target user (admin).
 pub async fn get_allowlist(
     State(state): State<ApiState>,

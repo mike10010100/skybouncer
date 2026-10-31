@@ -745,6 +745,45 @@ impl ModListManager {
         Ok(true)
     }
 
+    /// Upgrades a temporary bounce for `(protected_did, subject_did)` to permanent
+    /// (`expires_at = NULL`).
+    ///
+    /// Synchronizes on the composite shard lock to prevent races with concurrent bounces or
+    /// background expiration pruning. Because the `app.bsky.graph.listitem` record is already
+    /// active on the user's PDS, only the SQLite cache record needs to be updated.
+    ///
+    /// Returns:
+    /// - `Ok(Some(true))` if a temporary bounce was found and upgraded to permanent.
+    /// - `Ok(Some(false))` if a bounce record exists and is already permanent.
+    /// - `Ok(None)` if the subject is not recorded as bounced for `protected_did`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if cache access fails.
+    #[instrument(skip(self), fields(protected_did = %protected_did, subject_did = %subject_did))]
+    pub async fn upgrade_bounce_to_permanent(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<Option<bool>, SkybouncerError> {
+        let lock_key = format!("{protected_did}:{subject_did}");
+        let shard = self.bounce_locks.shard_for(&lock_key);
+        let _guard = shard.lock().await;
+
+        let res = self
+            .cache
+            .make_bounce_permanent_for(protected_did, subject_did)?;
+
+        if res == Some(true) {
+            info!(
+                subject_did = %subject_did,
+                protected_did = %protected_did,
+                "Upgraded temporary bounce to permanent"
+            );
+        }
+
+        Ok(res)
+    }
+
     /// Convenience pardon method using the client's repository owner DID.
     ///
     /// # Errors

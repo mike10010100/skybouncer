@@ -29,7 +29,8 @@ pub use api::{
     BouncesQuery, EvaluationsQuery, EvaluationsResponse, HealthResponse, PardonRequest,
     PardonResponse, RemoveAllowlistResponse, ResolveQuery, ResolveResponse, RulesResponse,
     SimulateRequest, SimulateResponse, StatusResponse, TenantSummary, ToggleTenantRequest,
-    ToggleTenantResponse, UpdateRulesRequest, UserSessionResponse,
+    ToggleTenantResponse, UpdateRulesRequest, UpgradeBounceRequest, UpgradeBounceResponse,
+    UserSessionResponse,
 };
 pub use oauth::{LoginQuery, OAuthState};
 pub use ui::{serve_dashboard, DASHBOARD_HTML};
@@ -177,6 +178,7 @@ pub fn create_web_router(
         .route("/status", get(api::get_status))
         .route("/rules", get(api::get_rules).post(api::update_rules))
         .route("/bounces", get(api::get_bounces))
+        .route("/bounces/upgrade", post(api::upgrade_bounce))
         .route("/pardon", post(api::pardon_user))
         .route(
             "/allowlist",

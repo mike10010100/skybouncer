@@ -80,8 +80,8 @@ pub use web::{
     AddAllowlistResponse, AllowlistQuery, ApiState, BouncedUserWithHandle, BouncesQuery,
     EvaluationsQuery, EvaluationsResponse, LoginQuery, OAuthState, PardonRequest, PardonResponse,
     RemoveAllowlistResponse, ResolveQuery, ResolveResponse, RulesResponse, SimulateRequest,
-    SimulateResponse, StatusResponse, UpdateRulesRequest, WebServerConfig, DEFAULT_WEB_HOST,
-    DEFAULT_WEB_PORT,
+    SimulateResponse, StatusResponse, UpdateRulesRequest, UpgradeBounceRequest,
+    UpgradeBounceResponse, WebServerConfig, DEFAULT_WEB_HOST, DEFAULT_WEB_PORT,
 };
 
 pub use classifier::{
