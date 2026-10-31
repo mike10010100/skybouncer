@@ -434,6 +434,72 @@ impl DeduplicationCache {
         Ok(rkeys)
     }
 
+    /// Upgrades an existing bounce record for `(protected_did, subject_did)` to permanent
+    /// (`expires_at = NULL`).
+    ///
+    /// Returns:
+    /// - `Ok(Some(true))` if a temporary bounce was found and upgraded to permanent.
+    /// - `Ok(Some(false))` if a bounce record exists for `(protected_did, subject_did)` and is already permanent.
+    /// - `Ok(None)` if no bounce record exists for `(protected_did, subject_did)`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the SQLite query or update fails.
+    pub fn make_bounce_permanent_for(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<Option<bool>, SkybouncerError> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(|e| {
+            SkybouncerError::Database(format!(
+                "Failed to start transaction for make_bounce_permanent: {e}"
+            ))
+        })?;
+
+        let existing_expires: Option<Option<i64>> = if protected_did.is_empty() {
+            let mut stmt = tx.prepare_cached(
+                "SELECT expires_at FROM bounced_users WHERE subject_did = ?1 LIMIT 1;",
+            )?;
+            stmt.query_row(params![subject_did], |row| row.get(0))
+                .optional()?
+        } else {
+            let mut stmt = tx.prepare_cached(
+                "SELECT expires_at FROM bounced_users
+                 WHERE subject_did = ?1 AND protected_did = ?2 LIMIT 1;",
+            )?;
+            stmt.query_row(params![subject_did, protected_did], |row| row.get(0))
+                .optional()?
+        };
+
+        let Some(expires_opt) = existing_expires else {
+            return Ok(None);
+        };
+
+        let was_temp = expires_opt.is_some();
+        if was_temp {
+            if protected_did.is_empty() {
+                let mut upd = tx.prepare_cached(
+                    "UPDATE bounced_users SET expires_at = NULL WHERE subject_did = ?1;",
+                )?;
+                upd.execute(params![subject_did])?;
+            } else {
+                let mut upd = tx.prepare_cached(
+                    "UPDATE bounced_users SET expires_at = NULL
+                     WHERE subject_did = ?1 AND protected_did = ?2;",
+                )?;
+                upd.execute(params![subject_did, protected_did])?;
+            }
+        }
+
+        tx.commit().map_err(|e| {
+            SkybouncerError::Database(format!(
+                "Failed to commit make_bounce_permanent transaction: {e}"
+            ))
+        })?;
+
+        Ok(Some(was_temp))
+    }
+
     /// Removes a bounced user from the cache across all lists, returning all known listitem `rkey` values.
     ///
     /// # Errors

@@ -56,6 +56,26 @@ impl SkybouncerEngine {
             .await
     }
 
+    /// Upgrades a temporary bounce for `(protected_did, subject_did)` to permanent
+    /// (`expires_at = NULL`).
+    ///
+    /// Returns:
+    /// - `Ok(Some(true))` if a temporary bounce was found and upgraded to permanent.
+    /// - `Ok(Some(false))` if a bounce record exists and is already permanent.
+    /// - `Ok(None)` if no bounce record exists for `(protected_did, subject_did)`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite cache mutation fails.
+    pub async fn upgrade_bounce_to_permanent(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<Option<bool>, SkybouncerError> {
+        self.modlist_manager
+            .upgrade_bounce_to_permanent(protected_did, subject_did)
+            .await
+    }
+
     /// Pardons an account by deleting its listitems from the PDS, purging the cache,
     /// and immunizes them from future moderation actions by adding them to the allowlist.
     ///

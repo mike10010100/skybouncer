@@ -52,16 +52,33 @@ pub fn format_bounce_alert(notification: &BounceNotification) -> String {
         notification.violator_handle.as_deref(),
     );
 
+    let duration_section =
+        if notification.bounce_duration != crate::classifier::BounceDuration::Permanent {
+            format!(
+                "\nDuration: {}",
+                notification.bounce_duration.display_label()
+            )
+        } else {
+            String::new()
+        };
+
+    let upgrade_section =
+        if notification.bounce_duration != crate::classifier::BounceDuration::Permanent {
+            format!("\n\nOr to upgrade this temporary block to permanent:\nperm {target}")
+        } else {
+            String::new()
+        };
+
     format!(
         "🛡️ Skybouncer Action Alert:\n\n\
          Bounced violator: {violator}\n\
          Violation: **{}** ({pct:.0}% confidence)\n\
-         Reason: {}{snippet_section}{profile_section}\n\
+         Reason: {}{duration_section}{snippet_section}{profile_section}\n\
          Post: {post_url}\n\n\
          To undo, reply with:\n\
          pardon {target}\n\n\
          Or to undo and permanently allowlist:\n\
-         pardon and allow {target}",
+         pardon and allow {target}{upgrade_section}",
         notification.category, notification.reason,
     )
 }
@@ -289,6 +306,38 @@ mod tests {
 
         let fallback_text = format_reauth_alert(&notif, "");
         assert!(fallback_text.contains("https://skybouncer.mike10010100.com/?auth=login"));
+    }
+
+    #[test]
+    fn test_format_bounce_alert_permanent_and_temporary_upgrade_reminder() {
+        let perm_notif = BounceNotification {
+            target_did: "did:plc:alice".to_string(),
+            violator_did: "did:plc:spammer".to_string(),
+            violator_handle: Some("spammer.bsky.social".to_string()),
+            category: crate::classifier::ViolationCategory::CryptoSpam,
+            confidence: 0.96,
+            reason: "Crypto airdrop link".to_string(),
+            post_uri: "at://did:plc:spammer/app.bsky.feed.post/123".to_string(),
+            post_snippet: "Free tokens".to_string(),
+            bounce_duration: crate::classifier::BounceDuration::Permanent,
+        };
+        let perm_text = format_bounce_alert(&perm_notif);
+        assert!(perm_text.contains("pardon spammer.bsky.social"));
+        assert!(perm_text.contains("pardon and allow spammer.bsky.social"));
+        assert!(!perm_text.contains("perm spammer.bsky.social"));
+        assert!(!perm_text.contains("Duration:"));
+
+        let temp_notif = BounceNotification {
+            bounce_duration: crate::classifier::BounceDuration::Cooldown24h,
+            ..perm_notif
+        };
+        let temp_text = format_bounce_alert(&temp_notif);
+        assert!(temp_text.contains("Duration: 24-Hour Cooldown"));
+        assert!(temp_text.contains("pardon spammer.bsky.social"));
+        assert!(temp_text.contains("pardon and allow spammer.bsky.social"));
+        assert!(temp_text.contains(
+            "Or to upgrade this temporary block to permanent:\nperm spammer.bsky.social"
+        ));
     }
 
     #[tokio::test]

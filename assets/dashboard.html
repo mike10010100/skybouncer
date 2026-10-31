@@ -1772,6 +1772,9 @@
         const targetCellHtml = isFleetScope
           ? `<td>${formatAccountCell(b.protected_did, b.protected_handle)}</td>`
           : '';
+        const upgradePermBtnHtml = b.expires_at
+          ? `<button class="btn btn-secondary btn-upgrade-perm" style="padding: 0.25rem 0.65rem; font-size: 0.75rem; margin-left: 0.25rem;" data-did="${escapeHtml(b.subject_did)}" data-protected-did="${escapeHtml(b.protected_did || '')}" title="Upgrade temporary block to permanent">Make Perm</button>`
+          : '';
 
         return `
         <tr>
@@ -1784,6 +1787,7 @@
           <td style="white-space: nowrap;">
             <button class="btn btn-danger btn-pardon" style="padding: 0.25rem 0.65rem; font-size: 0.75rem;" data-did="${escapeHtml(b.subject_did)}" data-protected-did="${escapeHtml(b.protected_did || '')}" title="Remove from moderation list">Pardon</button>
             <button class="btn btn-secondary btn-pardon-allow" style="padding: 0.25rem 0.65rem; font-size: 0.75rem; margin-left: 0.25rem;" data-did="${escapeHtml(b.subject_did)}" data-protected-did="${escapeHtml(b.protected_did || '')}" title="Pardon and add to allowlist to immunize against future bounces">Pardon &amp; Allow</button>
+            ${upgradePermBtnHtml}
           </td>
         </tr>
       `;
@@ -1853,11 +1857,49 @@
             const btnPardonAllow = e.target.closest(".btn-pardon-allow");
             if (btnPardonAllow && btnPardonAllow.dataset.did) {
               pardonUser(btnPardonAllow.dataset.did, btnPardonAllow.dataset.protectedDid, true);
+              return;
+            }
+            const btnUpgradePerm = e.target.closest(".btn-upgrade-perm");
+            if (btnUpgradePerm && btnUpgradePerm.dataset.did) {
+              upgradeBounceToPerm(btnUpgradePerm.dataset.did, btnUpgradePerm.dataset.protectedDid);
             }
           });
         }
       } catch (e) {
         console.error("Bounces fetch failed", e);
+      }
+    }
+
+    async function upgradeBounceToPerm(did, protectedDid) {
+      const cachedHandle = didHandleCache.get(did);
+      const displayLabel = cachedHandle ? `@${cachedHandle} (${formatDid(did)})` : did;
+      let targetLabel = "";
+      if (protectedDid && currentUser && protectedDid !== currentUser.did) {
+        const cachedTarget = didHandleCache.get(protectedDid);
+        targetLabel = cachedTarget ? ` on @${cachedTarget}'s list` : ` on tenant ${formatDid(protectedDid)}'s list`;
+      }
+      if (!confirm(`Are you sure you want to upgrade the temporary block for ${displayLabel}${targetLabel} to permanent?`)) return;
+
+      try {
+        const res = await fetch("/api/bounces/upgrade", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({
+            subject_did: did,
+            protected_did: protectedDid || (currentUser ? currentUser.did : undefined)
+          })
+        });
+        if (res.ok) {
+          const toastDisplay = cachedHandle ? `@${cachedHandle}` : did;
+          showToast(`🔒 Upgraded ${toastDisplay} to permanent block`);
+          loadBounces();
+          fetchStatus();
+        } else {
+          showToast("❌ Failed to upgrade block to permanent");
+        }
+      } catch (e) {
+        showToast("❌ Network error upgrading block");
       }
     }
 

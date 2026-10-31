@@ -7,6 +7,7 @@
 //! - `sensitivity <low|medium|high>`: Update sensitivity threshold.
 //! - `recent`: List recently bounced violators.
 //! - `pardon <did>`: Pardon and remove an account from the moderation list.
+//! - `perm <did>`: Upgrade a temporary bounce on the moderation list to permanent.
 //! - `status`: View engine operational telemetry and bounce counts.
 //! - `test <text>`: Dry-run evaluation on sample text.
 
@@ -258,6 +259,32 @@ impl BotCommandHandler {
             return self.cmd_pardon(sender_did, target.trim()).await;
         }
 
+        if trimmed.eq_ignore_ascii_case("perm")
+            || trimmed.eq_ignore_ascii_case("permanent")
+            || trimmed.eq_ignore_ascii_case("upgrade")
+            || trimmed.eq_ignore_ascii_case("make permanent")
+            || trimmed.eq_ignore_ascii_case("perm block")
+        {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return Ok(
+                "Usage: `perm <did|@handle>` (upgrade a temporary block to permanent)".to_string(),
+            );
+        }
+
+        if let Some(target) = strip_prefix_ci(trimmed, "make permanent ")
+            .or_else(|| strip_prefix_ci(trimmed, "perm block "))
+            .or_else(|| strip_prefix_ci(trimmed, "permanent "))
+            .or_else(|| strip_prefix_ci(trimmed, "upgrade "))
+            .or_else(|| strip_prefix_ci(trimmed, "perm "))
+        {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_upgrade_perm(sender_did, target.trim()).await;
+        }
+
         if trimmed.eq_ignore_ascii_case("status") {
             if !authorized {
                 return Ok(self.unauthorized_response());
@@ -301,6 +328,7 @@ impl BotCommandHandler {
              • `recent` — List the 5 most recently bounced accounts\n\
              • `pardon <did|@handle>` — Remove an account from your moderation list\n\
              • `pardon and allow <did|@handle>` — Pardon and permanently immunize\n\
+             • `perm <did|@handle>` — Upgrade a temporary block to permanent\n\
              • `allow <did|@handle>` — Add trusted account to your allowlist\n\
              • `unallow <did|@handle>` — Remove account from your allowlist\n\
              • `allowlist` — View your allowlisted accounts\n\
@@ -678,6 +706,55 @@ impl BotCommandHandler {
                 "{handle_prefix}ℹ️ Account {label} was not on your list, but has been added to your allowlist for future immunization."
             )),
             Err(e) => Ok(format!("{handle_prefix}❌ Failed to pardon and allowlist account: {e}")),
+        }
+    }
+
+    async fn cmd_upgrade_perm(
+        &self,
+        sender_did: &str,
+        raw_target: &str,
+    ) -> Result<String, SkybouncerError> {
+        let raw_target = raw_target.trim();
+        if raw_target.is_empty() {
+            return Ok(
+                "Usage: `perm <did|@handle>` (upgrade a temporary block to permanent)".to_string(),
+            );
+        }
+
+        let (resolved_did, resolved_handle, handle_prefix) = match self
+            .resolve_dm_target(raw_target, " (e.g. `perm did:plc:...`)")
+            .await
+        {
+            Ok(v) => v,
+            Err(msg) => return Ok(msg),
+        };
+
+        let protected_did = match self.authorized_protected(sender_did) {
+            Ok(did) => did,
+            Err(msg) => return Ok(msg),
+        };
+
+        let label = account_label_with_url(&resolved_did, resolved_handle.as_deref());
+        let target = command_target(&resolved_did, resolved_handle.as_deref());
+
+        match self
+            .engine
+            .upgrade_bounce_to_permanent(&protected_did, &resolved_did)
+            .await
+        {
+            Ok(Some(true)) => Ok(format!(
+                "{handle_prefix}🔒 Temporary block for {label} has been upgraded to **permanent** on your moderation list.\n\n\
+                 💡 Tip: If you later want to undo this block, reply with `pardon {target}` (or `pardon and allow {target}`)."
+            )),
+            Ok(Some(false)) => Ok(format!(
+                "{handle_prefix}ℹ️ Account {label} is already permanently blocked on your moderation list."
+            )),
+            Ok(None) => Ok(format!(
+                "{handle_prefix}ℹ️ Account {label} was not found in your bounced list."
+            )),
+            Err(e) => Ok(format!(
+                "{handle_prefix}❌ Failed to upgrade block to permanent: {e}"
+            )),
         }
     }
 

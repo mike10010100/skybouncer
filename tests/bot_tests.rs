@@ -2169,6 +2169,16 @@ async fn test_command_all_privileged_denied_for_stranger() {
         "pardon and allow did:plc:x",
         "pardon did:plc:x",
         "pardon did:plc:x and allow did:plc:x",
+        "perm",
+        "permanent",
+        "upgrade",
+        "make permanent",
+        "perm block",
+        "perm did:plc:x",
+        "permanent did:plc:x",
+        "upgrade did:plc:x",
+        "make permanent did:plc:x",
+        "perm block did:plc:x",
         "status",
         "test",
         "test some text",
@@ -2561,4 +2571,118 @@ async fn test_dm_test_command_respects_threshold_and_reports_classifier_errors()
         "expected below-threshold verdict, got: {below_reply}"
     );
     assert!(below_reply.contains("below your 90% low sensitivity threshold"));
+}
+
+#[tokio::test]
+async fn test_dm_upgrade_temp_bounce_to_permanent_and_proactive_alert_reminder() {
+    use skybouncer::classifier::BounceDuration;
+
+    let (engine, cache, _pds) = setup_test_engine("did:plc:protected1").await;
+    let enricher = Arc::new(skybouncer::enricher::MockContextEnricher::new());
+    enricher.set_handle("tempviolator.bsky.social", "did:plc:tempviolator");
+
+    // Set duration to 24h cooldown so live bounces emit temporary bounce alerts
+    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
+    handler
+        .handle_command("did:plc:protected1", "duration 24h")
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.rubric_for("did:plc:protected1").bounce_duration,
+        BounceDuration::Cooldown24h
+    );
+
+    // Subscribe to bounce notifications and trigger a temporary bounce
+    let mut bounce_rx = engine.subscribe_bounces();
+    cache
+        .set_handle_for_did("did:plc:tempviolator", "tempviolator.bsky.social")
+        .unwrap();
+
+    let commit = make_reply_commit(
+        "did:plc:tempviolator",
+        "did:plc:protected1",
+        "rep_temp_1",
+        "root_1",
+        "Check out this free crypto scam airdrop!",
+    );
+    let result = engine.process_commit(&commit).await.expect("process");
+    assert!(result.into_outcomes()[0].is_bounced());
+
+    let notif = bounce_rx.recv().await.expect("bounce notification");
+    assert_eq!(notif.bounce_duration, BounceDuration::Cooldown24h);
+    let alert_dm = skybouncer::bot::format_bounce_alert(&notif);
+    assert!(alert_dm.contains("Duration: 24-Hour Cooldown"));
+    assert!(alert_dm.contains("To undo, reply with:\npardon tempviolator.bsky.social"));
+    assert!(alert_dm.contains(
+        "Or to undo and permanently allowlist:\npardon and allow tempviolator.bsky.social"
+    ));
+    assert!(alert_dm.contains(
+        "Or to upgrade this temporary block to permanent:\nperm tempviolator.bsky.social"
+    ));
+
+    // Verify the bounce record in SQLite currently has an expiration timestamp
+    let before = cache
+        .get_bounced_user_for("did:plc:protected1", "did:plc:tempviolator")
+        .unwrap()
+        .unwrap();
+    assert!(before.expires_at.is_some());
+
+    // Usage prompts for bare commands
+    for bare in [
+        "perm",
+        "permanent",
+        "upgrade",
+        "make permanent",
+        "perm block",
+    ] {
+        let usage = handler
+            .handle_command("did:plc:protected1", bare)
+            .await
+            .unwrap();
+        assert!(usage.contains("Usage: `perm <did|@handle>`"), "bare={bare}");
+    }
+
+    // Upgrade non-existent user -> not found
+    let not_found = handler
+        .handle_command("did:plc:protected1", "perm did:plc:nonexistent")
+        .await
+        .unwrap();
+    assert!(not_found.contains("was not found in your bounced list"));
+
+    // Upgrade via handle (`perm @tempviolator.bsky.social` - cached in SQLite did_handles)
+    let upgraded = handler
+        .handle_command("did:plc:protected1", "perm @tempviolator.bsky.social")
+        .await
+        .unwrap();
+    assert!(
+        upgraded.contains("Temporary block for @tempviolator.bsky.social")
+            && upgraded.contains("upgraded to **permanent**"),
+        "upgraded={upgraded}"
+    );
+    assert!(upgraded.contains("pardon tempviolator.bsky.social"));
+
+    // Verify expires_at is now None (permanent) and pruning does NOT remove it
+    let after = cache
+        .get_bounced_user_for("did:plc:protected1", "did:plc:tempviolator")
+        .unwrap()
+        .unwrap();
+    assert!(after.expires_at.is_none());
+    assert_eq!(engine.prune_expired_bounces().await.unwrap(), 0);
+    assert!(cache
+        .is_bounced_for("did:plc:protected1", "did:plc:tempviolator")
+        .unwrap());
+
+    // Upgrading again reports already permanent
+    let already = handler
+        .handle_command("did:plc:protected1", "make permanent did:plc:tempviolator")
+        .await
+        .unwrap();
+    assert!(already.contains("is already permanently blocked"));
+
+    // Unresolvable handle error branch
+    let bad_handle = handler
+        .handle_command("did:plc:protected1", "perm @nonexistent.invalid.domain")
+        .await
+        .unwrap();
+    assert!(bad_handle.contains("Could not resolve handle"));
 }
