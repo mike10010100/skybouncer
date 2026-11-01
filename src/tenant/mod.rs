@@ -5,4 +5,7 @@
 
 pub mod registry;
 
-pub use registry::{Tenant, TenantRegistry, DEFAULT_HANDLE_TTL};
+pub use registry::{
+    Tenant, TenantRegistry, DEFAULT_HANDLE_TTL, DEFAULT_REAUTH_REMINDER_INTERVAL,
+    MAX_REAUTH_NOTIFICATIONS,
+};

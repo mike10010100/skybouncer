@@ -50,16 +50,20 @@ pub mod util;
 pub mod web;
 
 pub use crypto::SessionCipher;
-pub use tenant::{Tenant, TenantRegistry, DEFAULT_HANDLE_TTL};
+pub use tenant::{
+    Tenant, TenantRegistry, DEFAULT_HANDLE_TTL, DEFAULT_REAUTH_REMINDER_INTERVAL,
+    MAX_REAUTH_NOTIFICATIONS,
+};
 
 #[cfg(feature = "bot")]
 pub use bot::{
     account_label, account_label_with_url, bsky_post_url, bsky_post_url_from_at_uri,
     bsky_profile_url, command_target, extract_link_facets, format_bounce_alert,
-    format_reauth_alert, run_bot_poller, run_bounce_alert_dispatcher, run_reauth_alert_dispatcher,
-    AcceptConvoRequest, AcceptConvoResponse, BotCommandHandler, ChatClient, ConvoMember, ConvoView,
-    FacetIndex, GetMessagesResponse, ListConvoRequestsResponse, ListConvosResponse, MessageSender,
-    MessageView, SendMessagePayload, SendMessageRequest, UpdateReadRequest, BSKY_WEB_ORIGIN,
+    format_reauth_alert, format_reauth_alert_with_count, run_bot_poller,
+    run_bounce_alert_dispatcher, run_reauth_alert_dispatcher, AcceptConvoRequest,
+    AcceptConvoResponse, BotCommandHandler, ChatClient, ConvoMember, ConvoView, FacetIndex,
+    GetMessagesResponse, ListConvoRequestsResponse, ListConvosResponse, MessageSender, MessageView,
+    SendMessagePayload, SendMessageRequest, UpdateReadRequest, BSKY_WEB_ORIGIN,
     DEFAULT_BOT_POLL_INTERVAL, DEFAULT_CHAT_ENDPOINT,
 };
 pub use enricher::{
