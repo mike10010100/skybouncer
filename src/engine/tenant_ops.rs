@@ -47,14 +47,17 @@ impl SkybouncerEngine {
         non_admin_count <= 1
     }
 
-    /// Checks whether a tenant is paused (or the entire engine is paused).
+    /// Checks whether a tenant is paused (or the entire engine is paused),
+    /// including when the tenant's OAuth session requires manual re-authentication.
     #[must_use]
     pub fn is_tenant_paused(&self, did: &str) -> bool {
         if self.is_paused() {
             return true;
         }
         match self.tenant_registry.get(did) {
-            Ok(Some(tenant)) => !tenant.is_active,
+            Ok(Some(tenant)) => {
+                !tenant.is_active || self.tenant_registry.is_reauth_required(did).unwrap_or(true)
+            }
             Ok(None) => false,
             Err(e) => {
                 tracing::warn!(did = %did, error = %e, "Failed to query tenant status; failing closed (paused)");

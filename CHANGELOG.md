@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.19] - 2026-11-01
+
+### Fixed
+
+- **Short-Circuit Moderation & Startup Provisioning for Tenants Awaiting Re-Authentication (`src/engine/tenant_ops.rs`, `src/daemon.rs`, `src/engine/mod.rs`)**:
+  - Updated `SkybouncerEngine::is_tenant_paused` to return `true` when `TenantRegistry::is_reauth_required(did)` is set (or fail closed on database lookup error), short-circuiting incoming firehose interactions at Tier 3.5 with `InteractionOutcome::Paused` instead of running LLM classifier evaluations and failing with `invalid_grant` during `act_on_verdict`.
+  - Updated `daemon::provision_pds_resources` to skip remote PDS moderation list verification and sovereign config synchronization for tenants marked with `reauth_required = 1` until they re-authenticate via OAuth.
+
 ## [0.2.18] - 2026-10-31
 
 ### Added

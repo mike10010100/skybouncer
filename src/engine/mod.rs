@@ -2129,9 +2129,10 @@ mod tests {
             .enroll_tenant(
                 Tenant::new("did:plc:expired-bob")
                     .with_handle("bob.bsky.social")
-                    .with_session(expired_session),
+                    .with_session(expired_session.clone()),
             )
             .unwrap();
+        assert!(!engine.is_tenant_paused("did:plc:expired-bob"));
 
         // First maintenance pass attempts refresh, receives invalid_grant, marks reauth_required,
         // and emits a single ReauthNotification.
@@ -2140,8 +2141,32 @@ mod tests {
         assert_eq!(notif.target_did, "did:plc:expired-bob");
         assert_eq!(notif.handle.as_deref(), Some("bob.bsky.social"));
 
+        // Tenant is now treated as paused until manual re-authentication, short-circuiting
+        // incoming interactions before invoking the classifier or PDS.
+        assert!(engine.is_tenant_paused("did:plc:expired-bob"));
+        let interaction = Interaction::new(
+            "did:plc:stranger",
+            "did:plc:expired-bob",
+            crate::matcher::InteractionType::DirectReply,
+            "at://did:plc:stranger/app.bsky.feed.post/3reauth1",
+            "cid1",
+            "reply while reauth pending",
+        );
+        let outcome = engine.evaluate_candidate(interaction).await.unwrap();
+        assert!(outcome.is_paused());
+
         // Second maintenance pass skips the tenant because reauth_required is already set.
         assert_eq!(engine.refresh_expiring_tenant_sessions().await, 0);
         assert!(reauth_rx.try_recv().is_err());
+
+        // Re-enrolling with a fresh session clears reauth_required and unpauses the tenant.
+        engine
+            .enroll_tenant(
+                Tenant::new("did:plc:expired-bob")
+                    .with_handle("bob.bsky.social")
+                    .with_session(expired_session),
+            )
+            .unwrap();
+        assert!(!engine.is_tenant_paused("did:plc:expired-bob"));
     }
 }

@@ -73,6 +73,13 @@ pub async fn provision_pds_resources(
 
     let mut provisioned = 0;
     for did in &all_dids {
+        if engine
+            .tenant_registry()
+            .is_reauth_required(did)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         match engine.ensure_mod_list(did).await {
             Ok(list_uri) => {
                 provisioned += 1;
@@ -85,6 +92,13 @@ pub async fn provision_pds_resources(
             }
         }
 
+        if engine
+            .tenant_registry()
+            .is_reauth_required(did)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         match engine.sync_sovereign_config(did).await {
             Ok(Some(pds_rubric)) => {
                 info!(did = %did, prompt = %pds_rubric.prompt, "Synchronized sovereign rules from PDS repo");
