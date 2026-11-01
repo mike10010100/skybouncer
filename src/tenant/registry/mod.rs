@@ -26,6 +26,12 @@ use crate::time::{current_time_us, i64_to_us, us_to_i64};
 /// Default time-to-live for handle resolution caching (1 hour).
 pub const DEFAULT_HANDLE_TTL: Duration = Duration::from_secs(3600);
 
+/// Default interval between proactive OAuth re-authentication reminder DMs (7 days).
+pub const DEFAULT_REAUTH_REMINDER_INTERVAL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Maximum number of re-authentication DMs sent per expiration cycle (1 initial alert + 2 weekly reminders).
+pub const MAX_REAUTH_NOTIFICATIONS: u32 = 3;
+
 /// Multi-tenant record representing an enrolled Bluesky user.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tenant {
@@ -952,22 +958,102 @@ mod tests {
             )]
         );
 
-        // Once mark_reauth_notified is called, it is no longer pending notification
+        // Once mark_reauth_notified is called, it is no longer immediately pending notification
+        let t0: u64 = 1_700_000_000_000_000;
+        let seven_days_us: u64 = 7 * 24 * 3600 * 1_000_000;
+        assert_eq!(
+            registry
+                .reauth_notify_count("did:plc:expired-grant")
+                .unwrap(),
+            0
+        );
         assert!(registry
-            .mark_reauth_notified("did:plc:expired-grant")
+            .mark_reauth_notified_at("did:plc:expired-grant", t0)
             .unwrap());
+        assert_eq!(
+            registry
+                .reauth_notify_count("did:plc:expired-grant")
+                .unwrap(),
+            1
+        );
         assert!(registry
             .is_reauth_required("did:plc:expired-grant")
             .unwrap());
         assert!(!registry
-            .is_reauth_notification_pending("did:plc:expired-grant")
+            .is_reauth_notification_pending_at(
+                "did:plc:expired-grant",
+                t0 + seven_days_us - 1,
+                DEFAULT_REAUTH_REMINDER_INTERVAL,
+            )
             .unwrap());
         assert!(registry
-            .list_pending_reauth_notifications()
+            .list_pending_reauth_notifications_at(
+                t0 + seven_days_us - 1,
+                DEFAULT_REAUTH_REMINDER_INTERVAL,
+            )
             .unwrap()
             .is_empty());
 
-        // Re-authentication via update_session resets reauth_required and reauth_notified_at
+        // At t0 + 7d, the 1st weekly reminder (2nd total DM) becomes pending
+        let t1 = t0 + seven_days_us;
+        assert!(registry
+            .is_reauth_notification_pending_at(
+                "did:plc:expired-grant",
+                t1,
+                DEFAULT_REAUTH_REMINDER_INTERVAL,
+            )
+            .unwrap());
+        assert_eq!(
+            registry
+                .list_pending_reauth_notifications_at(t1, DEFAULT_REAUTH_REMINDER_INTERVAL)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(registry
+            .mark_reauth_notified_at("did:plc:expired-grant", t1)
+            .unwrap());
+        assert_eq!(
+            registry
+                .reauth_notify_count("did:plc:expired-grant")
+                .unwrap(),
+            2
+        );
+
+        // At t1 + 7d (t0 + 14d), the 2nd/final weekly reminder (3rd total DM) becomes pending
+        let t2 = t1 + seven_days_us;
+        assert!(registry
+            .is_reauth_notification_pending_at(
+                "did:plc:expired-grant",
+                t2,
+                DEFAULT_REAUTH_REMINDER_INTERVAL,
+            )
+            .unwrap());
+        assert!(registry
+            .mark_reauth_notified_at("did:plc:expired-grant", t2)
+            .unwrap());
+        assert_eq!(
+            registry
+                .reauth_notify_count("did:plc:expired-grant")
+                .unwrap(),
+            MAX_REAUTH_NOTIFICATIONS
+        );
+
+        // At t2 + 7d (t0 + 21d) and beyond, no further reminders are pending (capped at 3 total DMs)
+        let t3 = t2 + seven_days_us;
+        assert!(!registry
+            .is_reauth_notification_pending_at(
+                "did:plc:expired-grant",
+                t3,
+                DEFAULT_REAUTH_REMINDER_INTERVAL,
+            )
+            .unwrap());
+        assert!(registry
+            .list_pending_reauth_notifications_at(t3, DEFAULT_REAUTH_REMINDER_INTERVAL)
+            .unwrap()
+            .is_empty());
+
+        // Re-authentication via update_session resets reauth_required, reauth_notified_at, and reauth_notify_count
         let fresh_session = OAuthSession::new(
             "did:plc:expired-grant",
             "at-fresh",
@@ -987,6 +1073,12 @@ mod tests {
         assert!(!registry
             .is_reauth_required("did:plc:expired-grant")
             .unwrap());
+        assert_eq!(
+            registry
+                .reauth_notify_count("did:plc:expired-grant")
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

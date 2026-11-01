@@ -58,7 +58,8 @@ impl TenantRegistry {
                  updated_at = excluded.updated_at,
                  handle_updated_at = COALESCE(excluded.handle_updated_at, tenants.handle_updated_at),
                  reauth_required = CASE WHEN excluded.session_json IS NOT NULL THEN 0 ELSE tenants.reauth_required END,
-                 reauth_notified_at = CASE WHEN excluded.session_json IS NOT NULL THEN NULL ELSE tenants.reauth_notified_at END;",
+                 reauth_notified_at = CASE WHEN excluded.session_json IS NOT NULL THEN NULL ELSE tenants.reauth_notified_at END,
+                 reauth_notify_count = CASE WHEN excluded.session_json IS NOT NULL THEN 0 ELSE tenants.reauth_notify_count END;",
         )?;
 
         stmt.execute(params![
@@ -238,7 +239,7 @@ impl TenantRegistry {
         let conn = self.conn.lock();
         let rows = conn
             .execute(
-                "UPDATE tenants SET session_json = ?1, updated_at = ?2, reauth_required = 0, reauth_notified_at = NULL WHERE did = ?3",
+                "UPDATE tenants SET session_json = ?1, updated_at = ?2, reauth_required = 0, reauth_notified_at = NULL, reauth_notify_count = 0 WHERE did = ?3",
                 params![encrypted, now_us, did],
             )
             .map_err(|e| {
@@ -352,19 +353,49 @@ impl TenantRegistry {
         Ok(matches!(row, Some((active, None)) if active != 0))
     }
 
-    /// Records that a proactive re-authentication DM alert was delivered to `did`.
+    /// Records that a proactive re-authentication DM alert was delivered to `did`,
+    /// advancing `reauth_notified_at` and incrementing `reauth_notify_count`.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if SQLite update fails.
     pub fn mark_reauth_notified(&self, did: &str) -> Result<bool, SkybouncerError> {
-        let now_i64 = us_to_i64(current_time_us());
+        self.mark_reauth_notified_at(did, current_time_us())
+    }
+
+    /// Records that a proactive re-authentication DM alert was delivered to `did` at `now_us`,
+    /// advancing `reauth_notified_at` and incrementing `reauth_notify_count`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite update fails.
+    pub fn mark_reauth_notified_at(&self, did: &str, now_us: u64) -> Result<bool, SkybouncerError> {
+        let now_i64 = us_to_i64(now_us);
         let conn = self.conn.lock();
         let rows = conn.execute(
-            "UPDATE tenants SET reauth_notified_at = ?1, updated_at = ?1
+            "UPDATE tenants
+             SET reauth_notified_at = ?1,
+                 reauth_notify_count = reauth_notify_count + 1,
+                 updated_at = ?1
              WHERE did = ?2 AND reauth_required = 1;",
             params![now_i64, did],
         )?;
         Ok(rows > 0)
+    }
+
+    /// Returns the number of proactive re-authentication DM alerts delivered to `did`
+    /// during the current expiration cycle (`0` before the initial alert, up to [`MAX_REAUTH_NOTIFICATIONS`]).
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn reauth_notify_count(&self, did: &str) -> Result<u32, SkybouncerError> {
+        let conn = self.conn.lock();
+        let count: Option<i64> = conn
+            .query_row(
+                "SELECT reauth_notify_count FROM tenants WHERE did = ?1 LIMIT 1;",
+                params![did],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(u32::try_from(count.unwrap_or(0).max(0)).unwrap_or(0))
     }
 
     /// Checks whether a tenant is currently marked as requiring OAuth re-authentication.
@@ -383,40 +414,89 @@ impl TenantRegistry {
         Ok(flag.unwrap_or(0) != 0)
     }
 
-    /// Checks whether an active tenant requires OAuth re-authentication and has not yet been
-    /// sent a proactive DM notification (`is_active = 1 AND reauth_required = 1 AND reauth_notified_at IS NULL`).
+    /// Checks whether an active tenant requires OAuth re-authentication and is due for either
+    /// an initial DM alert (`reauth_notified_at IS NULL`) or a weekly follow-up reminder
+    /// (up to [`MAX_REAUTH_NOTIFICATIONS`] total alerts, spaced by [`DEFAULT_REAUTH_REMINDER_INTERVAL`]).
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if SQLite query fails.
     pub fn is_reauth_notification_pending(&self, did: &str) -> Result<bool, SkybouncerError> {
+        self.is_reauth_notification_pending_at(
+            did,
+            current_time_us(),
+            DEFAULT_REAUTH_REMINDER_INTERVAL,
+        )
+    }
+
+    /// Checks whether an active tenant requires OAuth re-authentication and is due for an alert
+    /// at `now_us` given `reminder_interval` and [`MAX_REAUTH_NOTIFICATIONS`].
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn is_reauth_notification_pending_at(
+        &self,
+        did: &str,
+        now_us: u64,
+        reminder_interval: Duration,
+    ) -> Result<bool, SkybouncerError> {
+        let interval_us = u64::try_from(reminder_interval.as_micros()).unwrap_or(u64::MAX);
+        let cutoff_i64 = us_to_i64(now_us.saturating_sub(interval_us));
+        let max_count = i64::from(MAX_REAUTH_NOTIFICATIONS);
         let conn = self.conn.lock();
         let pending: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM tenants
-                 WHERE did = ?1 AND is_active = 1 AND reauth_required = 1 AND reauth_notified_at IS NULL
+                 WHERE did = ?1
+                   AND is_active = 1
+                   AND reauth_required = 1
+                   AND reauth_notify_count < ?2
+                   AND (reauth_notified_at IS NULL OR reauth_notified_at <= ?3)
                  LIMIT 1;",
-                params![did],
+                params![did, max_count, cutoff_i64],
                 |r| r.get(0),
             )
             .optional()?;
         Ok(pending.is_some())
     }
 
-    /// Lists all active tenants whose OAuth session requires re-authentication and who have not
-    /// yet received a proactive DM alert (`reauth_required = 1 AND reauth_notified_at IS NULL`).
+    /// Lists all active tenants whose OAuth session requires re-authentication and who are due
+    /// for either an initial DM alert or a weekly follow-up reminder (up to [`MAX_REAUTH_NOTIFICATIONS`]
+    /// total alerts, spaced by [`DEFAULT_REAUTH_REMINDER_INTERVAL`]).
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if SQLite query fails.
     pub fn list_pending_reauth_notifications(
         &self,
     ) -> Result<Vec<(String, Option<String>)>, SkybouncerError> {
+        self.list_pending_reauth_notifications_at(
+            current_time_us(),
+            DEFAULT_REAUTH_REMINDER_INTERVAL,
+        )
+    }
+
+    /// Lists all active tenants whose OAuth session requires re-authentication and who are due
+    /// for an alert at `now_us` given `reminder_interval` and [`MAX_REAUTH_NOTIFICATIONS`].
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn list_pending_reauth_notifications_at(
+        &self,
+        now_us: u64,
+        reminder_interval: Duration,
+    ) -> Result<Vec<(String, Option<String>)>, SkybouncerError> {
+        let interval_us = u64::try_from(reminder_interval.as_micros()).unwrap_or(u64::MAX);
+        let cutoff_i64 = us_to_i64(now_us.saturating_sub(interval_us));
+        let max_count = i64::from(MAX_REAUTH_NOTIFICATIONS);
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT did, handle FROM tenants
-             WHERE is_active = 1 AND reauth_required = 1 AND reauth_notified_at IS NULL
+             WHERE is_active = 1
+               AND reauth_required = 1
+               AND reauth_notify_count < ?1
+               AND (reauth_notified_at IS NULL OR reauth_notified_at <= ?2)
              ORDER BY created_at ASC;",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![max_count, cutoff_i64], |row| {
             let did: String = row.get(0)?;
             let handle: Option<String> = row.get(1)?;
             Ok((did, handle))

@@ -12,8 +12,8 @@ pub mod poller;
 pub mod render;
 
 pub use dispatcher::{
-    format_bounce_alert, format_reauth_alert, run_bounce_alert_dispatcher,
-    run_reauth_alert_dispatcher,
+    format_bounce_alert, format_reauth_alert, format_reauth_alert_with_count,
+    run_bounce_alert_dispatcher, run_reauth_alert_dispatcher,
 };
 pub use handler::BotCommandHandler;
 pub use poller::{run_bot_poller, DEFAULT_BOT_POLL_INTERVAL};

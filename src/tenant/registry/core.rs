@@ -126,7 +126,8 @@ impl TenantRegistry {
                 updated_at INTEGER NOT NULL,
                 handle_updated_at INTEGER,
                 reauth_required INTEGER NOT NULL DEFAULT 0,
-                reauth_notified_at INTEGER
+                reauth_notified_at INTEGER,
+                reauth_notify_count INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_tenants_handle
@@ -175,6 +176,16 @@ impl TenantRegistry {
         );
         let _ = conn.execute(
             "ALTER TABLE tenants ADD COLUMN reauth_notified_at INTEGER;",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE tenants ADD COLUMN reauth_notify_count INTEGER NOT NULL DEFAULT 0;",
+            [],
+        );
+        // Backfill notification count for rows that already received their initial re-auth DM
+        // prior to the weekly reminder counter column.
+        let _ = conn.execute(
+            "UPDATE tenants SET reauth_notify_count = 1 WHERE reauth_notified_at IS NOT NULL AND reauth_notify_count = 0;",
             [],
         );
         // Backfill handle freshness for rows predating the column so TTL lookups

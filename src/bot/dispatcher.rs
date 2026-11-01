@@ -87,6 +87,18 @@ pub fn format_bounce_alert(notification: &BounceNotification) -> String {
 /// re-authenticate when their OAuth refresh token has expired or been revoked.
 #[must_use]
 pub fn format_reauth_alert(notification: &ReauthNotification, public_url: &str) -> String {
+    format_reauth_alert_with_count(notification, public_url, 0)
+}
+
+/// Formats a proactive ATProto direct message alert for either the initial expiration
+/// (`notify_count == 0`), the first weekly reminder (`notify_count == 1`), or the second/final
+/// weekly reminder (`notify_count >= 2`).
+#[must_use]
+pub fn format_reauth_alert_with_count(
+    notification: &ReauthNotification,
+    public_url: &str,
+    notify_count: u32,
+) -> String {
     let account = account_label(&notification.target_did, notification.handle.as_deref());
     let base = public_url.trim_end_matches('/');
     let auth_url = if base.is_empty() {
@@ -95,14 +107,34 @@ pub fn format_reauth_alert(notification: &ReauthNotification, public_url: &str) 
         format!("{base}/?auth=login")
     };
 
-    format!(
-        "🔑 Skybouncer Re-Authentication Needed:\n\n\
-         Your Bluesky OAuth session for {account} has expired or was revoked by your PDS, \
-         so Skybouncer cannot update your moderation list until you sign in again.\n\n\
-         Please reconnect your account (takes ~10 seconds):\n\
-         {auth_url}\n\n\
-         Your house rules, allowlist, and moderation history are safely preserved."
-    )
+    match notify_count {
+        0 => format!(
+            "🔑 Skybouncer Re-Authentication Needed:\n\n\
+             Your Bluesky OAuth session for {account} has expired or was revoked by your PDS, \
+             so Skybouncer cannot update your moderation list until you sign in again.\n\n\
+             Please reconnect your account (takes ~10 seconds):\n\
+             {auth_url}\n\n\
+             Your house rules, allowlist, and moderation history are safely preserved."
+        ),
+        1 => format!(
+            "🔑 Skybouncer Weekly Reminder (1/2) — Re-Authentication Needed:\n\n\
+             Your Bluesky OAuth session for {account} is still expired, \
+             so automated moderation remains paused until you sign in again.\n\n\
+             Please reconnect your account (takes ~10 seconds):\n\
+             {auth_url}\n\n\
+             Your house rules, allowlist, and moderation history are safely preserved. \
+             Reply `pause` if you want to stop these reminders."
+        ),
+        _ => format!(
+            "🔑 Skybouncer Final Reminder (2/2) — Re-Authentication Needed:\n\n\
+             Your Bluesky OAuth session for {account} is still expired, \
+             so automated moderation remains paused until you sign in again.\n\n\
+             Please reconnect your account whenever you're ready (takes ~10 seconds):\n\
+             {auth_url}\n\n\
+             This is our final automatic reminder so we don't clutter your DMs. \
+             Your house rules, allowlist, and moderation history remain safely preserved."
+        ),
+    }
 }
 
 async fn deliver_reauth_dm(
@@ -119,9 +151,11 @@ async fn deliver_reauth_dm(
         return false;
     }
 
-    let alert_text = format_reauth_alert(notification, public_url);
+    let notify_count = tenant_registry.reauth_notify_count(target_did).unwrap_or(0);
+    let alert_text = format_reauth_alert_with_count(notification, public_url, notify_count);
     debug!(
         target = %target_did,
+        notify_count,
         "Dispatching proactive OAuth re-authentication alert DM"
     );
 
@@ -137,6 +171,7 @@ async fn deliver_reauth_dm(
                 }
                 info!(
                     target = %target_did,
+                    notify_count = notify_count + 1,
                     "Proactive DM re-authentication alert delivered successfully"
                 );
                 true
@@ -163,10 +198,11 @@ async fn deliver_reauth_dm(
 
 /// Runs the proactive OAuth re-authentication DM alert dispatcher until `cancel` is triggered.
 ///
-/// On startup, immediately dispatches one-shot DMs for any active tenants already flagged with
-/// `reauth_required = 1 AND reauth_notified_at IS NULL` in [`TenantRegistry`] (for example,
-/// sessions that failed refresh during cold-start PDS provisioning), then listens for live
-/// [`ReauthNotification`] events. Each tenant is notified at most once per expiration cycle.
+/// On startup and on a periodic sweep timer, dispatches DMs for any active tenants due for
+/// an initial re-authentication alert or a weekly follow-up reminder (up to
+/// [`crate::tenant::MAX_REAUTH_NOTIFICATIONS`] total alerts per expiration cycle, spaced by
+/// [`crate::tenant::DEFAULT_REAUTH_REMINDER_INTERVAL`]), while also listening for live
+/// [`ReauthNotification`] broadcast events.
 ///
 /// # Errors
 /// Returns [`SkybouncerError`] if an unrecoverable initialization error occurs.
@@ -191,6 +227,11 @@ pub async fn run_reauth_alert_dispatcher(
             deliver_reauth_dm(&client, &tenant_registry, &notification, &public_url).await;
         }
     }
+
+    let mut reminder_sweep = tokio::time::interval(std::time::Duration::from_secs(60));
+    reminder_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick since we already ran the startup sweep above.
+    reminder_sweep.tick().await;
 
     while !cancel.is_cancelled() {
         tokio::select! {
@@ -222,6 +263,20 @@ pub async fn run_reauth_alert_dispatcher(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         info!("Re-authentication notification channel closed; terminating dispatcher");
                         break;
+                    }
+                }
+            }
+            _ = reminder_sweep.tick() => {
+                if let Ok(pending) = tenant_registry.list_pending_reauth_notifications() {
+                    for (did, handle) in pending {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        let notif = ReauthNotification {
+                            target_did: did,
+                            handle,
+                        };
+                        deliver_reauth_dm(&client, &tenant_registry, &notif, &public_url).await;
                     }
                 }
             }
@@ -306,6 +361,16 @@ mod tests {
 
         let fallback_text = format_reauth_alert(&notif, "");
         assert!(fallback_text.contains("https://skybouncer.mike10010100.com/?auth=login"));
+
+        let reminder_1 =
+            format_reauth_alert_with_count(&notif, "https://skybouncer.mike10010100.com/", 1);
+        assert!(reminder_1.contains("Weekly Reminder (1/2)"));
+        assert!(reminder_1.contains("Reply `pause` if you want to stop these reminders."));
+
+        let reminder_2 =
+            format_reauth_alert_with_count(&notif, "https://skybouncer.mike10010100.com/", 2);
+        assert!(reminder_2.contains("Final Reminder (2/2)"));
+        assert!(reminder_2.contains("final automatic reminder"));
     }
 
     #[test]

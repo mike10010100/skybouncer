@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.20] - 2026-11-01
+
+### Added
+
+- **Capped Weekly Re-Authentication Reminder DMs (`src/tenant/registry/mod.rs`, `src/tenant/registry/core.rs`, `src/tenant/registry/sessions.rs`, `src/bot/dispatcher.rs`)**:
+  - Added `DEFAULT_REAUTH_REMINDER_INTERVAL` (7 days) and `MAX_REAUTH_NOTIFICATIONS = 3` to configure re-auth reminder frequency and pacing.
+  - Added `reauth_notify_count` tracking column to `tenants` table with automatic backfill migration for previously notified tenants, resetting to 0 upon successful OAuth reconnection.
+  - Added `format_reauth_alert_with_count` to tailor message copy across the initial notification, weekly reminder 1/2 (with an opt-out reminder via `pause`), and final reminder 2/2.
+  - Updated `run_reauth_alert_dispatcher` with an automated 60-second periodic sweep checking for pending reminders against the 7-day interval and 3-notification cap.
+
 ## [0.2.19] - 2026-11-01
 
 ### Fixed
