@@ -232,39 +232,5 @@ fn extract_post_images(
 
 /// Extracts `(cid, alt)` pairs from an `app.bsky.embed.gallery` (or `images`) JSON object.
 fn extract_gallery_items(val: &serde_json::Value) -> Vec<(String, String)> {
-    let Some(items) = val
-        .get("items")
-        .or_else(|| val.get("images"))
-        .and_then(|v| v.as_array())
-    else {
-        return Vec::new();
-    };
-
-    let mut results = Vec::with_capacity(items.len().min(crate::enricher::MAX_POST_IMAGES));
-    for item in items.iter().take(crate::enricher::MAX_POST_IMAGES) {
-        let alt = item
-            .get("alt")
-            .or_else(|| item.get("media").and_then(|m| m.get("alt")))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-
-        let img_obj = item
-            .get("image")
-            .or_else(|| item.get("media").and_then(|m| m.get("image")));
-
-        let cid = img_obj
-            .and_then(|img| {
-                img.get("ref")
-                    .and_then(|r| r.get("$link"))
-                    .and_then(|l| l.as_str())
-                    .or_else(|| img.get("cid").and_then(|c| c.as_str()))
-            })
-            .or_else(|| item.get("cid").and_then(|c| c.as_str()));
-
-        if let Some(c) = cid.filter(|s| !s.is_empty()) {
-            results.push((c.to_string(), alt));
-        }
-    }
-    results
+    crate::types::Embed::extract_gallery_items(val)
 }

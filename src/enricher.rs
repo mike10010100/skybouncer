@@ -648,30 +648,14 @@ impl AppViewContextEnricher {
             }
         }
 
-        // 2. Fallback to PLC directory if did:plc:...
-        if clean.starts_with("did:plc:") {
-            let clean_plc: String = clean
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == ':')
-                .collect();
-            let plc_url = format!("https://plc.directory/{clean_plc}");
-            if let Ok(resp) = self.client.http_client().get(&plc_url).send().await {
-                if resp.status().is_success() {
-                    #[derive(Deserialize)]
-                    struct PlcDoc {
-                        #[serde(rename = "alsoKnownAs", default)]
-                        also_known_as: Vec<String>,
-                    }
-                    if let Ok(doc) = resp.json::<PlcDoc>().await {
-                        for alias in doc.also_known_as {
-                            if let Some(handle) = alias.strip_prefix("at://") {
-                                let trimmed = crate::util::normalize_handle(handle).to_string();
-                                if !trimmed.is_empty() {
-                                    return Some(trimmed);
-                                }
-                            }
-                        }
-                    }
+        // 2. Fallback to DID document resolution via skyauth::identity::IdentityResolver
+        let resolver =
+            skyauth::identity::IdentityResolver::new(skyauth::ssrf::SsrfFilter::default());
+        if let Ok(doc) = resolver.resolve_did(clean).await {
+            if let Some(handle) = doc.extract_primary_handle() {
+                let trimmed = crate::util::normalize_handle(&handle).to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
                 }
             }
         }

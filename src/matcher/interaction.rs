@@ -223,57 +223,7 @@ impl Interaction {
     }
 }
 
-/// Extracts the DID portion from an AT-URI (`at://{did}/{collection}/{rkey}`).
-///
-/// Returns `None` if the URI does not start with `at://` or lacks a valid repository DID authority.
-#[must_use]
-pub fn extract_did_from_at_uri(uri: &str) -> Option<&str> {
-    let stripped = uri.strip_prefix("at://")?;
-    let did = stripped.split('/').next()?;
-    if did.starts_with("did:") {
-        Some(did)
-    } else {
-        None
-    }
-}
-
-/// Extracts the authority DID from an AT-URI if and only if the collection matches `expected_collection`.
-///
-/// Returns `None` if the URI is malformed, lacks a `did:` authority, has a non-matching
-/// collection name, or has an empty record key.
-///
-/// # Examples
-/// ```
-/// use skybouncer::matcher::extract_did_for_collection;
-///
-/// assert_eq!(
-///     extract_did_for_collection("at://did:plc:123/app.bsky.feed.post/456", "app.bsky.feed.post"),
-///     Some("did:plc:123")
-/// );
-/// assert_eq!(
-///     extract_did_for_collection("at://did:plc:123/app.bsky.graph.list/456", "app.bsky.feed.post"),
-///     None
-/// );
-/// ```
-#[must_use]
-pub fn extract_did_for_collection<'a>(uri: &'a str, expected_collection: &str) -> Option<&'a str> {
-    let (did, collection, rkey) = split_at_uri(uri)?;
-    if !did.starts_with("did:") || collection != expected_collection || rkey.is_empty() {
-        return None;
-    }
-    Some(did)
-}
-
-/// Splits the `at://` scheme off a URI and returns its `(authority, rest)` components.
-#[must_use]
-fn split_at_uri(uri: &str) -> Option<(&str, &str, &str)> {
-    let stripped = uri.strip_prefix("at://")?;
-    let mut parts = stripped.split('/');
-    let authority = parts.next()?;
-    let collection = parts.next()?;
-    let rkey = parts.next()?;
-    Some((authority, collection, rkey))
-}
+pub use skybase::repo::{extract_did_for_collection, extract_did_from_at_uri};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]

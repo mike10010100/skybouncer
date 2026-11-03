@@ -6,48 +6,16 @@
 
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
-use skybase::ingest::backoff::BackoffManager;
-use skybase::ingest::events::{parse_jetstream_frame, JetstreamCommit, JetstreamEvent};
+use skybase::ingest::events::JetstreamCommit;
+pub use skybase::ingest::streamer::{
+    resolve_resume_cursor, CURSOR_REWIND_OVERLAP_US, DEFAULT_JETSTREAM_ENDPOINT,
+    DEFAULT_READ_TIMEOUT, INITIAL_BACKOFF, MAX_BACKOFF, MAX_JETSTREAM_REPLAY_WINDOW_US,
+};
 use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
 
 use crate::error::SkybouncerError;
 use crate::modlist::SOVEREIGN_CONFIG_COLLECTION;
-
-/// Default public Jetstream endpoint.
-pub const DEFAULT_JETSTREAM_ENDPOINT: &str = "wss://jetstream2.us-east.bsky.network/subscribe";
-
-/// Initial backoff delay on connection failure (500ms).
-pub const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
-
-/// Maximum backoff delay cap on repeated failures (30s).
-pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
-
-/// Default idle read timeout before treating the Jetstream WebSocket as stalled (30s).
-pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Maximum Jetstream replay retention window (72 hours in microseconds).
-pub const MAX_JETSTREAM_REPLAY_WINDOW_US: u64 = 72 * 3600 * 1_000_000;
-
-/// Safety overlap rewind applied when resuming from a persisted or reconnected cursor (5 seconds in microseconds).
-pub const CURSOR_REWIND_OVERLAP_US: u64 = 5_000_000;
-
-/// Resolves a safe Jetstream replay cursor from a persisted microsecond timestamp,
-/// rewinding by [`CURSOR_REWIND_OVERLAP_US`] (5s) and clamping to the maximum
-/// [`MAX_JETSTREAM_REPLAY_WINDOW_US`] (72h) retention window prior to `now_us`.
-#[must_use]
-pub fn resolve_resume_cursor(persisted_cursor_us: u64, now_us: u64) -> Option<u64> {
-    if persisted_cursor_us == 0 {
-        return None;
-    }
-    let rewound = persisted_cursor_us.saturating_sub(CURSOR_REWIND_OVERLAP_US);
-    let min_allowed = now_us.saturating_sub(MAX_JETSTREAM_REPLAY_WINDOW_US);
-    Some(rewound.max(min_allowed)).filter(|c| *c > 0)
-}
 
 /// Configuration for the Jetstream stream listener.
 #[derive(Debug, Clone)]
@@ -119,6 +87,18 @@ impl StreamConfig {
             self.cursor.filter(|c| *c > 0),
         )
     }
+
+    /// Converts this `skybouncer` [`StreamConfig`] into a [`skybase::ingest::streamer::StreamConfig`].
+    #[must_use]
+    pub fn to_skybase_config(&self) -> skybase::ingest::streamer::StreamConfig {
+        let mut cfg = skybase::ingest::streamer::StreamConfig::new(&self.endpoint)
+            .with_collections(self.collections.clone())
+            .with_read_timeout(self.read_timeout);
+        if let Some(c) = self.cursor {
+            cfg = cfg.with_cursor(c);
+        }
+        cfg
+    }
 }
 
 /// Connects to Jetstream and forwards parsed commits to `tx` until `cancel` is triggered.
@@ -133,113 +113,9 @@ pub async fn run_jetstream_streamer(
     tx: mpsc::Sender<JetstreamCommit>,
     cancel: CancellationToken,
 ) -> Result<(), SkybouncerError> {
-    let mut backoff = BackoffManager::new(INITIAL_BACKOFF, MAX_BACKOFF);
-    let mut current_cursor: Option<u64> = config.cursor;
-
-    while !cancel.is_cancelled() {
-        let mut active_config = config.clone();
-        if let Some(cursor) = current_cursor {
-            // Rewind 5s (5,000,000 µs) on reconnect to prevent missed events across network drops
-            active_config.cursor = Some(cursor.saturating_sub(5_000_000));
-        }
-        let url = active_config.build_url();
-        info!(endpoint = %url, cursor = ?active_config.cursor, "Connecting to Jetstream firehose");
-
-        match connect_async(&url).await {
-            Ok((ws_stream, response)) => {
-                debug!(status = %response.status(), "WebSocket connection established");
-
-                let (mut write_half, mut read_half) = ws_stream.split();
-
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {
-                            info!("Streamer received cancellation signal; closing connection");
-                            let _ = write_half.send(Message::Close(None)).await;
-                            return Ok(());
-                        }
-                        msg_res = tokio::time::timeout(active_config.read_timeout, read_half.next()) => {
-                            match msg_res {
-                                Ok(Some(Ok(Message::Text(text)))) => {
-                                    if let Some(JetstreamEvent::Commit(commit)) =
-                                        parse_jetstream_frame(&text)
-                                    {
-                                        current_cursor = Some(commit.time_us);
-                                        backoff.reset();
-                                        if tx.send(commit).await.is_err() {
-                                            debug!("Commit receiver dropped; stopping streamer");
-                                            return Ok(());
-                                        }
-                                    }
-                                }
-                                Ok(Some(Ok(Message::Binary(bytes)))) => {
-                                    if let Ok(text) = std::str::from_utf8(&bytes) {
-                                        if let Some(JetstreamEvent::Commit(commit)) =
-                                            parse_jetstream_frame(text)
-                                        {
-                                            current_cursor = Some(commit.time_us);
-                                            backoff.reset();
-                                            if tx.send(commit).await.is_err() {
-                                                debug!("Commit receiver dropped; stopping streamer");
-                                                return Ok(());
-                                            }
-                                        }
-                                    }
-                                }
-
-                                Ok(Some(Ok(Message::Ping(payload)))) => {
-                                    let _ = write_half.send(Message::Pong(payload)).await;
-                                }
-                                Ok(Some(Ok(Message::Pong(_)))) => {}
-                                Ok(Some(Ok(Message::Close(frame)))) => {
-                                    warn!(frame = ?frame, "Jetstream server sent close frame; reconnecting");
-                                    break;
-                                }
-                                Ok(Some(Ok(Message::Frame(_)))) => {}
-                                Ok(Some(Err(e))) => {
-                                    warn!(error = %e, "WebSocket read error; reconnecting");
-                                    break;
-                                }
-                                Ok(None) => {
-                                    warn!("Jetstream stream ended unexpectedly; reconnecting");
-                                    break;
-                                }
-                                Err(_elapsed) => {
-                                    warn!(
-                                        timeout = ?active_config.read_timeout,
-                                        cursor = ?current_cursor,
-                                        "Jetstream WebSocket read timed out (silent stall); closing and reconnecting"
-                                    );
-                                    let _ = tokio::time::timeout(
-                                        Duration::from_secs(1),
-                                        write_half.send(Message::Close(None)),
-                                    )
-                                    .await;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to connect to Jetstream");
-            }
-        }
-
-        // Backoff delay before attempting reconnect (exponential with jitter)
-        let delay = backoff.next_backoff();
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                return Ok(());
-            }
-            _ = tokio::time::sleep(delay) => {}
-        }
-    }
-
-    Ok(())
+    skybase::ingest::streamer::run_jetstream_streamer(config.to_skybase_config(), tx, cancel)
+        .await
+        .map_err(SkybouncerError::from)
 }
 
 #[cfg(test)]

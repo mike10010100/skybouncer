@@ -1022,6 +1022,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "k256"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93f50113171a713f4a4231ef82eb26703607139b35dcb56241f0ceab2ae1f7d8"
+dependencies = [
+ "cpubits",
+ "ecdsa",
+ "elliptic-curve",
+ "primeorder",
+ "sha2",
+ "wnaf",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1837,9 +1851,9 @@ dependencies = [
 
 [[package]]
 name = "skyauth"
-version = "0.3.9"
+version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0b63e29845137ae58f090825b51f8ce5f9a4e309203095731f93c5fe33d03c7"
+checksum = "adcf4813e72c6d537a3e12cbd6eed8598f48c5356470b38783229bd97033ca69"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1847,6 +1861,7 @@ dependencies = [
  "base64 0.23.1",
  "hmac",
  "http",
+ "k256",
  "p256",
  "parking_lot",
  "rand",
@@ -1868,9 +1883,9 @@ dependencies = [
 
 [[package]]
 name = "skybase"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb9e4e61be3778c900a5a8b536593dde12c10e6155ed6f14f53124efdedcae23"
+checksum = "1ac5c34f8de930bbd5031b8dffd179ddb39f05910c37545946da698b74cbf9fb"
 dependencies = [
  "futures-util",
  "parking_lot",
@@ -1892,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "skybouncer"
-version = "0.2.20"
+version = "0.2.21"
 dependencies = [
  "async-trait",
  "axum",
