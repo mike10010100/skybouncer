@@ -126,13 +126,18 @@ mod tests {
     #[test]
     fn apply_common_pragmas_succeeds_and_sets_busy_timeout() {
         // In-memory databases use the `memory` journal mode (WAL is unsupported),
-        // so assert only the applied timeout, not the journal mode.
+        // so assert the applied non-default timeout and synchronous NORMAL (1).
         let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
-        apply_common_pragmas(&conn, 5000).expect("pragmas apply");
+        apply_common_pragmas(&conn, 4321).expect("pragmas apply");
 
         let busy: i64 = conn
             .pragma_query_value(None, "busy_timeout", |r| r.get(0))
             .expect("busy_timeout");
-        assert_eq!(busy, 5000);
+        assert_eq!(busy, 4321);
+
+        let sync_mode: i64 = conn
+            .pragma_query_value(None, "synchronous", |r| r.get(0))
+            .expect("synchronous");
+        assert_eq!(sync_mode, 1);
     }
 }

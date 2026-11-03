@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.21] - 2026-11-03
+
+### Changed
+
+- **Unified ATProto Plane Consolidation (`Cargo.toml`, `src/stream.rs`, `src/matcher/interaction.rs`, `src/matcher/target.rs`, `src/web/api/resolve.rs`, `src/enricher.rs`)**:
+  - Upgraded to `skybase 0.1.7` and `skyauth 0.3.10`.
+  - Delegated `src/stream.rs` (`run_jetstream_streamer`, `resolve_resume_cursor`, and cursor rewind constants) to `skybase::ingest::streamer`, gaining periodic 15-second WebSocket keepalive pings and lock-free `CursorTracker` watermark management.
+  - Delegated AT-URI authority extraction (`extract_did_from_at_uri`, `extract_did_for_collection`) and `app.bsky.embed.gallery` extraction (`Embed::extract_gallery_items`) to `skybase::repo` and `skybase::lexicon`.
+  - Reused a shared `AppViewClient` connection pool across `GET /api/auth/typeahead` and `GET /api/auth/preview` instead of constructing a new `reqwest::Client` per request, and unified DID document fallback resolution in `AppViewContextEnricher::resolve_did` onto `skyauth::identity::IdentityResolver`.
+
 ## [0.2.20] - 2026-11-01
 
 ### Added

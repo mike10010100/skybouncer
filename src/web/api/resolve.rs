@@ -1,11 +1,22 @@
 use super::*;
 
 fn appview_client_from_env() -> skybase::appview::AppViewClient {
+    static SHARED_DEFAULT_APPVIEW: std::sync::LazyLock<skybase::appview::AppViewClient> =
+        std::sync::LazyLock::new(|| {
+            skybase::appview::AppViewClient::with_endpoint(
+                crate::enricher::DEFAULT_APPVIEW_ENDPOINT,
+            )
+        });
+
     let endpoint = crate::env::var_or(
         &["APPVIEW_ENDPOINT", "SKYBOUNCER_APPVIEW_ENDPOINT"],
         crate::enricher::DEFAULT_APPVIEW_ENDPOINT,
     );
-    skybase::appview::AppViewClient::with_endpoint(endpoint)
+    if endpoint == crate::enricher::DEFAULT_APPVIEW_ENDPOINT {
+        SHARED_DEFAULT_APPVIEW.clone()
+    } else {
+        skybase::appview::AppViewClient::with_endpoint(endpoint)
+    }
 }
 
 /// Handler for `GET /api/resolve`: resolves a DID to a handle, or a handle to a DID.
@@ -139,20 +150,7 @@ pub async fn auth_preview(
     let resolved_handle = ep.handle;
     let pds_endpoint = ep.pds_endpoint;
 
-    #[derive(Deserialize)]
-    struct RawProfile {
-        #[serde(default)]
-        handle: Option<String>,
-        #[serde(default, rename = "displayName")]
-        display_name: Option<String>,
-        #[serde(default)]
-        avatar: Option<String>,
-    }
-
-    let profile = appview_client_from_env()
-        .get::<RawProfile>("app.bsky.actor.getProfile", &[("actor", did.clone())])
-        .await
-        .ok();
+    let profile = appview_client_from_env().fetch_profile(&did).await;
 
     let canonical_handle = resolved_handle
         .or_else(|| profile.as_ref().and_then(|p| p.handle.clone()))
