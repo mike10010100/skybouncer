@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.22] - 2026-11-03
+
+### Changed
+
+- **Formally Verified `skyauth 0.3.11` & Hardened `skybase 0.1.8` Upgrade (`Cargo.toml`, `src/tenant/registry/mod.rs`)**:
+  - Upgraded `skyauth` to `0.3.11` (Verus + Kani formally verified `service_auth` Multikey & curve binding kernels) and `skybase` to `0.1.8`.
+  - Added disk-backed `TenantRegistry::open` persistence and nested directory creation test coverage (`93.09%` total line coverage).
+
 ## [0.2.21] - 2026-11-03
 
 ### Changed

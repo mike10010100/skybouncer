@@ -183,6 +183,16 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_open_creates_parent_dir_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nested").join("tenants.sqlite");
+        let reg = TenantRegistry::open(&db_path).unwrap();
+        reg.register_or_update(&Tenant::new("did:plc:file1"))
+            .unwrap();
+        assert_eq!(reg.count().unwrap(), 1);
+    }
+
+    #[test]
     pub(super) fn test_tenant_crud_in_memory() {
         let registry = test_registry();
         assert_eq!(registry.count().unwrap(), 0);
