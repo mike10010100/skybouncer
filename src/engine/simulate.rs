@@ -186,17 +186,22 @@ impl crate::engine::SkybouncerEngine {
         {
             let meets_threshold = rubric.meets_threshold(&category, confidence);
             if persist_log {
+                let outcome_label = if meets_threshold {
+                    "Simulated: Would Bounce (Regex Pre-filter)"
+                } else {
+                    "Simulated: Below Threshold (Permitted)"
+                };
                 let log = NewEvaluationLog::heuristic(
                     &interaction,
                     &format!("at://{author_did}/app.bsky.feed.post/simulated"),
                     &Verdict::Violation {
                         category: category.clone(),
-                        confidence: 1.0,
+                        confidence,
                         reason: reason.clone(),
                     },
                     EvaluationLogContext {
                         source: "simulation",
-                        outcome: "Simulated: Would Bounce (Regex Pre-filter)",
+                        outcome: outcome_label,
                     },
                     "simulated-test.bsky.social".to_string(),
                     self.target_handle(&target_did),

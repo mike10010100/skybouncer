@@ -732,14 +732,17 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash",
+]
 
 [[package]]
 name = "hashlink"
-version = "0.11.1"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -1049,9 +1052,9 @@ checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.37.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -1560,16 +1563,15 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.39.0"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0d2b0146dd9661bf67bb107c0bb2a55064d556eeb3fc314151b957f313bcd4e"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags",
  "fallible-iterator",
  "fallible-streaming-iterator",
  "hashlink",
  "libsqlite3-sys",
- "serde_json",
  "smallvec",
  "sqlite-wasm-rs",
 ]
@@ -1851,9 +1853,9 @@ dependencies = [
 
 [[package]]
 name = "skyauth"
-version = "0.3.12"
+version = "0.3.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cfe142abcc55c4c040099ff324a24c6165e3b95cb4f0c579326aa6371fcd444"
+checksum = "6022f9b8fa25d3f8fc385556f475412136801d1a97c1d0093901cfd3afd77b6c"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1883,15 +1885,14 @@ dependencies = [
 
 [[package]]
 name = "skybase"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4e076d43bcefa0b1c0cee958eee44356f91824a12742e5593c3b78e39895c5c"
+checksum = "f0823d40f7180f34b66c427ed827531bb81a6a1e130c70aa3e6863672ee98175"
 dependencies = [
  "futures-util",
  "parking_lot",
  "regex",
  "reqwest",
- "rusqlite",
  "rustls-webpki",
  "serde",
  "serde_json",
@@ -1907,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "skybouncer"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "async-trait",
  "axum",

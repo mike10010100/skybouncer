@@ -67,6 +67,13 @@ impl SkybouncerEngine {
         for did in &config.protected_dids {
             gate.set_bypass_incoming_followers(did, config.rubric.bypass_incoming_followers);
         }
+        if let Ok(active_tenants) = tenant_registry.list_active() {
+            for t in active_tenants {
+                if let Some(ref r) = t.rubric {
+                    gate.set_bypass_incoming_followers(&t.did, r.bypass_incoming_followers);
+                }
+            }
+        }
 
         Self {
             config,
@@ -240,7 +247,35 @@ impl SkybouncerEngine {
 
         match self.fast_path(&interaction).await? {
             FastPath::Resolved(outcome) => return Ok(outcome),
-            FastPath::Heuristic(outcome, _) => return outcome,
+            FastPath::Heuristic(outcome, verdict) => {
+                let outcome_str = match &outcome {
+                    Ok(InteractionOutcome::Bounced { .. }) => "Bounced (Regex Pre-filter)",
+                    Ok(InteractionOutcome::BelowThreshold { .. }) => {
+                        "Below Threshold (Regex Pre-filter)"
+                    }
+                    Ok(other) => other.label(),
+                    Err(_) => "Error (Regex Pre-filter)",
+                };
+                let target_handle = self.target_handle(&target_did);
+                let log_entry = crate::modlist::cache::NewEvaluationLog::heuristic(
+                    &interaction,
+                    &interaction.post_uri,
+                    &verdict,
+                    crate::modlist::EvaluationLogContext {
+                        source: "live",
+                        outcome: outcome_str,
+                    },
+                    String::new(),
+                    target_handle,
+                );
+                if let Err(e) = self.cache.record_evaluation_log(&log_entry) {
+                    tracing::warn!(error = %e, "Failed to record evaluation log in cache");
+                    self.stats
+                        .errors_encountered
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return outcome;
+            }
             FastPath::Continue => {}
         }
 
@@ -538,7 +573,7 @@ impl SkybouncerEngine {
             self.follow_graph.add_follower(
                 &target_did,
                 &author_did,
-                format!("lazy_in_{author_did}"),
+                format!("lazy_in_{target_did}_{author_did}"),
             );
             if self.gate.bypass_incoming_followers(&target_did) {
                 self.stats

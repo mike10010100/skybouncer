@@ -139,7 +139,13 @@ pub async fn oauth_callback(
             info!(did = %did, "OAuth authorization completed successfully");
 
             if let Some(ref engine) = state.engine {
-                let tenant = Tenant::new(did.clone()).with_session(session);
+                let existing = engine.tenant_registry().get(&did).ok().flatten();
+                let mut tenant = Tenant::new(did.clone()).with_session(session);
+                if let Some(prev) = existing {
+                    tenant.is_active = prev.is_active;
+                    tenant.rubric = prev.rubric;
+                    tenant.handle = prev.handle;
+                }
                 if let Err(e) = engine.enroll_tenant(tenant) {
                     error!(error = %e, did = %did, "Failed to enroll tenant into registry");
                 } else {

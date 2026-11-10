@@ -280,7 +280,7 @@ pub async fn toggle_tenant(
         Some(explicit) => explicit,
         None => match current_tenant {
             Some(ref t) => !t.is_active,
-            None => false,
+            None => state.engine.is_paused(),
         },
     };
 
@@ -295,7 +295,8 @@ pub async fn toggle_tenant(
             )
         })?;
 
-    if (state.engine.is_admin(&target_did) || state.engine.is_single_tenant())
+    if current_tenant.is_none()
+        && (state.engine.is_admin(&target_did) || state.engine.is_single_tenant())
         && state.engine.is_protected(&target_did)
     {
         if new_active {
@@ -330,10 +331,18 @@ pub async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Respon
         }
     }
 
+    let is_local_http = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|h| {
+            h.starts_with("localhost") || h.starts_with("127.0.0.1") || h.starts_with("[::1]")
+        });
+    let secure_attr = if is_local_http { "" } else { "; Secure" };
+    let clear_cookie =
+        format!("skybouncer_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{secure_attr}");
+
     let mut resp = Json(serde_json::json!({ "logged_out": true })).into_response();
-    if let Ok(cookie_val) = HeaderValue::from_str(
-        "skybouncer_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure",
-    ) {
+    if let Ok(cookie_val) = HeaderValue::from_str(&clear_cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, cookie_val);
     }
     resp

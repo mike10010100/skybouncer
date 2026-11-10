@@ -1,6 +1,6 @@
 [package]
 name = "skybouncer"
-version = "0.2.23"
+version = "0.2.24"
 edition = "2021"
 rust-version = "1.89"
 authors = ["Michael Paulauski <mike10010100@gmail.com>"]
@@ -35,8 +35,8 @@ telemetry = ["dep:tracing-subscriber"]
 
 [dependencies]
 # Sibling dependencies, consumed from crates.io (published by each repo's CI).
-skybase = "0.1.9"
-skyauth = "0.3.12"
+skybase = { version = "0.1.10", default-features = false }
+skyauth = "0.3.13"
 
 # HTTP Web Framework & Networking
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "query", "tokio", "macros", "http1"] }
@@ -53,7 +53,7 @@ parking_lot = "0.12"
 regex = "1.10"
 
 # Embedded Database & Persistence
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # Serialization & JSON
 serde = { version = "1.0", features = ["derive"] }

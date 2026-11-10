@@ -245,11 +245,24 @@ impl FollowGraph {
         let rk = rkey.into();
 
         let mut guard = self.inner.write();
-        guard
+        let old_p_did = guard
             .incoming_rkey_index
             .entry(f_did.clone())
             .or_default()
             .insert(rk, p_did.clone());
+        if let Some(prev_p_did) = old_p_did {
+            if prev_p_did != p_did {
+                let still_referenced = guard
+                    .incoming_rkey_index
+                    .get(&f_did)
+                    .is_some_and(|m| m.values().any(|v| v == &prev_p_did));
+                if !still_referenced {
+                    if let Some(set) = guard.followers.get_mut(&prev_p_did) {
+                        set.remove(&f_did);
+                    }
+                }
+            }
+        }
         guard.followers.entry(p_did).or_default().insert(f_did);
     }
 
@@ -309,7 +322,11 @@ impl FollowGraph {
         let p_did = protected_did.into();
         let mut count = 0;
         for (idx, follower_did) in followers.into_iter().enumerate() {
-            self.add_follower(&p_did, follower_did.into(), format!("hydrate_in_{idx}"));
+            self.add_follower(
+                &p_did,
+                follower_did.into(),
+                format!("hydrate_in_{p_did}_{idx}"),
+            );
             count += 1;
         }
         count

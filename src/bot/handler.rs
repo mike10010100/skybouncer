@@ -506,7 +506,7 @@ impl BotCommandHandler {
         sender_did: &str,
         level: &str,
     ) -> Result<String, SkybouncerError> {
-        let sens = match level {
+        let sens = match level.trim().to_ascii_lowercase().as_str() {
             "low" => Sensitivity::Low,
             "medium" => Sensitivity::Medium,
             "high" => Sensitivity::High,
