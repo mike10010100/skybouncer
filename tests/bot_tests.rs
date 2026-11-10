@@ -1676,8 +1676,11 @@ async fn test_chat_client_get_convo_for_members_and_find_or_create() {
     Mock::given(method("GET"))
         .and(path("/xrpc/chat.bsky.convo.getConvoForMembers"))
         .respond_with(|req: &wiremock::Request| {
-            let query = req.url.query().unwrap_or_default();
-            assert!(query.contains("members=did:plc:user42"));
+            let has_member = req
+                .url
+                .query_pairs()
+                .any(|(k, v)| k == "members" && v == "did:plc:user42");
+            assert!(has_member);
             ResponseTemplate::new(200).set_body_json(json!({
                 "convo": {
                     "id": "convo_user42",

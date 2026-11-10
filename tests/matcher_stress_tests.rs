@@ -351,13 +351,13 @@ fn test_adversarial_malformed_at_uris() {
         Some("did:web:example.com")
     );
 
-    // 7. Extra trailing segments
+    // 7. Extra trailing segments (rejected by strict 3-segment AT-URI syntax)
     assert_eq!(
         extract_did_for_collection(
             "at://did:plc:alice123/app.bsky.feed.post/post456/extra/trail",
             post_collection
         ),
-        Some("did:plc:alice123")
+        None
     );
 
     // 8. Enormous 100KB URI string (no buffer overflows, no allocation panic)

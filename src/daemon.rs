@@ -65,7 +65,7 @@ pub async fn provision_pds_resources(
     let mut all_dids = protected_dids.clone();
     if let Ok(tenants) = engine.tenant_registry().list_all() {
         for t in tenants {
-            if t.session.is_some() {
+            if t.is_active && t.session.is_some() {
                 all_dids.insert(t.did);
             }
         }

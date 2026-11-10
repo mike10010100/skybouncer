@@ -390,7 +390,7 @@ impl SkybouncerConfig {
                 model: fb_model,
                 timeout: Duration::from_millis(fb_timeout_ms),
                 max_retries: fb_max_retries,
-                supports_images: false,
+                supports_images: true,
             })
         } else {
             None

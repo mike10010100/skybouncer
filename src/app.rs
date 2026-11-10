@@ -62,7 +62,10 @@ pub async fn run_cli_status(args: &[String]) -> Result<(), SkybouncerError> {
         .map_err(|e| SkybouncerError::Config(format!("Failed to parse status response: {e}")))?;
 
     let s = &status.stats;
-    let total_bypassed = s.gate_bypassed_self + s.gate_bypassed_followed + s.gate_bypassed_follower;
+    let total_bypassed = s.gate_bypassed_self
+        + s.gate_bypassed_followed
+        + s.gate_bypassed_follower
+        + s.gate_bypassed_allowlist;
     let bypass_rate = if s.interactions_matched > 0 {
         format!(
             "{:.1}%",
@@ -474,13 +477,53 @@ pub async fn dispatch(
             };
             let mut probe_cfg = SkybouncerConfig::default();
             crate::cli::apply_daemon_overrides(&mut probe_cfg, daemon_args)?;
-            crate::daemon::run(daemon_args, cancel).await
+            #[cfg(all(
+                feature = "web",
+                feature = "stream",
+                feature = "bot",
+                feature = "telemetry"
+            ))]
+            {
+                crate::daemon::run(daemon_args, cancel).await
+            }
+            #[cfg(not(all(
+                feature = "web",
+                feature = "stream",
+                feature = "bot",
+                feature = "telemetry"
+            )))]
+            {
+                let _ = cancel;
+                Err(SkybouncerError::Config(
+                    "Daemon mode requires 'web', 'stream', 'bot', and 'telemetry' features".into(),
+                ))
+            }
         }
         arg if arg.starts_with('-') => {
             let daemon_args = &args[1..];
             let mut probe_cfg = SkybouncerConfig::default();
             crate::cli::apply_daemon_overrides(&mut probe_cfg, daemon_args)?;
-            crate::daemon::run(daemon_args, cancel).await
+            #[cfg(all(
+                feature = "web",
+                feature = "stream",
+                feature = "bot",
+                feature = "telemetry"
+            ))]
+            {
+                crate::daemon::run(daemon_args, cancel).await
+            }
+            #[cfg(not(all(
+                feature = "web",
+                feature = "stream",
+                feature = "bot",
+                feature = "telemetry"
+            )))]
+            {
+                let _ = cancel;
+                Err(SkybouncerError::Config(
+                    "Daemon mode requires 'web', 'stream', 'bot', and 'telemetry' features".into(),
+                ))
+            }
         }
         other => Err(SkybouncerError::Config(format!(
             "Unknown command: '{other}'"

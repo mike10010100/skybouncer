@@ -991,7 +991,7 @@
         const data = await res.json();
         document.getElementById("kpi-commits").innerText = data.stats.commits_received.toLocaleString();
         document.getElementById("kpi-matched").innerText = data.stats.interactions_matched.toLocaleString();
-        document.getElementById("kpi-bypassed").innerText = (data.stats.gate_bypassed_followed + data.stats.gate_bypassed_self + (data.stats.gate_bypassed_follower || 0)).toLocaleString();
+        document.getElementById("kpi-bypassed").innerText = (data.stats.gate_bypassed_followed + data.stats.gate_bypassed_self + (data.stats.gate_bypassed_follower || 0) + (data.stats.gate_bypassed_allowlist || 0)).toLocaleString();
         document.getElementById("kpi-dedup").innerText = data.stats.dedup_cache_hits.toLocaleString();
         
         const tier1Count = data.stats.tier1_evaluations !== undefined ? data.stats.tier1_evaluations : data.stats.model_evaluations;
@@ -1104,11 +1104,16 @@
     }
 
     function setBounceDuration(val, skipDirtyCheck = false) {
-      const norm = (val || "").toString().toLowerCase().trim();
+      let rawVal = val;
+      if (val && typeof val === "object" && val.custom !== undefined) {
+        rawVal = String(val.custom);
+      }
+      const norm = (rawVal || "").toString().toLowerCase().trim();
       const is24h = norm === "cooldown24h" || norm === "cooldown_24h" || norm === "24h" || norm === "1d" || norm === "86400";
       const is7d = norm === "timeout7d" || norm === "timeout_7d" || norm === "7d" || norm === "1w" || norm === "604800";
       const is30d = norm === "timeout30d" || norm === "timeout_30d" || norm === "30d" || norm === "1m" || norm === "2592000";
-      const isPerm = !is24h && !is7d && !is30d;
+      const isCustomSecs = !is24h && !is7d && !is30d && /^\d+$/.test(norm) && Number(norm) > 0;
+      const isPerm = !is24h && !is7d && !is30d && !isCustomSecs;
 
       if (is24h) {
         activeBounceDuration = "cooldown24h";
@@ -1116,6 +1121,8 @@
         activeBounceDuration = "timeout7d";
       } else if (is30d) {
         activeBounceDuration = "timeout30d";
+      } else if (isCustomSecs) {
+        activeBounceDuration = `${norm}s`;
       } else {
         activeBounceDuration = "permanent";
       }
@@ -1343,10 +1350,14 @@
         const multiNote = document.getElementById("sim-multimodal-note");
 
         box.style.display = "flex";
-        if (data.violates) {
+        if (data.violates && data.meets_threshold !== false) {
           badge.className = "verdict-badge verdict-violation";
           badge.innerText = `VIOLATION: ${data.category || 'Harassment'}`;
           bar.style.background = "var(--danger)";
+        } else if (data.violates) {
+          badge.className = "verdict-badge verdict-permitted";
+          badge.innerText = `BELOW THRESHOLD (PERMITTED): ${data.category || 'Borderline'}`;
+          bar.style.background = "var(--warning)";
         } else {
           badge.className = "verdict-badge verdict-permitted";
           badge.innerText = "PERMITTED";
@@ -2786,6 +2797,9 @@
       }
       localStorage.removeItem("skybouncer_did");
       currentUser = null;
+      allBounces = [];
+      const scopeSelect = document.getElementById("bounces-scope-select");
+      if (scopeSelect) scopeSelect.value = "mine";
       renderUnauthenticated();
       renderRulesUnauthenticated();
       loadBounces();

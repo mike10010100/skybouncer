@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.24] - 2026-11-10
+
+### Changed
+
+- **Upgraded `skyauth` to `0.3.13`, `skybase` to `0.1.10`, & `rusqlite` to `0.41` (`Cargo.toml`)**:
+  - Incorporates `skyauth 0.3.13` (formally verified Verus/rustc clock-skew leeway kernel, required service-auth claims, strict `did:plc`/`did:web` syntax checks, IPv6 SSRF validation) and `skybase 0.1.10` (transactional index notifications, monotonic cursor persistence, fail-closed `DPoP-Nonce` challenge handling, and `ChatClient`/`AppViewClient` hardening).
+  - Upgraded `rusqlite` from `0.40` to `0.41` (`libsqlite3-sys 0.37.0`) to resolve `RUSTSEC-2026-0459`.
+
+### Fixed
+
+- **Engine, Tenant Isolation, & Follower Hydration Correctness (`src/app.rs`, `src/daemon.rs`, `src/engine/mod.rs`, `src/engine/processing.rs`, `src/engine/simulate.rs`, `src/engine/tenant_ops.rs`, `src/matcher/follow_graph.rs`)**:
+  - Hydrated `bypass_incoming_followers` and `protected_dids` across startup (`hydrate_from_registry`), `register_tenant`, and `sync_tenant_from_registry`, and recorded `gate_bypassed_allowlist` in `AppMetrics::from_engine`.
+  - Filtered inactive tenants (`!t.is_active`) from startup PDS provisioning in `daemon::provision_pds_resources` and set `supports_images: true` on the fallback Ollama HTTP classifier.
+  - Logged heuristic hit verdicts to the tenant activity log in queued (`ApprovalMode::Queue`) mode and matched heuristic confidence/outcome parity in `simulate_interaction`.
+  - Scoped `rkey`-based follow deletion (`delete_record_by_rkey`) by tenant DID when `hydrate_followers` replaces a tenant's incoming follower snapshot.
+- **Sovereign Config, Rubric, Bot, & Web API Hardening (`src/modlist/sovereign_config.rs`, `src/classifier/rubric.rs`, `src/bot/handler.rs`, `src/web/api/tenant.rs`, `src/web/oauth.rs`, `assets/dashboard.html`)**:
+  - Replaced substring `find("}]")` in `SovereignConfigManager::extract_Rules_from_description` with balanced JSON array bracket scanning so rule strings containing `"}]"` are preserved intact.
+  - Normalized `{"custom": 0}` to `BounceDuration::Permanent` in `BounceDuration::deserialize` and made DM bot `sensitivity` commands case-insensitive.
+  - Preserved existing `is_active` and `sensitivity` state when an existing tenant re-authenticates via OAuth (`oauth_callback`), isolated `POST /api/tenant/toggle` to per-tenant pause (`set_tenant_paused`) rather than halting the global multi-tenant engine, and omitted `Secure` from the cleared session cookie on plain HTTP localhost logout.
+
 ## [0.2.23] - 2026-11-03
 
 ### Changed

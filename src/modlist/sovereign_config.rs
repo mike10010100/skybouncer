@@ -111,8 +111,9 @@ pub fn format_list_description_with_rubric(base_description: &str, rubric: &Rule
 pub fn extract_rubric_from_list_description(description: &str) -> Option<RuleRubric> {
     let marker = "[skybouncer:";
     let start_idx = description.find(marker)? + marker.len();
-    let end_idx = description[start_idx..].find(']')? + start_idx;
-    let json_str = &description[start_idx..end_idx];
+    let tail = &description[start_idx..];
+    let end_rel = tail.rfind("}]").map(|i| i + 1).or_else(|| tail.find(']'))?;
+    let json_str = &tail[..end_rel];
 
     let meta: ListMetadata = serde_json::from_str(json_str).ok()?;
     let sensitivity = sensitivity_from_db(Some(&meta.sensitivity));

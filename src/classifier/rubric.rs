@@ -184,7 +184,11 @@ impl<'de> Deserialize<'de> for BounceDuration {
                 if let Some(key) = map.next_key::<String>()? {
                     if key.eq_ignore_ascii_case("custom") {
                         let val = map.next_value::<u64>()?;
-                        return Ok(BounceDuration::Custom(val));
+                        return if val == 0 {
+                            Ok(BounceDuration::Permanent)
+                        } else {
+                            Ok(BounceDuration::Custom(val))
+                        };
                     }
                 }
                 Err(serde::de::Error::custom(

@@ -7,8 +7,17 @@ impl SkybouncerEngine {
     /// Returns [`SkybouncerError`] if tenant registration fails.
     pub fn enroll_tenant(&self, tenant: Tenant) -> Result<(), SkybouncerError> {
         let did = tenant.did.clone();
+        let is_active = tenant.is_active;
+        let bypass_followers = tenant.rubric.as_ref().map(|r| r.bypass_incoming_followers);
         self.tenant_registry.register_or_update(&tenant)?;
-        self.add_protected_did(did);
+        if let Some(bypass) = bypass_followers {
+            self.gate.set_bypass_incoming_followers(&did, bypass);
+        }
+        if is_active {
+            self.add_protected_did(did);
+        } else {
+            self.remove_protected_did(&did);
+        }
         Ok(())
     }
 
