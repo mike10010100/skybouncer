@@ -1885,9 +1885,9 @@ dependencies = [
 
 [[package]]
 name = "skybase"
-version = "0.1.10"
+version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0823d40f7180f34b66c427ed827531bb81a6a1e130c70aa3e6863672ee98175"
+checksum = "340d0a1594c4806455774af60fef934671ef1ec913a517ef70e7635dfcfe7cd4"
 dependencies = [
  "futures-util",
  "parking_lot",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "skybouncer"
-version = "0.2.29"
+version = "0.2.30"
 dependencies = [
  "async-trait",
  "axum",
