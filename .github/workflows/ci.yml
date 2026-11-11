@@ -136,10 +136,10 @@ jobs:
           cache-all-crates: true
           cache-on-failure: true
 
-      - name: Install cargo-mutants
+      - name: Install cargo-nextest & cargo-mutants
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-mutants
+          tool: cargo-nextest,cargo-mutants
 
       - name: 7. Mutation Testing Smoke Test (cargo-mutants)
         # Reuses cached target/ in-place and compiles only the library unit-test target
