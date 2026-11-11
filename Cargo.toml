@@ -1,6 +1,6 @@
 [package]
 name = "skybouncer"
-version = "0.2.26"
+version = "0.2.27"
 edition = "2021"
 rust-version = "1.89"
 authors = ["Michael Paulauski <mike10010100@gmail.com>"]
@@ -84,7 +84,13 @@ tempfile = "3"
 proptest = "1.5"
 rustls-pki-types = "1.12"
 
-[profile.test]
+# Optimize third-party dependencies in dev/test builds (cached across CI runs)
+# while keeping skybouncer's own crate and integration test binaries at opt-level = 0
+# for fast codegen and linking.
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.test.package."*"]
 opt-level = 1
 
 

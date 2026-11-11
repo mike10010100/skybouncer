@@ -9,14 +9,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   version-bump-check:
@@ -37,86 +36,144 @@ jobs:
           chmod +x ./scripts/check_version_bump.sh
           ./scripts/check_version_bump.sh
 
-  quality-gate:
-    name: Rust Quality Gate
+  lint-and-audit:
+    name: Lint, Audit & Lean Core
     runs-on: ubuntu-latest
-
+    env:
+      RUSTFLAGS: "-D warnings"
     steps:
       - name: Checkout skybouncer
         uses: actions/checkout@v7
         with:
-          path: skybouncer
-
-      - name: Checkout sibling dependency (skybase)
-        uses: actions/checkout@v7
-        with:
-          repository: mike10010100/skybase
-          path: skybase
-
-      - name: Checkout sibling dependency (skyauth)
-        uses: actions/checkout@v7
-        with:
-          repository: mike10010100/skyauth
-          path: skyauth
+          persist-credentials: false
 
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt, llvm-tools-preview
+          components: clippy, rustfmt
 
       - name: Enable Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            skybouncer -> skybouncer/target
-            skybase -> skybase/target
-            skyauth -> skyauth/target
+          shared-key: "lint"
+          cache-on-failure: true
 
       - name: Install CI Cargo Utilities
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest,cargo-llvm-cov,cargo-deny,cargo-audit,cargo-mutants
+          tool: cargo-deny,cargo-audit
 
       - name: 1. Enforce Code Formatting
-        working-directory: skybouncer
         run: cargo fmt --all -- --check
 
       - name: 2. Enforce Strict Clippy Lints
-        working-directory: skybouncer
         run: cargo clippy --all-targets -- -D warnings
 
       - name: 2b. Enforce Lean Core Build (no default features)
-        working-directory: skybouncer
         run: cargo clippy --lib --no-default-features -- -D warnings
 
       - name: 3. Dependency Policy Governance (cargo-deny)
-        working-directory: skybouncer
         run: cargo deny check
 
       - name: 4. Security Vulnerability Scan (cargo-audit)
-        working-directory: skybouncer
         run: cargo audit
 
-      - name: 5. Run Test Suite (cargo-nextest)
-        working-directory: skybouncer
-        run: cargo nextest run --all-targets
+  coverage-and-tests:
+    name: Test Suite & Coverage (>= 92%)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+      CARGO_LLVM_COV_TARGET_DIR: target
+    steps:
+      - name: Checkout skybouncer
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      - name: 6. Run Documentation Tests
-        working-directory: skybouncer
-        run: cargo test --doc
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
 
-      - name: 7. Generate Code Coverage (cargo-llvm-cov, >= 92%)
-        working-directory: skybouncer
+      - name: Install CI Cargo Utilities
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-llvm-cov
+
+      - name: Enable Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "coverage"
+          cache-all-crates: true
+          cache-on-failure: true
+
+      - name: 5. Run Test Suite & Enforce >= 92% Coverage (nextest + llvm-cov)
         run: |
           cargo llvm-cov clean --workspace
-          cargo llvm-cov --all-targets --lcov --output-path lcov.info
+          cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info
           cargo llvm-cov report --fail-under-lines 92
 
-      - name: 8. Mutation Testing Smoke Test (cargo-mutants)
-        working-directory: skybouncer
-        # Quick smoke test over a small, high-signal module to verify test
-        # effectiveness without a full (very slow) mutation sweep.
-        run: cargo mutants --file src/time.rs --file src/util.rs
+      - name: 6. Run Documentation Tests
+        run: cargo test --doc
+
+  mutants-smoke:
+    name: Mutation Testing Smoke Test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout skybouncer
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Enable Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "mutants"
+          cache-all-crates: true
+          cache-on-failure: true
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: 7. Mutation Testing Smoke Test (cargo-mutants)
+        # Reuses cached target/ in-place and compiles only the library unit-test target
+        # (avoiding relinking all 34 integration test binaries per mutant).
+        run: cargo mutants --in-place --cargo-arg --lib --file src/time.rs --file src/util.rs
+
+  quality-gate:
+    name: Rust Quality Gate
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [lint-and-audit, coverage-and-tests, mutants-smoke]
+    steps:
+      - name: Verify All Parallel Quality Gate Jobs Succeeded
+        env:
+          LINT_RESULT: ${{ needs.lint-and-audit.result }}
+          COV_RESULT: ${{ needs.coverage-and-tests.result }}
+          MUTANTS_RESULT: ${{ needs.mutants-smoke.result }}
+        run: |
+          echo "lint-and-audit    : ${LINT_RESULT}"
+          echo "coverage-and-tests: ${COV_RESULT}"
+          echo "mutants-smoke     : ${MUTANTS_RESULT}"
+          if [[ "${LINT_RESULT}" != "success" ]]; then
+            echo "::error::lint-and-audit failed (${LINT_RESULT})"
+            exit 1
+          fi
+          if [[ "${COV_RESULT}" != "success" ]]; then
+            echo "::error::coverage-and-tests failed (${COV_RESULT})"
+            exit 1
+          fi
+          if [[ "${MUTANTS_RESULT}" != "success" && "${MUTANTS_RESULT}" != "skipped" ]]; then
+            echo "::error::mutants-smoke failed (${MUTANTS_RESULT})"
+            exit 1
+          fi
+          echo "All quality gate checks passed!"
 
   publish:
     name: Auto-Publish to Crates.io & Create GitHub Release
@@ -130,57 +187,49 @@ jobs:
       - name: Checkout skybouncer
         uses: actions/checkout@v7
         with:
-          path: skybouncer
           persist-credentials: false
-
-      - name: Checkout sibling dependency (skybase)
-        uses: actions/checkout@v7
-        with:
-          repository: mike10010100/skybase
-          path: skybase
-
-      - name: Checkout sibling dependency (skyauth)
-        uses: actions/checkout@v7
-        with:
-          repository: mike10010100/skyauth
-          path: skyauth
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Extract Current Version & Name
         id: pkg_info
-        working-directory: skybouncer
         run: |
           VERSION=$(grep -m1 '^[[:space:]]*version[[:space:]]*=' Cargo.toml | awk -F'"' '{print $2}')
           NAME=$(grep -m1 '^[[:space:]]*name[[:space:]]*=' Cargo.toml | awk -F'"' '{print $2}')
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "name=${NAME}" >> $GITHUB_OUTPUT
-          echo "Detected package: ${NAME} v${VERSION}"
+          SKYBASE_VER=$(grep -m1 '^skybase[[:space:]]*=' Cargo.toml | sed -E 's/.*version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+          SKYAUTH_VER=$(grep -m1 '^skyauth[[:space:]]*=' Cargo.toml | awk -F'"' '{print $2}')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "skybase_version=${SKYBASE_VER}" >> "$GITHUB_OUTPUT"
+          echo "skyauth_version=${SKYAUTH_VER}" >> "$GITHUB_OUTPUT"
+          echo "Detected package: ${NAME} v${VERSION} (skybase=${SKYBASE_VER}, skyauth=${SKYAUTH_VER})"
 
       - name: Check if Version Already Published on Crates.io
         id: check_published
         run: |
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: ${{ steps.pkg_info.outputs.name }}-release-check" "https://crates.io/api/v1/crates/${{ steps.pkg_info.outputs.name }}/${{ steps.pkg_info.outputs.version }}" || echo "000")
           if [ "$HTTP_STATUS" -eq 200 ]; then
-            echo "published=true" >> $GITHUB_OUTPUT
+            echo "published=true" >> "$GITHUB_OUTPUT"
             echo "Version ${{ steps.pkg_info.outputs.version }} is already published on crates.io."
           else
-            echo "published=false" >> $GITHUB_OUTPUT
+            echo "published=false" >> "$GITHUB_OUTPUT"
             echo "Version ${{ steps.pkg_info.outputs.version }} is NOT published on crates.io yet."
           fi
 
       - name: Wait for Sibling Dependencies in Crates.io Index
         if: steps.check_published.outputs.published == 'false'
         run: |
-          echo "Checking if skybase 0.1.7 and skyauth 0.3.10 are available on crates.io..."
+          SKYBASE_VER="${{ steps.pkg_info.outputs.skybase_version }}"
+          SKYAUTH_VER="${{ steps.pkg_info.outputs.skyauth_version }}"
+          echo "Checking if skybase ${SKYBASE_VER} and skyauth ${SKYAUTH_VER} are available on crates.io..."
           max_attempts=30
           attempt=1
           until [ $attempt -gt $max_attempts ]; do
-            STATUS_BASE=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: skybouncer-dep-check" "https://crates.io/api/v1/crates/skybase/0.1.7" || echo "000")
-            STATUS_AUTH=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: skybouncer-dep-check" "https://crates.io/api/v1/crates/skyauth/0.3.10" || echo "000")
+            STATUS_BASE=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: skybouncer-dep-check" "https://crates.io/api/v1/crates/skybase/${SKYBASE_VER}" || echo "000")
+            STATUS_AUTH=$(curl -s -o /dev/null -w "%{http_code}" -H "User-Agent: skybouncer-dep-check" "https://crates.io/api/v1/crates/skyauth/${SKYAUTH_VER}" || echo "000")
             if [ "$STATUS_BASE" -eq 200 ] && [ "$STATUS_AUTH" -eq 200 ]; then
-              echo "skybase 0.1.7 and skyauth 0.3.10 are confirmed published on crates.io!"
+              echo "skybase ${SKYBASE_VER} and skyauth ${SKYAUTH_VER} are confirmed published on crates.io!"
               break
             fi
             echo "Attempt $attempt/$max_attempts: skybase=$STATUS_BASE skyauth=$STATUS_AUTH. Waiting 15s..."
@@ -188,18 +237,16 @@ jobs:
             attempt=$((attempt + 1))
           done
           if [ $attempt -gt $max_attempts ]; then
-            echo "::error::Timed out waiting for dependencies 'skybase 0.1.7' / 'skyauth 0.3.10' on crates.io."
+            echo "::error::Timed out waiting for dependencies 'skybase ${SKYBASE_VER}' / 'skyauth ${SKYAUTH_VER}' on crates.io."
             exit 1
           fi
 
       - name: Validate package before publish
         if: steps.check_published.outputs.published == 'false'
-        working-directory: skybouncer
         run: cargo publish --dry-run --allow-dirty
 
       - name: Publish to Crates.io
         if: steps.check_published.outputs.published == 'false'
-        working-directory: skybouncer
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -212,7 +259,6 @@ jobs:
 
       - name: Create or Update GitHub Release Tag
         if: steps.check_published.outputs.published == 'false'
-        working-directory: skybouncer
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: "v${{ steps.pkg_info.outputs.version }}"
