@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.29] - 2026-11-11
+
+### Changed
+
+- **Atmosphere Suite Dashboard Redesign & Sister-App Unification (`assets/dashboard.html`)**:
+  - Redesigned the embedded single-file Sovereign Moderation Dashboard around the shared **Atmosphere Instrument** visual system (`1px` architectural hairlines, `tabular-nums` counters, inline stroke SVG iconography, and cobalt `#3b82f6` / `#2563eb` signature accents) unified with sister app `for-your-consideration`.
+  - Added a zero-FOUC `<head>` theme bootstrap and 3-way header theme switcher (`System` / `Light` / `Dark`) persisted in `localStorage` (`atmosphere-theme`) with synchronized `aria-pressed` accessibility state and live `prefers-color-scheme` tracking.
+  - Added a `.suite-nav` sister-app switcher pill in the sticky header and footer cross-link routing dynamically between Skybouncer and For Your Consideration (`localhost:3030/dashboard` locally, `fyc.mike10010100.com/dashboard` in production).
+  - Condensed pipeline KPI cards into a compact single-row horizontal telemetry strip above the fold with responsive full-span mobile wrapping and equal-height side-by-side workspace cards.
+
 ## [0.2.28] - 2026-11-11
 
 ### Fixed
