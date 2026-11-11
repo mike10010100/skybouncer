@@ -215,8 +215,10 @@ impl SkybouncerEngine {
         protected_did: &str,
     ) -> Result<Option<RuleRubric>, SkybouncerError> {
         let pds_client = self.resolve_pds_client_for(protected_did).await?;
-        let pds_rubric = crate::modlist::fetch_sovereign_config(&pds_client, protected_did).await?;
-        if let Some(ref rubric) = pds_rubric {
+        let mut pds_rubric =
+            crate::modlist::fetch_sovereign_config(&pds_client, protected_did).await?;
+        if let Some(ref mut rubric) = pds_rubric {
+            let upgraded_legacy = rubric.upgrade_legacy_prompt();
             self.gate
                 .set_bypass_incoming_followers(protected_did, rubric.bypass_incoming_followers);
             if self.is_enrolled(protected_did) {
@@ -226,6 +228,26 @@ impl SkybouncerEngine {
                 || (self.is_single_tenant() && self.is_protected(protected_did))
             {
                 self.set_rubric(rubric.clone());
+            }
+            if upgraded_legacy {
+                match crate::modlist::publish_sovereign_config(&pds_client, protected_did, rubric)
+                    .await
+                {
+                    Ok(uri) => {
+                        info!(
+                            did = %protected_did,
+                            %uri,
+                            "Upgraded unmodified legacy sovereign rubric to target-scoped wording on PDS"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            did = %protected_did,
+                            error = %e,
+                            "Upgraded legacy sovereign rubric in memory/DB, but PDS writeback failed"
+                        );
+                    }
+                }
             }
             info!(
                 did = %protected_did,

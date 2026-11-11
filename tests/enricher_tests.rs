@@ -619,4 +619,67 @@ async fn test_appview_enricher_hops_across_blocked_post_boundary() {
     assert!(role_formatted.contains("[1] OtherUser (did:plc:troll): \"Bad faith strawman claim\""));
     assert!(role_formatted.contains("[2] Author (did:plc:other): \"No.\""));
     assert!(role_formatted.contains("[3] Target (did:plc:target): \"\"nuh uh\"\""));
+    assert!(role_formatted.contains("[IMMEDIATE PARENT — Author is replying to this post]"));
+}
+
+#[test]
+fn test_subthread_reply_marks_immediate_other_user_parent_for_interaction() {
+    use skybouncer::enricher::{EnrichedContext, ParentPostContext, ThreadPost};
+
+    let target_did = "did:plc:mmtjkssv6jeneahkgfdxuy7p";
+    let author_did = "did:plc:qgzzrfoh3fapodvfpeqjbtii";
+    let immediate_other_did = "did:plc:kpizu7db55xo3m3vy5alpwaf";
+    let third_did = "did:plc:ttabju4hgr5y6abt353dtkbd";
+
+    let mut ctx = EnrichedContext::empty();
+    ctx.parent_post = Some(ParentPostContext {
+        author_did: immediate_other_did.to_string(),
+        text: "AIPAC doesn't necessarily mean Jews...".to_string(),
+        cid: Some("bafyparent".to_string()),
+    });
+    ctx.thread_ancestors = vec![
+        ThreadPost {
+            author_did: target_did.to_string(),
+            text: "Root thread opener".to_string(),
+        },
+        ThreadPost {
+            author_did: third_did.to_string(),
+            text: "Intermediate sub-thread reply".to_string(),
+        },
+        ThreadPost {
+            author_did: immediate_other_did.to_string(),
+            text: "AIPAC doesn't necessarily mean Jews...".to_string(),
+        },
+    ];
+
+    // Role-aware formatting marks ONLY the immediate parent post.
+    let role_formatted = ctx.format_for_interaction(author_did, target_did);
+    assert!(role_formatted.contains(&format!(
+        "[3] OtherUser ({immediate_other_did}): \"AIPAC doesn't necessarily mean Jews...\" [IMMEDIATE PARENT — Author is replying to this post]"
+    )));
+    assert_eq!(
+        role_formatted
+            .matches("[IMMEDIATE PARENT — Author is replying to this post]")
+            .count(),
+        1
+    );
+    assert!(!role_formatted.contains("In Reply To (by"));
+
+    // Role-less format_for_classifier remains compact and unchanged.
+    let raw_formatted = ctx.format_for_classifier();
+    assert!(!raw_formatted.contains("[IMMEDIATE PARENT"));
+    assert!(!raw_formatted.contains("In Reply To"));
+
+    // If parent_post author differs from the last resolved ancestor (e.g. partial thread fetch),
+    // In Reply To is emitted explicitly alongside Conversation Thread.
+    ctx.parent_post = Some(ParentPostContext {
+        author_did: "did:plc:unlisted_parent".to_string(),
+        text: "Separate immediate parent".to_string(),
+        cid: None,
+    });
+    let mismatched = ctx.format_for_interaction(author_did, target_did);
+    assert!(!mismatched.contains("[IMMEDIATE PARENT"));
+    assert!(mismatched.contains(
+        "In Reply To (by OtherUser (did:plc:unlisted_parent)): \"Separate immediate parent\""
+    ));
 }

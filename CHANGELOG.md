@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.32] - 2026-11-11
+
+### Fixed
+
+- **Sub-Thread Reply Recipient Disambiguation & Target-Scoped Presets (`src/enricher.rs`, `src/classifier/jev.rs`, `src/classifier/rubric.rs`, `src/web/api/simulate.rs`, `assets/dashboard.html`, `src/tenant/registry/core.rs`, `src/engine/tenant_ops.rs`)**:
+  - Added an explicit `Replying To:` speaker-role header (`Target`, `Author`, or `OtherUser [NOT Target — sub-thread reply to another commenter; second-person 'you'/'your' addresses this OtherUser unless Target is explicitly named or @mentioned]`) in `build_candidate_prompt` and tagged the final ancestor post in `EnrichedContext::format_for_interaction` with `[IMMEDIATE PARENT — Author is replying to this post]`, preventing sub-thread replies aimed at other commenters inside a protected user's thread from losing immediate-parent framing when `THREAD_CONTEXT=true`.
+  - Tightened both Ollama System-2 disambiguation rules and SystemOne (`nimble`) criteria (`harassment`, `sealioning_or_bad_faith`, `spam`, `permitted`) so second-person insults (`"you"`, `"your"`) in `Replying To: OtherUser` sub-threads and generic rubric clauses (`"direct harassment"`, `"personal attacks"`) strictly require targeting the protected `Target` user rather than commenter-on-commenter arguments.
+  - Scoped built-in rubric presets (`PRESET_BALANCED_PROMPT`, `PRESET_ANTI_HOSTILITY_PROMPT`, `PRESET_ANTI_RAGEBAIT_PROMPT`) across both the web dashboard (`RUBRIC_PRESETS`) and guest sandbox (`resolve_guest_preset`), and added idempotent startup migration (`LEGACY_PROMPT_UPGRADES` / `RuleRubric::upgrade_legacy_prompt`) across SQLite (`TenantRegistry::init_schema`) and ATProto sovereign configs (`SkybouncerEngine::sync_sovereign_config`, with best-effort PDS writeback) while preserving all custom tenant prompts verbatim.
+
 ## [0.2.31] - 2026-11-11
 
 ### Added

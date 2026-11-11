@@ -550,6 +550,75 @@ pub const LEGACY_DEFAULT_RUBRIC_PROMPT: &str =
 /// protected user to argue with someone else, and hostility directed at third parties.
 pub const DEFAULT_RUBRIC_PROMPT: &str = "Block crypto/airdrop scams, scam bots, phishing, unsolicited promotional spam, personal attacks/insults/name-calling/slurs/threats aimed at the protected user, and relentless bad-faith sea-lioning aimed at the protected user. Permit non-targeted profanity, sarcasm, blunt disagreement, heated political debate, quoting the protected user to argue with someone else, and hostility directed at third parties, unrelated public figures, politicians, groups, or other commenters.";
 
+/// Legacy built-in `"balanced"` preset prompt prior to v0.2.32 (unscoped interpersonal clause).
+pub const LEGACY_PRESET_BALANCED_PROMPT: &str =
+    "Filter blatant spam, automated bot promotions, crypto/NFT shilling, unwanted commercial links, and direct harassment or personal attacks. Allow constructive critique, benign banter, and standard disagreements.";
+
+/// Built-in `"balanced"` preset prompt scoping harassment and personal attacks to the protected user.
+pub const PRESET_BALANCED_PROMPT: &str =
+    "Filter blatant spam, automated bot promotions, crypto/NFT shilling, unwanted commercial links, and direct harassment or personal attacks aimed at the protected user. Allow constructive critique, benign banter, standard disagreements, and arguments or hostility directed at other commenters or third parties.";
+
+/// Built-in `"anti_crypto"` preset prompt aggressively filtering token, wallet, and bot promotions.
+pub const PRESET_ANTI_CRYPTO_PROMPT: &str =
+    "Aggressively filter all cryptocurrency, token, airdrop, memecoin, pump-and-dump, web3 wallet, NFT promotions, unsolicited WhatsApp/Telegram investment invitations, and high-frequency automated bot links.";
+
+/// Legacy built-in `"anti_hostility"` preset prompt prior to v0.2.32 (`"directed at users"`).
+pub const LEGACY_PRESET_ANTI_HOSTILITY_PROMPT: &str =
+    "Strictly filter hostile language, targeted harassment, abusive insults, slurs, doxxing threats, demeaning personal attacks, and aggressive intimidation directed at users.";
+
+/// Built-in `"anti_hostility"` preset prompt scoping hostility and personal attacks to the protected user.
+pub const PRESET_ANTI_HOSTILITY_PROMPT: &str =
+    "Strictly filter hostile language, targeted harassment, abusive insults, slurs, doxxing threats, demeaning personal attacks, and aggressive intimidation directed at the protected user (not hostility aimed at other commenters, public figures, or third parties).";
+
+/// Legacy built-in `"anti_ragebait"` preset prompt prior to v0.2.32 (unscoped conflict clause).
+pub const LEGACY_PRESET_ANTI_RAGEBAIT_PROMPT: &str =
+    "Filter bad-faith sealioning, deceptive ragebait, troll provocations intended to incite conflict, and bad-faith harassment campaigns.";
+
+/// Built-in `"anti_ragebait"` preset prompt scoping sea-lioning and ragebait to the protected user.
+pub const PRESET_ANTI_RAGEBAIT_PROMPT: &str =
+    "Filter bad-faith sea-lioning, deceptive ragebait, troll provocations, and bad-faith harassment aimed at the protected user, while permitting debates or arguments between other commenters.";
+
+/// Canonical `(legacy_prompt, upgraded_prompt)` mapping for idempotent startup migrations
+/// across both SQLite tenant records and sovereign ATProto PDS configurations.
+pub const LEGACY_PROMPT_UPGRADES: &[(&str, &str)] = &[
+    (LEGACY_DEFAULT_RUBRIC_PROMPT, DEFAULT_RUBRIC_PROMPT),
+    (LEGACY_PRESET_BALANCED_PROMPT, PRESET_BALANCED_PROMPT),
+    (
+        LEGACY_PRESET_ANTI_HOSTILITY_PROMPT,
+        PRESET_ANTI_HOSTILITY_PROMPT,
+    ),
+    (
+        LEGACY_PRESET_ANTI_RAGEBAIT_PROMPT,
+        PRESET_ANTI_RAGEBAIT_PROMPT,
+    ),
+];
+
+/// Returns the target-scoped replacement prompt when `prompt` matches an unmodified legacy
+/// default or built-in preset string, or `None` when `prompt` is already current or custom.
+#[must_use]
+pub fn upgrade_legacy_prompt_str(prompt: &str) -> Option<&'static str> {
+    let trimmed = prompt.trim();
+    for &(legacy, upgraded) in LEGACY_PROMPT_UPGRADES {
+        if trimmed == legacy {
+            return Some(upgraded);
+        }
+    }
+    None
+}
+
+impl RuleRubric {
+    /// Upgrades `self.prompt` in place when it matches an unmodified legacy default or
+    /// built-in preset string, returning `true` if the prompt was upgraded.
+    pub fn upgrade_legacy_prompt(&mut self) -> bool {
+        if let Some(upgraded) = upgrade_legacy_prompt_str(&self.prompt) {
+            self.prompt = upgraded.to_string();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl Default for RuleRubric {
     fn default() -> Self {
         Self {
@@ -797,5 +866,28 @@ mod tests {
         );
         assert!("nonsense".parse::<BounceDuration>().is_err());
         assert!(Sensitivity::Medium.threshold() > Sensitivity::High.threshold());
+    }
+
+    #[test]
+    fn test_upgrade_legacy_prompts_preserves_custom_and_idempotent() {
+        for &(legacy, expected) in LEGACY_PROMPT_UPGRADES {
+            assert_eq!(upgrade_legacy_prompt_str(legacy), Some(expected));
+            // Already-upgraded prompts are idempotent (return None).
+            assert_eq!(upgrade_legacy_prompt_str(expected), None);
+
+            let mut rubric = RuleRubric::new(legacy, Sensitivity::High)
+                .with_bounce_duration(BounceDuration::Timeout7d)
+                .with_bypass_incoming_followers(false);
+            assert!(rubric.upgrade_legacy_prompt());
+            assert_eq!(rubric.prompt, expected);
+            assert_eq!(rubric.sensitivity, Sensitivity::High);
+            assert_eq!(rubric.bounce_duration, BounceDuration::Timeout7d);
+            assert!(!rubric.bypass_incoming_followers);
+            assert!(!rubric.upgrade_legacy_prompt());
+        }
+
+        let mut custom = RuleRubric::with_default_sensitivity("Block all spoilers.");
+        assert!(!custom.upgrade_legacy_prompt());
+        assert_eq!(custom.prompt, "Block all spoilers.");
     }
 }

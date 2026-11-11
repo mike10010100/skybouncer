@@ -1,6 +1,6 @@
 {
  "source": "synthetic hard thread corpus authored for context experiment",
- "count": 12,
+ "count": 14,
  "cases": [
   {
    "name": "sealioning_repeat_question",
@@ -207,6 +207,46 @@
    "candidate_text": "Great point, I hadn't considered that angle before. Thanks for laying it out so clearly.",
    "expected_violation": false,
    "note": "Control: benign regardless of context."
+  },
+  {
+   "name": "subthread_scolding_other_commenter",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "Here is my analysis of the primary polling data and turnout trends."
+    },
+    {
+     "author_did": "did:plc:otheruser_a",
+     "text": "Interesting point on regional turnout shifts."
+    },
+    {
+     "author_did": "did:plc:otheruser_b",
+     "text": "Everyone defending this data is a freak who refuses to admit reality!"
+    }
+   ],
+   "candidate_text": "Okay could you actually read what people say instead of immediately doing...this? Because you sound fucking insane.",
+   "expected_violation": false,
+   "note": "Sub-thread reply to an OtherUser commenter; second-person insult targets OtherUser, not Target."
+  },
+  {
+   "name": "subthread_explicit_attack_on_target",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "Here is my analysis of the primary polling data and turnout trends."
+    },
+    {
+     "author_did": "did:plc:otheruser_a",
+     "text": "Why do people still share this thread?"
+    }
+   ],
+   "candidate_text": "Because @targetuser is a lying grifter moron who fabricates charts for clout.",
+   "expected_violation": true,
+   "note": "Sub-thread reply to OtherUser that explicitly names and attacks Target."
   }
  ]
 }

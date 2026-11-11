@@ -2213,10 +2213,10 @@
     let activeGuestPreset = "balanced";
 
     const GUEST_PRESET_DESCRIPTIONS = {
-      balanced: "Filters spam, bot links, crypto shilling, and personal attacks while allowing normal disagreement.",
+      balanced: "Filters spam, bot links, crypto shilling, and personal attacks on you while allowing normal disagreement and third-party banter.",
       anti_crypto: "Aggressively filters cryptocurrency, airdrops, memecoins, NFT promos, and Telegram/WhatsApp pump links.",
-      anti_hostility: "Strictly filters insults, targeted harassment, slurs, threats, and demeaning personal attacks.",
-      anti_ragebait: "Filters bad-faith sealioning, troll provocations, and ragebait intended to derail threads."
+      anti_hostility: "Strictly filters insults, targeted harassment, slurs, threats, and demeaning personal attacks aimed at you.",
+      anti_ragebait: "Filters bad-faith sea-lioning, troll provocations, and ragebait aimed at you while allowing other commenters to debate."
     };
 
     function switchWorkspaceTab(tab) {
@@ -3120,7 +3120,7 @@
 
     const RUBRIC_PRESETS = {
       balanced: {
-        prompt: "Filter blatant spam, automated bot promotions, crypto/NFT shilling, unwanted commercial links, and direct harassment or personal attacks. Allow constructive critique, benign banter, and standard disagreements.",
+        prompt: "Filter blatant spam, automated bot promotions, crypto/NFT shilling, unwanted commercial links, and direct harassment or personal attacks aimed at the protected user. Allow constructive critique, benign banter, standard disagreements, and arguments or hostility directed at other commenters or third parties.",
         sensitivity: "medium"
       },
       anti_crypto: {
@@ -3128,11 +3128,11 @@
         sensitivity: "high"
       },
       anti_hostility: {
-        prompt: "Strictly filter hostile language, targeted harassment, abusive insults, slurs, doxxing threats, demeaning personal attacks, and aggressive intimidation directed at users.",
+        prompt: "Strictly filter hostile language, targeted harassment, abusive insults, slurs, doxxing threats, demeaning personal attacks, and aggressive intimidation directed at the protected user (not hostility aimed at other commenters, public figures, or third parties).",
         sensitivity: "high"
       },
       anti_ragebait: {
-        prompt: "Filter bad-faith sealioning, deceptive ragebait, troll provocations intended to incite conflict, and bad-faith harassment campaigns.",
+        prompt: "Filter bad-faith sea-lioning, deceptive ragebait, troll provocations, and bad-faith harassment aimed at the protected user, while permitting debates or arguments between other commenters.",
         sensitivity: "medium"
       }
     };
