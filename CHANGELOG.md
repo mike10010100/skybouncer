@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.27] - 2026-11-11
+
+### Changed
+
+- **Parallelized & Cached CI Quality Gate Pipeline (`.github/workflows/ci.yml`, `Cargo.toml`)**:
+  - Split the monolithic serial quality gate into parallel `lint-and-audit`, `coverage-and-tests`, and PR-scoped `mutants-smoke` jobs fanned into the branch-protected `Rust Quality Gate` check, eliminating redundant sibling repository checkouts and dynamically reading `skybase`/`skyauth` dependency versions during release publishing.
+  - Combined `cargo nextest` and `cargo llvm-cov` into a single `cargo llvm-cov nextest --all-targets` pass with `CARGO_LLVM_COV_TARGET_DIR=target` so `Swatinem/rust-cache` caches third-party dependency builds across coverage runs instead of rebuilding from scratch twice per run.
+  - Configured `cargo mutants` with `--in-place --cargo-arg --lib` and scoped `[profile.dev.package."*"]` / `[profile.test.package."*"]` `opt-level = 1` to dependencies so mutation smoke tests reuse cached dependencies, link only the library unit-test binary rather than all 34 integration test binaries, and execute all 17 mutants cleanly without `-D warnings` unviable false negatives.
+
 ## [0.2.26] - 2026-11-11
 
 ### Added
