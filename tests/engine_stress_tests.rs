@@ -910,6 +910,7 @@ async fn test_engine_builder_with_tiered_classifier() {
         interaction_type: skybouncer::matcher::InteractionType::DirectReply,
         parent_uri: Some(format!("at://{protected_did}/app.bsky.feed.post/root")),
         root_uri: Some(format!("at://{protected_did}/app.bsky.feed.post/root")),
+        quote_uri: None,
         created_at_us: 1_700_000_000_000_000,
         image_cids: Vec::new(),
         image_alts: Vec::new(),

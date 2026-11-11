@@ -33,6 +33,7 @@ fn sample_interaction(text: &str) -> Interaction {
         interaction_type: InteractionType::DirectReply,
         parent_uri: Some("at://did:plc:protected_target/app.bsky.feed.post/root".to_string()),
         root_uri: Some("at://did:plc:protected_target/app.bsky.feed.post/root".to_string()),
+        quote_uri: None,
         created_at_us: 1_700_000_000_000_000,
         image_cids: Vec::new(),
         image_alts: Vec::new(),
@@ -1582,4 +1583,58 @@ fn test_jev_endpoint_url_construction_variants() {
         RuleRubric::default(),
     )
     .is_err());
+}
+
+#[tokio::test]
+async fn test_systemone_fragmented_violation_probabilities_uses_choice_probability_and_house_rules()
+{
+    let server = MockServer::start().await;
+
+    // Verify that Active House Rules are injected into `state` AND fragmented probabilities
+    // across violation buckets use `probabilities[choice]` (0.52) rather than `1 - permitted` (0.88).
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(wiremock::matchers::body_string_contains(
+            "Active House Rules for Target: \\\"Block Severance spoilers\\\"",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "harassment",
+                    "probabilities": {
+                        "harassment": 0.52,
+                        "sealioning_or_bad_faith": 0.22,
+                        "spam": 0.14,
+                        "permitted": 0.12
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = JevConfig {
+        base_url: format!("{}/v1/systemone", server.uri()),
+        api_key: None,
+        model: "nimble".to_string(),
+        timeout: Duration::from_millis(1000),
+        max_retries: 0,
+        supports_images: false,
+    };
+    // Sensitivity::High threshold is 0.60. With choice probability 0.52 (< 0.60),
+    // it MUST downgrade to Permitted with confidence 0.52 (in uncertainty band [0.40, 0.85))!
+    let rubric = RuleRubric::new(
+        "Block Severance spoilers",
+        skybouncer::classifier::Sensitivity::High,
+    );
+    let classifier = JevClassifier::new(config, rubric).unwrap();
+    let verdict = classifier
+        .classify(&sample_interaction("ambiguous snarky reply"))
+        .await
+        .unwrap();
+
+    assert!(verdict.is_permitted());
+    assert!((verdict.confidence().unwrap() - 0.52).abs() < 1e-6);
 }

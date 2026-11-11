@@ -421,3 +421,202 @@ async fn test_mock_enricher_handle_resolution_and_did() {
     );
     assert_eq!(enricher.resolve_did("did:plc:unknown").await, None);
 }
+
+#[tokio::test]
+async fn test_mock_enricher_target_and_quoted_post_formatting() {
+    let enricher = MockContextEnricher::new();
+    enricher.set_target(
+        "did:plc:target",
+        AuthorContext {
+            handle: Some("protected.bsky.social".to_string()),
+            display_name: Some("Protected User".to_string()),
+            description: Some("Civic researcher".to_string()),
+            ..Default::default()
+        },
+    );
+    enricher.set_quoted_post(
+        "at://did:plc:target/app.bsky.feed.post/quoted1",
+        ParentPostContext {
+            author_did: "did:plc:target".to_string(),
+            text: "Full roll-call breakdown of Tuesday's vote.".to_string(),
+            cid: Some("bafyquoted1".to_string()),
+        },
+    );
+
+    let interaction = Interaction::new(
+        "did:plc:commenter",
+        "did:plc:target",
+        InteractionType::Quote,
+        "at://did:plc:commenter/app.bsky.feed.post/q1",
+        "bafyq1",
+        "Read this thread before yelling at them!",
+    )
+    .with_quote_uri("at://did:plc:target/app.bsky.feed.post/quoted1");
+
+    let ctx = enricher.enrich(&interaction).await;
+    assert!(!ctx.is_empty());
+    assert!(ctx.target.is_some());
+    assert!(ctx.quoted_post.is_some());
+
+    let rendered = ctx.format_for_classifier();
+    assert!(rendered.contains("Target Profile (protected user) [handle: @protected.bsky.social, name: \"Protected User\", bio: \"Civic researcher\"]"));
+    assert!(rendered.contains(
+        "Quoted Post (by did:plc:target): \"Full roll-call breakdown of Tuesday's vote.\""
+    ));
+}
+
+#[tokio::test]
+async fn test_appview_enricher_target_profile_cache_and_quoted_post() {
+    let mock_server = MockServer::start().await;
+    let author_did = "did:plc:commenter";
+    let target_did = "did:plc:protected";
+    let quote_uri = "at://did:plc:protected/app.bsky.feed.post/exp1";
+
+    // Target profile endpoint MUST be hit only ONCE across two enrich() calls due to target_cache!
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .and(query_param("actor", target_did))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": target_did,
+            "handle": "protected.example.com",
+            "displayName": "Protected Host",
+            "description": "Protected bio"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .and(query_param("actor", author_did))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": author_did,
+            "handle": "commenter.bsky.social"
+        })))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPosts"))
+        .and(query_param("uris", quote_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "posts": [{
+                "uri": quote_uri,
+                "cid": "bafyexp1",
+                "author": { "did": target_did, "handle": "protected.example.com" },
+                "record": {
+                    "$type": "app.bsky.feed.post",
+                    "text": "Explainer post content"
+                }
+            }]
+        })))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let enricher = AppViewContextEnricher::with_endpoint(mock_server.uri());
+    let interaction = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Quote,
+        "at://did:plc:commenter/app.bsky.feed.post/1",
+        "bafy1",
+        "Great breakdown here",
+    )
+    .with_quote_uri(quote_uri);
+
+    let ctx1 = enricher.enrich(&interaction).await;
+    let ctx2 = enricher.enrich(&interaction).await;
+    assert_eq!(ctx1, ctx2);
+    assert_eq!(
+        ctx1.target.as_ref().and_then(|t| t.handle.as_deref()),
+        Some("protected.example.com")
+    );
+    assert_eq!(
+        ctx1.quoted_post.as_ref().map(|q| q.text.as_str()),
+        Some("Explainer post content")
+    );
+}
+
+#[tokio::test]
+async fn test_appview_enricher_hops_across_blocked_post_boundary() {
+    let mock_server = MockServer::start().await;
+    let parent_uri = "at://did:plc:target/app.bsky.feed.post/parent";
+    let blocked_gp_uri = "at://did:plc:other/app.bsky.feed.post/grandparent";
+    let root_uri = "at://did:plc:troll/app.bsky.feed.post/root";
+
+    // Hop 1: querying parent_uri hits a `#blockedPost` at parent.parent!
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPostThread"))
+        .and(query_param("uri", parent_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "thread": {
+                "$type": "app.bsky.feed.defs#threadViewPost",
+                "post": {
+                    "uri": parent_uri,
+                    "author": { "did": "did:plc:target" },
+                    "record": { "$type": "app.bsky.feed.post", "text": "\"nuh uh\"" }
+                },
+                "parent": {
+                    "$type": "app.bsky.feed.defs#blockedPost",
+                    "uri": blocked_gp_uri,
+                    "blocked": true
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Hop 2: querying blocked_gp_uri recovers both the blocked grandparent AND the root post!
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPostThread"))
+        .and(query_param("uri", blocked_gp_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "thread": {
+                "$type": "app.bsky.feed.defs#threadViewPost",
+                "post": {
+                    "uri": blocked_gp_uri,
+                    "author": { "did": "did:plc:other" },
+                    "record": { "$type": "app.bsky.feed.post", "text": "No." }
+                },
+                "parent": {
+                    "$type": "app.bsky.feed.defs#threadViewPost",
+                    "post": {
+                        "uri": root_uri,
+                        "author": { "did": "did:plc:troll" },
+                        "record": { "$type": "app.bsky.feed.post", "text": "Bad faith strawman claim" }
+                    },
+                    "parent": null
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let enricher =
+        AppViewContextEnricher::with_endpoint(mock_server.uri()).with_thread_context(true);
+    let interaction = Interaction::new(
+        "did:plc:other",
+        "did:plc:target",
+        InteractionType::DirectReply,
+        "at://did:plc:other/app.bsky.feed.post/candidate",
+        "bafycand",
+        "He's arguing a straw man and being stupid on purpose.",
+    )
+    .with_parent_uri(parent_uri);
+
+    let ctx = enricher.enrich(&interaction).await;
+    assert_eq!(ctx.thread_ancestors.len(), 3);
+    assert_eq!(ctx.thread_ancestors[0].text, "Bad faith strawman claim");
+    assert_eq!(ctx.thread_ancestors[1].text, "No.");
+    assert_eq!(ctx.thread_ancestors[2].text, "\"nuh uh\"");
+
+    let role_formatted =
+        ctx.format_for_interaction(&interaction.author_did, &interaction.target_did);
+    assert!(role_formatted.contains("[1] OtherUser (did:plc:troll): \"Bad faith strawman claim\""));
+    assert!(role_formatted.contains("[2] Author (did:plc:other): \"No.\""));
+    assert!(role_formatted.contains("[3] Target (did:plc:target): \"\"nuh uh\"\""));
+}

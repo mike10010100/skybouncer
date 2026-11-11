@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.25] - 2026-11-11
+
+### Added
+
+- **Target-Aware Default Rubric & Nuanced Interpersonal Tier-2 Escalation (`src/classifier/rubric.rs`, `src/classifier/mod.rs`, `src/classifier/tiered.rs`, `src/engine/mod.rs`, `src/tenant/registry/core.rs`)**:
+  - Added `DEFAULT_RUBRIC_PROMPT` (and idempotent SQLite startup migration from `LEGACY_DEFAULT_RUBRIC_PROMPT` for unmodified default tenant rubrics) explicitly scoping harassment and sea-lioning to attacks aimed at the protected user while carving out non-targeted profanity, sarcasm, blunt disagreement, heated political debate, quoting the protected user to argue with someone else, and hostility directed at third parties, politicians, groups, or other commenters.
+  - Added `ViolationCategory::is_nuanced_interpersonal` and `CertaintyConfig::escalate_nuanced_violations` (default `true`, configurable via `ESCALATE_NUANCED_VIOLATIONS` / `SKYBOUNCER_ESCALATE_NUANCED_VIOLATIONS`) so Tier-1 interpersonal violation candidates (`harassment`, `sea_lioning`, `hate_speech`, `custom`) escalate to System-2 reasoning before bouncing an account, while automated `crypto_spam`, `phishing`, and `spam` resolve immediately at Tier-1.
+- **Quote Post, Target Profile, & Speaker-Role Enrichment (`src/matcher/interaction.rs`, `src/matcher/target.rs`, `src/enricher.rs`)**:
+  - Added `Interaction::quote_uri` preserved across all four `TargetMatcher::match_all_interactions` vectors (`DirectReply`, `ThreadReply`, `Mention`, `Quote`).
+  - Enriched cached protected `target` profiles and `quoted_post` records in `AppViewContextEnricher`, enabled `thread_context: true` by default in `AppViewContextEnricher::from_env` (`THREAD_CONTEXT` / `SKYBOUNCER_THREAD_CONTEXT`), and added `EnrichedContext::format_for_interaction` labeling thread/parent/quote speakers as `Author`, `Target`, or `OtherUser`.
+
+### Fixed
+
+- **SystemOne & Deterministic Ollama Classification Precision (`src/classifier/jev.rs`)**:
+  - Injected `Active House Rules for Target` into `SystemOne` `state` payloads, rewrote choice criteria around target directionality (catching derisive third-person nicknames while excluding non-targeted profanity and mild grumbling), and read `probabilities.get(&answer.choice)` before falling back to `1.0 - permitted` when computing `SystemOne` violation confidence.
+  - Enforced deterministic `temperature: 0.0` in `OllamaChatOptions`, added explicit multi-turn pronoun/thread referent disambiguation rules to the Ollama system prompt, and normalized verbose LLM category labels to canonical `ViolationCategory` variants.
+- **AppView Immediate Parent & `#blockedPost` Thread Truncation (`src/enricher.rs`)**:
+  - Fixed `AppViewContextEnricher::fetch_thread_chain` to retain the immediate parent post when `app.bsky.feed.getPostThread` is queried by `parent_uri` and to hop across up to 3 ATProto `app.bsky.feed.defs#blockedPost` boundaries so multi-turn threads involving blocked participants are not truncated.
+
 ## [0.2.24] - 2026-11-10
 
 ### Changed

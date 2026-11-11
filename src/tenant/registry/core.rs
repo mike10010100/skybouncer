@@ -194,6 +194,15 @@ impl TenantRegistry {
             "UPDATE tenants SET handle_updated_at = updated_at WHERE handle_updated_at IS NULL;",
             [],
         );
+        // Upgrade unmodified legacy pre-v0.2.25 default rubric strings to the target-aware
+        // default while preserving any customized tenant rubric prompts verbatim.
+        let _ = conn.execute(
+            "UPDATE tenants SET rubric_prompt = ?1 WHERE rubric_prompt = ?2;",
+            params![
+                crate::classifier::DEFAULT_RUBRIC_PROMPT,
+                crate::classifier::rubric::LEGACY_DEFAULT_RUBRIC_PROMPT,
+            ],
+        );
 
         Ok(())
     }

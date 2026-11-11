@@ -221,6 +221,7 @@ async fn test_adversarial_concurrent_multitenant_rubric_isolation() {
                 interaction_type: InteractionType::DirectReply,
                 parent_uri: Some(format!("at://{target_did}/app.bsky.feed.post/root")),
                 root_uri: Some(format!("at://{target_did}/app.bsky.feed.post/root")),
+                quote_uri: None,
                 created_at_us: 1_700_000_000_000_000 + i,
                 image_cids: Vec::new(),
                 image_alts: Vec::new(),

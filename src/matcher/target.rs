@@ -90,6 +90,11 @@ impl TargetMatcher {
         // Extract attached image CIDs and alt texts once for this post, supporting both
         // legacy `app.bsky.embed.images` and multi-image `app.bsky.embed.gallery` embeds.
         let (image_cids, image_alts) = extract_post_images(&post, record_val);
+        let post_quote_uri = post
+            .embed
+            .as_ref()
+            .and_then(|e| e.quote_uri())
+            .map(str::to_owned);
 
         // Vector 1: Direct Reply (parent.uri)
         if let Some(ref reply) = post.reply {
@@ -106,6 +111,7 @@ impl TargetMatcher {
                         interaction_type: InteractionType::DirectReply,
                         parent_uri: Some(reply.parent.uri.clone()),
                         root_uri: Some(reply.root.uri.clone()),
+                        quote_uri: post_quote_uri.clone(),
                         created_at_us: commit.time_us,
                         image_cids: image_cids.clone(),
                         image_alts: image_alts.clone(),
@@ -128,6 +134,7 @@ impl TargetMatcher {
                         interaction_type: InteractionType::ThreadReply,
                         parent_uri: Some(reply.parent.uri.clone()),
                         root_uri: Some(reply.root.uri.clone()),
+                        quote_uri: post_quote_uri.clone(),
                         created_at_us: commit.time_us,
                         image_cids: image_cids.clone(),
                         image_alts: image_alts.clone(),
@@ -154,6 +161,7 @@ impl TargetMatcher {
                                 interaction_type: InteractionType::Mention,
                                 parent_uri: post.reply.as_ref().map(|r| r.parent.uri.clone()),
                                 root_uri: post.reply.as_ref().map(|r| r.root.uri.clone()),
+                                quote_uri: post_quote_uri.clone(),
                                 created_at_us: commit.time_us,
                                 image_cids: image_cids.clone(),
                                 image_alts: image_alts.clone(),
@@ -167,27 +175,26 @@ impl TargetMatcher {
         }
 
         // Vector 4: Quotes (embed.record or embed.recordWithMedia)
-        if let Some(ref embed) = post.embed {
-            if let Some(quote_uri) = embed.quote_uri() {
-                if let Some(quoted_did) = extract_did_for_collection(quote_uri, POST_COLLECTION) {
-                    if protected_dids.contains(quoted_did) && !seen_targets.contains(quoted_did) {
-                        seen_targets.insert(quoted_did.to_string());
-                        matches.push(Interaction {
-                            post_uri: commit.uri(),
-                            post_cid: commit.cid.clone(),
-                            author_did: commit.did.clone(),
-                            target_did: quoted_did.to_string(),
-                            text: post.text.clone(),
-                            interaction_type: InteractionType::Quote,
-                            parent_uri: post.reply.as_ref().map(|r| r.parent.uri.clone()),
-                            root_uri: post.reply.as_ref().map(|r| r.root.uri.clone()),
-                            created_at_us: commit.time_us,
-                            image_cids: image_cids.clone(),
-                            image_alts: image_alts.clone(),
-                            enriched_context: None,
-                            rubric: None,
-                        });
-                    }
+        if let Some(ref quote_uri) = post_quote_uri {
+            if let Some(quoted_did) = extract_did_for_collection(quote_uri, POST_COLLECTION) {
+                if protected_dids.contains(quoted_did) && !seen_targets.contains(quoted_did) {
+                    seen_targets.insert(quoted_did.to_string());
+                    matches.push(Interaction {
+                        post_uri: commit.uri(),
+                        post_cid: commit.cid.clone(),
+                        author_did: commit.did.clone(),
+                        target_did: quoted_did.to_string(),
+                        text: post.text.clone(),
+                        interaction_type: InteractionType::Quote,
+                        parent_uri: post.reply.as_ref().map(|r| r.parent.uri.clone()),
+                        root_uri: post.reply.as_ref().map(|r| r.root.uri.clone()),
+                        quote_uri: Some(quote_uri.clone()),
+                        created_at_us: commit.time_us,
+                        image_cids: image_cids.clone(),
+                        image_alts: image_alts.clone(),
+                        enriched_context: None,
+                        rubric: None,
+                    });
                 }
             }
         }

@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   • Secondary System-2: {fallback_endpoint} (model: {fallback_model})");
 
     let rubric = RuleRubric::new(
-        "Block crypto airdrop spam, scam bots, phishing, targeted harassment, and bad-faith sea-lioning.",
+        skybouncer::classifier::DEFAULT_RUBRIC_PROMPT,
         Sensitivity::Medium,
     );
     println!("   • Moderation Rubric: \"{}\"", rubric.prompt);

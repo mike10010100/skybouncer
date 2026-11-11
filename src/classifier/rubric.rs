@@ -538,10 +538,22 @@ impl RuleRubric {
     }
 }
 
+/// Legacy default moderation house rules prior to v0.2.25, retained so unmodified
+/// persisted tenant defaults can be migrated idempotently on startup.
+pub const LEGACY_DEFAULT_RUBRIC_PROMPT: &str =
+    "Block crypto airdrop spam, scam bots, phishing, targeted harassment, and bad-faith sea-lioning.";
+
+/// Default moderation house rules for newly enrolled accounts and fallback configuration.
+///
+/// Explicitly scopes harassment and sea-lioning to abuse directed at the protected user,
+/// while carving out casual profanity, sarcasm, heated political debate, quoting the
+/// protected user to argue with someone else, and hostility directed at third parties.
+pub const DEFAULT_RUBRIC_PROMPT: &str = "Block crypto/airdrop scams, scam bots, phishing, unsolicited promotional spam, personal attacks/insults/name-calling/slurs/threats aimed at the protected user, and relentless bad-faith sea-lioning aimed at the protected user. Permit non-targeted profanity, sarcasm, blunt disagreement, heated political debate, quoting the protected user to argue with someone else, and hostility directed at third parties, unrelated public figures, politicians, groups, or other commenters.";
+
 impl Default for RuleRubric {
     fn default() -> Self {
         Self {
-            prompt: "Block crypto airdrop spam, scam bots, phishing, targeted harassment, and bad-faith sea-lioning.".to_string(),
+            prompt: DEFAULT_RUBRIC_PROMPT.to_string(),
             sensitivity: Sensitivity::Medium,
             bounce_duration: BounceDuration::Permanent,
             bypass_incoming_followers: true,

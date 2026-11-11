@@ -55,6 +55,9 @@ pub struct Interaction {
     pub parent_uri: Option<String>,
     /// Root post AT-URI, if this interaction is a thread reply.
     pub root_uri: Option<String>,
+    /// Quoted post AT-URI, if this interaction embeds a quoted post (`app.bsky.embed.record`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_uri: Option<String>,
     /// Event timestamp in monotonic microseconds since Unix epoch.
     pub created_at_us: u64,
     /// CIDs of attached images (e.g. in `app.bsky.embed.images`).
@@ -91,6 +94,7 @@ impl Interaction {
             interaction_type,
             parent_uri: None,
             root_uri: None,
+            quote_uri: None,
             created_at_us: 1_700_000_000_000_000,
             image_cids: Vec::new(),
             image_alts: Vec::new(),
@@ -141,6 +145,7 @@ impl Interaction {
             interaction_type,
             parent_uri: None,
             root_uri: None,
+            quote_uri: None,
             created_at_us: 0,
             image_cids: Vec::new(),
             image_alts: Vec::new(),
@@ -153,6 +158,13 @@ impl Interaction {
     #[must_use]
     pub fn with_root_uri(mut self, uri: impl Into<String>) -> Self {
         self.root_uri = Some(uri.into());
+        self
+    }
+
+    /// Sets the quoted post AT-URI when the candidate embeds a quote (`app.bsky.embed.record`).
+    #[must_use]
+    pub fn with_quote_uri(mut self, uri: impl Into<String>) -> Self {
+        self.quote_uri = Some(uri.into());
         self
     }
 
@@ -214,6 +226,7 @@ impl Interaction {
                 "at://{target_did}/app.bsky.feed.post/3parentrkey123"
             )),
             root_uri: Some(format!("at://{target_did}/app.bsky.feed.post/3rootrkey123")),
+            quote_uri: None,
             created_at_us: 1_700_000_000_000_000,
             image_cids: Vec::new(),
             image_alts: Vec::new(),

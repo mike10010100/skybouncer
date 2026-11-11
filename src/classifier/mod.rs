@@ -25,6 +25,7 @@ pub use jev::{
 pub use mock::MockClassifier;
 pub use rubric::{
     bounce_duration_from_db, sensitivity_from_db, BounceDuration, RuleRubric, Sensitivity,
+    DEFAULT_RUBRIC_PROMPT,
 };
 pub use tiered::{
     CertaintyConfig, TieredClassifier, TieredClassifierStats, TieredEvaluationResult,
@@ -77,6 +78,20 @@ impl ViolationCategory {
             "hate_speech" | "hatespeech" => Self::HateSpeech,
             other => Self::Custom(other.to_string()),
         }
+    }
+
+    /// Returns `true` when this category represents nuanced interpersonal speech
+    /// (`harassment`, `sea_lioning`, `hate_speech`, or custom rules) rather than
+    /// clear-cut automated spam, crypto lures, or phishing links.
+    ///
+    /// Used by [`TieredClassifier`] so lightweight System-1 classifiers escalate
+    /// interpersonal bounce candidates to System-2 reasoning before blocking a user.
+    #[must_use]
+    pub const fn is_nuanced_interpersonal(&self) -> bool {
+        matches!(
+            self,
+            Self::Harassment | Self::SeaLioning | Self::HateSpeech | Self::Custom(_)
+        )
     }
 }
 
