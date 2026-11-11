@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.30] - 2026-11-11
+
+### Fixed
+
+- **Authoritative PDS Chat Proxy Discovery for ATProto DM Bot (`Cargo.toml`, `src/daemon.rs`, `.env.example`, `tests/daemon_helpers_tests.rs`)**:
+  - Upgraded `skybase` to `0.1.11` so `ChatClient::login_with_app_password` automatically extracts the bot account's `#atproto_pds` `serviceEndpoint` from `createSession`/`refreshSession` `didDoc` and proxies `chat.bsky.convo.*` calls through the PDS with `atproto-proxy: did:web:api.bsky.chat#bsky_chat`, resolving `401 BadJwtType` (`Invalid jwt type "at+jwt"`) rejections from `api.bsky.chat` and eliminating `refreshSession` retry storms.
+  - Logged the resolved `chat_endpoint` at daemon startup in `resolve_bot_client` and updated `.env.example` so `CHAT_ENDPOINT` is commented out by default.
+
 ## [0.2.29] - 2026-11-11
 
 ### Changed

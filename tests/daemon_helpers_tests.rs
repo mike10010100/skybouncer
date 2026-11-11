@@ -195,6 +195,120 @@ async fn resolve_bot_client_app_password_login_success() {
 }
 
 #[tokio::test]
+async fn resolve_bot_client_discovers_did_doc_pds_for_default_chat_endpoint_and_dispatches_bounce_dm(
+) {
+    let entryway = MockServer::start().await;
+    let shard_pds = MockServer::start().await;
+
+    // Entryway handles createSession and returns didDoc pointing #atproto_pds at shard_pds,
+    // while rejecting chat XRPCs with 501 if misrouted.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.getConvoForMembers"))
+        .respond_with(ResponseTemplate::new(501).set_body_string("MethodNotImplemented"))
+        .expect(0)
+        .mount(&entryway)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.server.createSession"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": "did:plc:pl7wa2phjeo4zp4zxmewnsis",
+            "handle": "skybouncer.bsky.social",
+            "accessJwt": "at-jwt-token",
+            "refreshJwt": "rt-jwt-token",
+            "didDoc": {
+                "id": "did:plc:pl7wa2phjeo4zp4zxmewnsis",
+                "alsoKnownAs": ["at://skybouncer.bsky.social"],
+                "service": [{
+                    "id": "#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": shard_pds.uri()
+                }]
+            }
+        })))
+        .expect(1)
+        .mount(&entryway)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.getConvoForMembers"))
+        .respond_with(|req: &wiremock::Request| {
+            let proxy = req
+                .headers
+                .get("atproto-proxy")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert_eq!(proxy, "did:web:api.bsky.chat#bsky_chat");
+            ResponseTemplate::new(200).set_body_json(json!({
+                "convo": {
+                    "id": "convo-dm-1",
+                    "rev": "1",
+                    "members": [{"did": "did:plc:alice"}],
+                    "muted": false,
+                    "unreadCount": 0
+                }
+            }))
+        })
+        .expect(1)
+        .mount(&shard_pds)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(|req: &wiremock::Request| {
+            let proxy = req
+                .headers
+                .get("atproto-proxy")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert_eq!(proxy, "did:web:api.bsky.chat#bsky_chat");
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg-alert-1",
+                "rev": "2",
+                "text": "ok",
+                "sender": {"did": "did:plc:pl7wa2phjeo4zp4zxmewnsis"},
+                "sentAt": "2026-11-11T17:00:00Z"
+            }))
+        })
+        .expect(1)
+        .mount(&shard_pds)
+        .await;
+
+    let (client, did) = skybouncer::daemon::resolve_bot_client(
+        Some("skybouncer.bsky.social".to_string()),
+        Some("app-password".to_string()),
+        &entryway.uri(),
+        skybouncer::DEFAULT_CHAT_ENDPOINT,
+        None,
+        None,
+    )
+    .await
+    .expect("bot client should resolve via didDoc PDS");
+    assert_eq!(did, "did:plc:pl7wa2phjeo4zp4zxmewnsis");
+    assert_eq!(client.base_url().await, shard_pds.uri());
+
+    let (tx, rx) = tokio::sync::broadcast::channel(8);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _ = tx.send(skybouncer::BounceNotification {
+        target_did: "did:plc:alice".to_string(),
+        violator_did: "did:plc:spammer".to_string(),
+        violator_handle: Some("spammer.bsky.social".to_string()),
+        category: skybouncer::ViolationCategory::Harassment,
+        confidence: 0.99,
+        reason: "Targeted personal insult".to_string(),
+        post_uri: "at://did:plc:spammer/app.bsky.feed.post/3n22gtcw4qk24".to_string(),
+        reply_to_uri: None,
+        post_snippet: "insult".to_string(),
+        bounce_duration: skybouncer::BounceDuration::Cooldown24h,
+    });
+    drop(tx);
+
+    skybouncer::run_bounce_alert_dispatcher(client, rx, cancel)
+        .await
+        .expect("bounce alert dispatcher must deliver DM via shard_pds proxy");
+}
+
+#[tokio::test]
 async fn resolve_bot_client_app_password_login_failure_returns_none() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

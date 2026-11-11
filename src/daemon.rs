@@ -139,7 +139,12 @@ pub async fn resolve_bot_client(
         .await
         {
             Ok((client, resolved_did)) => {
-                info!(did = %resolved_did, "ATProto DM bot authenticated successfully");
+                let resolved_chat_url = client.base_url().await;
+                info!(
+                    did = %resolved_did,
+                    chat_endpoint = %resolved_chat_url,
+                    "ATProto DM bot authenticated successfully"
+                );
                 Some((client, resolved_did))
             }
             Err(e) => {
