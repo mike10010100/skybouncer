@@ -82,9 +82,10 @@ pub use stream::{run_jetstream_streamer, StreamConfig, DEFAULT_JETSTREAM_ENDPOIN
 pub use web::{
     create_web_router, get_prometheus_metrics, run_web_server, AddAllowlistRequest,
     AddAllowlistResponse, AllowlistQuery, ApiState, BouncedUserWithHandle, BouncesQuery,
-    EvaluationsQuery, EvaluationsResponse, LoginQuery, OAuthState, PardonRequest, PardonResponse,
-    RemoveAllowlistResponse, ResolveQuery, ResolveResponse, RulesResponse, SimulateRequest,
-    SimulateResponse, StatusResponse, UpdateRulesRequest, UpgradeBounceRequest,
+    EvaluationsQuery, EvaluationsResponse, GuestRateLimitDecision, GuestSandboxLimiter,
+    GuestSimulateRequest, GuestSimulateResponse, LoginQuery, OAuthState, PardonRequest,
+    PardonResponse, RemoveAllowlistResponse, ResolveQuery, ResolveResponse, RulesResponse,
+    SimulateRequest, SimulateResponse, StatusResponse, UpdateRulesRequest, UpgradeBounceRequest,
     UpgradeBounceResponse, WebServerConfig, DEFAULT_WEB_HOST, DEFAULT_WEB_PORT,
 };
 

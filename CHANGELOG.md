@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.31] - 2026-11-11
+
+### Added
+
+- **Rate-Limited Anonymous Live Classifier Sandbox (`src/web/api/simulate.rs`, `src/web/api/mod.rs`, `src/web/mod.rs`, `src/lib.rs`)**:
+  - Added `POST /api/simulate/guest` (`simulate_guest_interaction`) backed by `GuestSandboxLimiter` (`6/min` per client IP + `30/min` global circuit breaker, `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `Retry-After` headers, 4 curated presets, `500`-char text cap, and zero `evaluation_log` database writes) so logged-out visitors can test live AI reply classification immediately without signing in.
+- **Unsaved Draft House Rule Simulation (`src/engine/simulate.rs`, `src/web/api/simulate.rs`, `src/web/api/mod.rs`, `src/app.rs`)**:
+  - Added `SimulationInputs::rubric_override` and optional `draft_prompt` / `draft_sensitivity` fields on `SimulateRequest` (`POST /api/simulate`) so authenticated tenants can test unsaved rubric edits live in the simulator before committing changes to their active rules.
+
+### Changed
+
+- **Progressive-Disclosure Onboarding & 3-Tab Tenant Workspace (`assets/dashboard.html`, `tests/web_tests.rs`)**:
+  - Replaced the logged-out telemetry wall and locked rule forms with a dedicated **Onboarding Hero + Try the Live Classifier** sandbox (`#onboarding-view`).
+  - Reorganized the signed-in dashboard into a focused 3-tab workspace (**Activity & Pardons** with personal summary tiles, bounce action wrapping, and Bluesky DM bot quick-reference; **House Rules & Sandbox** side-by-side editor + draft simulator; **Trusted Allowlist**).
+  - Tucked engine KPIs and evaluation audit logs into a collapsed `<details id="operator-drawer">` (`Engine & Operator Telemetry`) and strictly hid `#admin-fleet-card` unless signed in as an administrator (`user.is_admin`).
+
 ## [0.2.30] - 2026-11-11
 
 ### Fixed

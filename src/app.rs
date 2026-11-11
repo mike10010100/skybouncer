@@ -370,6 +370,8 @@ pub async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
             target_did: None,
             image_base64: image_base64.clone(),
             image_url: image_url.clone(),
+            draft_prompt: None,
+            draft_sensitivity: None,
         };
 
         let mut req = client.post(&sim_endpoint).json(&payload);
