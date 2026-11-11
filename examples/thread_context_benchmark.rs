@@ -352,10 +352,19 @@ async fn run_hard_thread_l2_experiment(
 
     for c in &hard.cases {
         total += 1;
+        let itype = if c
+            .ancestors
+            .last()
+            .is_some_and(|a| a.author_did != c.target_did)
+        {
+            InteractionType::ThreadReply
+        } else {
+            InteractionType::DirectReply
+        };
         let interaction = Interaction::new(
             &c.author_did,
             &c.target_did,
-            InteractionType::DirectReply,
+            itype,
             format!("at://{}/app.bsky.feed.post/l2exp{}", c.author_did, total),
             "bafyl2cid",
             &c.candidate_text,
@@ -472,10 +481,19 @@ async fn run_hard_thread_experiment(
 
     for c in &hard.cases {
         total += 1;
+        let itype = if c
+            .ancestors
+            .last()
+            .is_some_and(|a| a.author_did != c.target_did)
+        {
+            InteractionType::ThreadReply
+        } else {
+            InteractionType::DirectReply
+        };
         let mut interaction = Interaction::new(
             &c.author_did,
             &c.target_did,
-            InteractionType::DirectReply,
+            itype,
             format!("at://{}/app.bsky.feed.post/exp{}", c.author_did, total),
             "bafyhardcid",
             &c.candidate_text,

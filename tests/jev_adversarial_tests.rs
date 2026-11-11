@@ -1638,3 +1638,228 @@ async fn test_systemone_fragmented_violation_probabilities_uses_choice_probabili
     assert!(verdict.is_permitted());
     assert!((verdict.confidence().unwrap() - 0.52).abs() < 1e-6);
 }
+
+#[tokio::test]
+async fn test_subthread_reply_to_other_user_injects_not_target_recipient_framing() {
+    use skybouncer::enricher::{EnrichedContext, ParentPostContext, ThreadPost};
+
+    let server = MockServer::start().await;
+    let target_did = "did:plc:mmtjkssv6jeneahkgfdxuy7p";
+    let author_did = "did:plc:qgzzrfoh3fapodvfpeqjbtii";
+    let other_did = "did:plc:kpizu7db55xo3m3vy5alpwaf";
+
+    let expected_replying_to = format!(
+        "Replying To: OtherUser ({other_did}) [NOT Target — sub-thread reply to another commenter; second-person 'you'/'your' addresses this OtherUser unless Target is explicitly named or @mentioned]"
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(wiremock::matchers::body_string_contains(
+            &expected_replying_to,
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "[IMMEDIATE PARENT — Author is replying to this post]",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "permitted",
+                    "probabilities": { "permitted": 0.96, "harassment": 0.04 }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(wiremock::matchers::body_string_contains(
+            &expected_replying_to,
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "[IMMEDIATE PARENT — Author is replying to this post]",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": {
+                "role": "assistant",
+                "content": "{\"violates\":false,\"category\":null,\"confidence\":0.98,\"reason\":\"Sub-thread scolding directed at OtherUser, not Target.\"}"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut ctx = EnrichedContext::empty();
+    ctx.parent_post = Some(ParentPostContext {
+        author_did: other_did.to_string(),
+        text: "AIPAC doesn't necessarily mean Jews...".to_string(),
+        cid: Some("bafyparent".to_string()),
+    });
+    ctx.thread_ancestors = vec![
+        ThreadPost {
+            author_did: target_did.to_string(),
+            text: "Original thread root".to_string(),
+        },
+        ThreadPost {
+            author_did: other_did.to_string(),
+            text: "AIPAC doesn't necessarily mean Jews...".to_string(),
+        },
+    ];
+
+    let subthread_interaction = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::ThreadReply,
+        format!("at://{author_did}/app.bsky.feed.post/3n22v76mrj22a"),
+        "bafycand",
+        "Okay could you actually read what people say instead of immediately doing...this? Because you sound fucking insane.",
+    )
+    .with_parent_uri(format!("at://{other_did}/app.bsky.feed.post/3n22girgtls24"))
+    .with_root_uri(format!("at://{target_did}/app.bsky.feed.post/3n223xnkqqw2m"))
+    .with_enriched_context(ctx);
+
+    let sys1 = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(sys1
+        .classify(&subthread_interaction)
+        .await
+        .unwrap()
+        .is_permitted());
+
+    let ollama = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/api/chat", server.uri()),
+            api_key: None,
+            model: "gemma4:26b".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(ollama
+        .classify(&subthread_interaction)
+        .await
+        .unwrap()
+        .is_permitted());
+}
+
+#[tokio::test]
+async fn test_reply_recipient_line_self_reply_mention_and_standalone_quote() {
+    let server = MockServer::start().await;
+    let target_did = "did:plc:target";
+    let author_did = "did:plc:author";
+    let other_did = "did:plc:other";
+
+    // 1. Self-reply continuation inside Target's thread
+    Mock::given(method("POST"))
+        .and(path("/self/v1/systemone"))
+        .and(wiremock::matchers::body_string_contains(
+            "Replying To: Author (did:plc:author) [self-reply / thread continuation]",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": { "moderation": { "type": "choice", "choice": "permitted", "probabilities": { "permitted": 0.99 } } }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // 2. Mention of Target while replying to OtherUser
+    Mock::given(method("POST"))
+        .and(path("/mention/v1/systemone"))
+        .and(wiremock::matchers::body_string_contains(
+            "Replying To: OtherUser (did:plc:other) [NOT Target — replying to another commenter while mentioning/quoting Target]",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": { "moderation": { "type": "choice", "choice": "permitted", "probabilities": { "permitted": 0.99 } } }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // 3. Standalone Quote (no reply parent -> no Replying To line)
+    Mock::given(method("POST"))
+        .and(path("/quote/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": { "moderation": { "type": "choice", "choice": "permitted", "probabilities": { "permitted": 0.99 } } }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let make = |suffix: &str| {
+        JevClassifier::new(
+            JevConfig {
+                base_url: format!("{}/{suffix}/v1/systemone", server.uri()),
+                api_key: None,
+                model: "nimble".to_string(),
+                timeout: Duration::from_millis(1000),
+                max_retries: 0,
+                supports_images: false,
+            },
+            RuleRubric::default(),
+        )
+        .unwrap()
+    };
+
+    let self_reply = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::ThreadReply,
+        "at://did:plc:author/app.bsky.feed.post/2",
+        "cid2",
+        "adding one more note",
+    )
+    .with_parent_uri("at://did:plc:author/app.bsky.feed.post/1")
+    .with_root_uri("at://did:plc:target/app.bsky.feed.post/root");
+    assert!(make("self")
+        .classify(&self_reply)
+        .await
+        .unwrap()
+        .is_permitted());
+
+    let mention_in_reply = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Mention,
+        "at://did:plc:author/app.bsky.feed.post/3",
+        "cid3",
+        "see what @target posted above",
+    )
+    .with_parent_uri(format!("at://{other_did}/app.bsky.feed.post/1"));
+    assert!(make("mention")
+        .classify(&mention_in_reply)
+        .await
+        .unwrap()
+        .is_permitted());
+
+    let standalone_quote = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Quote,
+        "at://did:plc:author/app.bsky.feed.post/4",
+        "cid4",
+        "great post",
+    );
+    assert!(make("quote")
+        .classify(&standalone_quote)
+        .await
+        .unwrap()
+        .is_permitted());
+    let reqs = server.received_requests().await.unwrap();
+    let quote_body = String::from_utf8_lossy(&reqs[2].body);
+    assert!(!quote_body.contains("Replying To:"));
+}

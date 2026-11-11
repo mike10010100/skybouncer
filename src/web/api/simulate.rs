@@ -204,28 +204,28 @@ fn resolve_guest_preset(
         "balanced" => Ok((
             "balanced",
             RuleRubric::new(
-                "Filter blatant spam, automated bot promotions, crypto/NFT shilling, unwanted commercial links, and direct harassment or personal attacks. Allow constructive critique, benign banter, and standard disagreements.",
+                crate::classifier::PRESET_BALANCED_PROMPT,
                 Sensitivity::Medium,
             ),
         )),
         "anti_crypto" => Ok((
             "anti_crypto",
             RuleRubric::new(
-                "Aggressively filter all cryptocurrency, token, airdrop, memecoin, pump-and-dump, web3 wallet, NFT promotions, unsolicited WhatsApp/Telegram investment invitations, and high-frequency automated bot links.",
+                crate::classifier::PRESET_ANTI_CRYPTO_PROMPT,
                 Sensitivity::High,
             ),
         )),
         "anti_hostility" => Ok((
             "anti_hostility",
             RuleRubric::new(
-                "Strictly filter hostile language, targeted harassment, abusive insults, slurs, doxxing threats, demeaning personal attacks, and aggressive intimidation directed at users.",
+                crate::classifier::PRESET_ANTI_HOSTILITY_PROMPT,
                 Sensitivity::High,
             ),
         )),
         "anti_ragebait" => Ok((
             "anti_ragebait",
             RuleRubric::new(
-                "Filter bad-faith sealioning, deceptive ragebait, troll provocations intended to incite conflict, and bad-faith harassment campaigns.",
+                crate::classifier::PRESET_ANTI_RAGEBAIT_PROMPT,
                 Sensitivity::Medium,
             ),
         )),

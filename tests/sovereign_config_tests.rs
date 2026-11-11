@@ -551,3 +551,119 @@ async fn test_engine_publish_sovereign_config_roundtrips_active_rubric() {
         .expect("publish ok");
     assert!(uri.contains(SOVEREIGN_CONFIG_COLLECTION));
 }
+
+#[tokio::test]
+async fn test_engine_sync_sovereign_config_upgrades_legacy_balanced_preset_and_republishes() {
+    use wiremock::matchers::{body_string_contains, query_param};
+
+    let protected_did = "did:plc:protected_legacy_balanced";
+    let (engine, server) = setup_sovereign_test_engine(protected_did).await;
+    engine
+        .enroll_tenant(Tenant::new(protected_did))
+        .expect("enroll");
+
+    let legacy_rubric = RuleRubric::new(
+        skybouncer::classifier::rubric::LEGACY_PRESET_BALANCED_PROMPT,
+        Sensitivity::Medium,
+    );
+    let record = SovereignConfigRecord::from_rubric(&legacy_rubric);
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .and(query_param("repo", protected_did))
+        .and(query_param("collection", SOVEREIGN_CONFIG_COLLECTION))
+        .and(query_param("rkey", SOVEREIGN_CONFIG_RKEY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uri": format!("at://{protected_did}/{SOVEREIGN_CONFIG_COLLECTION}/{SOVEREIGN_CONFIG_RKEY}"),
+            "cid": "bafylegacy",
+            "value": record
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.repo.putRecord"))
+        .and(body_string_contains(
+            skybouncer::classifier::PRESET_BALANCED_PROMPT,
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uri": format!("at://{protected_did}/{SOVEREIGN_CONFIG_COLLECTION}/{SOVEREIGN_CONFIG_RKEY}"),
+            "cid": "bafyupgraded"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let synced = engine
+        .sync_sovereign_config(protected_did)
+        .await
+        .expect("sync ok")
+        .expect("rubric present");
+    assert_eq!(
+        synced.prompt,
+        skybouncer::classifier::PRESET_BALANCED_PROMPT
+    );
+
+    let tenant = engine
+        .tenant_registry()
+        .get(protected_did)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tenant.rubric.unwrap().prompt,
+        skybouncer::classifier::PRESET_BALANCED_PROMPT
+    );
+    assert_eq!(
+        engine.rubric().prompt,
+        skybouncer::classifier::PRESET_BALANCED_PROMPT
+    );
+}
+
+#[tokio::test]
+async fn test_engine_sync_sovereign_config_legacy_upgrade_survives_put_record_failure() {
+    use wiremock::matchers::query_param;
+
+    let protected_did = "did:plc:protected_legacy_writeback_fail";
+    let (engine, server) = setup_sovereign_test_engine(protected_did).await;
+    engine
+        .enroll_tenant(Tenant::new(protected_did))
+        .expect("enroll");
+
+    let legacy_rubric = RuleRubric::with_default_sensitivity(
+        skybouncer::classifier::rubric::LEGACY_DEFAULT_RUBRIC_PROMPT,
+    );
+    let record = SovereignConfigRecord::from_rubric(&legacy_rubric);
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .and(query_param("repo", protected_did))
+        .and(query_param("collection", SOVEREIGN_CONFIG_COLLECTION))
+        .and(query_param("rkey", SOVEREIGN_CONFIG_RKEY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uri": format!("at://{protected_did}/{SOVEREIGN_CONFIG_COLLECTION}/{SOVEREIGN_CONFIG_RKEY}"),
+            "cid": "bafylegacy2",
+            "value": record
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.repo.putRecord"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("PDS temporary error"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let synced = engine
+        .sync_sovereign_config(protected_did)
+        .await
+        .expect("sync still succeeds")
+        .expect("rubric present");
+    assert_eq!(synced.prompt, skybouncer::classifier::DEFAULT_RUBRIC_PROMPT);
+    assert_eq!(
+        engine.rubric().prompt,
+        skybouncer::classifier::DEFAULT_RUBRIC_PROMPT
+    );
+}

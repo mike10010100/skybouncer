@@ -24,8 +24,9 @@ pub use jev::{
 };
 pub use mock::MockClassifier;
 pub use rubric::{
-    bounce_duration_from_db, sensitivity_from_db, BounceDuration, RuleRubric, Sensitivity,
-    DEFAULT_RUBRIC_PROMPT,
+    bounce_duration_from_db, sensitivity_from_db, upgrade_legacy_prompt_str, BounceDuration,
+    RuleRubric, Sensitivity, DEFAULT_RUBRIC_PROMPT, PRESET_ANTI_CRYPTO_PROMPT,
+    PRESET_ANTI_HOSTILITY_PROMPT, PRESET_ANTI_RAGEBAIT_PROMPT, PRESET_BALANCED_PROMPT,
 };
 pub use tiered::{
     CertaintyConfig, TieredClassifier, TieredClassifierStats, TieredEvaluationResult,

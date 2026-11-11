@@ -164,17 +164,21 @@ mod tests {
     }
 
     #[test]
-    fn test_init_schema_upgrades_unmodified_legacy_default_rubric_preserving_custom() {
+    fn test_init_schema_upgrades_unmodified_legacy_default_and_presets_preserving_custom() {
         let conn = std::sync::Arc::new(parking_lot::Mutex::new(
             rusqlite::Connection::open_in_memory().unwrap(),
         ));
         let a = TenantRegistry::from_connection(std::sync::Arc::clone(&conn)).unwrap();
-        a.register_or_update(&Tenant::new("did:plc:legacy").with_rubric(
-            RuleRubric::with_default_sensitivity(
-                crate::classifier::rubric::LEGACY_DEFAULT_RUBRIC_PROMPT,
-            ),
-        ))
-        .unwrap();
+        for (idx, &(legacy, _)) in crate::classifier::rubric::LEGACY_PROMPT_UPGRADES
+            .iter()
+            .enumerate()
+        {
+            a.register_or_update(
+                &Tenant::new(format!("did:plc:legacy{idx}"))
+                    .with_rubric(RuleRubric::with_default_sensitivity(legacy)),
+            )
+            .unwrap();
+        }
         a.register_or_update(
             &Tenant::new("did:plc:custom")
                 .with_rubric(RuleRubric::with_default_sensitivity("Block all spoilers.")),
@@ -182,11 +186,16 @@ mod tests {
         .unwrap();
 
         let b = TenantRegistry::from_connection(std::sync::Arc::clone(&conn)).unwrap();
-        let legacy_tenant = b.get("did:plc:legacy").unwrap().unwrap();
-        assert_eq!(
-            legacy_tenant.rubric.unwrap().prompt,
-            crate::classifier::DEFAULT_RUBRIC_PROMPT
-        );
+        for (idx, &(_, expected)) in crate::classifier::rubric::LEGACY_PROMPT_UPGRADES
+            .iter()
+            .enumerate()
+        {
+            let tenant = b
+                .get(&format!("did:plc:legacy{idx}"))
+                .unwrap()
+                .expect("legacy tenant present");
+            assert_eq!(tenant.rubric.unwrap().prompt, expected);
+        }
         let custom_tenant = b.get("did:plc:custom").unwrap().unwrap();
         assert_eq!(custom_tenant.rubric.unwrap().prompt, "Block all spoilers.");
     }

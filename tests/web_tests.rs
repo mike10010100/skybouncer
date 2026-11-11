@@ -2142,12 +2142,27 @@ fn test_ui_dom_and_javascript_contract_validation() {
         "DOM contract failure: saveRules must submit bypass_incoming_followers!"
     );
 
-    // 4. Verify all preset buttons invoke defined RUBRIC_PRESETS
+    // 4. Verify all preset buttons invoke defined RUBRIC_PRESETS and match Rust constants
     let presets_marker = "const RUBRIC_PRESETS = {";
     let presets_start = html
         .find(presets_marker)
         .expect("RUBRIC_PRESETS defined in UI");
-    let presets_block = &html[presets_start..presets_start + 1000];
+    let presets_end_rel = html[presets_start..]
+        .find("const RUBRIC_PRESET_LABELS")
+        .expect("RUBRIC_PRESET_LABELS follows RUBRIC_PRESETS");
+    let presets_block = &html[presets_start..presets_start + presets_end_rel];
+
+    for expected_prompt in [
+        skybouncer::classifier::PRESET_BALANCED_PROMPT,
+        skybouncer::classifier::PRESET_ANTI_CRYPTO_PROMPT,
+        skybouncer::classifier::PRESET_ANTI_HOSTILITY_PROMPT,
+        skybouncer::classifier::PRESET_ANTI_RAGEBAIT_PROMPT,
+    ] {
+        assert!(
+            presets_block.contains(expected_prompt),
+            "DOM contract failure: RUBRIC_PRESETS drifted from canonical Rust preset prompt: {expected_prompt}"
+        );
+    }
 
     let mut preset_idx = 0;
     while let Some(start) = html[preset_idx..].find("applyRubricPreset('") {
@@ -2170,22 +2185,13 @@ async fn test_api_all_rubric_presets_submission_matrix() {
     let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
     let alice_token = create_test_session(&engine, "did:plc:alice");
 
-    // All presets defined in UI
+    // All presets defined in UI / canonical Rust constants
     let presets = [
+        (skybouncer::classifier::PRESET_BALANCED_PROMPT, "medium"),
+        (skybouncer::classifier::PRESET_ANTI_CRYPTO_PROMPT, "high"),
+        (skybouncer::classifier::PRESET_ANTI_HOSTILITY_PROMPT, "high"),
         (
-            "Filter blatant spam, automated bot promotions, crypto/NFT shilling, unwanted commercial links, and direct harassment or personal attacks. Allow constructive critique, benign banter, and standard disagreements.",
-            "medium",
-        ),
-        (
-            "Aggressively filter all cryptocurrency, token, airdrop, memecoin, pump-and-dump, web3 wallet, NFT promotions, unsolicited WhatsApp/Telegram investment invitations, and high-frequency automated bot links.",
-            "high",
-        ),
-        (
-            "Strictly filter hostile language, targeted harassment, abusive insults, slurs, doxxing threats, demeaning personal attacks, and aggressive intimidation directed at users.",
-            "high",
-        ),
-        (
-            "Filter bad-faith sealioning, deceptive ragebait, troll provocations intended to incite conflict, and bad-faith harassment campaigns.",
+            skybouncer::classifier::PRESET_ANTI_RAGEBAIT_PROMPT,
             "medium",
         ),
     ];

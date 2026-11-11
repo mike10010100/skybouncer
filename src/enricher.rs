@@ -198,24 +198,55 @@ impl EnrichedContext {
                 .thread_ancestors
                 .len()
                 .saturating_sub(MAX_RENDERED_THREAD_ANCESTORS);
+            let slice = &self.thread_ancestors[start..];
+            let last_idx = slice.len().saturating_sub(1);
             let mut rendered = Vec::new();
-            for (offset, ancestor) in self.thread_ancestors[start..].iter().enumerate() {
+            for (offset, ancestor) in slice.iter().enumerate() {
                 let depth = start + offset + 1;
                 let snippet: String = ancestor
                     .text
                     .chars()
                     .take(THREAD_ANCESTOR_CHAR_CAP)
                     .collect();
-                rendered.push(format!(
-                    "[{depth}] {}: \"{}\"",
-                    format_actor(&ancestor.author_did),
-                    snippet
-                ));
+                let is_immediate_parent = roles.is_some()
+                    && offset == last_idx
+                    && self
+                        .parent_post
+                        .as_ref()
+                        .is_none_or(|p| p.author_did == ancestor.author_did);
+                if is_immediate_parent {
+                    rendered.push(format!(
+                        "[{depth}] {}: \"{}\" [IMMEDIATE PARENT — Author is replying to this post]",
+                        format_actor(&ancestor.author_did),
+                        snippet
+                    ));
+                } else {
+                    rendered.push(format!(
+                        "[{depth}] {}: \"{}\"",
+                        format_actor(&ancestor.author_did),
+                        snippet
+                    ));
+                }
             }
             sections.push(format!(
                 "Conversation Thread (oldest → newest):\n{}",
                 rendered.join("\n")
             ));
+            if roles.is_some() {
+                if let Some(ref parent) = self.parent_post {
+                    if slice
+                        .last()
+                        .is_none_or(|last| last.author_did != parent.author_did)
+                    {
+                        let text_snippet: String = parent.text.chars().take(200).collect();
+                        sections.push(format!(
+                            "In Reply To (by {}): \"{}\"",
+                            format_actor(&parent.author_did),
+                            text_snippet
+                        ));
+                    }
+                }
+            }
         }
 
         if let Some(ref quoted) = self.quoted_post {
