@@ -121,8 +121,8 @@ impl DeduplicationCache {
                 "INSERT INTO bounced_users (
                         subject_did, listitem_uri, listitem_rkey, listitem_cid,
                         category, confidence, reason, post_uri, bounced_at,
-                        protected_did, post_text, expires_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                        protected_did, post_text, expires_at, reply_to_uri
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                      ON CONFLICT(protected_did, subject_did) DO UPDATE SET
                          listitem_uri = excluded.listitem_uri,
                          listitem_rkey = excluded.listitem_rkey,
@@ -133,7 +133,8 @@ impl DeduplicationCache {
                          post_uri = excluded.post_uri,
                          bounced_at = excluded.bounced_at,
                          post_text = excluded.post_text,
-                         expires_at = excluded.expires_at;",
+                         expires_at = excluded.expires_at,
+                         reply_to_uri = excluded.reply_to_uri;",
             )?;
 
             user_stmt.execute(params![
@@ -149,10 +150,42 @@ impl DeduplicationCache {
                 entry.protected_did,
                 entry.post_text,
                 expires_at_i64,
+                entry.reply_to_uri,
             ])?;
         }
 
-        // 2. Record in historical rkeys table (never overwrites or erases existing rkeys)
+        // 2. Archive latest bounce metadata in bounce_history so pardoned/expired accounts
+        //    retain their original rationale and post links if re-bounced via DM.
+        {
+            let mut history_stmt = tx.prepare_cached(
+                "INSERT INTO bounce_history (
+                    protected_did, subject_did, category, confidence, reason,
+                    post_uri, post_text, reply_to_uri, archived_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(protected_did, subject_did) DO UPDATE SET
+                     category = excluded.category,
+                     confidence = excluded.confidence,
+                     reason = excluded.reason,
+                     post_uri = excluded.post_uri,
+                     post_text = excluded.post_text,
+                     reply_to_uri = excluded.reply_to_uri,
+                     archived_at = excluded.archived_at;",
+            )?;
+
+            history_stmt.execute(params![
+                entry.protected_did,
+                entry.subject_did,
+                entry.category,
+                entry.confidence,
+                entry.reason,
+                entry.post_uri,
+                entry.post_text,
+                entry.reply_to_uri,
+                bounced_at_i64,
+            ])?;
+        }
+
+        // 3. Record in historical rkeys table (never overwrites or erases existing rkeys)
         {
             let mut rkey_stmt = tx.prepare_cached(
                 "INSERT INTO bounced_user_rkeys (
@@ -506,6 +539,56 @@ impl DeduplicationCache {
     /// Returns [`SkybouncerError::Database`] if the query or deletion fails.
     pub fn remove_all_bounces(&self, subject_did: &str) -> Result<Vec<String>, SkybouncerError> {
         self.remove_all_bounces_for("", subject_did)
+    }
+
+    /// Retrieves archived bounce metadata for `(protected_did, subject_did)`, if any prior bounce
+    /// was recorded for this pair (including bounces that were subsequently pardoned or expired).
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    pub fn get_bounce_history_for(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+    ) -> Result<Option<ArchivedBounce>, SkybouncerError> {
+        let conn = self.conn.lock();
+        let map_archived = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ArchivedBounce> {
+            Ok(ArchivedBounce {
+                protected_did: row.get(0)?,
+                subject_did: row.get(1)?,
+                category: row.get(2)?,
+                confidence: row.get(3)?,
+                reason: row.get(4)?,
+                post_uri: row.get(5)?,
+                post_text: row.get(6)?,
+                reply_to_uri: row.get(7)?,
+                archived_at: i64_to_us(row.get(8)?),
+            })
+        };
+
+        let res = if protected_did.trim().is_empty() {
+            let mut stmt = conn.prepare_cached(
+                "SELECT protected_did, subject_did, category, confidence, reason,
+                        post_uri, post_text, reply_to_uri, archived_at
+                 FROM bounce_history
+                 WHERE subject_did = ?1
+                 ORDER BY archived_at DESC
+                 LIMIT 1;",
+            )?;
+            stmt.query_row(params![subject_did], map_archived)
+                .optional()?
+        } else {
+            let mut stmt = conn.prepare_cached(
+                "SELECT protected_did, subject_did, category, confidence, reason,
+                        post_uri, post_text, reply_to_uri, archived_at
+                 FROM bounce_history
+                 WHERE subject_did = ?1 AND protected_did = ?2
+                 LIMIT 1;",
+            )?;
+            stmt.query_row(params![subject_did, protected_did], map_archived)
+                .optional()?
+        };
+        Ok(res)
     }
 
     /// Counts the total number of bounced users recorded in the cache.

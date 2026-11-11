@@ -583,6 +583,7 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
         reason: "Targeted harassment".to_string(),
         post_uri: "at://did:plc:toxic-violator-999/app.bsky.feed.post/post123".to_string(),
         post_text: "You are terrible".to_string(),
+        reply_to_uri: None,
         bounced_at: 1_720_000_000_000_000,
         expires_at: None,
     };
@@ -715,6 +716,7 @@ async fn test_api_upgrade_bounce_to_permanent_lifecycle() {
             reason: "Temporary cooldown".to_string(),
             post_uri: "at://did:plc:temp-violator-777/app.bsky.feed.post/post777".to_string(),
             post_text: "Spam reply".to_string(),
+            reply_to_uri: None,
             bounced_at: 1_720_000_000_000_000,
             expires_at: Some(1_720_086_400_000_000),
         })
@@ -1787,6 +1789,7 @@ async fn test_web_allowlist_endpoints_and_pardon_immunization() {
             reason: "Targeted insult".to_string(),
             post_uri: format!("at://{violator_did}/app.bsky.feed.post/post999"),
             post_text: "Insulting text".to_string(),
+            reply_to_uri: None,
             bounced_at: 1_700_000_000,
             expires_at: None,
         })
@@ -2557,6 +2560,7 @@ async fn test_api_bounces_and_allowlist_handle_enrichment() {
             reason: "Blatant token shill".to_string(),
             post_uri: format!("at://{violator_did}/app.bsky.feed.post/123"),
             post_text: "spam text".to_string(),
+            reply_to_uri: None,
             bounced_at: now_us,
             expires_at: None,
         })
@@ -3564,6 +3568,7 @@ async fn test_api_admin_bounces_and_pardon_with_explicit_protected_did() {
             reason: "spam".to_string(),
             post_uri: "at://spammer/post".to_string(),
             post_text: "spam".to_string(),
+            reply_to_uri: None,
             bounced_at: 1_720_000_000_000_000,
             expires_at: None,
         })

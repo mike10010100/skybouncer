@@ -59,6 +59,9 @@ pub struct BouncedUser {
     /// Snippet or plaintext of the offending post that triggered the bounce.
     #[serde(default)]
     pub post_text: String,
+    /// Canonical AT-URI of the parent post that the offending post was replying to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_uri: Option<String>,
     /// Microsecond Unix timestamp when the bounce was recorded.
     pub bounced_at: u64,
     /// Optional microsecond Unix timestamp when the temporary bounce expires (or `None` for permanent).
@@ -74,10 +77,38 @@ impl BouncedUser {
     }
 }
 
+/// Archived metadata of a prior bounce for a `(protected_did, subject_did)` pair.
+///
+/// Preserved across pardons and temporary TTL expirations so manual DM `bounce` or `perm`
+/// commands can restore the original violation rationale and post links.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArchivedBounce {
+    /// Protected user DID whose moderation list recorded the bounce.
+    pub protected_did: String,
+    /// Decentralized identifier (DID) of the bounced subject.
+    pub subject_did: String,
+    /// Category of the moderation violation.
+    pub category: String,
+    /// Classifier confidence score (0.0 to 1.0).
+    pub confidence: f64,
+    /// Human-readable or model-generated reason for the bounce.
+    pub reason: String,
+    /// Canonical AT-URI of the offending post, if recorded.
+    pub post_uri: String,
+    /// Plaintext snippet of the offending post, if recorded.
+    #[serde(default)]
+    pub post_text: String,
+    /// Canonical AT-URI of the parent post that the offending post was replying to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_uri: Option<String>,
+    /// Microsecond Unix timestamp when the bounce was recorded or archived.
+    pub archived_at: u64,
+}
+
 /// Canonical projection of `bounced_users` columns in [`map_bounced_user`] ordinal order.
 pub(crate) const BOUNCED_USER_COLUMNS: &str = "subject_did, listitem_uri, listitem_rkey, \
      listitem_cid, category, confidence, reason, post_uri, bounced_at, protected_did, \
-     post_text, expires_at";
+     post_text, expires_at, reply_to_uri";
 
 /// Maps a `bounced_users` row (projected via [`BOUNCED_USER_COLUMNS`]) to a [`BouncedUser`].
 pub(crate) fn map_bounced_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<BouncedUser> {
@@ -96,10 +127,12 @@ pub(crate) fn map_bounced_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<Boun
         protected_did: row.get(9)?,
         post_text: row.get(10)?,
         expires_at,
+        reply_to_uri: row.get(12)?,
     })
 }
 
-/// Deletes all `bounced_users` and `bounced_user_rkeys` rows for `(protected_did, subject_did)`.
+/// Archives `bounced_users` rows into `bounce_history` and deletes all `bounced_users` and
+/// `bounced_user_rkeys` rows for `(protected_did, subject_did)`.
 ///
 /// An empty `protected_did` matches the subject across every protected user.
 fn delete_bounce_rows(
@@ -107,7 +140,28 @@ fn delete_bounce_rows(
     protected_did: &str,
     subject_did: &str,
 ) -> Result<(), SkybouncerError> {
+    let archived_at_i64 = us_to_i64(current_time_us());
     if protected_did.is_empty() {
+        let mut archive_stmt = tx.prepare_cached(
+            "INSERT INTO bounce_history (
+                protected_did, subject_did, category, confidence, reason,
+                post_uri, post_text, reply_to_uri, archived_at
+             )
+             SELECT protected_did, subject_did, category, confidence, reason,
+                    post_uri, post_text, reply_to_uri, ?2
+             FROM bounced_users
+             WHERE subject_did = ?1
+             ON CONFLICT(protected_did, subject_did) DO UPDATE SET
+                 category = excluded.category,
+                 confidence = excluded.confidence,
+                 reason = excluded.reason,
+                 post_uri = excluded.post_uri,
+                 post_text = excluded.post_text,
+                 reply_to_uri = excluded.reply_to_uri,
+                 archived_at = excluded.archived_at;",
+        )?;
+        archive_stmt.execute(params![subject_did, archived_at_i64])?;
+
         let mut delete_rkeys =
             tx.prepare_cached("DELETE FROM bounced_user_rkeys WHERE subject_did = ?1;")?;
         let _ = delete_rkeys.execute(params![subject_did]);
@@ -116,6 +170,26 @@ fn delete_bounce_rows(
             tx.prepare_cached("DELETE FROM bounced_users WHERE subject_did = ?1;")?;
         delete_stmt.execute(params![subject_did])?;
     } else {
+        let mut archive_stmt = tx.prepare_cached(
+            "INSERT INTO bounce_history (
+                protected_did, subject_did, category, confidence, reason,
+                post_uri, post_text, reply_to_uri, archived_at
+             )
+             SELECT protected_did, subject_did, category, confidence, reason,
+                    post_uri, post_text, reply_to_uri, ?3
+             FROM bounced_users
+             WHERE subject_did = ?1 AND protected_did = ?2
+             ON CONFLICT(protected_did, subject_did) DO UPDATE SET
+                 category = excluded.category,
+                 confidence = excluded.confidence,
+                 reason = excluded.reason,
+                 post_uri = excluded.post_uri,
+                 post_text = excluded.post_text,
+                 reply_to_uri = excluded.reply_to_uri,
+                 archived_at = excluded.archived_at;",
+        )?;
+        archive_stmt.execute(params![subject_did, protected_did, archived_at_i64])?;
+
         let mut delete_rkeys = tx.prepare_cached(
             "DELETE FROM bounced_user_rkeys WHERE subject_did = ?1 AND protected_did = ?2;",
         )?;
@@ -434,6 +508,7 @@ mod tests {
             reason: "Test bounce".to_string(),
             post_uri: format!("at://{subject_did}/app.bsky.feed.post/1"),
             post_text: "Test post text".to_string(),
+            reply_to_uri: None,
             bounced_at: 1_700_000_000,
             expires_at: None,
         }

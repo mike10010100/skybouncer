@@ -56,6 +56,7 @@ fn test_concurrent_load_shared_cache_30_threads() {
                             reason: "Automated airdrop attack".to_string(),
                             post_uri: format!("at://{did}/app.bsky.feed.post/1"),
                             post_text: "Airdrop link".to_string(),
+                            reply_to_uri: None,
                             bounced_at: 1_720_000_000_000_000 + (op as u64),
                             expires_at: None,
                         };
@@ -193,6 +194,7 @@ fn test_concurrent_load_distinct_disk_connections_25_threads() {
                     reason: "Mass mention abuse".to_string(),
                     post_uri: format!("at://{did}/app.bsky.feed.post/1"),
                     post_text: "Mass mention attack".to_string(),
+                    reply_to_uri: None,
                     bounced_at: 1_720_000_000_000_000 + (op as u64),
                     expires_at: None,
                 };
@@ -457,6 +459,7 @@ fn test_clock_drift_and_timestamp_boundary_resilience() {
         reason: "Timestamp boundary test".to_string(),
         post_uri: "at://did:plc:extreme_did/app.bsky.feed.post/1".to_string(),
         post_text: "Boundary test".to_string(),
+        reply_to_uri: None,
         bounced_at: u64::MAX, // Saturates to i64::MAX in SQLite
         expires_at: None,
     };
@@ -527,6 +530,7 @@ fn test_disk_backed_recovery_across_persistence_boundaries() {
                 reason: format!("Spam incident {i}"),
                 post_uri: format!("at://did:plc:violator_{i}/app.bsky.feed.post/1"),
                 post_text: format!("Spam text {i}"),
+                reply_to_uri: None,
                 bounced_at: 1_720_000_000_000_000 + (i as u64),
                 expires_at: None,
             };
@@ -610,6 +614,7 @@ fn test_disk_backed_recovery_across_persistence_boundaries() {
             reason: "Doxxing threat".to_string(),
             post_uri: "at://did:plc:extra_violator/app.bsky.feed.post/1".to_string(),
             post_text: "Doxxing text".to_string(),
+            reply_to_uri: None,
             bounced_at: 1_720_000_000_000_999,
             expires_at: None,
         };
@@ -756,6 +761,7 @@ fn test_high_volume_cache_throughput_and_sla() {
             reason: "Bulk population".to_string(),
             post_uri: format!("at://did:plc:scale_actor_{i}/app.bsky.feed.post/1"),
             post_text: "Bulk spam message".to_string(),
+            reply_to_uri: None,
             bounced_at: 1_720_000_000_000_000 + (i as u64),
             expires_at: None,
         };

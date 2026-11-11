@@ -8,10 +8,12 @@ pub mod manager;
 pub mod sovereign_config;
 
 pub use cache::{
-    AllowlistEntry, BouncedUser, DeduplicationCache, EvaluationLogContext, ModListConfig,
+    AllowlistEntry, ArchivedBounce, BouncedUser, DeduplicationCache, EvaluationLogContext,
+    ModListConfig,
 };
 pub use manager::{
-    BounceRequest, ModListManager, DEFAULT_MOD_LIST_DESCRIPTION, DEFAULT_MOD_LIST_NAME,
+    BounceRequest, ManualBounceOutcome, ModListManager, DEFAULT_MOD_LIST_DESCRIPTION,
+    DEFAULT_MOD_LIST_NAME,
 };
 pub use sovereign_config::{
     extract_rubric_from_list_description, fetch_sovereign_config,

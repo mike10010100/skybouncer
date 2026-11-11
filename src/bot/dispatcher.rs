@@ -10,7 +10,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::bot::render::{
-    account_label, bsky_post_url_from_at_uri, bsky_profile_url, command_target,
+    account_label, bsky_post_or_web_url, bsky_post_url_from_at_uri, bsky_profile_url,
+    command_target, send_dm_chunked, truncate_chars,
 };
 use crate::engine::{BounceNotification, ReauthNotification};
 use crate::error::SkybouncerError;
@@ -35,10 +36,13 @@ pub fn format_bounce_alert(notification: &BounceNotification) -> String {
     let post_url = bsky_post_url_from_at_uri(&notification.post_uri)
         .unwrap_or_else(|| notification.post_uri.clone());
 
-    let snippet_section = if notification.post_snippet.trim().is_empty() {
+    let reason = truncate_chars(notification.reason.trim(), 150);
+
+    let snippet_trimmed = notification.post_snippet.trim();
+    let snippet_section = if snippet_trimmed.is_empty() {
         String::new()
     } else {
-        format!("\nSnippet: \"{}\"", notification.post_snippet.trim())
+        format!("\nSnippet: \"{}\"", truncate_chars(snippet_trimmed, 140))
     };
 
     let profile_section = if profile_url.is_empty() {
@@ -46,6 +50,13 @@ pub fn format_bounce_alert(notification: &BounceNotification) -> String {
     } else {
         format!("\nProfile: {profile_url}")
     };
+
+    let reply_to_section = notification
+        .reply_to_uri
+        .as_deref()
+        .and_then(bsky_post_or_web_url)
+        .map(|url| format!("\nReplying to: {url}"))
+        .unwrap_or_default();
 
     let target = command_target(
         &notification.violator_did,
@@ -73,13 +84,13 @@ pub fn format_bounce_alert(notification: &BounceNotification) -> String {
         "🛡️ Skybouncer Action Alert:\n\n\
          Bounced violator: {violator}\n\
          Violation: **{}** ({pct:.0}% confidence)\n\
-         Reason: {}{duration_section}{snippet_section}{profile_section}\n\
-         Post: {post_url}\n\n\
+         Reason: {reason}{duration_section}{snippet_section}{profile_section}\n\
+         Post: {post_url}{reply_to_section}\n\n\
          To undo, reply with:\n\
          pardon {target}\n\n\
          Or to undo and permanently allowlist:\n\
          pardon and allow {target}{upgrade_section}",
-        notification.category, notification.reason,
+        notification.category,
     )
 }
 
@@ -314,7 +325,7 @@ pub async fn run_bounce_alert_dispatcher(
 
                         match client.find_or_create_convo_for_did(&target_did).await {
                             Ok(convo_id) => {
-                                if let Err(e) = client.send_message(&convo_id, &alert_text).await {
+                                if let Err(e) = send_dm_chunked(&client, &convo_id, &alert_text).await {
                                     warn!(error = %e, target = %target_did, "Failed to send proactive DM bounce alert");
                                 } else {
                                     info!(target = %target_did, violator = %notification.violator_did, "Proactive DM bounce alert delivered successfully");
@@ -383,26 +394,53 @@ mod tests {
             confidence: 0.96,
             reason: "Crypto airdrop link".to_string(),
             post_uri: "at://did:plc:spammer/app.bsky.feed.post/123".to_string(),
+            reply_to_uri: None,
             post_snippet: "Free tokens".to_string(),
             bounce_duration: crate::classifier::BounceDuration::Permanent,
         };
         let perm_text = format_bounce_alert(&perm_notif);
+        assert!(perm_text.contains("Profile: https://bsky.app/profile/spammer.bsky.social"));
+        assert!(perm_text.contains("Post: https://bsky.app/profile/did:plc:spammer/post/123"));
+        assert!(!perm_text.contains("Replying to:"));
         assert!(perm_text.contains("pardon spammer.bsky.social"));
         assert!(perm_text.contains("pardon and allow spammer.bsky.social"));
         assert!(!perm_text.contains("perm spammer.bsky.social"));
         assert!(!perm_text.contains("Duration:"));
 
-        let temp_notif = BounceNotification {
+        let temp_reply_notif = BounceNotification {
+            reply_to_uri: Some("at://did:plc:alice/app.bsky.feed.post/root999".to_string()),
             bounce_duration: crate::classifier::BounceDuration::Cooldown24h,
             ..perm_notif
         };
-        let temp_text = format_bounce_alert(&temp_notif);
+        let temp_text = format_bounce_alert(&temp_reply_notif);
         assert!(temp_text.contains("Duration: 24-Hour Cooldown"));
+        assert!(temp_text.contains(
+            "Post: https://bsky.app/profile/did:plc:spammer/post/123\n\
+             Replying to: https://bsky.app/profile/did:plc:alice/post/root999"
+        ));
         assert!(temp_text.contains("pardon spammer.bsky.social"));
         assert!(temp_text.contains("pardon and allow spammer.bsky.social"));
         assert!(temp_text.contains(
             "Or to upgrade this temporary block to permanent:\nperm spammer.bsky.social"
         ));
+
+        let facets = skybase::lexicon::extract_link_facets(&temp_text);
+        assert_eq!(facets.len(), 3);
+        let uris: Vec<&str> = facets
+            .iter()
+            .filter_map(|f| match f.features.first() {
+                Some(skybase::lexicon::FacetFeature::Link { uri }) => Some(uri.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            uris,
+            vec![
+                "https://bsky.app/profile/spammer.bsky.social",
+                "https://bsky.app/profile/did:plc:spammer/post/123",
+                "https://bsky.app/profile/did:plc:alice/post/root999",
+            ]
+        );
     }
 
     #[tokio::test]

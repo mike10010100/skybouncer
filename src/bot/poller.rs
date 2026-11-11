@@ -39,20 +39,44 @@ async fn process_convo(
         return;
     }
 
-    // Fetch all unread messages if multiple unread, otherwise use last_message
-    let mut messages: Vec<MessageView> = if convo.unread_count > 1 {
-        let fetch_limit = usize::try_from(convo.unread_count)
-            .unwrap_or(20)
-            .clamp(1, 50);
+    // Fetch message history when multiple messages are unread OR when a proactive bot alert
+    // interleaved after the user's unread DM (making `last_message.sender.did == bot_did`
+    // while `unread_count >= 1`). Add headroom so interspersed bot alerts cannot push unread
+    // user commands outside the `getMessages` window, while taking at most `unread_count`
+    // non-bot messages so previously read user messages are never re-executed.
+    let last_is_bot = convo
+        .last_message
+        .as_ref()
+        .is_some_and(|m| m.sender.did == handler.bot_did());
+    let need_history = convo.unread_count > 1 || (convo.unread_count > 0 && last_is_bot);
+
+    let mut messages: Vec<MessageView> = if need_history {
+        let max_user_msgs = usize::try_from(convo.unread_count).unwrap_or(1).max(1);
+        let fetch_limit = max_user_msgs.saturating_add(10).clamp(2, 50);
         match client
             .get_messages(&convo.id, Some(fetch_limit), None)
             .await
         {
             Ok(msg_resp) => {
-                let mut msgs = msg_resp.messages;
-                // Messages from getMessages are returned newest-first; reverse to chronological order
-                msgs.reverse();
-                msgs
+                // `getMessages` returns newest-first; collect up to `max_user_msgs` non-bot
+                // messages plus any interspersed bot messages, then reverse to chronological order.
+                let mut selected = Vec::with_capacity(msg_resp.messages.len());
+                let mut user_taken = 0usize;
+                for m in msg_resp.messages {
+                    if m.sender.did == handler.bot_did() {
+                        selected.push(m);
+                    } else if user_taken < max_user_msgs {
+                        user_taken += 1;
+                        selected.push(m);
+                        if user_taken >= max_user_msgs {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                selected.reverse();
+                selected
             }
             Err(e) => {
                 warn!(
@@ -91,7 +115,9 @@ async fn process_convo(
 
         match handler.handle_command(&msg.sender.did, &msg.text).await {
             Ok(reply_text) => {
-                if let Err(e) = client.send_message(&convo.id, &reply_text).await {
+                if let Err(e) =
+                    crate::bot::render::send_dm_chunked(client, &convo.id, &reply_text).await
+                {
                     error!(error = %e, convo_id = %convo.id, "Failed to send bot reply");
                 } else {
                     debug!(convo_id = %convo.id, "Dispatched bot reply");

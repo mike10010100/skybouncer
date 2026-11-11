@@ -10,6 +10,10 @@
 /// Public Bluesky web origin used for profile and post deep links.
 pub const BSKY_WEB_ORIGIN: &str = "https://bsky.app";
 
+/// Maximum Unicode scalar characters per outbound ATProto Chat DM chunk (stays safely within
+/// `chat.bsky.convo.defs#messageInput`'s 1,000-grapheme lexicon ceiling).
+pub(crate) const MAX_DM_CHARS: usize = 980;
+
 /// Sanitizes an ATProto handle or DID for safe inclusion in a URL path segment.
 ///
 /// DIDs require literal colons (`did:plc:...`), so percent-encoding is intentionally
@@ -65,6 +69,123 @@ pub fn bsky_post_url_from_at_uri(at_uri: &str) -> Option<String> {
     } else {
         Some(url)
     }
+}
+
+/// Converts a feed-post AT-URI (`at://{authority}/app.bsky.feed.post/{rkey}`) or an
+/// already-resolved `http(s)://` URL into a navigable web link.
+///
+/// Returns `None` when the input is blank or neither a feed-post AT-URI nor an HTTP(S) URL.
+#[must_use]
+pub fn bsky_post_or_web_url(uri_or_url: &str) -> Option<String> {
+    let trimmed = uri_or_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    bsky_post_url_from_at_uri(trimmed).or_else(|| {
+        if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Truncates `text` to at most `max_chars` Unicode scalar values, appending `…` when truncated.
+#[must_use]
+pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+/// Splits an outbound DM body on newline boundaries into chunks of at most `max_chars`
+/// Unicode scalar values so URLs and link facets are never split mid-line and each
+/// message obeys `chat.bsky.convo.defs#messageInput` (`maxGraphemes: 1000`).
+#[must_use]
+pub(crate) fn split_dm_chunks(text: &str, max_chars: usize) -> Vec<String> {
+    let cap = max_chars.max(64);
+    if text.chars().count() <= cap {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+
+    for line in text.split('\n') {
+        let line_chars = line.chars().count();
+        let needed = if current.is_empty() {
+            line_chars
+        } else {
+            line_chars.saturating_add(1)
+        };
+
+        if !current.is_empty() && current_chars.saturating_add(needed) > cap {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+
+        if line_chars > cap {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+                current_chars = 0;
+            }
+            let mut buf = String::new();
+            let mut buf_len = 0usize;
+            for ch in line.chars() {
+                if buf_len >= cap {
+                    chunks.push(std::mem::take(&mut buf));
+                    buf_len = 0;
+                }
+                buf.push(ch);
+                buf_len += 1;
+            }
+            if !buf.is_empty() {
+                current = buf;
+                current_chars = buf_len;
+            }
+        } else {
+            if !current.is_empty() {
+                current.push('\n');
+                current_chars += 1;
+            }
+            current.push_str(line);
+            current_chars += line_chars;
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
+}
+
+/// Sends a DM via [`skybase::chat::ChatClient::send_message`], automatically splitting into
+/// line-aligned chunks only if `text` exceeds [`MAX_DM_CHARS`].
+pub(crate) async fn send_dm_chunked(
+    client: &skybase::chat::ChatClient,
+    convo_id: &str,
+    text: &str,
+) -> Result<(), skybase::error::SkybaseError> {
+    if text.chars().count() <= MAX_DM_CHARS {
+        let _ = client.send_message(convo_id, text).await?;
+        return Ok(());
+    }
+    for chunk in split_dm_chunks(text, MAX_DM_CHARS) {
+        if !chunk.trim().is_empty() {
+            let _ = client.send_message(convo_id, &chunk).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Formats a human-readable account label, preferring the handle over the raw DID.
@@ -164,5 +285,38 @@ mod tests {
             "alice.bsky.social"
         );
         assert_eq!(command_target("did:plc:abc", None), "did:plc:abc");
+    }
+
+    #[test]
+    fn post_or_web_url_and_dm_chunking() {
+        assert_eq!(
+            bsky_post_or_web_url("at://did:plc:abc/app.bsky.feed.post/3la7xyz"),
+            Some("https://bsky.app/profile/did:plc:abc/post/3la7xyz".to_string())
+        );
+        assert_eq!(
+            bsky_post_or_web_url("https://bsky.app/profile/alice.bsky.social/post/abc"),
+            Some("https://bsky.app/profile/alice.bsky.social/post/abc".to_string())
+        );
+        assert_eq!(bsky_post_or_web_url("   "), None);
+        assert_eq!(
+            bsky_post_or_web_url("at://did:plc:abc/app.bsky.graph.list/x"),
+            None
+        );
+
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("abcdefghij", 5), "abcd…");
+        assert_eq!(truncate_chars("abc", 0), "");
+
+        let long_text = (1..=30)
+            .map(|i| format!("Line {i}: https://bsky.app/profile/did:plc:actor{i}/post/rkey{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunks = split_dm_chunks(&long_text, 200);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 200);
+            assert!(!chunk.ends_with("https://bsky.app/profile/did:"));
+        }
+        assert_eq!(chunks.join("\n"), long_text);
     }
 }

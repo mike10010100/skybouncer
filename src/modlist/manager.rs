@@ -69,10 +69,10 @@ impl Default for StripedAsyncLocks {
 /// Description of a single violation to bounce, grouping the offending account,
 /// classification, and post evidence into one request value.
 ///
-/// The optional [`post_text`](Self::post_text) and [`expires_at`](Self::expires_at)
-/// fields are populated when the interaction body is available or a bounce duration
-/// override applies; otherwise they default to an empty body and the rubric-derived
-/// expiry.
+/// The optional [`post_text`](Self::post_text), [`reply_to_uri`](Self::reply_to_uri), and
+/// [`expires_at`](Self::expires_at) fields are populated when interaction metadata is available
+/// or a bounce duration override applies; otherwise they default to an empty body, no parent
+/// reply URI, and the rubric-derived expiry.
 #[derive(Debug, Clone)]
 pub struct BounceRequest<'a> {
     /// DID of the protected user whose moderation list receives the entry.
@@ -89,8 +89,12 @@ pub struct BounceRequest<'a> {
     pub post_uri: &'a str,
     /// Plaintext body of the offending post, if available.
     pub post_text: &'a str,
-    /// Explicit expiry (microseconds since Unix epoch); falls back to the rubric duration.
+    /// Canonical AT-URI of the parent post being replied to, if the offending post is a reply.
+    pub reply_to_uri: Option<&'a str>,
+    /// Explicit expiry (microseconds since Unix epoch); falls back to the rubric duration unless
+    /// explicitly set via [`Self::with_expires_at`].
     pub expires_at: Option<u64>,
+    explicit_expiry: bool,
 }
 
 impl<'a> BounceRequest<'a> {
@@ -112,7 +116,9 @@ impl<'a> BounceRequest<'a> {
             reason,
             post_uri,
             post_text: "",
+            reply_to_uri: None,
             expires_at: None,
+            explicit_expiry: false,
         }
     }
 
@@ -123,12 +129,43 @@ impl<'a> BounceRequest<'a> {
         self
     }
 
-    /// Attaches an explicit bounce expiry (microseconds since Unix epoch).
+    /// Attaches the parent post AT-URI when the offending post is a reply.
+    #[must_use]
+    pub fn with_reply_to_uri(mut self, reply_to_uri: Option<&'a str>) -> Self {
+        self.reply_to_uri = reply_to_uri;
+        self
+    }
+
+    /// Attaches an explicit bounce expiry (microseconds since Unix epoch), or `None` for an
+    /// explicitly permanent bounce regardless of the manager's default rubric duration.
     #[must_use]
     pub fn with_expires_at(mut self, expires_at: Option<u64>) -> Self {
         self.expires_at = expires_at;
+        self.explicit_expiry = true;
         self
     }
+}
+
+/// Outcome of an explicit user-initiated `bounce` or `perm` action on a sovereign moderation list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManualBounceOutcome {
+    /// A new `app.bsky.graph.listitem` record was created on the PDS and persisted in SQLite.
+    Bounced {
+        /// Canonical AT-URI of the newly created listitem record on the PDS.
+        listitem_uri: String,
+        /// Duration applied to the bounce (`Permanent` or temporary cooldown/timeout).
+        duration: crate::classifier::BounceDuration,
+        /// `true` if prior bounce metadata (`category`, `reason`, `post_uri`, `reply_to_uri`)
+        /// was restored from `bounce_history` (e.g. re-bouncing after a pardon or expiration).
+        restored_from_history: bool,
+    },
+    /// An active temporary bounce already existed on the PDS and was upgraded in-place to permanent.
+    UpgradedToPermanent,
+    /// The subject was already recorded as bounced on this moderation list.
+    AlreadyBounced {
+        /// `true` if the existing bounce is permanent (`expires_at.is_none()`).
+        is_permanent: bool,
+    },
 }
 
 /// High-level orchestration manager for sovereign ATProto moderation lists.
@@ -526,7 +563,9 @@ impl ModListManager {
             reason,
             post_uri,
             post_text,
+            reply_to_uri,
             expires_at,
+            explicit_expiry,
         } = request;
 
         // 1. Check rubric threshold if rubric is configured
@@ -567,17 +606,174 @@ impl ModListManager {
             return Ok(None);
         }
 
-        // 5. Ensure parent moderation list exists (cache-first / synchronized)
+        let now_us = current_time_us();
+        let effective_expires_at = if explicit_expiry {
+            expires_at
+        } else {
+            expires_at.or_else(|| {
+                self.rubric
+                    .read()
+                    .as_ref()
+                    .and_then(|r| r.bounce_duration.expires_at_us(now_us))
+            })
+        };
+
+        let result_uri = self
+            .write_listitem_and_persist(
+                pds_client,
+                protected_did,
+                candidate_did,
+                &category.to_string(),
+                confidence,
+                reason,
+                post_uri,
+                post_text,
+                reply_to_uri.map(str::to_string),
+                now_us,
+                effective_expires_at,
+            )
+            .await?;
+
+        Ok(Some(result_uri))
+    }
+
+    /// Manually bounces (or permanently blocks) an account on the sovereign PDS, restoring any
+    /// archived bounce metadata (`category`, `confidence`, `reason`, `post_uri`, `post_text`,
+    /// `reply_to_uri`) if the account was previously pardoned or expired.
+    ///
+    /// Synchronizes on the composite `(protected_did, subject_did)` shard lock so concurrent
+    /// live bounces, pardons, and manual DM commands cannot race.
+    ///
+    /// - When `upgrade_if_temp` is `true` (used by `perm <target>`) and an active temporary bounce
+    ///   already exists in SQLite, upgrades it in-place to permanent (`expires_at = NULL`) without
+    ///   issuing a redundant PDS write.
+    /// - When the subject is not currently bounced (e.g. after `pardon` or TTL expiration),
+    ///   provisions the parent moderation list if needed, creates a fresh `app.bsky.graph.listitem`
+    ///   record on the PDS, and persists the bounce with `duration`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Repo`] if PDS mutation fails, or [`SkybouncerError::Database`]
+    /// if SQLite cache access fails.
+    #[instrument(
+        skip(self, pds_client),
+        fields(
+            protected_did = %protected_did,
+            subject_did = %subject_did,
+            duration = %duration.display_label(),
+            upgrade_if_temp = %upgrade_if_temp
+        )
+    )]
+    pub async fn manual_bounce_or_perm(
+        &self,
+        pds_client: &PdsRepoClient,
+        protected_did: &str,
+        subject_did: &str,
+        duration: crate::classifier::BounceDuration,
+        upgrade_if_temp: bool,
+    ) -> Result<ManualBounceOutcome, SkybouncerError> {
+        let lock_key = format!("{protected_did}:{subject_did}");
+        let shard = self.bounce_locks.shard_for(&lock_key);
+        let _guard = shard.lock().await;
+
+        if let Some(existing) = self
+            .cache
+            .get_bounced_user_for(protected_did, subject_did)?
+        {
+            if upgrade_if_temp && existing.expires_at.is_some() {
+                let _ = self
+                    .cache
+                    .make_bounce_permanent_for(protected_did, subject_did)?;
+                info!(
+                    subject_did = %subject_did,
+                    protected_did = %protected_did,
+                    "Upgraded existing temporary bounce to permanent via manual command"
+                );
+                return Ok(ManualBounceOutcome::UpgradedToPermanent);
+            }
+            return Ok(ManualBounceOutcome::AlreadyBounced {
+                is_permanent: existing.expires_at.is_none(),
+            });
+        }
+
+        let archived = self
+            .cache
+            .get_bounce_history_for(protected_did, subject_did)?;
+        let restored_from_history = archived.is_some();
+
+        let (category, confidence, reason, post_uri, post_text, reply_to_uri) = match archived {
+            Some(h) => (
+                h.category,
+                h.confidence,
+                h.reason,
+                h.post_uri,
+                h.post_text,
+                h.reply_to_uri,
+            ),
+            None => {
+                let default_reason = if duration == crate::classifier::BounceDuration::Permanent {
+                    "Manually blocked permanently via DM".to_string()
+                } else {
+                    "Manually bounced via DM".to_string()
+                };
+                (
+                    ViolationCategory::Custom("manual_dm_block".to_string()).to_string(),
+                    1.0,
+                    default_reason,
+                    String::new(),
+                    String::new(),
+                    None,
+                )
+            }
+        };
+
+        let now_us = current_time_us();
+        let effective_expires_at = duration.expires_at_us(now_us);
+        let listitem_uri = self
+            .write_listitem_and_persist(
+                pds_client,
+                protected_did,
+                subject_did,
+                &category,
+                confidence,
+                &reason,
+                &post_uri,
+                &post_text,
+                reply_to_uri,
+                now_us,
+                effective_expires_at,
+            )
+            .await?;
+
+        Ok(ManualBounceOutcome::Bounced {
+            listitem_uri,
+            duration,
+            restored_from_history,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_listitem_and_persist(
+        &self,
+        pds_client: &PdsRepoClient,
+        protected_did: &str,
+        candidate_did: &str,
+        category: &str,
+        confidence: f64,
+        reason: &str,
+        post_uri: &str,
+        post_text: &str,
+        reply_to_uri: Option<String>,
+        now_us: u64,
+        effective_expires_at: Option<u64>,
+    ) -> Result<String, SkybouncerError> {
         let list_uri = self.ensure_mod_list(pds_client, protected_did).await?;
 
-        // 6. Construct listitem record
         let rkey = if self.dry_run {
             format!("shadow_{}", skybase::repo::generate_tid())
         } else {
             skybase::repo::generate_tid()
         };
         let now_iso = now_iso8601();
-        let now_us = current_time_us();
 
         let (result_uri, result_cid) = if self.dry_run {
             let simulated_uri = format!("at://{protected_did}/app.bsky.graph.listitem/{rkey}");
@@ -597,7 +793,6 @@ impl ModListManager {
         } else {
             let listitem = ListItemRecord::new(candidate_did, list_uri, now_iso);
 
-            // 7. Issue DPoP-signed mutation on sovereign PDS
             let result = pds_client
                 .create_record("app.bsky.graph.listitem", Some(&rkey), &listitem, true)
                 .await
@@ -616,13 +811,6 @@ impl ModListManager {
             (result.uri, result.cid)
         };
 
-        // 8. Persist to SQLite cache with compensating deletion on failure
-        let effective_expires_at = expires_at.or_else(|| {
-            self.rubric
-                .read()
-                .as_ref()
-                .and_then(|r| r.bounce_duration.expires_at_us(now_us))
-        });
         let bounce_record = BouncedUser {
             subject_did: candidate_did.to_string(),
             protected_did: protected_did.to_string(),
@@ -634,6 +822,7 @@ impl ModListManager {
             reason: reason.to_string(),
             post_uri: post_uri.to_string(),
             post_text: post_text.to_string(),
+            reply_to_uri,
             bounced_at: now_us,
             expires_at: effective_expires_at,
         };
@@ -660,7 +849,7 @@ impl ModListManager {
             return Err(cache_err);
         }
 
-        Ok(Some(result_uri))
+        Ok(result_uri)
     }
 
     /// Pardons an account by deleting its `app.bsky.graph.listitem` records from the sovereign PDS

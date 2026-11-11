@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.26] - 2026-11-11
+
+### Added
+
+- **Parent `"Replying to:"` Deep Links in Bounce Alerts & `recent` DMs (`src/engine/mod.rs`, `src/engine/processing.rs`, `src/bot/dispatcher.rs`, `src/bot/handler.rs`, `src/bot/render.rs`, `src/modlist/cache/`)**:
+  - Added `BounceNotification::reply_to_uri` and persisted `BouncedUser::reply_to_uri` (`bounced_users.reply_to_uri`) populated from `Interaction::parent_uri` whenever a bounced post is a reply.
+  - Updated `format_bounce_alert` and `BotCommandHandler` (`recent`) to emit a hotlinkable `Replying to: https://bsky.app/profile/.../post/...` line alongside `Profile:` and `Post:` (omitted cleanly for non-reply mentions and standalone quotes), plus line-aligned DM chunking (`MAX_DM_CHARS`) so outbound ATProto Chat messages stay within `chat.bsky.convo.defs#messageInput` grapheme limits.
+- **Post-Pardon `bounce` & `perm` DM Commands with Bounce History Restoration (`src/bot/handler.rs`, `src/engine/modlist_ops.rs`, `src/modlist/manager.rs`, `src/modlist/cache/`)**:
+  - Added `bounce <did|@handle>` (aliases `rebounce`, `re-bounce`, `block`) and upgraded `perm <did|@handle>` so protected users can re-bounce or permanently block an account via DM after `pardon`, `pardon and allow`, or temporary TTL expiration (automatically revoking any prior allowlist immunity and guarding against self/bot targets).
+  - Added the `bounce_history` SQLite table (`ArchivedBounce`, `DeduplicationCache::get_bounce_history_for`) to preserve violation category, confidence, rationale, offending post URI/text, and parent `reply_to_uri` across pardons and expirations when an account is re-bounced or permanently blocked.
+
+### Fixed
+
+- **Enriched Handle Persistence & Interleaved DM Alert Polling (`src/engine/processing.rs`, `src/bot/poller.rs`)**:
+  - Persisted author handles resolved during live `ContextEnricher` evaluations and bounce notifications into SQLite `did_handles` so subsequent `recent` DMs, dashboard `/api/bounces` feeds, and `@handle` commands render `@handle` without redundant remote lookups.
+  - Fixed `run_bot_poller` so unread user DM commands are never skipped or prematurely marked read when a proactive bounce alert from `run_bounce_alert_dispatcher` interleaves as `convo.last_message` within the same polling interval.
+
 ## [0.2.25] - 2026-11-11
 
 ### Added

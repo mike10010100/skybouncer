@@ -171,6 +171,7 @@ async fn run_cli_simulate_via_daemon() {
 
 #[tokio::test]
 async fn run_cli_simulate_offline_uses_local_engine() {
+    let _guard = ENV_LOCK.lock().await;
     // No network; forces the offline dry-run engine path.
     let a = args(&["definitely benign text here", "--offline"]);
     // The offline path builds an engine from env; JEV isn't configured so it may
@@ -187,6 +188,7 @@ async fn run_cli_simulate_missing_text_errors() {
 
 #[tokio::test]
 async fn run_cli_simulate_falls_back_to_offline_when_daemon_unreachable() {
+    let _guard = ENV_LOCK.lock().await;
     // Daemon URL points nowhere valid; simulate should fall through to offline.
     let a = args(&["some sample text", "--url", "http://127.0.0.1:1"]);
     let _ = run_cli_simulate(&a).await;
@@ -260,6 +262,7 @@ async fn dispatch_daemon_bare_flag_form_cancels() {
     use skybouncer::app::dispatch;
     use tokio_util::sync::CancellationToken;
 
+    let _guard = ENV_LOCK.lock().await;
     // Bare `--dry-run` (no `daemon` keyword) routes to the daemon; cancel immediately.
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -269,6 +272,7 @@ async fn dispatch_daemon_bare_flag_form_cancels() {
 
 #[tokio::test]
 async fn run_cli_simulate_offline_with_jev_config_uses_local_engine() {
+    let _guard = ENV_LOCK.lock().await;
     // Point the Jev classifier at a mock so the offline dry-run engine builds,
     // and the daemon URL at an unreachable port to force the offline path.
     let server = MockServer::start().await;
@@ -311,6 +315,7 @@ async fn run_cli_simulate_offline_with_jev_config_uses_local_engine() {
 
 #[tokio::test]
 async fn run_cli_pardon_handle_resolution_via_override() {
+    let _guard = ENV_LOCK.lock().await;
     let server = MockServer::start().await;
     // Resolution endpoint (SKYBOUNCER_RESOLVE_HANDLE_URL).
     Mock::given(method("GET"))
@@ -345,6 +350,7 @@ async fn run_cli_pardon_handle_resolution_via_override() {
 
 #[tokio::test]
 async fn run_cli_pardon_handle_resolution_error_paths() {
+    let _guard = ENV_LOCK.lock().await;
     let server = MockServer::start().await;
     // 404 resolution -> Config error.
     Mock::given(method("GET"))
@@ -402,7 +408,7 @@ async fn run_cli_status_with_populated_stats_and_shadow_mode() {
     run_cli_status(&a).await.expect("status with stats");
 }
 
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn set_resolve_url(url: &str) {
     std::env::set_var("SKYBOUNCER_RESOLVE_HANDLE_URL", url);
@@ -410,7 +416,7 @@ fn set_resolve_url(url: &str) {
 
 #[tokio::test]
 async fn run_cli_pardon_resolves_handle_via_override() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().await;
     let resolver = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/xrpc/com.atproto.identity.resolveHandle"))
@@ -441,7 +447,7 @@ async fn run_cli_pardon_resolves_handle_via_override() {
 
 #[tokio::test]
 async fn run_cli_pardon_handle_resolution_http_error() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().await;
     let resolver = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/xrpc/com.atproto.identity.resolveHandle"))
@@ -460,7 +466,7 @@ async fn run_cli_pardon_handle_resolution_http_error() {
 
 #[tokio::test]
 async fn run_cli_pardon_handle_resolution_missing_did_field() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().await;
     let resolver = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/xrpc/com.atproto.identity.resolveHandle"))
@@ -481,6 +487,7 @@ async fn run_cli_pardon_handle_resolution_missing_did_field() {
 async fn dispatch_daemon_with_subcommand_args_reaches_daemon() {
     use skybouncer::app::dispatch;
     use tokio_util::sync::CancellationToken;
+    let _guard = ENV_LOCK.lock().await;
     // `daemon <extra>` exercises the args.len() > 2 branch; cancel immediately.
     let a = args(&["skybouncer", "daemon", "--dry-run"]);
     let cancel = CancellationToken::new();

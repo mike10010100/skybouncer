@@ -57,9 +57,9 @@ pub use tenant::{
 
 #[cfg(feature = "bot")]
 pub use bot::{
-    account_label, account_label_with_url, bsky_post_url, bsky_post_url_from_at_uri,
-    bsky_profile_url, command_target, extract_link_facets, format_bounce_alert,
-    format_reauth_alert, format_reauth_alert_with_count, run_bot_poller,
+    account_label, account_label_with_url, bsky_post_or_web_url, bsky_post_url,
+    bsky_post_url_from_at_uri, bsky_profile_url, command_target, extract_link_facets,
+    format_bounce_alert, format_reauth_alert, format_reauth_alert_with_count, run_bot_poller,
     run_bounce_alert_dispatcher, run_reauth_alert_dispatcher, AcceptConvoRequest,
     AcceptConvoResponse, BotCommandHandler, ChatClient, ConvoMember, ConvoView, FacetIndex,
     GetMessagesResponse, ListConvoRequestsResponse, ListConvosResponse, MessageSender, MessageView,
@@ -109,10 +109,10 @@ pub use matcher::{
 };
 pub use modlist::{
     extract_rubric_from_list_description, fetch_sovereign_config,
-    format_list_description_with_rubric, publish_sovereign_config, AllowlistEntry, BounceRequest,
-    BouncedUser, DeduplicationCache, ModListConfig, ModListManager, SovereignConfigRecord,
-    DEFAULT_MOD_LIST_DESCRIPTION, DEFAULT_MOD_LIST_NAME, SOVEREIGN_CONFIG_COLLECTION,
-    SOVEREIGN_CONFIG_RKEY,
+    format_list_description_with_rubric, publish_sovereign_config, AllowlistEntry, ArchivedBounce,
+    BounceRequest, BouncedUser, DeduplicationCache, ManualBounceOutcome, ModListConfig,
+    ModListManager, SovereignConfigRecord, DEFAULT_MOD_LIST_DESCRIPTION, DEFAULT_MOD_LIST_NAME,
+    SOVEREIGN_CONFIG_COLLECTION, SOVEREIGN_CONFIG_RKEY,
 };
 pub use types::{
     format_system_time_iso8601, now_iso8601, ByteSlice, Embed, Facet, FacetFeature, FollowRecord,

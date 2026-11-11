@@ -611,6 +611,15 @@ impl SkybouncerEngine {
 
         // Context Enricher: Fetch author profile & parent post context (PRD §3 & §4.2)
         let enriched = self.enricher.enrich(&interaction).await;
+        if let Some(handle) = enriched
+            .author
+            .as_ref()
+            .and_then(|a| a.handle.as_deref())
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+        {
+            let _ = self.cache.set_handle_for_did(&author_did, handle);
+        }
         let interaction = if !enriched.is_empty() {
             self.stats
                 .context_enrichments
@@ -808,6 +817,7 @@ impl SkybouncerEngine {
                             &post_uri,
                         )
                         .with_post_text(&post_text)
+                        .with_reply_to_uri(interaction.parent_uri.as_deref())
                         .with_expires_at(expires_at),
                     )
                     .await
@@ -829,14 +839,31 @@ impl SkybouncerEngine {
                             "Bounced violator on sovereign PDS"
                         );
 
-                        // Prefer the enriched author handle; fall back to any cached mapping
-                        // so proactive alerts can render `@handle` instead of a raw DID.
-                        let violator_handle = interaction
+                        // Prefer the enriched author handle (persisting to SQLite did_handles so
+                        // subsequent `recent` / dashboard / pardon lookups resolve `@handle` locally);
+                        // fall back to cached mappings or one-shot DID resolution.
+                        let violator_handle = match interaction
                             .enriched_context
                             .as_ref()
                             .and_then(|c| c.author.as_ref())
                             .and_then(|a| a.handle.clone())
-                            .or_else(|| self.cached_handle_for_did(&author_did));
+                            .filter(|h| !h.trim().is_empty())
+                        {
+                            Some(h) => {
+                                let _ = self.cache.set_handle_for_did(&author_did, &h);
+                                Some(h)
+                            }
+                            None => match self.cached_handle_for_did(&author_did) {
+                                Some(h) => Some(h),
+                                None => {
+                                    let resolved = self.enricher.resolve_did(&author_did).await;
+                                    if let Some(ref h) = resolved {
+                                        let _ = self.cache.set_handle_for_did(&author_did, h);
+                                    }
+                                    resolved
+                                }
+                            },
+                        };
 
                         // Emit proactive bounce notification for alert dispatchers
                         let _ = self.bounce_notifier.send(BounceNotification {
@@ -847,6 +874,7 @@ impl SkybouncerEngine {
                             confidence,
                             reason: reason.clone(),
                             post_uri: post_uri.clone(),
+                            reply_to_uri: interaction.parent_uri.clone(),
                             post_snippet: interaction.text.chars().take(200).collect(),
                             bounce_duration: rubric.bounce_duration,
                         });
