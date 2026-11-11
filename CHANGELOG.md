@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.28] - 2026-11-11
+
+### Fixed
+
+- **Release Auto-Publish DAG Condition (`.github/workflows/ci.yml`)**:
+  - Added `always() && needs.quality-gate.result == 'success'` to the `publish` job's `if:` expression so GitHub Actions does not transitively skip release publishing when the PR-only `mutants-smoke` job is skipped on `main` pushes.
+
 ## [0.2.27] - 2026-11-11
 
 ### Changed
