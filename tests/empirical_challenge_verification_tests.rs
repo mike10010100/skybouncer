@@ -493,6 +493,7 @@ async fn test_fast_path_dedup_and_eval_cache_short_circuits() {
             reason: "seed".to_string(),
             post_uri: "at://seed".to_string(),
             post_text: "seed".to_string(),
+            reply_to_uri: None,
             bounced_at: 1_700_000_000_000_000,
             expires_at: None,
         })

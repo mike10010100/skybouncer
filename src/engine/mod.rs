@@ -41,7 +41,8 @@ use crate::matcher::{
     TargetMatcher,
 };
 use crate::modlist::{
-    BounceRequest, BouncedUser, DeduplicationCache, ModListManager, DEFAULT_MOD_LIST_NAME,
+    BounceRequest, BouncedUser, DeduplicationCache, ManualBounceOutcome, ModListManager,
+    DEFAULT_MOD_LIST_NAME,
 };
 use crate::tenant::{Tenant, TenantRegistry};
 use crate::time::current_time_us;
@@ -852,6 +853,9 @@ pub struct BounceNotification {
     pub reason: String,
     /// Canonical AT-URI of the offending post.
     pub post_uri: String,
+    /// Canonical AT-URI of the parent post that the offending post was replying to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_uri: Option<String>,
     /// Text snippet of the offending post.
     pub post_snippet: String,
     /// Configured bounce duration applied to this bounce (e.g. permanent vs temporary timeout).

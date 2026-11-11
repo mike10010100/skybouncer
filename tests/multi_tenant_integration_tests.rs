@@ -308,6 +308,7 @@ async fn test_temporary_ttl_timeout_pruning_in_engine() {
         reason: "24h cooldown".to_string(),
         post_uri: "at://did:plc:timed_out_spammer/app.bsky.feed.post/1".to_string(),
         post_text: "Crypto spam".to_string(),
+        reply_to_uri: None,
         bounced_at: now_us - 100_000_000,
         expires_at: Some(now_us - 10_000_000), // Expired
     };

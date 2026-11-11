@@ -95,6 +95,20 @@ impl DeduplicationCache {
                 protected_did TEXT NOT NULL DEFAULT '',
                 post_text TEXT NOT NULL DEFAULT '',
                 expires_at INTEGER,
+                reply_to_uri TEXT,
+                PRIMARY KEY (protected_did, subject_did)
+            );
+
+            CREATE TABLE IF NOT EXISTS bounce_history (
+                protected_did TEXT NOT NULL DEFAULT '',
+                subject_did TEXT NOT NULL,
+                category TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                reason TEXT NOT NULL,
+                post_uri TEXT NOT NULL,
+                post_text TEXT NOT NULL DEFAULT '',
+                reply_to_uri TEXT,
+                archived_at INTEGER NOT NULL,
                 PRIMARY KEY (protected_did, subject_did)
             );
 
@@ -195,6 +209,10 @@ impl DeduplicationCache {
             "ALTER TABLE bounced_users ADD COLUMN expires_at INTEGER;",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE bounced_users ADD COLUMN reply_to_uri TEXT;",
+            [],
+        );
 
         // 3. Migrate legacy bounced_users table from single-column PK (subject_did) to composite PK (protected_did, subject_did)
         let needs_pk_migration: bool = {
@@ -231,12 +249,14 @@ impl DeduplicationCache {
                     protected_did TEXT NOT NULL DEFAULT '',
                     post_text TEXT NOT NULL DEFAULT '',
                     expires_at INTEGER,
+                    reply_to_uri TEXT,
                     PRIMARY KEY (protected_did, subject_did)
                 );
                 INSERT OR IGNORE INTO bounced_users_v2
                     SELECT subject_did, listitem_uri, listitem_rkey, listitem_cid,
                            category, confidence, reason, post_uri, bounced_at,
-                           COALESCE(protected_did, ''), COALESCE(post_text, ''), expires_at
+                           COALESCE(protected_did, ''), COALESCE(post_text, ''), expires_at,
+                           reply_to_uri
                     FROM bounced_users;
                 DROP TABLE bounced_users;
                 ALTER TABLE bounced_users_v2 RENAME TO bounced_users;
@@ -307,6 +327,17 @@ impl DeduplicationCache {
 
             INSERT OR IGNORE INTO bounced_user_rkeys (protected_did, subject_did, listitem_rkey, listitem_uri, listitem_cid, created_at)
                 SELECT protected_did, subject_did, listitem_rkey, listitem_uri, listitem_cid, bounced_at FROM bounced_users;
+
+            CREATE INDEX IF NOT EXISTS idx_bounce_history_subject
+                ON bounce_history(subject_did);
+
+            INSERT OR IGNORE INTO bounce_history (
+                protected_did, subject_did, category, confidence, reason,
+                post_uri, post_text, reply_to_uri, archived_at
+            )
+            SELECT protected_did, subject_did, category, confidence, reason,
+                   post_uri, post_text, reply_to_uri, bounced_at
+            FROM bounced_users;
 
             CREATE TABLE IF NOT EXISTS evaluation_cache (
                 cache_key TEXT PRIMARY KEY,

@@ -1085,6 +1085,7 @@ async fn test_command_handler_recent_and_pardon() {
             reason: "Detected crypto scam keyword".to_string(),
             post_uri: "at://did:plc:spammer1/app.bsky.feed.post/post1".to_string(),
             post_text: "Scam post".to_string(),
+            reply_to_uri: None,
             bounced_at: 1_700_000_000,
             expires_at: None,
         })
@@ -1641,6 +1642,7 @@ async fn test_command_handler_pardon_with_handle_resolution() {
             reason: "spam".to_string(),
             post_uri: "at://did:plc:alice123/post/1".to_string(),
             post_text: "Spam content".to_string(),
+            reply_to_uri: None,
             bounced_at: 1_700_000_000,
             expires_at: None,
         })
@@ -1865,6 +1867,7 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
             reason: "airdrop spam".to_string(),
             post_uri: "at://did:plc:violator_to_immunize/app.bsky.feed.post/123".to_string(),
             post_text: "spam".to_string(),
+            reply_to_uri: None,
             bounced_at: 1_700_000_000,
             expires_at: None,
         })
@@ -2613,8 +2616,15 @@ async fn test_dm_upgrade_temp_bounce_to_permanent_and_proactive_alert_reminder()
 
     let notif = bounce_rx.recv().await.expect("bounce notification");
     assert_eq!(notif.bounce_duration, BounceDuration::Cooldown24h);
+    assert_eq!(
+        notif.reply_to_uri.as_deref(),
+        Some("at://did:plc:protected1/app.bsky.feed.post/root_1")
+    );
     let alert_dm = skybouncer::bot::format_bounce_alert(&notif);
     assert!(alert_dm.contains("Duration: 24-Hour Cooldown"));
+    assert!(
+        alert_dm.contains("Replying to: https://bsky.app/profile/did:plc:protected1/post/root_1")
+    );
     assert!(alert_dm.contains("To undo, reply with:\npardon tempviolator.bsky.social"));
     assert!(alert_dm.contains(
         "Or to undo and permanently allowlist:\npardon and allow tempviolator.bsky.social"
@@ -2645,12 +2655,20 @@ async fn test_dm_upgrade_temp_bounce_to_permanent_and_proactive_alert_reminder()
         assert!(usage.contains("Usage: `perm <did|@handle>`"), "bare={bare}");
     }
 
-    // Upgrade non-existent user -> not found
-    let not_found = handler
+    // Perm on an account not yet bounced creates a permanent block on the moderation list
+    let direct_perm = handler
         .handle_command("did:plc:protected1", "perm did:plc:nonexistent")
         .await
         .unwrap();
-    assert!(not_found.contains("was not found in your bounced list"));
+    assert!(
+        direct_perm.contains("**permanently** blocked on your moderation list"),
+        "direct_perm={direct_perm}"
+    );
+    let direct_record = cache
+        .get_bounced_user_for("did:plc:protected1", "did:plc:nonexistent")
+        .unwrap()
+        .unwrap();
+    assert!(direct_record.expires_at.is_none());
 
     // Upgrade via handle (`perm @tempviolator.bsky.social` - cached in SQLite did_handles)
     let upgraded = handler
@@ -2688,4 +2706,558 @@ async fn test_dm_upgrade_temp_bounce_to_permanent_and_proactive_alert_reminder()
         .await
         .unwrap();
     assert!(bad_handle.contains("Could not resolve handle"));
+}
+
+#[tokio::test]
+async fn test_proactive_alert_and_recent_include_replying_to_link_only_for_replies() {
+    let (engine, cache, _pds) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
+    let mut bounce_rx = engine.subscribe_bounces();
+
+    cache
+        .set_handle_for_did("did:plc:replyspammer", "replyspammer.bsky.social")
+        .unwrap();
+    cache
+        .set_handle_for_did("did:plc:mentionspammer", "mentionspammer.bsky.social")
+        .unwrap();
+
+    // 1. Reply bounce -> includes Profile, Post, and Replying to links with exact RichText facets
+    let reply_commit = make_reply_commit(
+        "did:plc:replyspammer",
+        "did:plc:protected1",
+        "rep_post_42",
+        "parent_post_777",
+        "Check out this free crypto scam airdrop!",
+    );
+    let reply_outcomes = engine
+        .process_commit(&reply_commit)
+        .await
+        .expect("process reply")
+        .into_outcomes();
+    assert!(reply_outcomes[0].is_bounced());
+
+    let reply_notif = bounce_rx.recv().await.expect("reply bounce notif");
+    assert_eq!(
+        reply_notif.reply_to_uri.as_deref(),
+        Some("at://did:plc:protected1/app.bsky.feed.post/parent_post_777")
+    );
+    let reply_alert = skybouncer::bot::format_bounce_alert(&reply_notif);
+    assert!(reply_alert.contains("Profile: https://bsky.app/profile/replyspammer.bsky.social"));
+    assert!(reply_alert
+        .contains("Post: https://bsky.app/profile/did:plc:replyspammer/post/rep_post_42"));
+    assert!(reply_alert
+        .contains("Replying to: https://bsky.app/profile/did:plc:protected1/post/parent_post_777"));
+
+    let facets = skybouncer::bot::extract_link_facets(&reply_alert);
+    assert_eq!(facets.len(), 3);
+    let slices: Vec<&str> = facets
+        .iter()
+        .map(|f| &reply_alert[f.index.byte_start..f.index.byte_end])
+        .collect();
+    assert_eq!(
+        slices,
+        vec![
+            "https://bsky.app/profile/replyspammer.bsky.social",
+            "https://bsky.app/profile/did:plc:replyspammer/post/rep_post_42",
+            "https://bsky.app/profile/did:plc:protected1/post/parent_post_777",
+        ]
+    );
+
+    // 2. Standalone mention bounce (not a reply) -> omits Replying to
+    let mention_commit = make_mention_commit(
+        "did:plc:mentionspammer",
+        "did:plc:protected1",
+        "mention_post_99",
+        "@protected1 Check out this free crypto scam airdrop!",
+    );
+    let mention_outcomes = engine
+        .process_commit(&mention_commit)
+        .await
+        .expect("process mention")
+        .into_outcomes();
+    assert!(mention_outcomes[0].is_bounced());
+
+    let mention_notif = bounce_rx.recv().await.expect("mention bounce notif");
+    assert!(mention_notif.reply_to_uri.is_none());
+    let mention_alert = skybouncer::bot::format_bounce_alert(&mention_notif);
+    assert!(mention_alert.contains("Profile: https://bsky.app/profile/mentionspammer.bsky.social"));
+    assert!(mention_alert
+        .contains("Post: https://bsky.app/profile/did:plc:mentionspammer/post/mention_post_99"));
+    assert!(!mention_alert.contains("Replying to:"));
+
+    // 3. `recent` DM command includes Replying to for the reply bounce and omits it for the mention bounce
+    let recent_dm = handler
+        .handle_command("did:plc:protected1", "recent")
+        .await
+        .expect("recent");
+    assert!(
+        recent_dm.contains("Post: https://bsky.app/profile/did:plc:replyspammer/post/rep_post_42\n   Replying to: https://bsky.app/profile/did:plc:protected1/post/parent_post_777"),
+        "recent_dm={recent_dm}"
+    );
+    assert!(
+        recent_dm.contains(
+            "Post: https://bsky.app/profile/did:plc:mentionspammer/post/mention_post_99\n   Reason:"
+        ),
+        "recent_dm={recent_dm}"
+    );
+}
+
+#[tokio::test]
+async fn test_dm_pardon_then_bounce_or_perm_again_lifecycle_and_guards() {
+    use skybouncer::classifier::BounceDuration;
+
+    let (engine, cache, pds) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
+
+    // 0. Stranger is denied on bounce / rebounce / perm
+    for cmd in [
+        "bounce",
+        "bounce did:plc:troll",
+        "rebounce did:plc:troll",
+        "re-bounce did:plc:troll",
+        "block did:plc:troll",
+        "perm did:plc:troll",
+    ] {
+        let unauth = handler
+            .handle_command("did:plc:stranger", cmd)
+            .await
+            .unwrap();
+        assert!(
+            unauth.contains("You do not have an active bouncer session"),
+            "cmd={cmd}, unauth={unauth}"
+        );
+    }
+
+    // Bare usage prompts for bounce aliases
+    for bare in ["bounce", "rebounce", "re-bounce", "block"] {
+        let usage = handler
+            .handle_command("did:plc:protected1", bare)
+            .await
+            .unwrap();
+        assert!(
+            usage.contains("Usage: `bounce <did|@handle>`"),
+            "bare={bare}"
+        );
+    }
+
+    // Self-bounce and bot-bounce guards
+    for self_cmd in ["bounce did:plc:protected1", "perm did:plc:protected1"] {
+        let msg = handler
+            .handle_command("did:plc:protected1", self_cmd)
+            .await
+            .unwrap();
+        assert!(msg.contains("cannot bounce or block your own account"));
+    }
+    for bot_cmd in ["bounce did:plc:bot", "perm did:plc:bot"] {
+        let msg = handler
+            .handle_command("did:plc:protected1", bot_cmd)
+            .await
+            .unwrap();
+        assert!(msg.contains("cannot bounce the Skybouncer bot account"));
+    }
+    assert_eq!(pds.created_records.lock().len(), 0);
+
+    // Configure 24h cooldown duration
+    handler
+        .handle_command("did:plc:protected1", "duration 24h")
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.rubric_for("did:plc:protected1").bounce_duration,
+        BounceDuration::Cooldown24h
+    );
+
+    cache
+        .set_handle_for_did("did:plc:troll", "troll.bsky.social")
+        .unwrap();
+
+    // 1. Initial live reply bounce
+    let commit = make_reply_commit(
+        "did:plc:troll",
+        "did:plc:protected1",
+        "troll_reply_1",
+        "protected_root_9",
+        "Check out this free crypto scam airdrop!",
+    );
+    let outcomes = engine
+        .process_commit(&commit)
+        .await
+        .unwrap()
+        .into_outcomes();
+    assert!(outcomes[0].is_bounced());
+    let initial_listitem_count = pds
+        .created_records
+        .lock()
+        .iter()
+        .filter(|r| r["collection"] == "app.bsky.graph.listitem")
+        .count();
+    assert_eq!(initial_listitem_count, 1);
+
+    // 2. Pardon via DM -> deletes listitem from PDS, suggests bounce/perm if user changes mind
+    let pardon_reply = handler
+        .handle_command("did:plc:protected1", "pardon @troll.bsky.social")
+        .await
+        .unwrap();
+    assert!(pardon_reply.contains("has been pardoned and removed from your moderation list"));
+    assert!(pardon_reply.contains("bounce troll.bsky.social"));
+    assert!(pardon_reply.contains("perm troll.bsky.social"));
+    assert!(!cache
+        .is_bounced_for("did:plc:protected1", "did:plc:troll")
+        .unwrap());
+    assert_eq!(pds.deleted_records.lock().len(), 1);
+
+    // 3. Re-bounce via DM (`bounce @troll.bsky.social`) -> creates new PDS listitem with 24h duration
+    //    AND restores original reason, post_uri, and reply_to_uri from bounce_history!
+    let rebounce_reply = handler
+        .handle_command("did:plc:protected1", "bounce @troll.bsky.social")
+        .await
+        .unwrap();
+    assert!(
+        rebounce_reply
+            .contains("re-added to your moderation list (Duration: **24-Hour Cooldown**)"),
+        "rebounce_reply={rebounce_reply}"
+    );
+    assert!(rebounce_reply.contains("perm troll.bsky.social"));
+
+    let rebounced = cache
+        .get_bounced_user_for("did:plc:protected1", "did:plc:troll")
+        .unwrap()
+        .expect("rebounced user in SQLite");
+    assert!(rebounced.expires_at.is_some());
+    assert_eq!(
+        rebounced.post_uri,
+        "at://did:plc:troll/app.bsky.feed.post/troll_reply_1"
+    );
+    assert_eq!(
+        rebounced.reply_to_uri.as_deref(),
+        Some("at://did:plc:protected1/app.bsky.feed.post/protected_root_9")
+    );
+
+    let listitem_count_after_rebounce = pds
+        .created_records
+        .lock()
+        .iter()
+        .filter(|r| r["collection"] == "app.bsky.graph.listitem")
+        .count();
+    assert_eq!(listitem_count_after_rebounce, 2);
+
+    // Sending `bounce` again while already bounced is idempotent (0 extra PDS writes)
+    let dup_bounce = handler
+        .handle_command("did:plc:protected1", "bounce @troll.bsky.social")
+        .await
+        .unwrap();
+    assert!(dup_bounce.contains("already on your moderation list (temporary block)"));
+    let listitem_count_after_dup = pds
+        .created_records
+        .lock()
+        .iter()
+        .filter(|r| r["collection"] == "app.bsky.graph.listitem")
+        .count();
+    assert_eq!(listitem_count_after_dup, 2);
+
+    // 4. Pardon again, then `perm @troll.bsky.social` while rubric duration is still 24h ->
+    //    creates a strictly PERMANENT block on PDS and restores bounce_history!
+    handler
+        .handle_command("did:plc:protected1", "pardon @troll.bsky.social")
+        .await
+        .unwrap();
+    assert!(!cache
+        .is_bounced_for("did:plc:protected1", "did:plc:troll")
+        .unwrap());
+    assert_eq!(pds.deleted_records.lock().len(), 2);
+
+    let perm_after_pardon = handler
+        .handle_command("did:plc:protected1", "perm @troll.bsky.social")
+        .await
+        .unwrap();
+    assert!(
+        perm_after_pardon.contains("re-added and **permanently** blocked on your moderation list"),
+        "perm_after_pardon={perm_after_pardon}"
+    );
+    let perm_record = cache
+        .get_bounced_user_for("did:plc:protected1", "did:plc:troll")
+        .unwrap()
+        .expect("perm record in SQLite");
+    assert!(perm_record.expires_at.is_none());
+    assert_eq!(
+        perm_record.reply_to_uri.as_deref(),
+        Some("at://did:plc:protected1/app.bsky.feed.post/protected_root_9")
+    );
+    assert_eq!(engine.prune_expired_bounces().await.unwrap(), 0);
+
+    // 5. `pardon and allow` -> immunizes on allowlist; subsequent `bounce` or `perm` revokes allowlist immunity!
+    let paa_reply = handler
+        .handle_command("did:plc:protected1", "pardon and allow @troll.bsky.social")
+        .await
+        .unwrap();
+    assert!(paa_reply.contains("has been pardoned and added to your allowlist"));
+    assert!(paa_reply.contains("bounce troll.bsky.social"));
+    assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:troll"));
+
+    let bounce_after_paa = handler
+        .handle_command("did:plc:protected1", "rebounce @troll.bsky.social")
+        .await
+        .unwrap();
+    assert!(bounce_after_paa.contains("re-added to your moderation list"));
+    assert!(bounce_after_paa.contains("Allowlist immunity was also removed."));
+    assert!(!engine.is_allowlisted("did:plc:protected1", "did:plc:troll"));
+    assert!(cache
+        .is_bounced_for("did:plc:protected1", "did:plc:troll")
+        .unwrap());
+
+    // And `pardon and allow` followed by `perm` also revokes allowlist immunity and permanently blocks
+    handler
+        .handle_command("did:plc:protected1", "pardon and allow @troll.bsky.social")
+        .await
+        .unwrap();
+    assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:troll"));
+
+    let perm_after_paa = handler
+        .handle_command("did:plc:protected1", "perm @troll.bsky.social")
+        .await
+        .unwrap();
+    assert!(perm_after_paa.contains("re-added and **permanently** blocked"));
+    assert!(perm_after_paa.contains("Allowlist immunity was also removed."));
+    assert!(!engine.is_allowlisted("did:plc:protected1", "did:plc:troll"));
+    assert!(cache
+        .get_bounced_user_for("did:plc:protected1", "did:plc:troll")
+        .unwrap()
+        .unwrap()
+        .expires_at
+        .is_none());
+}
+
+#[tokio::test]
+async fn test_regression_live_enriched_bounce_persists_handle_for_recent_dm() {
+    use skybouncer::enricher::{AuthorContext, MockContextEnricher};
+
+    let pds = MockPdsServer::start().await;
+    let cache = Arc::new(DeduplicationCache::open_in_memory().expect("in-memory cache"));
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block crypto spam", Sensitivity::Medium);
+    let modlist_manager =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let pds_client = Arc::new(pds.pds_client("did:plc:protected1"));
+    let classifier = Arc::new(skybouncer::classifier::MockClassifier::new(
+        Verdict::violation(
+            skybouncer::classifier::ViolationCategory::CryptoSpam,
+            0.96,
+            "Live spam reply",
+        ),
+    ));
+
+    let enricher = Arc::new(MockContextEnricher::new());
+    enricher.set_author(
+        "did:plc:live-replier",
+        AuthorContext {
+            handle: Some("live-replier.bsky.social".to_string()),
+            display_name: Some("Live Replier".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let config = SkybouncerConfig::new(["did:plc:protected1"], rubric);
+    let engine = Arc::new(
+        SkybouncerEngine::builder(config)
+            .with_follow_graph(follow_graph)
+            .with_gate(gate)
+            .with_classifier(classifier)
+            .with_modlist_manager(modlist_manager)
+            .with_pds_client(pds_client)
+            .with_enricher(enricher)
+            .build()
+            .expect("build test engine"),
+    );
+    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
+
+    // Do NOT manually seed `cache.set_handle_for_did`; live enrichment must persist it!
+    let commit = make_reply_commit(
+        "did:plc:live-replier",
+        "did:plc:protected1",
+        "live_reply_77",
+        "protected_parent_12",
+        "Claim free giveaway tokens",
+    );
+    let outcomes = engine
+        .process_commit(&commit)
+        .await
+        .unwrap()
+        .into_outcomes();
+    assert!(outcomes[0].is_bounced());
+
+    let recent_dm = handler
+        .handle_command("did:plc:protected1", "recent")
+        .await
+        .unwrap();
+    assert!(
+        recent_dm.contains(
+            "1. @live-replier.bsky.social (https://bsky.app/profile/live-replier.bsky.social)"
+        ),
+        "recent_dm must render enriched @handle instead of raw DID: {recent_dm}"
+    );
+    assert!(
+        recent_dm.contains(
+            "Replying to: https://bsky.app/profile/did:plc:protected1/post/protected_parent_12"
+        ),
+        "recent_dm={recent_dm}"
+    );
+}
+
+#[tokio::test]
+async fn test_regression_poller_executes_unread_dm_when_proactive_bot_alert_interleaves() {
+    let server = MockServer::start().await;
+    let (engine, cache, pds) = setup_test_engine("did:plc:protected1").await;
+    cache
+        .set_handle_for_did("did:plc:troll", "troll.bsky.social")
+        .unwrap();
+    let commit = make_reply_commit(
+        "did:plc:troll",
+        "did:plc:protected1",
+        "troll_r1",
+        "parent_r1",
+        "Check out this free crypto scam airdrop!",
+    );
+    assert!(engine
+        .process_commit(&commit)
+        .await
+        .unwrap()
+        .into_outcomes()[0]
+        .is_bounced());
+
+    let bot_did = "did:plc:skybouncer-bot";
+    let handler = BotCommandHandler::new(Arc::clone(&engine), bot_did);
+
+    let list_calls = Arc::new(AtomicUsize::new(0));
+    let lc = Arc::clone(&list_calls);
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvoRequests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "requests": [] })))
+        .mount(&server)
+        .await;
+
+    // `unreadCount` is 1 (for the user's `pardon` DM), while `lastMessage` is a proactive
+    // alert sent by `bot_did` milliseconds later!
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .respond_with(move |_: &wiremock::Request| {
+            if lc.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "convos": [{
+                        "id": "convo_interleaved",
+                        "rev": "rev_2",
+                        "unreadCount": 1,
+                        "members": [
+                            {"did": "did:plc:protected1"},
+                            {"did": "did:plc:skybouncer-bot"}
+                        ],
+                        "lastMessage": {
+                            "id": "msg_bot_alert_2",
+                            "rev": "rev_2",
+                            "text": "🛡️ Skybouncer Action Alert",
+                            "sender": {"did": "did:plc:skybouncer-bot"},
+                            "sentAt": "2026-11-11T12:00:02Z"
+                        }
+                    }],
+                    "cursor": null
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({"convos": [], "cursor": null}))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    // `getMessages` returns newest-first: [bot_alert_2, user_pardon_1, old_already_read_user_0].
+    // Only `user_pardon_1` should be executed (not `old_already_read_user_0`, since unreadCount == 1).
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.getMessages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "messages": [
+                {
+                    "id": "msg_bot_alert_2",
+                    "rev": "rev_2",
+                    "text": "🛡️ Skybouncer Action Alert",
+                    "sender": {"did": "did:plc:skybouncer-bot"},
+                    "sentAt": "2026-11-11T12:00:02Z"
+                },
+                {
+                    "id": "msg_user_pardon_1",
+                    "rev": "rev_1",
+                    "text": "pardon @troll.bsky.social",
+                    "sender": {"did": "did:plc:protected1"},
+                    "sentAt": "2026-11-11T12:00:01Z"
+                },
+                {
+                    "id": "msg_old_pause_0",
+                    "rev": "rev_0",
+                    "text": "pause",
+                    "sender": {"did": "did:plc:protected1"},
+                    "sentAt": "2026-11-11T11:55:00Z"
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let sent_replies: Arc<parking_lot::Mutex<Vec<String>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sr = Arc::clone(&sent_replies);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            sr.lock()
+                .push(body["message"]["text"].as_str().unwrap_or("").to_string());
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_reply_3",
+                "rev": "rev_3",
+                "text": "ok",
+                "sender": {"did": "did:plc:skybouncer-bot"},
+                "sentAt": "2026-11-11T12:00:03Z"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.updateRead"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "convo": {
+                "id": "convo_interleaved",
+                "rev": "rev_3",
+                "members": [],
+                "muted": false,
+                "unreadCount": 0
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "test_token").expect("client");
+    let cancel = CancellationToken::new();
+    let cancel_poller = cancel.clone();
+    let poller_task = tokio::spawn(async move {
+        run_bot_poller(client, handler, Duration::from_millis(20), cancel_poller).await
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    cancel.cancel();
+    poller_task.await.unwrap().unwrap();
+
+    let replies = sent_replies.lock().clone();
+    assert_eq!(
+        replies.len(),
+        1,
+        "expected exactly 1 reply (pardon executed, old pause skipped): {replies:?}"
+    );
+    assert!(replies[0].contains("has been pardoned and removed from your moderation list"));
+    assert!(!cache
+        .is_bounced_for("did:plc:protected1", "did:plc:troll")
+        .unwrap());
+    assert_eq!(pds.deleted_records.lock().len(), 1);
+    assert!(
+        !engine.is_paused(),
+        "already-read msg_old_pause_0 must NOT be re-executed"
+    );
 }

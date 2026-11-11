@@ -6,18 +6,22 @@
 //! - `set rules <prompt>`: Update active moderation rules.
 //! - `sensitivity <low|medium|high>`: Update sensitivity threshold.
 //! - `recent`: List recently bounced violators.
-//! - `pardon <did>`: Pardon and remove an account from the moderation list.
-//! - `perm <did>`: Upgrade a temporary bounce on the moderation list to permanent.
+//! - `pardon <did|@handle>`: Pardon and remove an account from the moderation list.
+//! - `bounce <did|@handle>`: Bounce or re-bounce an account onto the moderation list.
+//! - `perm <did|@handle>`: Permanently block an account or upgrade a temporary bounce to permanent.
 //! - `status`: View engine operational telemetry and bounce counts.
 //! - `test <text>`: Dry-run evaluation on sample text.
 
 use std::sync::Arc;
 
-use crate::bot::render::{account_label_with_url, bsky_post_url_from_at_uri, command_target};
-use crate::classifier::{Sensitivity, Verdict};
+use crate::bot::render::{
+    account_label_with_url, bsky_post_or_web_url, bsky_post_url_from_at_uri, command_target,
+};
+use crate::classifier::{BounceDuration, Sensitivity, Verdict};
 use crate::engine::SkybouncerEngine;
 use crate::error::SkybouncerError;
 use crate::matcher::Interaction;
+use crate::modlist::ManualBounceOutcome;
 
 /// Command parser and dispatcher for incoming direct messages.
 #[derive(Clone)]
@@ -259,6 +263,31 @@ impl BotCommandHandler {
             return self.cmd_pardon(sender_did, target.trim()).await;
         }
 
+        if trimmed.eq_ignore_ascii_case("bounce")
+            || trimmed.eq_ignore_ascii_case("rebounce")
+            || trimmed.eq_ignore_ascii_case("re-bounce")
+            || trimmed.eq_ignore_ascii_case("block")
+        {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return Ok(
+                "Usage: `bounce <did|@handle>` (bounce or re-bounce an account onto your moderation list)"
+                    .to_string(),
+            );
+        }
+
+        if let Some(target) = strip_prefix_ci(trimmed, "re-bounce ")
+            .or_else(|| strip_prefix_ci(trimmed, "rebounce "))
+            .or_else(|| strip_prefix_ci(trimmed, "bounce "))
+            .or_else(|| strip_prefix_ci(trimmed, "block "))
+        {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_bounce(sender_did, target.trim()).await;
+        }
+
         if trimmed.eq_ignore_ascii_case("perm")
             || trimmed.eq_ignore_ascii_case("permanent")
             || trimmed.eq_ignore_ascii_case("upgrade")
@@ -269,7 +298,8 @@ impl BotCommandHandler {
                 return Ok(self.unauthorized_response());
             }
             return Ok(
-                "Usage: `perm <did|@handle>` (upgrade a temporary block to permanent)".to_string(),
+                "Usage: `perm <did|@handle>` (permanently block an account or upgrade a temporary block to permanent)"
+                    .to_string(),
             );
         }
 
@@ -318,24 +348,25 @@ impl BotCommandHandler {
     fn cmd_help(&self) -> String {
         format!(
             "🛡️ Skybouncer Bot Commands:\n\n\
-             • `rules` — View your active moderation prompt & sensitivity\n\
-             • `set rules <prompt>` — Update your moderation prompt\n\
-             • `sensitivity <low|medium|high>` — Adjust detection sensitivity\n\
-             • `duration <permanent|24h|7d|30d>` — Set timeout/cooldown duration\n\
-             • `trust followers <on|off>` — Toggle zero-cost bypass for incoming followers\n\
-             • `pause` — Temporarily suspend automated moderation\n\
-             • `resume` — Reactivate automated moderation\n\
-             • `recent` — List the 5 most recently bounced accounts\n\
-             • `pardon <did|@handle>` — Remove an account from your moderation list\n\
-             • `pardon and allow <did|@handle>` — Pardon and permanently immunize\n\
-             • `perm <did|@handle>` — Upgrade a temporary block to permanent\n\
-             • `allow <did|@handle>` — Add trusted account to your allowlist\n\
-             • `unallow <did|@handle>` — Remove account from your allowlist\n\
-             • `allowlist` — View your allowlisted accounts\n\
-             • `status` — View engine telemetry & total bounces\n\
-             • `test <text>` — Dry-run evaluation on sample text\n\
-             • `start` / `auth` — 1-click link to activate Skybouncer ({})\n\
-             • `help` — Show this help message",
+             • `rules` — View active prompt & sensitivity\n\
+             • `set rules <prompt>` — Update moderation rules\n\
+             • `sensitivity <low|medium|high>` — Set sensitivity\n\
+             • `duration <permanent|24h|7d|30d>` — Block duration\n\
+             • `trust followers <on|off>` — Follower bypass\n\
+             • `pause` — Suspend moderation\n\
+             • `resume` — Resume moderation\n\
+             • `recent` — Last 5 bounced accounts\n\
+             • `pardon <did|@handle>` — Pardon from list\n\
+             • `pardon and allow <did|@handle>` — Pardon & allow\n\
+             • `bounce <did|@handle>` — Bounce/re-bounce\n\
+             • `perm <did|@handle>` — Permanently block\n\
+             • `allow <did|@handle>` — Add to allowlist\n\
+             • `unallow <did|@handle>` — Remove from allowlist\n\
+             • `allowlist` — View allowlist\n\
+             • `status` — View stats\n\
+             • `test <text>` — Dry-run text\n\
+             • `start` / `auth` — Activate ({})\n\
+             • `help` — Show commands",
             self.auth_url()
         )
     }
@@ -615,9 +646,15 @@ impl BotCommandHandler {
             let post_link = bsky_post_url_from_at_uri(&b.post_uri)
                 .map(|url| format!("\n   Post: {url}"))
                 .unwrap_or_default();
+            let reply_to_link = b
+                .reply_to_uri
+                .as_deref()
+                .and_then(bsky_post_or_web_url)
+                .map(|url| format!("\n   Replying to: {url}"))
+                .unwrap_or_default();
 
             out.push_str(&format!(
-                "{num}. {label} — **{}** ({:.0}% confidence){post_link}\n   Reason: {}\n",
+                "{num}. {label} — **{}** ({:.0}% confidence){post_link}{reply_to_link}\n   Reason: {}\n",
                 b.category,
                 b.confidence * 100.0,
                 b.reason
@@ -657,7 +694,8 @@ impl BotCommandHandler {
         match self.engine.pardon_user(&protected_did, &resolved_did).await {
             Ok(true) => Ok(format!(
                 "{handle_prefix}✅ Account {label} has been pardoned and removed from your moderation list.\n\n\
-                 💡 Tip: To permanently immunize this account against future bounces, use `pardon and allow {target}` or `allow {target}`."
+                 💡 Tip: To permanently immunize this account against future bounces, use `pardon and allow {target}` or `allow {target}`.\n\
+                 Changed your mind? Reply with `bounce {target}` or `perm {target}`."
             )),
             Ok(false) => Ok(format!(
                 "{handle_prefix}ℹ️ Account {label} was not found in your bounced list."
@@ -688,6 +726,7 @@ impl BotCommandHandler {
         };
 
         let label = account_label_with_url(&resolved_did, resolved_handle.as_deref());
+        let target = command_target(&resolved_did, resolved_handle.as_deref());
 
         match self
             .engine
@@ -700,12 +739,96 @@ impl BotCommandHandler {
         {
             Ok(true) => Ok(format!(
                 "{handle_prefix}✅ Account {label} has been pardoned and added to your allowlist!\n\
-                 They are now permanently immunized against future automatic bounces."
+                 They are now permanently immunized against future automatic bounces.\n\n\
+                 💡 Changed your mind? Reply with `bounce {target}` or `perm {target}`."
             )),
             Ok(false) => Ok(format!(
                 "{handle_prefix}ℹ️ Account {label} was not on your list, but has been added to your allowlist for future immunization."
             )),
             Err(e) => Ok(format!("{handle_prefix}❌ Failed to pardon and allowlist account: {e}")),
+        }
+    }
+
+    async fn cmd_bounce(
+        &self,
+        sender_did: &str,
+        raw_target: &str,
+    ) -> Result<String, SkybouncerError> {
+        let raw_target = raw_target.trim();
+        if raw_target.is_empty() {
+            return Ok(
+                "Usage: `bounce <did|@handle>` (bounce or re-bounce an account onto your moderation list)"
+                    .to_string(),
+            );
+        }
+
+        let (resolved_did, resolved_handle, handle_prefix) = match self
+            .resolve_dm_target(raw_target, " (e.g. `bounce did:plc:...`)")
+            .await
+        {
+            Ok(v) => v,
+            Err(msg) => return Ok(msg),
+        };
+
+        let protected_did = match self.authorized_protected(sender_did) {
+            Ok(did) => did,
+            Err(msg) => return Ok(msg),
+        };
+
+        if let Err(guard_msg) =
+            self.validate_moderation_target(&protected_did, &resolved_did, &handle_prefix)
+        {
+            return Ok(guard_msg);
+        }
+
+        let label = account_label_with_url(&resolved_did, resolved_handle.as_deref());
+        let target = command_target(&resolved_did, resolved_handle.as_deref());
+
+        match self
+            .engine
+            .manual_bounce_user(&protected_did, &resolved_did)
+            .await
+        {
+            Ok((
+                ManualBounceOutcome::Bounced {
+                    duration,
+                    restored_from_history,
+                    ..
+                },
+                was_allowlisted,
+            )) => {
+                let allowlist_note = if was_allowlisted {
+                    "\nAllowlist immunity was also removed."
+                } else {
+                    ""
+                };
+                let verb = if restored_from_history {
+                    "re-added to"
+                } else {
+                    "added to"
+                };
+                if duration == BounceDuration::Permanent {
+                    Ok(format!(
+                        "{handle_prefix}✅ Account {label} has been {verb} your moderation list (**permanent** block).{allowlist_note}\n\n\
+                         💡 Tip: To undo, reply with `pardon {target}` (or `pardon and allow {target}`)."
+                    ))
+                } else {
+                    Ok(format!(
+                        "{handle_prefix}✅ Account {label} has been {verb} your moderation list (Duration: **{}**).{allowlist_note}\n\n\
+                         💡 Tip: Reply with `perm {target}` to make it permanent, or `pardon {target}` to undo.",
+                        duration.display_label()
+                    ))
+                }
+            }
+            Ok((ManualBounceOutcome::AlreadyBounced { is_permanent: true }, _))
+            | Ok((ManualBounceOutcome::UpgradedToPermanent, _)) => Ok(format!(
+                "{handle_prefix}ℹ️ Account {label} is already permanently blocked on your moderation list."
+            )),
+            Ok((ManualBounceOutcome::AlreadyBounced { is_permanent: false }, _)) => Ok(format!(
+                "{handle_prefix}ℹ️ Account {label} is already on your moderation list (temporary block).\n\n\
+                 💡 Tip: Reply with `perm {target}` to make it permanent, or `pardon {target}` to undo."
+            )),
+            Err(e) => Ok(format!("{handle_prefix}❌ Failed to bounce account: {e}")),
         }
     }
 
@@ -717,7 +840,8 @@ impl BotCommandHandler {
         let raw_target = raw_target.trim();
         if raw_target.is_empty() {
             return Ok(
-                "Usage: `perm <did|@handle>` (upgrade a temporary block to permanent)".to_string(),
+                "Usage: `perm <did|@handle>` (permanently block an account or upgrade a temporary block to permanent)"
+                    .to_string(),
             );
         }
 
@@ -734,26 +858,58 @@ impl BotCommandHandler {
             Err(msg) => return Ok(msg),
         };
 
+        if let Err(guard_msg) =
+            self.validate_moderation_target(&protected_did, &resolved_did, &handle_prefix)
+        {
+            return Ok(guard_msg);
+        }
+
         let label = account_label_with_url(&resolved_did, resolved_handle.as_deref());
         let target = command_target(&resolved_did, resolved_handle.as_deref());
 
         match self
             .engine
-            .upgrade_bounce_to_permanent(&protected_did, &resolved_did)
+            .perm_bounce_user(&protected_did, &resolved_did)
             .await
         {
-            Ok(Some(true)) => Ok(format!(
-                "{handle_prefix}🔒 Temporary block for {label} has been upgraded to **permanent** on your moderation list.\n\n\
-                 💡 Tip: If you later want to undo this block, reply with `pardon {target}` (or `pardon and allow {target}`)."
-            )),
-            Ok(Some(false)) => Ok(format!(
+            Ok((ManualBounceOutcome::UpgradedToPermanent, was_allowlisted)) => {
+                let allowlist_note = if was_allowlisted {
+                    "\nAllowlist immunity was also removed."
+                } else {
+                    ""
+                };
+                Ok(format!(
+                    "{handle_prefix}🔒 Temporary block for {label} has been upgraded to **permanent** on your moderation list.{allowlist_note}\n\n\
+                     💡 Tip: If you later want to undo this block, reply with `pardon {target}` (or `pardon and allow {target}`)."
+                ))
+            }
+            Ok((
+                ManualBounceOutcome::Bounced {
+                    restored_from_history,
+                    ..
+                },
+                was_allowlisted,
+            )) => {
+                let allowlist_note = if was_allowlisted {
+                    "\nAllowlist immunity was also removed."
+                } else {
+                    ""
+                };
+                let phrase = if restored_from_history {
+                    "re-added and **permanently** blocked"
+                } else {
+                    "**permanently** blocked"
+                };
+                Ok(format!(
+                    "{handle_prefix}🔒 Account {label} has been {phrase} on your moderation list.{allowlist_note}\n\n\
+                     💡 Tip: If you later want to undo this block, reply with `pardon {target}` (or `pardon and allow {target}`)."
+                ))
+            }
+            Ok((ManualBounceOutcome::AlreadyBounced { .. }, _)) => Ok(format!(
                 "{handle_prefix}ℹ️ Account {label} is already permanently blocked on your moderation list."
             )),
-            Ok(None) => Ok(format!(
-                "{handle_prefix}ℹ️ Account {label} was not found in your bounced list."
-            )),
             Err(e) => Ok(format!(
-                "{handle_prefix}❌ Failed to upgrade block to permanent: {e}"
+                "{handle_prefix}❌ Failed to permanently block account: {e}"
             )),
         }
     }
@@ -1058,16 +1214,33 @@ impl BotCommandHandler {
         }
     }
 
+    /// Rejects attempts to bounce the protected user themselves or the Skybouncer bot account.
+    fn validate_moderation_target(
+        &self,
+        protected_did: &str,
+        resolved_did: &str,
+        handle_prefix: &str,
+    ) -> Result<(), String> {
+        if resolved_did == protected_did {
+            return Err(format!(
+                "{handle_prefix}⚠️ You cannot bounce or block your own account on your moderation list."
+            ));
+        }
+        if !self.bot_did.is_empty() && resolved_did == self.bot_did {
+            return Err(format!(
+                "{handle_prefix}⚠️ You cannot bounce the Skybouncer bot account."
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns the sender DID if they are authorized to mutate a protected user's
     /// moderation list, or the permission-denied message otherwise.
     fn authorized_protected(&self, sender_did: &str) -> Result<String, String> {
         if self.is_authorized_sender(sender_did) {
             Ok(sender_did.to_string())
         } else {
-            Err(
-                "❌ You do not have permission to pardon users on this moderation list."
-                    .to_string(),
-            )
+            Err("❌ You do not have permission to modify this moderation list.".to_string())
         }
     }
 

@@ -62,6 +62,7 @@ fn test_sqlite_cache_bounced_user_deduplication() {
         reason: "Crypto giveaway bot".to_string(),
         post_uri: "at://did:plc:spammer1/app.bsky.feed.post/1".to_string(),
         post_text: "Crypto giveaway link".to_string(),
+        reply_to_uri: None,
         bounced_at: 1_720_000_000_000_000,
         expires_at: None,
     };
@@ -610,6 +611,7 @@ async fn test_multi_rkey_tracking_and_pardon_cleanup() {
             reason: format!("Repeated attack attempt {i}"),
             post_uri: format!("at://{target_did}/app.bsky.feed.post/{i}"),
             post_text: format!("Attack post {i}"),
+            reply_to_uri: None,
             bounced_at: 1_720_000_000_000_000 + (i as u64),
             expires_at: None,
         };
@@ -692,6 +694,7 @@ async fn test_temporary_ttl_bounce_expiration_and_cache_pruning() {
         reason: "Temporary spam timeout".to_string(),
         post_uri: "at://did:plc:expired_violator/app.bsky.feed.post/1".to_string(),
         post_text: "Spam text".to_string(),
+        reply_to_uri: None,
         bounced_at: now_us - 100_000_000,
         expires_at: Some(now_us - 50_000_000), // Expired in the past
     };
@@ -707,6 +710,7 @@ async fn test_temporary_ttl_bounce_expiration_and_cache_pruning() {
         reason: "Active 7-day timeout".to_string(),
         post_uri: "at://did:plc:active_violator/app.bsky.feed.post/1".to_string(),
         post_text: "Harassment text".to_string(),
+        reply_to_uri: None,
         bounced_at: now_us,
         expires_at: Some(now_us + 100_000_000), // Active into future
     };
@@ -722,6 +726,7 @@ async fn test_temporary_ttl_bounce_expiration_and_cache_pruning() {
         reason: "Permanent ban".to_string(),
         post_uri: "at://did:plc:permanent_violator/app.bsky.feed.post/1".to_string(),
         post_text: "Airdrop link".to_string(),
+        reply_to_uri: None,
         bounced_at: now_us,
         expires_at: None,
     };
