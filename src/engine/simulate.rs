@@ -75,6 +75,8 @@ pub struct SimulationInputs {
     pub fetched_url_image: bool,
     /// Whether to persist a `source = "simulation"` audit log entry for this run.
     pub persist_log: bool,
+    /// Optional explicit rubric override (e.g. for guest sandbox presets or unsaved draft rules).
+    pub rubric_override: Option<crate::classifier::RuleRubric>,
 }
 
 impl SimulationInputs {
@@ -92,6 +94,7 @@ impl SimulationInputs {
             image_base64: None,
             fetched_url_image: false,
             persist_log: false,
+            rubric_override: None,
         }
     }
 
@@ -107,6 +110,13 @@ impl SimulationInputs {
     #[must_use]
     pub fn with_persist_log(mut self, persist_log: bool) -> Self {
         self.persist_log = persist_log;
+        self
+    }
+
+    /// Overrides the target DID's persisted rubric with an explicit [`crate::classifier::RuleRubric`].
+    #[must_use]
+    pub fn with_rubric_override(mut self, rubric: crate::classifier::RuleRubric) -> Self {
+        self.rubric_override = Some(rubric);
         self
     }
 }
@@ -131,9 +141,10 @@ impl crate::engine::SkybouncerEngine {
             image_base64,
             fetched_url_image,
             persist_log,
+            rubric_override,
         } = inputs;
 
-        let rubric = self.rubric_for(&target_did);
+        let rubric = rubric_override.unwrap_or_else(|| self.rubric_for(&target_did));
         let threshold = rubric.sensitivity.threshold();
 
         let mut image_cids = Vec::new();

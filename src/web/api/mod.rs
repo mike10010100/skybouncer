@@ -26,6 +26,19 @@ use crate::types::default_true;
 pub struct ApiState {
     /// Reference to the core moderation engine.
     pub engine: Arc<SkybouncerEngine>,
+    /// Bounded sliding-window rate limiter for the anonymous live sandbox (`POST /api/simulate/guest`).
+    pub guest_limiter: Arc<GuestSandboxLimiter>,
+}
+
+impl ApiState {
+    /// Creates a new [`ApiState`] wrapping `engine` and a fresh guest sandbox rate limiter.
+    #[must_use]
+    pub fn new(engine: Arc<SkybouncerEngine>) -> Self {
+        Self {
+            engine,
+            guest_limiter: Arc::new(GuestSandboxLimiter::default()),
+        }
+    }
 }
 
 /// Response payload for service health check endpoints.
@@ -194,6 +207,41 @@ pub struct SimulateRequest {
     /// Optional image URL to fetch and evaluate.
     #[serde(default)]
     pub image_url: Option<String>,
+    /// Optional unsaved draft prompt from the live rules editor.
+    #[serde(default)]
+    pub draft_prompt: Option<String>,
+    /// Optional unsaved draft sensitivity from the live rules editor.
+    #[serde(default)]
+    pub draft_sensitivity: Option<Sensitivity>,
+}
+
+/// Request payload for the rate-limited anonymous live sandbox (`POST /api/simulate/guest`).
+///
+/// Anonymous callers select one of the built-in public rubric presets rather than supplying
+/// arbitrary LLM prompt instructions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestSimulateRequest {
+    /// Sample post text to evaluate (capped to 500 characters).
+    pub text: String,
+    /// Built-in preset key (`"balanced"`, `"anti_crypto"`, `"anti_hostility"`, or `"anti_ragebait"`).
+    #[serde(default)]
+    pub preset: Option<String>,
+}
+
+/// Response payload for the rate-limited anonymous live sandbox (`POST /api/simulate/guest`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GuestSimulateResponse {
+    /// Core dry-run evaluation verdict and multi-tier breakdown.
+    #[serde(flatten)]
+    pub simulation: SimulateResponse,
+    /// Canonical preset key evaluated for this request.
+    pub preset: String,
+    /// Remaining evaluations allowed for this client IP within the rolling window.
+    pub remaining_quota: usize,
+    /// Total evaluations allowed per rolling window for a single client IP.
+    pub quota_limit: usize,
+    /// Rolling rate-limit window duration in seconds.
+    pub window_seconds: u64,
 }
 
 /// Detailed stage breakdown for a single tier in the simulation pipeline.

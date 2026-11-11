@@ -23,14 +23,16 @@ use tracing::info;
 
 pub use api::{
     auth_preview, auth_typeahead, get_prometheus_metrics, health_check, resolve_identity,
-    AddAllowlistRequest, AddAllowlistResponse, AdminEvaluationsQuery, AdminEvaluationsResponse,
-    AdminTenantsResponse, AllowlistQuery, ApiState, AuthActorSuggestion, AuthPreviewQuery,
-    AuthPreviewResponse, AuthTypeaheadQuery, AuthTypeaheadResponse, BouncedUserWithHandle,
-    BouncesQuery, EvaluationsQuery, EvaluationsResponse, HealthResponse, PardonRequest,
-    PardonResponse, RemoveAllowlistResponse, ResolveQuery, ResolveResponse, RulesResponse,
-    SimulateRequest, SimulateResponse, StatusResponse, TenantSummary, ToggleTenantRequest,
-    ToggleTenantResponse, UpdateRulesRequest, UpgradeBounceRequest, UpgradeBounceResponse,
-    UserSessionResponse,
+    simulate_guest_interaction, AddAllowlistRequest, AddAllowlistResponse, AdminEvaluationsQuery,
+    AdminEvaluationsResponse, AdminTenantsResponse, AllowlistQuery, ApiState, AuthActorSuggestion,
+    AuthPreviewQuery, AuthPreviewResponse, AuthTypeaheadQuery, AuthTypeaheadResponse,
+    BouncedUserWithHandle, BouncesQuery, EvaluationsQuery, EvaluationsResponse,
+    GuestRateLimitDecision, GuestSandboxLimiter, GuestSimulateRequest, GuestSimulateResponse,
+    HealthResponse, PardonRequest, PardonResponse, RemoveAllowlistResponse, ResolveQuery,
+    ResolveResponse, RulesResponse, SimulateRequest, SimulateResponse, StatusResponse,
+    TenantSummary, ToggleTenantRequest, ToggleTenantResponse, UpdateRulesRequest,
+    UpgradeBounceRequest, UpgradeBounceResponse, UserSessionResponse, GUEST_SANDBOX_GLOBAL_LIMIT,
+    GUEST_SANDBOX_MAX_TEXT_CHARS, GUEST_SANDBOX_PER_IP_LIMIT, GUEST_SANDBOX_WINDOW_SECS,
 };
 pub use oauth::{LoginQuery, OAuthState};
 pub use ui::{serve_dashboard, DASHBOARD_HTML};
@@ -162,9 +164,7 @@ pub fn create_web_router(
         }
     }
 
-    let api_state = ApiState {
-        engine: Arc::clone(&engine),
-    };
+    let api_state = ApiState::new(Arc::clone(&engine));
 
     let oauth_state = OAuthState {
         oauth_client,
@@ -192,6 +192,11 @@ pub fn create_web_router(
             "/simulate",
             post(api::simulate_interaction)
                 .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route(
+            "/simulate/guest",
+            post(api::simulate_guest_interaction)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/me", get(api::get_current_user))
         .route("/admin/tenants", get(api::get_admin_tenants))

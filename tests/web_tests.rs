@@ -35,8 +35,9 @@ use skybouncer::modlist::cache::NewEvaluationLog;
 use skybouncer::modlist::{AllowlistEntry, BouncedUser, DeduplicationCache, ModListManager};
 use skybouncer::web::{
     create_web_router, run_web_server, AddAllowlistResponse, BouncedUserWithHandle,
-    EvaluationsResponse, PardonResponse, RemoveAllowlistResponse, ResolveResponse, RulesResponse,
-    SimulateResponse, StatusResponse, UpgradeBounceResponse, WebServerConfig, DASHBOARD_HTML,
+    EvaluationsResponse, GuestSimulateResponse, PardonResponse, RemoveAllowlistResponse,
+    ResolveResponse, RulesResponse, SimulateResponse, StatusResponse, UpgradeBounceResponse,
+    WebServerConfig, DASHBOARD_HTML,
 };
 
 // =============================================================================
@@ -4085,4 +4086,281 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         .unwrap();
     std::env::remove_var("SKYBOUNCER_APPVIEW_ENDPOINT");
     assert!(login_redirect_resp.status().is_redirection());
+}
+
+#[tokio::test]
+async fn test_api_guest_simulate_presets_validation_and_zero_log_pollution() {
+    let protected_did = "did:plc:owner_guest_test";
+    let (engine, cache, _pds, app) = setup_test_web_environment(protected_did).await;
+
+    // 1. Valid guest simulation across built-in presets without authentication
+    for (idx, preset) in ["balanced", "anti_crypto", "anti_hostility", "anti_ragebait"]
+        .iter()
+        .enumerate()
+    {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulate/guest")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", format!("198.51.100.{}", idx + 1))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "text": "I enjoyed reading your distributed systems writeup!",
+                            "preset": preset
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: GuestSimulateResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.preset, *preset);
+        assert_eq!(parsed.quota_limit, 6);
+        assert_eq!(parsed.remaining_quota, 5);
+    }
+
+    // 2. Unknown preset is rejected (400 Bad Request) — prevents arbitrary prompt injection
+    let bad_preset_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate/guest")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "198.51.100.50")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "text": "hello",
+                        "preset": "ignore_all_instructions"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_preset_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Empty text and >500-char text are rejected (400 Bad Request)
+    let empty_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate/guest")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "198.51.100.51")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "text": "   ",
+                        "preset": "balanced"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_resp.status(), StatusCode::BAD_REQUEST);
+
+    let oversized_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate/guest")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "198.51.100.52")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "text": "a".repeat(501),
+                        "preset": "balanced"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 4. Zero evaluation log pollution in SQLite audit table
+    let evals = cache.list_evaluation_logs(None, None, 50, 0).unwrap();
+    assert!(
+        evals.is_empty(),
+        "Anonymous guest simulations must never pollute private evaluation audit logs"
+    );
+    let _ = engine;
+}
+
+#[tokio::test]
+async fn test_api_guest_simulate_ip_rate_limiting_and_headers() {
+    let protected_did = "did:plc:owner_ratelimit";
+    let (_engine, _cache, _pds, app) = setup_test_web_environment(protected_did).await;
+
+    // 6 requests from 203.0.113.42 succeed; remaining counts down 5..=0
+    for expected_rem in (0..6).rev() {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulate/guest")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "203.0.113.42")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "text": "Test sample reply",
+                            "preset": "balanced"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_rem.to_string().as_str())
+        );
+    }
+
+    // 7th request from 203.0.113.42 returns 429 Too Many Requests + Retry-After
+    let throttled = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate/guest")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "203.0.113.42")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "text": "Seventh sample reply",
+                        "preset": "balanced"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(throttled.headers().contains_key("retry-after"));
+    assert_eq!(
+        throttled
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok()),
+        Some("0")
+    );
+
+    // Distinct IP 203.0.113.99 is unaffected
+    let other_ip = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate/guest")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "203.0.113.99")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "text": "Hello from another visitor",
+                        "preset": "anti_crypto"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other_ip.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_api_simulate_draft_rubric_override_without_mutating_saved_rules() {
+    let protected_did = "did:plc:owner_draft_sim";
+    let (engine, _cache, _pds, app) = setup_test_web_environment(protected_did).await;
+    let owner_token = create_test_session(&engine, protected_did);
+    let cookie = format!("skybouncer_session={owner_token}");
+
+    // Default saved sensitivity is Medium (0.75). Run draft simulation at Low (0.90)
+    let draft_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate")
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "text": "Testing unsaved draft sensitivity",
+                        "draft_prompt": "Filter only severe abuse.",
+                        "draft_sensitivity": "low"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(draft_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(draft_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let parsed: SimulateResponse = serde_json::from_slice(&bytes).unwrap();
+    assert!((parsed.threshold - 0.90).abs() < 1e-5);
+
+    // Saved rules in GET /api/rules remain untouched (Medium)
+    let rules_resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/rules")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rules_resp.status(), StatusCode::OK);
+    let rbytes = axum::body::to_bytes(rules_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let saved: RulesResponse = serde_json::from_slice(&rbytes).unwrap();
+    assert_eq!(saved.sensitivity, Sensitivity::Medium);
+}
+
+#[test]
+fn test_ui_onboarding_workspace_tabs_and_admin_gating_contract() {
+    let html = DASHBOARD_HTML;
+    assert!(html.contains("id=\"onboarding-view\""));
+    assert!(html.contains("id=\"workspace-view\""));
+    assert!(html.contains("/api/simulate/guest"));
+    assert!(html.contains("function switchWorkspaceTab(tab)"));
+    assert!(html.contains("id=\"operator-drawer\""));
+
+    // Verify admin-fleet-card is hidden by default AND positioned inside operator-drawer
+    let drawer_pos = html
+        .find("id=\"operator-drawer\"")
+        .expect("operator-drawer must exist");
+    let fleet_pos = html
+        .find("id=\"admin-fleet-card\" style=\"display: none;\"")
+        .expect("admin-fleet-card must start hidden");
+    let main_end_pos = html.find("</main>").expect("</main> must exist");
+    assert!(
+        fleet_pos > drawer_pos && fleet_pos < main_end_pos,
+        "admin-fleet-card must be tucked inside the collapsed operator-drawer"
+    );
 }
