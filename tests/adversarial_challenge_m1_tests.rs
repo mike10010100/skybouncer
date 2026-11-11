@@ -120,6 +120,7 @@ fn make_interaction(target_did: &str, author_did: &str, post_id: &str, text: &st
         interaction_type: InteractionType::DirectReply,
         parent_uri: Some(format!("at://{target_did}/app.bsky.feed.post/root")),
         root_uri: Some(format!("at://{target_did}/app.bsky.feed.post/root")),
+        quote_uri: None,
         created_at_us: 1_700_000_000_000_000,
         image_cids: Vec::new(),
         image_alts: Vec::new(),

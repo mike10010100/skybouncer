@@ -361,7 +361,7 @@ impl SkybouncerConfig {
 
         let rubric_prompt = crate::env::var_or(
             &["MODERATION_RUBRIC", "SKYBOUNCER_RULES"],
-            "Block crypto airdrop spam, scam bots, phishing, targeted harassment, and bad-faith sea-lioning.",
+            crate::classifier::DEFAULT_RUBRIC_PROMPT,
         );
         let rubric = RuleRubric::parse(&rubric_prompt)?;
 
@@ -411,8 +411,17 @@ impl SkybouncerConfig {
             true,
         );
 
+        let escalate_nuanced_violations = crate::env::bool_or(
+            &[
+                "ESCALATE_NUANCED_VIOLATIONS",
+                "SKYBOUNCER_ESCALATE_NUANCED_VIOLATIONS",
+            ],
+            true,
+        );
+
         let certainty_config =
-            CertaintyConfig::new(uncertainty_min, uncertainty_max, escalate_on_images);
+            CertaintyConfig::new(uncertainty_min, uncertainty_max, escalate_on_images)
+                .with_escalate_nuanced_violations(escalate_nuanced_violations);
 
         // Optional dynamic Tier-1 multimodal primary: route image-bearing interactions
         // to a multimodal model before falling back to the heavyweight System-2 tier.
@@ -1371,11 +1380,7 @@ impl SkybouncerEngineBuilder {
         // disabled to avoid a redundant heavyweight model call. Uncertainty-band
         // escalation still applies.
         let effective_certainty = if has_multimodal_primary {
-            CertaintyConfig::new(
-                self.config.certainty_config.min_confidence,
-                self.config.certainty_config.max_confidence,
-                false,
-            )
+            self.config.certainty_config.with_escalate_on_images(false)
         } else {
             self.config.certainty_config
         };

@@ -33,6 +33,13 @@ pub const THREAD_ANCESTOR_CHAR_CAP: usize = 300;
 /// gallery posts (10-item UI limit, 20-item protocol max).
 pub const MAX_POST_IMAGES: usize = 20;
 
+/// Maximum number of protected target profiles cached in memory by [`AppViewContextEnricher`].
+const MAX_TARGET_PROFILE_CACHE_ENTRIES: usize = 1024;
+
+/// Maximum number of additional `getPostThread` hops performed when a conversation thread
+/// crosses a `blockedPost` boundary (e.g. a previously bounced troll higher up in the thread).
+const MAX_BLOCKED_THREAD_HOPS: usize = 3;
+
 /// A single ancestor post resolved from the conversation thread above the candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct ThreadPost {
@@ -75,8 +82,14 @@ pub struct ParentPostContext {
 pub struct EnrichedContext {
     /// Resolved author profile details.
     pub author: Option<AuthorContext>,
+    /// Resolved protected target user profile details (handle, display name, bio).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<AuthorContext>,
     /// Resolved parent post content and author.
     pub parent_post: Option<ParentPostContext>,
+    /// Resolved quoted post content and author when the candidate embeds a quote (`app.bsky.embed.record`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_post: Option<ParentPostContext>,
     /// Ordered ancestor posts from oldest (thread root) to newest (immediate parent).
     ///
     /// Populated only when thread-context enrichment is enabled; empty otherwise.
@@ -94,11 +107,13 @@ impl EnrichedContext {
         Self::default()
     }
 
-    /// Returns `true` if no author, parent post, thread ancestor, or image context was resolved.
+    /// Returns `true` if no author, target, parent post, quoted post, thread ancestor, or image context was resolved.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.author.is_none()
+            && self.target.is_none()
             && self.parent_post.is_none()
+            && self.quoted_post.is_none()
             && self.thread_ancestors.is_empty()
             && self.images_base64.is_empty()
     }
@@ -106,7 +121,48 @@ impl EnrichedContext {
     /// Formats the enriched context into a concise string block for classifier prompt injection.
     #[must_use]
     pub fn format_for_classifier(&self) -> String {
+        self.format_internal(None)
+    }
+
+    /// Formats the enriched context with explicit speaker role labels (`Author`, `Target`,
+    /// or `OtherUser`) on parent, quoted, and thread ancestor posts so downstream models can
+    /// disambiguate multi-party conversations without matching opaque DIDs.
+    #[must_use]
+    pub fn format_for_interaction(&self, author_did: &str, target_did: &str) -> String {
+        self.format_internal(Some((author_did, target_did)))
+    }
+
+    fn format_internal(&self, roles: Option<(&str, &str)>) -> String {
+        let format_actor = |did: &str| match roles {
+            Some((_, target_did)) if did == target_did => format!("Target ({did})"),
+            Some((author_did, _)) if did == author_did => format!("Author ({did})"),
+            Some(_) => format!("OtherUser ({did})"),
+            None => did.to_string(),
+        };
+
         let mut sections = Vec::new();
+
+        if let Some(ref target) = self.target {
+            let mut target_desc = Vec::new();
+            if let Some(ref handle) = target.handle {
+                target_desc.push(format!("handle: @{handle}"));
+            }
+            if let Some(ref name) = target.display_name {
+                target_desc.push(format!("name: \"{name}\""));
+            }
+            if let Some(ref bio) = target.description {
+                let bio_snippet: String = bio.chars().take(160).collect();
+                if !bio_snippet.trim().is_empty() {
+                    target_desc.push(format!("bio: \"{bio_snippet}\""));
+                }
+            }
+            if !target_desc.is_empty() {
+                sections.push(format!(
+                    "Target Profile (protected user) [{}]",
+                    target_desc.join(", ")
+                ));
+            }
+        }
 
         if let Some(ref author) = self.author {
             let mut author_desc = Vec::new();
@@ -133,7 +189,8 @@ impl EnrichedContext {
                 let text_snippet: String = parent.text.chars().take(200).collect();
                 sections.push(format!(
                     "In Reply To (by {}): \"{}\"",
-                    parent.author_did, text_snippet
+                    format_actor(&parent.author_did),
+                    text_snippet
                 ));
             }
         } else {
@@ -151,12 +208,22 @@ impl EnrichedContext {
                     .collect();
                 rendered.push(format!(
                     "[{depth}] {}: \"{}\"",
-                    ancestor.author_did, snippet
+                    format_actor(&ancestor.author_did),
+                    snippet
                 ));
             }
             sections.push(format!(
                 "Conversation Thread (oldest → newest):\n{}",
                 rendered.join("\n")
+            ));
+        }
+
+        if let Some(ref quoted) = self.quoted_post {
+            let text_snippet: String = quoted.text.chars().take(300).collect();
+            sections.push(format!(
+                "Quoted Post (by {}): \"{}\"",
+                format_actor(&quoted.author_did),
+                text_snippet
             ));
         }
 
@@ -229,7 +296,9 @@ type RelationshipMap = HashMap<(String, String), (bool, bool)>;
 #[derive(Debug, Default, Clone)]
 pub struct MockContextEnricher {
     authors: Arc<RwLock<HashMap<String, AuthorContext>>>,
+    targets: Arc<RwLock<HashMap<String, AuthorContext>>>,
     parent_posts: Arc<RwLock<HashMap<String, ParentPostContext>>>,
+    quoted_posts: Arc<RwLock<HashMap<String, ParentPostContext>>>,
     handles: Arc<RwLock<HashMap<String, String>>>,
     images: Arc<RwLock<HashMap<(String, String), String>>>,
     relationships: Arc<RwLock<RelationshipMap>>,
@@ -247,9 +316,19 @@ impl MockContextEnricher {
         self.authors.write().insert(did.into(), author);
     }
 
+    /// Injects protected target profile metadata for a given DID.
+    pub fn set_target(&self, did: impl Into<String>, target: AuthorContext) {
+        self.targets.write().insert(did.into(), target);
+    }
+
     /// Injects parent post context for a given AT-URI.
     pub fn set_parent_post(&self, uri: impl Into<String>, parent: ParentPostContext) {
         self.parent_posts.write().insert(uri.into(), parent);
+    }
+
+    /// Injects quoted post context for a given AT-URI.
+    pub fn set_quoted_post(&self, uri: impl Into<String>, quoted: ParentPostContext) {
+        self.quoted_posts.write().insert(uri.into(), quoted);
     }
 
     /// Registers a mock handle-to-DID resolution mapping.
@@ -290,10 +369,18 @@ impl MockContextEnricher {
 impl ContextEnricher for MockContextEnricher {
     async fn enrich(&self, interaction: &Interaction) -> EnrichedContext {
         let author = self.authors.read().get(&interaction.author_did).cloned();
+        let target = self.targets.read().get(&interaction.target_did).cloned();
         let parent_post = interaction
             .parent_uri
             .as_ref()
             .and_then(|uri| self.parent_posts.read().get(uri).cloned());
+        let quoted_post = interaction.quote_uri.as_ref().and_then(|uri| {
+            self.quoted_posts
+                .read()
+                .get(uri)
+                .cloned()
+                .or_else(|| self.parent_posts.read().get(uri).cloned())
+        });
 
         let mut images_base64 = Vec::new();
         {
@@ -307,7 +394,9 @@ impl ContextEnricher for MockContextEnricher {
 
         EnrichedContext {
             author,
+            target,
             parent_post,
+            quoted_post,
             thread_ancestors: Vec::new(),
             images_base64,
         }
@@ -358,12 +447,13 @@ impl ContextEnricher for MockContextEnricher {
 /// AppView HTTP client resolving author profiles and parent posts via public XRPC endpoints.
 ///
 /// Delegates all XRPC reads and cursor pagination to [`skybase::appview::AppViewClient`];
-/// this type layers skybouncer's interaction-level enrichment (parallel author/parent/image
-/// fetch) and PLC-directory fallback on top.
+/// this type layers skybouncer's interaction-level enrichment (parallel author/target/parent/quote/image
+/// fetch, cached target profiles, and thread ancestor resolution) and PLC-directory fallback on top.
 #[derive(Debug, Clone)]
 pub struct AppViewContextEnricher {
     client: skybase::appview::AppViewClient,
     thread_context: bool,
+    target_cache: Arc<RwLock<HashMap<String, AuthorContext>>>,
 }
 
 impl AppViewContextEnricher {
@@ -380,14 +470,18 @@ impl AppViewContextEnricher {
     }
 
     /// Creates an enricher using the AppView endpoint from `APPVIEW_ENDPOINT` /
-    /// `SKYBOUNCER_APPVIEW_ENDPOINT`, falling back to [`DEFAULT_APPVIEW_ENDPOINT`].
+    /// `SKYBOUNCER_APPVIEW_ENDPOINT` (falling back to [`DEFAULT_APPVIEW_ENDPOINT`]) and
+    /// enabling full conversation-thread ancestor resolution by default (controlled via
+    /// `THREAD_CONTEXT` / `SKYBOUNCER_THREAD_CONTEXT`).
     #[must_use]
     pub fn from_env() -> Self {
         let endpoint = crate::env::var_or(
             &["APPVIEW_ENDPOINT", "SKYBOUNCER_APPVIEW_ENDPOINT"],
             DEFAULT_APPVIEW_ENDPOINT,
         );
-        Self::with_endpoint(endpoint)
+        let thread_context =
+            crate::env::bool_or(&["THREAD_CONTEXT", "SKYBOUNCER_THREAD_CONTEXT"], true);
+        Self::with_endpoint(endpoint).with_thread_context(thread_context)
     }
 
     /// Creates a new [`AppViewContextEnricher`] with custom AppView and CDN endpoints.
@@ -399,6 +493,7 @@ impl AppViewContextEnricher {
         Self {
             client: skybase::appview::AppViewClient::with_endpoints(appview_endpoint, cdn_endpoint),
             thread_context: false,
+            target_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -445,6 +540,72 @@ impl AppViewContextEnricher {
         })
     }
 
+    /// Fetches and caches protected target profile metadata from the AppView.
+    ///
+    /// Verifies that the returned profile DID matches `did` so unparameterized test mocks
+    /// returning another actor's profile do not misattribute identity.
+    async fn fetch_target_profile(&self, did: &str) -> Option<AuthorContext> {
+        let clean = did.trim();
+        if !clean.starts_with("did:") {
+            return None;
+        }
+        {
+            if let Some(cached) = self.target_cache.read().get(clean).cloned() {
+                return Some(cached);
+            }
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawTargetProfile {
+            #[serde(default)]
+            did: Option<String>,
+            #[serde(default)]
+            handle: Option<String>,
+            #[serde(default)]
+            display_name: Option<String>,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            followers_count: Option<u64>,
+            #[serde(default)]
+            follows_count: Option<u64>,
+            #[serde(default)]
+            created_at: Option<String>,
+        }
+
+        let resp = self
+            .client
+            .get::<RawTargetProfile>("app.bsky.actor.getProfile", &[("actor", clean.to_string())])
+            .await
+            .ok()?;
+
+        if resp.did.as_deref() != Some(clean) {
+            return None;
+        }
+
+        let ctx = AuthorContext {
+            handle: resp.handle,
+            display_name: resp.display_name,
+            description: resp.description,
+            followers_count: resp.followers_count,
+            follows_count: resp.follows_count,
+            created_at: resp.created_at,
+        };
+        if ctx.handle.is_none() && ctx.display_name.is_none() {
+            return None;
+        }
+
+        {
+            let mut cache = self.target_cache.write();
+            if cache.len() >= MAX_TARGET_PROFILE_CACHE_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(clean.to_string(), ctx.clone());
+        }
+        Some(ctx)
+    }
+
     /// Fetches parent post text content from the AppView.
     async fn fetch_parent_post(&self, uri: &str) -> Option<ParentPostContext> {
         let post = self.client.fetch_post(uri).await?;
@@ -461,6 +622,29 @@ impl AppViewContextEnricher {
     ///
     /// Returns an empty vector on any AppView failure.
     pub async fn fetch_thread_ancestors(&self, uri: &str) -> Vec<ThreadPost> {
+        self.fetch_thread_chain(uri, false, "", "").await
+    }
+
+    /// Resolves the conversation thread anchored at `parent_uri`, including `parent_uri`
+    /// itself as the newest ancestor when `getPostThread` returns the parent post as the
+    /// focal `thread.post` node (standard AppView behavior when querying by `parent_uri`).
+    async fn fetch_thread_from_parent(
+        &self,
+        parent_uri: &str,
+        candidate_author_did: &str,
+        candidate_text: &str,
+    ) -> Vec<ThreadPost> {
+        self.fetch_thread_chain(parent_uri, true, candidate_author_did, candidate_text)
+            .await
+    }
+
+    async fn fetch_thread_chain(
+        &self,
+        uri: &str,
+        include_focal_when_parent: bool,
+        candidate_author_did: &str,
+        candidate_text: &str,
+    ) -> Vec<ThreadPost> {
         #[derive(Deserialize)]
         struct RawAuthor {
             did: String,
@@ -472,11 +656,17 @@ impl AppViewContextEnricher {
         }
         #[derive(Deserialize)]
         struct RawPost {
+            #[serde(default)]
+            uri: Option<String>,
             author: RawAuthor,
             record: RawRecord,
         }
         #[derive(Deserialize)]
         struct RawThreadNode {
+            #[serde(default)]
+            uri: Option<String>,
+            #[serde(default)]
+            blocked: bool,
             #[serde(default)]
             parent: Option<Box<RawThreadNode>>,
             post: Option<RawPost>,
@@ -486,27 +676,85 @@ impl AppViewContextEnricher {
             thread: RawThreadNode,
         }
 
-        let resp = self
-            .client
-            .get::<RawThreadResponse>("app.bsky.feed.getPostThread", &[("uri", uri.to_string())])
-            .await;
-
-        let thread = match resp {
-            Ok(r) => r.thread,
-            Err(_) => return Vec::new(),
-        };
-
         let mut chain = Vec::new();
-        let mut cursor = thread.parent;
-        while let Some(node) = cursor {
-            if let Some(post) = node.post {
-                chain.push(ThreadPost {
-                    author_did: post.author.did,
-                    text: post.record.text,
-                });
+        let mut visited = std::collections::HashSet::new();
+        let mut current_uri = Some(uri.to_string());
+        let mut is_first_hop = true;
+        let mut hops = 0usize;
+
+        while let Some(query_uri) = current_uri.take() {
+            if !visited.insert(query_uri.clone()) {
+                break;
             }
-            cursor = node.parent;
+            let resp = self
+                .client
+                .get::<RawThreadResponse>(
+                    "app.bsky.feed.getPostThread",
+                    &[("uri", query_uri.clone())],
+                )
+                .await;
+
+            let Ok(r) = resp else {
+                break;
+            };
+            let thread = r.thread;
+
+            let include_focal = if is_first_hop {
+                include_focal_when_parent
+            } else {
+                true
+            };
+            is_first_hop = false;
+
+            if include_focal {
+                if let Some(focal) = thread.post {
+                    let is_ancestor = if hops > 0 {
+                        true
+                    } else {
+                        match focal.uri.as_deref() {
+                            Some(focal_uri) => focal_uri == query_uri,
+                            None => {
+                                !(focal.author.did == candidate_author_did
+                                    && focal.record.text == candidate_text)
+                            }
+                        }
+                    };
+                    if is_ancestor {
+                        chain.push(ThreadPost {
+                            author_did: focal.author.did,
+                            text: focal.record.text,
+                        });
+                    }
+                }
+            }
+
+            let mut cursor = thread.parent;
+            while let Some(node) = cursor {
+                if let Some(post) = node.post {
+                    chain.push(ThreadPost {
+                        author_did: post.author.did,
+                        text: post.record.text,
+                    });
+                    cursor = node.parent;
+                } else if node.blocked
+                    && hops < MAX_BLOCKED_THREAD_HOPS
+                    && chain.len() < MAX_RENDERED_THREAD_ANCESTORS
+                {
+                    if let Some(blocked_uri) = node.uri.filter(|u| !u.is_empty()) {
+                        current_uri = Some(blocked_uri);
+                        hops += 1;
+                    }
+                    break;
+                } else {
+                    cursor = node.parent;
+                }
+            }
+
+            if chain.len() >= MAX_RENDERED_THREAD_ANCESTORS {
+                break;
+            }
         }
+
         // Walk yields newest-first; reverse to oldest-first.
         chain.reverse();
         let start = chain.len().saturating_sub(MAX_RENDERED_THREAD_ANCESTORS);
@@ -674,8 +922,16 @@ impl Default for AppViewContextEnricher {
 impl ContextEnricher for AppViewContextEnricher {
     async fn enrich(&self, interaction: &Interaction) -> EnrichedContext {
         let author_fut = self.fetch_author_profile(&interaction.author_did);
+        let target_fut = self.fetch_target_profile(&interaction.target_did);
         let parent_fut = async {
             if let Some(ref uri) = interaction.parent_uri {
+                self.fetch_parent_post(uri).await
+            } else {
+                None
+            }
+        };
+        let quoted_fut = async {
+            if let Some(ref uri) = interaction.quote_uri {
                 self.fetch_parent_post(uri).await
             } else {
                 None
@@ -691,17 +947,22 @@ impl ContextEnricher for AppViewContextEnricher {
         };
         let thread_fut = async {
             match (self.thread_context, interaction.parent_uri.as_ref()) {
-                (true, Some(uri)) => self.fetch_thread_ancestors(uri).await,
+                (true, Some(uri)) => {
+                    self.fetch_thread_from_parent(uri, &interaction.author_did, &interaction.text)
+                        .await
+                }
                 _ => Vec::new(),
             }
         };
 
-        let (author, parent_post, images_base64, thread_ancestors) =
-            tokio::join!(author_fut, parent_fut, images_fut, thread_fut);
+        let (author, target, parent_post, quoted_post, images_base64, thread_ancestors) =
+            tokio::join!(author_fut, target_fut, parent_fut, quoted_fut, images_fut, thread_fut);
 
         EnrichedContext {
             author,
+            target,
             parent_post,
+            quoted_post,
             thread_ancestors,
             images_base64,
         }

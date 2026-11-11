@@ -195,16 +195,20 @@ pub struct OllamaChatMessage {
 }
 
 /// Runtime inference options supplied to Ollama chat requests (`/api/chat`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct OllamaChatOptions {
     /// Context window size (`num_ctx`) in tokens allocated for the request.
     pub num_ctx: usize,
+    /// Sampling temperature (`0.0` enforces deterministic greedy decoding for moderation).
+    #[serde(default)]
+    pub temperature: f64,
 }
 
 impl Default for OllamaChatOptions {
     fn default() -> Self {
         Self {
             num_ctx: DEFAULT_OLLAMA_NUM_CTX,
+            temperature: 0.0,
         }
     }
 }
@@ -543,21 +547,21 @@ impl JevClassifier {
                         .as_ref()
                         .map(|imgs| !imgs.is_empty())
                         .unwrap_or(false);
-                    let system_prompt = if has_images {
-                        format!(
-                            "You are an automated multimodal content moderation classifier. \
-                            Evaluate candidate posts and any attached visual images (including embedded text, screenshots, or graphics) against this rubric: \"{rubric_prompt}\". \
-                            Output ONLY a single valid JSON object matching: \
-                            {{\"violates\": boolean, \"category\": string or null, \"confidence\": float (0.0 to 1.0), \"reason\": string}}"
-                        )
+                    let modality_guidance = if has_images {
+                        "candidate posts and any attached visual images (including embedded text, screenshots, or graphics)"
                     } else {
-                        format!(
-                            "You are an automated content moderation classifier. \
-                            Evaluate candidate posts against this rubric: \"{rubric_prompt}\". \
-                            Output ONLY a single valid JSON object matching: \
-                            {{\"violates\": boolean, \"category\": string or null, \"confidence\": float (0.0 to 1.0), \"reason\": string}}"
-                        )
+                        "candidate posts"
                     };
+                    let system_prompt = format!(
+                        "You are an automated content moderation classifier protecting the Target user on Bluesky. \
+                        Evaluate {modality_guidance} against the Target's rubric: \"{rubric_prompt}\". \
+                        Apply these disambiguation rules unless the rubric explicitly states otherwise: \
+                        (1) Directionality & thread referents: distinguish hostility aimed AT the Target user from hostility aimed at OtherUser thread participants, third parties, politicians, or groups. In Conversation Thread, posts are labeled Author, Target, or OtherUser: if Author was arguing with an OtherUser earlier in the thread and replies to Target using third-person references ('he', 'she', 'they', 'someone') to vent about that OtherUser's behavior or arguments (especially when Target's post is brief or agrees with Author, e.g. '\"nuh uh\"'), that hostility is aimed at the OtherUser, NOT at Target. \
+                        (2) Targeted harassment: personal attacks, insults, name-calling, mocking nicknames, slurs, threats, or crude demeaning remarks aimed at Target's intelligence, character, or appearance (including derisive third-person nicknames like 'its the [insult] back again' when replying to Target) violate as \"harassment\". Mild grumbling about an action (such as complaining 'blocked me for some stupid reason') or casual handle references ('that @handle guy') are NOT harassment. \
+                        (3) Benign discourse: casual profanity, sarcasm, blunt disagreement, heated political commentary, quoting Target to argue with someone else, and insults directed at third parties rather than at Target are permitted. \
+                        Output ONLY a single valid JSON object matching: \
+                        {{\"violates\": boolean, \"category\": \"harassment\" | \"sea_lioning\" | \"spam\" | \"crypto_spam\" | \"phishing\" | \"hate_speech\" | \"custom\" | null, \"confidence\": float (0.0 to 1.0), \"reason\": string}}"
+                    );
                     let enrichment_str = enrichment_suffix(interaction);
 
                     let user_prompt =
@@ -580,6 +584,7 @@ impl JevClassifier {
                         stream: false,
                         options: OllamaChatOptions {
                             num_ctx: self.num_ctx,
+                            temperature: 0.0,
                         },
                     };
                     request_builder.json(&payload).send().await
@@ -592,7 +597,7 @@ impl JevClassifier {
                     );
                     criteria.insert(
                         "harassment".to_string(),
-                        "Targeted harassment, personal attacks, insults, slurs, threats, abusive hostility".to_string(),
+                        "Personal attacks, insults, name-calling, mocking nicknames, slurs, threats, or crude demeaning remarks aimed at the Target user's intelligence, character, or appearance — NOT non-targeted profanity, NOT mild grumbling or neutral handle references, and NOT hostility aimed at OtherUser commenters, third parties, unrelated public figures, politicians, or groups".to_string(),
                     );
                     criteria.insert(
                         "phishing".to_string(),
@@ -600,17 +605,17 @@ impl JevClassifier {
                     );
                     criteria.insert(
                         "sealioning_or_bad_faith".to_string(),
-                        "Bad-faith sea-lioning, disingenuous badgering, relentless interrogation, feigned ignorance, or debate-bro trolling".to_string(),
+                        "Relentless bad-faith sea-lioning, disingenuous badgering, or sealion interrogation aimed specifically at the Target user to waste their time, NOT genuine questions, skepticism, sarcasm, or blunt disagreement".to_string(),
                     );
                     criteria.insert(
                         "spam".to_string(),
                         format!(
-                            "Unsolicited promotional spam, mass-mention tag spam, unsolicited livestream or channel promotion, scam bots, commercial solicitations, or content violating: {rubric_prompt}"
+                            "Unsolicited promotional spam, mass-mention tag spam, scam bots, commercial solicitations, or an explicit violation of a specific custom rule in the Target's Active House Rules: {rubric_prompt}"
                         ),
                     );
                     criteria.insert(
                         "permitted".to_string(),
-                        "Benign social discussion, genuine questions, technical debate, respectful disagreement, humor, or normal social chatter conforming to house rules"
+                        "Permitted interaction conforming to Active House Rules — including friendly or emphatic agreement, blunt or sarcastic disagreement on substance, non-targeted profanity, heated political commentary, quoting Target to argue with someone else, or insults and hostility directed at third parties, unrelated public figures, politicians, institutions, groups, or other commenters rather than at Target"
                             .to_string(),
                     );
                     let mut questions = std::collections::BTreeMap::new();
@@ -622,10 +627,14 @@ impl JevClassifier {
                         },
                     );
                     let enrichment_str = enrichment_suffix(interaction);
+                    let candidate_prompt =
+                        build_candidate_prompt(interaction, &capped_text, &enrichment_str);
 
                     let payload = SystemOneRequest {
                         model: Some(self.config.model.clone()),
-                        state: build_candidate_prompt(interaction, &capped_text, &enrichment_str),
+                        state: format!(
+                            "Active House Rules for Target: \"{rubric_prompt}\"\n{candidate_prompt}"
+                        ),
                         questions,
                         // Text-only System-One decision models reject image payloads with HTTP 400,
                         // so images are forwarded only when the configured model supports them.
@@ -697,13 +706,12 @@ impl JevClassifier {
                                 .probabilities
                                 .as_ref()
                                 .and_then(|p| {
-                                    p.get("permitted").map(|perm| (1.0 - perm).clamp(0.0, 1.0))
+                                    p.get(&answer.choice).copied().map(|c| c.clamp(0.0, 1.0))
                                 })
                                 .or_else(|| {
-                                    answer
-                                        .probabilities
-                                        .as_ref()
-                                        .and_then(|p| p.get(&answer.choice).copied())
+                                    answer.probabilities.as_ref().and_then(|p| {
+                                        p.get("permitted").map(|perm| (1.0 - perm).clamp(0.0, 1.0))
+                                    })
                                 })
                                 .or(answer.confidence)
                                 .ok_or_else(|| {
@@ -776,19 +784,37 @@ impl JevClassifier {
     fn build_verdict(&self, resp: JevClassifyResponse, rubric: &RuleRubric) -> Verdict {
         let is_actionable = rubric.is_actionable(resp.confidence);
         if resp.violates && is_actionable {
-            let category = match resp.category.as_deref() {
+            let norm = resp
+                .category
+                .as_deref()
+                .map(|s| s.trim().to_ascii_lowercase());
+            let category = match norm.as_deref() {
                 Some("spam") => ViolationCategory::Spam,
                 Some("crypto_spam") | Some("crypto-spam") | Some("crypto") => {
                     ViolationCategory::CryptoSpam
                 }
-                Some("harassment") => ViolationCategory::Harassment,
+                Some("harassment")
+                | Some("targeted_harassment")
+                | Some("targeted harassment")
+                | Some("personal_attack") => ViolationCategory::Harassment,
                 Some("sea_lioning")
                 | Some("sealioning")
                 | Some("sealioning_or_bad_faith")
-                | Some("bad_faith") => ViolationCategory::SeaLioning,
+                | Some("bad_faith")
+                | Some("bad-faith sea-lioning")
+                | Some("relentless bad-faith sea-lioning") => ViolationCategory::SeaLioning,
                 Some("phishing") => ViolationCategory::Phishing,
-                Some("hate_speech") | Some("hatespeech") => ViolationCategory::HateSpeech,
-                Some(other) => ViolationCategory::Custom(other.to_string()),
+                Some("hate_speech") | Some("hatespeech") | Some("hate speech") => {
+                    ViolationCategory::HateSpeech
+                }
+                Some(other) if other.contains("sea-lion") || other.contains("sealion") => {
+                    ViolationCategory::SeaLioning
+                }
+                Some(other) if other.contains("harass") => ViolationCategory::Harassment,
+                Some(_) => match resp.category.as_deref() {
+                    Some(raw) => ViolationCategory::Custom(raw.trim().to_string()),
+                    None => ViolationCategory::Custom("unspecified".to_string()),
+                },
                 None => ViolationCategory::Custom("unspecified".to_string()),
             };
 
@@ -828,7 +854,7 @@ fn enrichment_suffix(interaction: &Interaction) -> String {
     interaction
         .enriched_context
         .as_ref()
-        .map(|ctx| ctx.format_for_classifier())
+        .map(|ctx| ctx.format_for_interaction(&interaction.author_did, &interaction.target_did))
         .filter(|s| !s.is_empty())
         .map(|s| format!("\n{s}"))
         .unwrap_or_default()

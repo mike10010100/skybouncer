@@ -1198,3 +1198,86 @@ async fn test_lazy_relationship_backfill_bypasses_unhydrated_follower_and_caches
     assert!(engine.is_following(PROTECTED_ALICE, followed_peer));
     assert_eq!(engine.stats().snapshot().gate_bypassed_followed, 1);
 }
+
+#[test]
+fn test_target_matcher_preserves_quote_uri_across_quote_and_reply_vectors() {
+    let mut protected = HashSet::new();
+    protected.insert(PROTECTED_ALICE.to_string());
+
+    let quoted_alice_uri = format!("at://{PROTECTED_ALICE}/app.bsky.feed.post/3explainer");
+    let third_party_parent = "at://did:plc:thirdparty/app.bsky.feed.post/3other";
+
+    // Case 1: Replying to a third party while quoting PROTECTED_ALICE (e.g. FP1 @thoreau pattern).
+    let quote_reply_commit = JetstreamCommit {
+        did: SPAMMER_CHARLIE.to_string(),
+        time_us: 1_700_000_000_000_000,
+        operation: CommitOperation::Create,
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3quotereply".to_string(),
+        cid: Some("bafyquotereply".to_string()),
+        record: Some(serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Read the explainer, those 4 members had medical excuses, nimrod!",
+            "createdAt": "2026-11-10T00:00:00Z",
+            "reply": {
+                "parent": { "uri": third_party_parent, "cid": "bafyparent" },
+                "root": { "uri": third_party_parent, "cid": "bafyparent" }
+            },
+            "embed": {
+                "$type": "app.bsky.embed.record",
+                "record": { "uri": quoted_alice_uri, "cid": "bafyquoted" }
+            }
+        })),
+    };
+
+    let matched = TargetMatcher::match_all_interactions(&quote_reply_commit, &protected);
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].interaction_type, InteractionType::Quote);
+    assert_eq!(
+        matched[0].parent_uri.as_deref(),
+        Some(third_party_parent),
+        "Parent URI of third-party reply must be retained"
+    );
+    assert_eq!(
+        matched[0].quote_uri.as_deref(),
+        Some(quoted_alice_uri.as_str()),
+        "Quoted post URI must be preserved on Quote interactions"
+    );
+
+    // Case 2: Direct reply to PROTECTED_ALICE that also embeds a third-party quote.
+    let alice_parent = format!("at://{PROTECTED_ALICE}/app.bsky.feed.post/3alicepost");
+    let quoted_third_uri = "at://did:plc:politician/app.bsky.feed.post/3badtake";
+    let direct_reply_with_quote = JetstreamCommit {
+        did: SPAMMER_CHARLIE.to_string(),
+        time_us: 1_700_000_000_000_000,
+        operation: CommitOperation::Create,
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "3replywithquote".to_string(),
+        cid: Some("bafyreplyquote".to_string()),
+        record: Some(serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Look at what this clown said earlier!",
+            "createdAt": "2026-11-10T00:00:00Z",
+            "reply": {
+                "parent": { "uri": alice_parent, "cid": "bafyalice" },
+                "root": { "uri": alice_parent, "cid": "bafyalice" }
+            },
+            "embed": {
+                "$type": "app.bsky.embed.record",
+                "record": { "uri": quoted_third_uri, "cid": "bafythird" }
+            }
+        })),
+    };
+
+    let matched_reply = TargetMatcher::match_all_interactions(&direct_reply_with_quote, &protected);
+    assert_eq!(matched_reply.len(), 1);
+    assert_eq!(
+        matched_reply[0].interaction_type,
+        InteractionType::DirectReply
+    );
+    assert_eq!(
+        matched_reply[0].quote_uri.as_deref(),
+        Some(quoted_third_uri),
+        "Quoted post URI must also be preserved on DirectReply interactions"
+    );
+}

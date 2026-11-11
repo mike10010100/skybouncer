@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let enricher = AppViewContextEnricher::new();
     let rubric = RuleRubric::new(
-        "Block crypto airdrop spam, scam bots, phishing, targeted harassment, and bad-faith sea-lioning.",
+        skybouncer::classifier::DEFAULT_RUBRIC_PROMPT,
         Sensitivity::Medium,
     );
 

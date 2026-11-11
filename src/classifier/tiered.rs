@@ -31,6 +31,10 @@ pub const DEFAULT_UNCERTAINTY_MIN_CONFIDENCE: f64 = 0.40;
 /// Default upper bound for the classifier uncertainty band (0.85).
 pub const DEFAULT_UNCERTAINTY_MAX_CONFIDENCE: f64 = 0.85;
 
+const fn default_true() -> bool {
+    true
+}
+
 /// Configuration governing when primary evaluations escalate to the fallback model.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CertaintyConfig {
@@ -40,6 +44,11 @@ pub struct CertaintyConfig {
     pub max_confidence: f64,
     /// Whether to automatically escalate interactions with attached images to the multimodal model.
     pub escalate_on_images: bool,
+    /// Whether nuanced interpersonal violation categories (`harassment`, `sea_lioning`,
+    /// `hate_speech`, or custom rules) emitted by Tier-1 always escalate to Tier-2 for
+    /// contextual verification before bouncing an account.
+    #[serde(default = "default_true")]
+    pub escalate_nuanced_violations: bool,
 }
 
 impl Default for CertaintyConfig {
@@ -48,6 +57,7 @@ impl Default for CertaintyConfig {
             min_confidence: DEFAULT_UNCERTAINTY_MIN_CONFIDENCE,
             max_confidence: DEFAULT_UNCERTAINTY_MAX_CONFIDENCE,
             escalate_on_images: true,
+            escalate_nuanced_violations: true,
         }
     }
 }
@@ -70,7 +80,23 @@ impl CertaintyConfig {
             min_confidence: min.min(max),
             max_confidence: max.max(min),
             escalate_on_images,
+            escalate_nuanced_violations: true,
         }
+    }
+
+    /// Overrides whether attached images trigger Tier-2 escalation.
+    #[must_use]
+    pub const fn with_escalate_on_images(mut self, escalate: bool) -> Self {
+        self.escalate_on_images = escalate;
+        self
+    }
+
+    /// Overrides whether nuanced interpersonal violations (`harassment`, `sea_lioning`,
+    /// `hate_speech`, `custom`) always escalate to Tier-2 regardless of Tier-1 confidence.
+    #[must_use]
+    pub const fn with_escalate_nuanced_violations(mut self, escalate: bool) -> Self {
+        self.escalate_nuanced_violations = escalate;
+        self
     }
 
     /// Evaluates whether a raw confidence score falls inside the uncertainty band.
@@ -85,6 +111,17 @@ impl CertaintyConfig {
     /// Determines whether a primary verdict should escalate to the secondary fallback classifier.
     #[must_use]
     pub fn should_escalate(&self, primary_verdict: &Verdict, has_images: bool) -> bool {
+        // Nuanced interpersonal violation categories require System-2 contextual verification
+        // (target directionality, sarcasm, quoted-post context, thread referents) before
+        // bouncing a human commenter, whereas automated spam/crypto/phishing resolve at Tier-1.
+        if self.escalate_nuanced_violations {
+            if let Verdict::Violation { category, .. } = primary_verdict {
+                if category.is_nuanced_interpersonal() {
+                    return true;
+                }
+            }
+        }
+
         // If candidate post contains attached images and escalation on images is enabled:
         if self.escalate_on_images && has_images {
             // If primary verdict was already a decisive, high-confidence violation on text alone,
@@ -273,7 +310,9 @@ impl TieredClassifier {
                     .fetch_add(1, Ordering::Relaxed);
             }
 
-            let (escalation_prefix, escalation_reason) = if has_images {
+            let (escalation_prefix, escalation_reason) = if has_images
+                && self.certainty.escalate_on_images
+            {
                 if record_stats {
                     self.stats.image_escalations.fetch_add(1, Ordering::Relaxed);
                 }
@@ -292,20 +331,38 @@ impl TieredClassifier {
                         .uncertainty_escalations
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                debug!(
-                    post_uri = %interaction.post_uri,
-                    confidence = ?primary_verdict.confidence(),
-                    "Escalating candidate to secondary classifier due to uncertainty band"
-                );
-                (
-                    "[Tiered Fallback: uncertainty escalation]",
-                    format!(
-                        "Confidence {:.2} in uncertainty band [{:.2}..{:.2})",
-                        primary_verdict.confidence().unwrap_or(0.0),
-                        self.certainty.min_confidence,
-                        self.certainty.max_confidence
-                    ),
-                )
+                let conf = primary_verdict.confidence().unwrap_or(0.0);
+                let reason = match &primary_verdict {
+                    Verdict::Violation { category, .. }
+                        if self.certainty.escalate_nuanced_violations
+                            && category.is_nuanced_interpersonal()
+                            && !self.certainty.is_uncertain(conf) =>
+                    {
+                        debug!(
+                            post_uri = %interaction.post_uri,
+                            category = %category,
+                            confidence = conf,
+                            "Escalating nuanced interpersonal Tier-1 violation to System-2 for verification"
+                        );
+                        format!(
+                            "Nuanced interpersonal category '{}' ({:.2}) escalated for System-2 verification",
+                            category.as_str(),
+                            conf
+                        )
+                    }
+                    _ => {
+                        debug!(
+                            post_uri = %interaction.post_uri,
+                            confidence = ?primary_verdict.confidence(),
+                            "Escalating candidate to secondary classifier due to uncertainty band"
+                        );
+                        format!(
+                            "Confidence {:.2} in uncertainty band [{:.2}..{:.2})",
+                            conf, self.certainty.min_confidence, self.certainty.max_confidence
+                        )
+                    }
+                };
+                ("[Tiered Fallback: uncertainty escalation]", reason)
             };
 
             // 3. Evaluate candidate with the heavier System-2 fallback model

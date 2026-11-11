@@ -31,6 +31,7 @@ fn sample_interaction(text: &str) -> Interaction {
         interaction_type: InteractionType::DirectReply,
         parent_uri: Some("at://did:plc:protected456/app.bsky.feed.post/root".to_string()),
         root_uri: Some("at://did:plc:protected456/app.bsky.feed.post/root".to_string()),
+        quote_uri: None,
         created_at_us: 1_700_000_000_000_000,
         image_cids: Vec::new(),
         image_alts: Vec::new(),
@@ -1053,4 +1054,48 @@ async fn test_jev_classifier_ollama_sends_num_ctx_options() {
         .unwrap()
         .with_num_ctx(12_288);
     assert_eq!(custom.num_ctx(), 12_288);
+}
+
+#[tokio::test]
+async fn test_tiered_classifier_nuanced_interpersonal_violation_escalates_to_system2() {
+    // Even when Tier-1 (e.g. nimble) emits a high-confidence (0.94 >= 0.85) Harassment verdict
+    // on snarky/third-party political speech, TieredClassifier MUST escalate nuanced
+    // interpersonal violations to System-2 (e.g. gemma4:26b) for contextual verification!
+    let primary = Arc::new(MockClassifier::new(Verdict::violation(
+        ViolationCategory::Harassment,
+        0.94,
+        "SystemOne choice 'harassment' with confidence 0.94",
+    )));
+    let fallback = Arc::new(MockClassifier::new(Verdict::permitted_with_confidence(
+        "Insult is directed at third-party politicians, not Target",
+        0.96,
+    )));
+
+    let tiered = TieredClassifier::new(
+        primary.clone(),
+        fallback.clone(),
+        CertaintyConfig::default(),
+    );
+    let interaction = sample_interaction("Those politicians are fucking idiots, you nailed it.");
+    let detailed = tiered.classify_detailed(&interaction).await.unwrap();
+
+    assert!(detailed.escalated);
+    assert!(detailed.final_verdict.is_permitted());
+    assert!(detailed
+        .escalation_reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Nuanced interpersonal category 'harassment'"));
+    assert_eq!(primary.call_count(), 1);
+    assert_eq!(fallback.call_count(), 1);
+
+    // Explicit opt-out (`with_escalate_nuanced_violations(false)`) preserves Tier-1 bypass.
+    let opt_out = TieredClassifier::new(
+        primary.clone(),
+        fallback.clone(),
+        CertaintyConfig::default().with_escalate_nuanced_violations(false),
+    );
+    let verdict_no_esc = opt_out.classify(&interaction).await.unwrap();
+    assert!(verdict_no_esc.is_violation());
+    assert_eq!(fallback.call_count(), 1); // unchanged
 }
