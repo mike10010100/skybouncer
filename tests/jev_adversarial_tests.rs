@@ -1862,6 +1862,7 @@ async fn test_reply_recipient_line_self_reply_mention_and_standalone_quote() {
     let reqs = server.received_requests().await.unwrap();
     let quote_body = String::from_utf8_lossy(&reqs[2].body);
     assert!(!quote_body.contains("Replying To:"));
+    assert!(quote_body.contains("Quoting: Target (did:plc:target)"));
 }
 
 #[tokio::test]
@@ -2123,4 +2124,225 @@ async fn test_systemone_and_classifier_edge_branches() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn test_standalone_quote_group_label_dunk_systemone_and_ollama() {
+    use skybouncer::classifier::Verdict;
+    use skybouncer::enricher::{EnrichedContext, ParentPostContext, ThreadPost};
+
+    let server = MockServer::start().await;
+    let target_did = "did:plc:mmtjkssv6jeneahkgfdxuy7p";
+    let author_did = "did:plc:qwpty6y2kbyathbxlfcejz2p";
+    let interlocutor_did = "did:plc:vasmwozbxda25bah7d6sb3ja";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(wiremock::matchers::body_string_contains("Quoting: Target"))
+        .and(wiremock::matchers::body_string_contains(
+            "[QUOTED POST — Author is quote-posting this post]",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "standalone 'Quoting: Target' quote-posts that hurl demeaning intelligence/character insults",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "harassment",
+                    "probabilities": { "harassment": 0.91, "permitted": 0.08 }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(wiremock::matchers::body_string_contains("Quoting: Target"))
+        .and(wiremock::matchers::body_string_contains(
+            "[QUOTED POST — Author is quote-posting this post]",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "Standalone quote-posts ('Quoting: Target') & group-label quote-dunks",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": {
+                "role": "assistant",
+                "content": r#"{"violates": true, "category": "harassment", "confidence": 0.95, "reason": "Standalone quote-post demeans Target via the 'Chuck supporters' group label representing Target's stance in the thread."}"#
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Also verify `Quoting:` header omission when quoting an OtherUser and resolution from `enriched_context.quoted_post`.
+    Mock::given(method("POST"))
+        .and(path("/other_quote/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "permitted",
+                    "probabilities": { "permitted": 0.95 }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/ctx_quote/v1/systemone"))
+        .and(wiremock::matchers::body_string_contains("Quoting: Target"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "harassment",
+                    "probabilities": { "harassment": 0.93 }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut ctx = EnrichedContext::empty();
+    ctx.quoted_post = Some(ParentPostContext {
+        author_did: target_did.to_string(),
+        text: "So just the two things then.\n\nOr will there inevitably be more?".to_string(),
+        cid: Some("bafyquoted".to_string()),
+    });
+    ctx.thread_ancestors = vec![
+        ThreadPost {
+            author_did: interlocutor_did.to_string(),
+            text: "So yes I find Schumer uniquely unsatisfactory for the job".to_string(),
+        },
+        ThreadPost {
+            author_did: target_did.to_string(),
+            text: "So just the two things then.\n\nOr will there inevitably be more?".to_string(),
+        },
+    ];
+
+    let mut interaction = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Quote,
+        "at://did:plc:qwpty6y2kbyathbxlfcejz2p/app.bsky.feed.post/3n27kxiexm22j",
+        "bafycand",
+        "Chuck supporters are the dumbest fucks around.",
+    )
+    .with_quote_uri("at://did:plc:mmtjkssv6jeneahkgfdxuy7p/app.bsky.feed.post/3n264mmxavs2v");
+    interaction.enriched_context = Some(ctx);
+
+    let systemone = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    let res_s1 = systemone.classify(&interaction).await.unwrap();
+    assert!(matches!(
+        res_s1,
+        Verdict::Violation {
+            category: ViolationCategory::Harassment,
+            ..
+        }
+    ));
+
+    let ollama = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/api/chat", server.uri()),
+            api_key: None,
+            model: "gemma4:26b".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    let res_ollama = ollama.classify(&interaction).await.unwrap();
+    assert!(matches!(
+        res_ollama,
+        Verdict::Violation {
+            category: ViolationCategory::Harassment,
+            ..
+        }
+    ));
+
+    // Standalone quote without `quote_uri` falls back to `enriched_context.quoted_post.author_did`.
+    let mut ctx_only = EnrichedContext::empty();
+    ctx_only.quoted_post = Some(ParentPostContext {
+        author_did: target_did.to_string(),
+        text: "Target take".to_string(),
+        cid: None,
+    });
+    let mut quote_via_ctx = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Quote,
+        "at://did:plc:qwpty6y2kbyathbxlfcejz2p/app.bsky.feed.post/ctxonly",
+        "bafyctx",
+        "People like this are morons.",
+    );
+    quote_via_ctx.enriched_context = Some(ctx_only);
+    let ctx_clf = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/ctx_quote/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(ctx_clf
+        .classify(&quote_via_ctx)
+        .await
+        .unwrap()
+        .is_violation());
+
+    // Standalone quote whose `quote_uri` points at an OtherUser omits `Quoting: Target`.
+    let other_quote = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Quote,
+        "at://did:plc:qwpty6y2kbyathbxlfcejz2p/app.bsky.feed.post/otherq",
+        "bafyother",
+        "agree completely",
+    )
+    .with_quote_uri("at://did:plc:someoneelse/app.bsky.feed.post/1");
+    let other_clf = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/other_quote/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(other_clf
+        .classify(&other_quote)
+        .await
+        .unwrap()
+        .is_permitted());
+    let reqs = server.received_requests().await.unwrap();
+    let other_req_body = reqs
+        .iter()
+        .find(|r| r.url.path() == "/other_quote/v1/systemone")
+        .expect("other_quote request recorded");
+    assert!(!String::from_utf8_lossy(&other_req_body.body).contains("Quoting: Target ("));
 }

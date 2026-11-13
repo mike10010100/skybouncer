@@ -543,12 +543,17 @@ impl RuleRubric {
 pub const LEGACY_DEFAULT_RUBRIC_PROMPT: &str =
     "Block crypto airdrop spam, scam bots, phishing, targeted harassment, and bad-faith sea-lioning.";
 
+/// Legacy default moderation house rules from v0.2.25 through v0.2.33, retained so
+/// unmodified persisted tenant defaults can be migrated idempotently on startup.
+pub const LEGACY_DEFAULT_RUBRIC_PROMPT_V0_2_25: &str = "Block crypto/airdrop scams, scam bots, phishing, unsolicited promotional spam, personal attacks/insults/name-calling/slurs/threats aimed at the protected user, and relentless bad-faith sea-lioning aimed at the protected user. Permit non-targeted profanity, sarcasm, blunt disagreement, heated political debate, quoting the protected user to argue with someone else, and hostility directed at third parties, unrelated public figures, politicians, groups, or other commenters.";
+
 /// Default moderation house rules for newly enrolled accounts and fallback configuration.
 ///
-/// Explicitly scopes harassment and sea-lioning to abuse directed at the protected user,
-/// while carving out casual profanity, sarcasm, heated political debate, quoting the
-/// protected user to argue with someone else, and hostility directed at third parties.
-pub const DEFAULT_RUBRIC_PROMPT: &str = "Block crypto/airdrop scams, scam bots, phishing, unsolicited promotional spam, personal attacks/insults/name-calling/slurs/threats aimed at the protected user, and relentless bad-faith sea-lioning aimed at the protected user. Permit non-targeted profanity, sarcasm, blunt disagreement, heated political debate, quoting the protected user to argue with someone else, and hostility directed at third parties, unrelated public figures, politicians, groups, or other commenters.";
+/// Explicitly scopes harassment and sea-lioning to abuse directed at the protected user
+/// (including quote-posts demeaning the protected user via supporter or group labels),
+/// while carving out constructive critique, non-targeted profanity, sarcasm, blunt
+/// disagreement, and arguments or hostility directed at other commenters or third parties.
+pub const DEFAULT_RUBRIC_PROMPT: &str = "Block crypto/airdrop scams, scam bots, phishing, unsolicited promotional spam, personal attacks/insults/name-calling/slurs/threats aimed at the protected user (including quote-posts demeaning the protected user via supporter or group labels), and relentless bad-faith sea-lioning aimed at the protected user. Permit constructive critique, non-targeted profanity, sarcasm, blunt disagreement, and arguments or hostility directed at other commenters or third parties.";
 
 /// Legacy built-in `"balanced"` preset prompt prior to v0.2.32 (unscoped interpersonal clause).
 pub const LEGACY_PRESET_BALANCED_PROMPT: &str =
@@ -582,6 +587,7 @@ pub const PRESET_ANTI_RAGEBAIT_PROMPT: &str =
 /// across both SQLite tenant records and sovereign ATProto PDS configurations.
 pub const LEGACY_PROMPT_UPGRADES: &[(&str, &str)] = &[
     (LEGACY_DEFAULT_RUBRIC_PROMPT, DEFAULT_RUBRIC_PROMPT),
+    (LEGACY_DEFAULT_RUBRIC_PROMPT_V0_2_25, DEFAULT_RUBRIC_PROMPT),
     (LEGACY_PRESET_BALANCED_PROMPT, PRESET_BALANCED_PROMPT),
     (
         LEGACY_PRESET_ANTI_HOSTILITY_PROMPT,
