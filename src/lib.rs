@@ -68,7 +68,7 @@ pub use bot::{
 };
 pub use enricher::{
     AppViewContextEnricher, AuthorContext, ContextEnricher, EnrichedContext, MockContextEnricher,
-    NoopContextEnricher, ParentPostContext, ThreadPost, DEFAULT_APPVIEW_ENDPOINT,
+    NoopContextEnricher, ParentPostContext, QuotedAncestor, ThreadPost, DEFAULT_APPVIEW_ENDPOINT,
     DEFAULT_ENRICHER_TIMEOUT_MS, MAX_POST_IMAGES, MAX_RENDERED_THREAD_ANCESTORS,
     THREAD_ANCESTOR_CHAR_CAP,
 };

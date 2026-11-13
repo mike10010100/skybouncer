@@ -49,6 +49,18 @@ pub struct ThreadPost {
     pub text: String,
 }
 
+/// Embedded quoted post attached to a thread ancestor post.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct QuotedAncestor {
+    /// DID of the quoted post's author.
+    pub author_did: String,
+    /// Normalized Bluesky handle of the quoted post's author, when present in the AppView record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_handle: Option<String>,
+    /// Plaintext content of the quoted post.
+    pub text: String,
+}
+
 /// Profile metadata describing the author of an interaction.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct AuthorContext {
@@ -95,6 +107,12 @@ pub struct EnrichedContext {
     /// Populated only when thread-context enrichment is enabled; empty otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub thread_ancestors: Vec<ThreadPost>,
+    /// Optional quoted post embeds corresponding by index to `thread_ancestors`.
+    ///
+    /// Empty when no thread ancestor embeds a readable quote post (including during
+    /// mock enrichment or simple fixtures).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thread_ancestor_quotes: Vec<Option<QuotedAncestor>>,
     /// Base64-encoded image payloads fetched from CDN for attached images.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images_base64: Vec<String>,
@@ -115,6 +133,7 @@ impl EnrichedContext {
             && self.parent_post.is_none()
             && self.quoted_post.is_none()
             && self.thread_ancestors.is_empty()
+            && self.thread_ancestor_quotes.iter().all(Option::is_none)
             && self.images_base64.is_empty()
     }
 
@@ -214,15 +233,42 @@ impl EnrichedContext {
                         .parent_post
                         .as_ref()
                         .is_none_or(|p| p.author_did == ancestor.author_did);
+                let quote_suffix = match roles {
+                    Some((author_did, target_did)) => self
+                        .thread_ancestor_quotes
+                        .get(start + offset)
+                        .and_then(Option::as_ref)
+                        .map(|q| {
+                            let q_snippet: String = q.text.chars().take(160).collect();
+                            let role = if q.author_did == target_did {
+                                "Target"
+                            } else if q.author_did == author_did {
+                                "Author"
+                            } else {
+                                "OtherUser"
+                            };
+                            let actor = match q.author_handle.as_deref() {
+                                Some(h) if !h.trim().is_empty() => format!(
+                                    "{role} @{} ({})",
+                                    crate::util::normalize_handle(h),
+                                    q.author_did
+                                ),
+                                _ => format!("{role} ({})", q.author_did),
+                            };
+                            format!(" [quoting {actor}: \"{q_snippet}\"]")
+                        })
+                        .unwrap_or_default(),
+                    None => String::new(),
+                };
                 if is_immediate_parent {
                     rendered.push(format!(
-                        "[{depth}] {}: \"{}\" [IMMEDIATE PARENT — Author is replying to this post]",
+                        "[{depth}] {}: \"{}\"{quote_suffix} [IMMEDIATE PARENT — Author is replying to this post]",
                         format_actor(&ancestor.author_did),
                         snippet
                     ));
                 } else {
                     rendered.push(format!(
-                        "[{depth}] {}: \"{}\"",
+                        "[{depth}] {}: \"{}\"{quote_suffix}",
                         format_actor(&ancestor.author_did),
                         snippet
                     ));
@@ -429,6 +475,7 @@ impl ContextEnricher for MockContextEnricher {
             parent_post,
             quoted_post,
             thread_ancestors: Vec::new(),
+            thread_ancestor_quotes: Vec::new(),
             images_base64,
         }
     }
@@ -647,35 +694,76 @@ impl AppViewContextEnricher {
         })
     }
 
+    /// Extracts an embedded quote-post summary from a `getPostThread` post `embed` object.
+    fn extract_ancestor_quote(embed: &serde_json::Value) -> Option<QuotedAncestor> {
+        let embed_type = embed.get("$type").and_then(|v| v.as_str())?;
+        let record = match embed_type {
+            "app.bsky.embed.record#view" => embed.get("record")?,
+            "app.bsky.embed.recordWithMedia#view" => embed.get("record")?.get("record")?,
+            _ => return None,
+        };
+        if let Some(rec_type) = record.get("$type").and_then(|v| v.as_str()) {
+            if rec_type != "app.bsky.embed.record#viewRecord" {
+                return None;
+            }
+        }
+        let author = record.get("author")?;
+        let author_did = author
+            .get("did")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())?
+            .to_string();
+        let author_handle = author
+            .get("handle")
+            .and_then(|v| v.as_str())
+            .map(crate::util::normalize_handle)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let text = record
+            .get("value")
+            .and_then(|v| v.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Some(QuotedAncestor {
+            author_did,
+            author_handle,
+            text,
+        })
+    }
+
     /// Resolves the full ancestor chain above `uri` via `app.bsky.feed.getPostThread`
     /// with `depth = 0`, returning posts ordered oldest (thread root) to newest
     /// (immediate parent). Caps the chain at [`MAX_RENDERED_THREAD_ANCESTORS`].
     ///
     /// Returns an empty vector on any AppView failure.
     pub async fn fetch_thread_ancestors(&self, uri: &str) -> Vec<ThreadPost> {
-        self.fetch_thread_chain(uri, false, "", "").await
+        self.fetch_thread_chain_with_quotes(uri, false, "", "")
+            .await
+            .0
     }
 
     /// Resolves the conversation thread anchored at `parent_uri`, including `parent_uri`
-    /// itself as the newest ancestor when `getPostThread` returns the parent post as the
-    /// focal `thread.post` node (standard AppView behavior when querying by `parent_uri`).
+    /// itself as the newest ancestor (along with any embedded quoted posts) when `getPostThread`
+    /// returns the parent post as the focal `thread.post` node (standard AppView behavior
+    /// when querying by `parent_uri`).
     async fn fetch_thread_from_parent(
         &self,
         parent_uri: &str,
         candidate_author_did: &str,
         candidate_text: &str,
-    ) -> Vec<ThreadPost> {
-        self.fetch_thread_chain(parent_uri, true, candidate_author_did, candidate_text)
+    ) -> (Vec<ThreadPost>, Vec<Option<QuotedAncestor>>) {
+        self.fetch_thread_chain_with_quotes(parent_uri, true, candidate_author_did, candidate_text)
             .await
     }
 
-    async fn fetch_thread_chain(
+    async fn fetch_thread_chain_with_quotes(
         &self,
         uri: &str,
         include_focal_when_parent: bool,
         candidate_author_did: &str,
         candidate_text: &str,
-    ) -> Vec<ThreadPost> {
+    ) -> (Vec<ThreadPost>, Vec<Option<QuotedAncestor>>) {
         #[derive(Deserialize)]
         struct RawAuthor {
             did: String,
@@ -691,6 +779,8 @@ impl AppViewContextEnricher {
             uri: Option<String>,
             author: RawAuthor,
             record: RawRecord,
+            #[serde(default)]
+            embed: Option<serde_json::Value>,
         }
         #[derive(Deserialize)]
         struct RawThreadNode {
@@ -708,6 +798,7 @@ impl AppViewContextEnricher {
         }
 
         let mut chain = Vec::new();
+        let mut quotes = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut current_uri = Some(uri.to_string());
         let mut is_first_hop = true;
@@ -751,6 +842,7 @@ impl AppViewContextEnricher {
                         }
                     };
                     if is_ancestor {
+                        quotes.push(focal.embed.as_ref().and_then(Self::extract_ancestor_quote));
                         chain.push(ThreadPost {
                             author_did: focal.author.did,
                             text: focal.record.text,
@@ -762,6 +854,7 @@ impl AppViewContextEnricher {
             let mut cursor = thread.parent;
             while let Some(node) = cursor {
                 if let Some(post) = node.post {
+                    quotes.push(post.embed.as_ref().and_then(Self::extract_ancestor_quote));
                     chain.push(ThreadPost {
                         author_did: post.author.did,
                         text: post.record.text,
@@ -788,8 +881,14 @@ impl AppViewContextEnricher {
 
         // Walk yields newest-first; reverse to oldest-first.
         chain.reverse();
+        quotes.reverse();
         let start = chain.len().saturating_sub(MAX_RENDERED_THREAD_ANCESTORS);
-        chain.split_off(start)
+        let ancestors = chain.split_off(start);
+        let mut trimmed_quotes = quotes.split_off(start);
+        if trimmed_quotes.iter().all(Option::is_none) {
+            trimmed_quotes.clear();
+        }
+        (ancestors, trimmed_quotes)
     }
 
     /// Fetches initial followed DIDs for an actor from the public AppView (XRPC `app.bsky.graph.getFollows`).
@@ -982,12 +1081,18 @@ impl ContextEnricher for AppViewContextEnricher {
                     self.fetch_thread_from_parent(uri, &interaction.author_did, &interaction.text)
                         .await
                 }
-                _ => Vec::new(),
+                _ => (Vec::new(), Vec::new()),
             }
         };
 
-        let (author, target, parent_post, quoted_post, images_base64, thread_ancestors) =
-            tokio::join!(author_fut, target_fut, parent_fut, quoted_fut, images_fut, thread_fut);
+        let (
+            author,
+            target,
+            parent_post,
+            quoted_post,
+            images_base64,
+            (thread_ancestors, thread_ancestor_quotes),
+        ) = tokio::join!(author_fut, target_fut, parent_fut, quoted_fut, images_fut, thread_fut);
 
         EnrichedContext {
             author,
@@ -995,6 +1100,7 @@ impl ContextEnricher for AppViewContextEnricher {
             parent_post,
             quoted_post,
             thread_ancestors,
+            thread_ancestor_quotes,
             images_base64,
         }
     }

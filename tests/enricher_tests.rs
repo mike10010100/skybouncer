@@ -683,3 +683,223 @@ fn test_subthread_reply_marks_immediate_other_user_parent_for_interaction() {
         "In Reply To (by OtherUser (did:plc:unlisted_parent)): \"Separate immediate parent\""
     ));
 }
+
+#[tokio::test]
+async fn test_appview_enricher_preserves_ancestor_quote_embeds_for_interaction() {
+    let mock_server = MockServer::start().await;
+    let target_did = "did:plc:mmtjkssv6jeneahkgfdxuy7p";
+    let author_did = "did:plc:lqvsqsm4bjxqeue3bulyhvwl";
+    let root_author_did = "did:plc:sailormichael0000000000";
+    let quoted_did = "did:plc:7umvpuxe2vbrc3zrzuquzniu";
+    let third_did = "did:plc:commenter111111111111111";
+    let media_quoted_did = "did:plc:quotedmedia222222222222";
+    let parent_uri = "at://did:plc:mmtjkssv6jeneahkgfdxuy7p/app.bsky.feed.post/3n27fphhcx22b";
+
+    // Ancestor chain ordered oldest -> newest:
+    // [1] root with `app.bsky.embed.record#view`
+    // [2] intermediate with `app.bsky.embed.recordWithMedia#view`
+    // [3] intermediate with non-quote `app.bsky.embed.images#view` (ignored -> None)
+    // [4] immediate parent with blocked quote `#viewBlocked` (ignored -> None)
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPostThread"))
+        .and(query_param("uri", parent_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "thread": {
+                "$type": "app.bsky.feed.defs#threadViewPost",
+                "post": {
+                    "uri": parent_uri,
+                    "author": { "did": target_did },
+                    "record": { "$type": "app.bsky.feed.post", "text": "Charmin really earned that ratio." },
+                    "embed": {
+                        "$type": "app.bsky.embed.record#view",
+                        "record": {
+                            "$type": "app.bsky.embed.record#viewBlocked",
+                            "uri": "at://did:plc:blocked/app.bsky.feed.post/1",
+                            "blocked": true
+                        }
+                    }
+                },
+                "parent": {
+                    "$type": "app.bsky.feed.defs#threadViewPost",
+                    "post": {
+                        "uri": "at://did:plc:commenter/app.bsky.feed.post/3",
+                        "author": { "did": third_did },
+                        "record": { "$type": "app.bsky.feed.post", "text": "Screenshot attached." },
+                        "embed": {
+                            "$type": "app.bsky.embed.images#view",
+                            "images": [{ "fullsize": "https://cdn.bsky.app/img/1.jpg", "alt": "chart" }]
+                        }
+                    },
+                    "parent": {
+                        "$type": "app.bsky.feed.defs#threadViewPost",
+                        "post": {
+                            "uri": "at://did:plc:target/app.bsky.feed.post/2",
+                            "author": { "did": target_did },
+                            "record": { "$type": "app.bsky.feed.post", "text": "Look at the follow-up too." },
+                            "embed": {
+                                "$type": "app.bsky.embed.recordWithMedia#view",
+                                "record": {
+                                    "record": {
+                                        "$type": "app.bsky.embed.record#viewRecord",
+                                        "author": {
+                                            "did": media_quoted_did,
+                                            "handle": "mediaquoted.bsky.social"
+                                        },
+                                        "value": { "text": "Original quoted take with media." }
+                                    }
+                                },
+                                "media": { "$type": "app.bsky.embed.images#view", "images": [] }
+                            }
+                        },
+                        "parent": {
+                            "$type": "app.bsky.feed.defs#threadViewPost",
+                            "post": {
+                                "uri": "at://did:plc:root/app.bsky.feed.post/1",
+                                "author": { "did": root_author_did },
+                                "record": { "$type": "app.bsky.feed.post", "text": "Unbelievable meltdown." },
+                                "embed": {
+                                    "$type": "app.bsky.embed.record#view",
+                                    "record": {
+                                        "$type": "app.bsky.embed.record#viewRecord",
+                                        "author": {
+                                            "did": quoted_did,
+                                            "handle": "@whstancil.bsky.social"
+                                        },
+                                        "value": { "text": "I am very mad online about being criticized." }
+                                    }
+                                }
+                            },
+                            "parent": null
+                        }
+                    }
+                }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let enricher =
+        AppViewContextEnricher::with_endpoint(mock_server.uri()).with_thread_context(true);
+    let interaction = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::DirectReply,
+        "at://did:plc:lqvsqsm4bjxqeue3bulyhvwl/app.bsky.feed.post/3n27g24tm3s26",
+        "bafycand",
+        "And now he's super sad this morning.",
+    )
+    .with_parent_uri(parent_uri);
+
+    let ctx = enricher.enrich(&interaction).await;
+    assert_eq!(ctx.thread_ancestors.len(), 4);
+    assert_eq!(ctx.thread_ancestor_quotes.len(), 4);
+    assert_eq!(
+        ctx.thread_ancestor_quotes[0]
+            .as_ref()
+            .and_then(|q| q.author_handle.as_deref()),
+        Some("whstancil.bsky.social")
+    );
+    assert_eq!(
+        ctx.thread_ancestor_quotes[1]
+            .as_ref()
+            .and_then(|q| q.author_handle.as_deref()),
+        Some("mediaquoted.bsky.social")
+    );
+    assert!(ctx.thread_ancestor_quotes[2].is_none());
+    assert!(ctx.thread_ancestor_quotes[3].is_none());
+
+    let role_formatted = ctx.format_for_interaction(author_did, target_did);
+    assert!(role_formatted.contains(&format!(
+        "[1] OtherUser ({root_author_did}): \"Unbelievable meltdown.\" [quoting OtherUser @whstancil.bsky.social ({quoted_did}): \"I am very mad online about being criticized.\"]"
+    )));
+    assert!(role_formatted.contains(&format!(
+        "[2] Target ({target_did}): \"Look at the follow-up too.\" [quoting OtherUser @mediaquoted.bsky.social ({media_quoted_did}): \"Original quoted take with media.\"]"
+    )));
+    assert!(role_formatted.contains(&format!(
+        "[4] Target ({target_did}): \"Charmin really earned that ratio.\" [IMMEDIATE PARENT — Author is replying to this post]"
+    )));
+
+    // `format_for_classifier()` must remain unchanged without role or quote annotations.
+    let raw_formatted = ctx.format_for_classifier();
+    assert!(!raw_formatted.contains("[quoting"));
+    assert!(!raw_formatted.contains("[IMMEDIATE PARENT"));
+
+    // Public `fetch_thread_ancestors` keeps its original signature and returns `Vec<ThreadPost>`.
+    let raw_chain = enricher.fetch_thread_ancestors(parent_uri).await;
+    assert_eq!(raw_chain.len(), 3);
+}
+
+#[tokio::test]
+async fn test_quoted_ancestor_target_author_roles_is_empty_and_image_enrich() {
+    use skybouncer::enricher::{EnrichedContext, QuotedAncestor, ThreadPost};
+
+    let target_did = "did:plc:target_role";
+    let author_did = "did:plc:author_role";
+
+    // `is_empty()` treats all-`None` `thread_ancestor_quotes` as empty, and non-`None` as non-empty.
+    let mut ctx = EnrichedContext::empty();
+    ctx.thread_ancestor_quotes = vec![None];
+    assert!(ctx.is_empty());
+
+    ctx.thread_ancestor_quotes = vec![Some(QuotedAncestor {
+        author_did: target_did.to_string(),
+        author_handle: None,
+        text: "Quoted Target without handle".to_string(),
+    })];
+    assert!(!ctx.is_empty());
+
+    // Role formatting covers `Target (did)` (no handle) and `Author @handle (did)` quote labels.
+    ctx.thread_ancestors = vec![
+        ThreadPost {
+            author_did: "did:plc:other".to_string(),
+            text: "First post".to_string(),
+        },
+        ThreadPost {
+            author_did: target_did.to_string(),
+            text: "Second post".to_string(),
+        },
+    ];
+    ctx.thread_ancestor_quotes = vec![
+        Some(QuotedAncestor {
+            author_did: target_did.to_string(),
+            author_handle: None,
+            text: "Quoted Target without handle".to_string(),
+        }),
+        Some(QuotedAncestor {
+            author_did: author_did.to_string(),
+            author_handle: Some("author.bsky.social".to_string()),
+            text: "Quoted Author with handle".to_string(),
+        }),
+    ];
+    let formatted = ctx.format_for_interaction(author_did, target_did);
+    assert!(formatted.contains(&format!(
+        "[quoting Target ({target_did}): \"Quoted Target without handle\"]"
+    )));
+    assert!(formatted.contains(&format!(
+        "[quoting Author @author.bsky.social ({author_did}): \"Quoted Author with handle\"]"
+    )));
+
+    // `AppViewContextEnricher::enrich` exercises image fetching when `interaction.has_images()`.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/img/feed_thumbnail/plain/{author_did}/bafkreiimg@jpeg"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"IMG".to_vec()))
+        .mount(&mock_server)
+        .await;
+
+    let enricher = AppViewContextEnricher::with_endpoints(mock_server.uri(), mock_server.uri());
+    let mut img_interaction = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Mention,
+        "at://did:plc:author_role/app.bsky.feed.post/1",
+        "bafy1",
+        "check this image",
+    );
+    img_interaction.image_cids = vec!["bafkreiimg".to_string()];
+
+    let enriched = enricher.enrich(&img_interaction).await;
+    assert_eq!(enriched.images_base64, vec!["SU1H".to_string()]);
+}

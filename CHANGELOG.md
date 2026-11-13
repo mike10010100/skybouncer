@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.33] - 2026-11-13
+
+### Fixed
+
+- **Third-Person Commiseration & Ancestor Quote Coreference (`src/enricher.rs`, `src/classifier/jev.rs`, `src/lib.rs`)**:
+  - Added `QuotedAncestor` (`EnrichedContext::thread_ancestor_quotes`) and `extract_ancestor_quote` to preserve embedded quote-post views (`app.bsky.embed.record#view` and `app.bsky.embed.recordWithMedia#view`, safely ignoring media-only, blocked, detached, or not-found embeds) along `getPostThread` ancestor walks without changing `ThreadPost` or `format_for_classifier()`.
+  - Rendered ancestor quote summaries (`[quoting OtherUser @handle (did): "..."]`) before `[IMMEDIATE PARENT]` in `EnrichedContext::format_for_interaction`, exposing the third-party subject when `Target` or earlier commenters quote another user.
+  - Expanded Ollama System-2 disambiguation rules (`(1)(a)`/`(1)(b)`/`(2)`/`(3)`) and SystemOne (`nimble`) criteria (`harassment`, `permitted`) so third-person insults/criticism (`"he"`, `"him"`, `"his"`, `"she"`, `"they"`) commiserating with `Target` about a quoted `OtherUser` or third party already discussed by `Target` are permitted, while third-person dunks aimed at `Target` for an audience when no third-party subject is under discussion remain flagged.
+
 ## [0.2.32] - 2026-11-11
 
 ### Fixed

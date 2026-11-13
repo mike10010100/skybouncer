@@ -1863,3 +1863,264 @@ async fn test_reply_recipient_line_self_reply_mention_and_standalone_quote() {
     let quote_body = String::from_utf8_lossy(&reqs[2].body);
     assert!(!quote_body.contains("Replying To:"));
 }
+
+#[tokio::test]
+async fn test_third_person_commiseration_with_quoted_ancestor_systemone_and_ollama() {
+    use skybouncer::enricher::{EnrichedContext, ParentPostContext, QuotedAncestor, ThreadPost};
+
+    let server = MockServer::start().await;
+    let target_did = "did:plc:mmtjkssv6jeneahkgfdxuy7p";
+    let author_did = "did:plc:lqvsqsm4bjxqeue3bulyhvwl";
+    let quoted_did = "did:plc:7umvpuxe2vbrc3zrzuquzniu";
+
+    // Both SystemOne (`nimble`) and Ollama (`gemma4:26b`) receive the `[quoting OtherUser ...]`
+    // annotation alongside `Replying To: Target`, plus updated 3p commiseration guidance.
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(wiremock::matchers::body_string_contains(
+            "Replying To: Target",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "[quoting OtherUser @whstancil.bsky.social (did:plc:7umvpuxe2vbrc3zrzuquzniu):",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "aimed at a '[quoting OtherUser ...]' subject",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "permitted",
+                    "probabilities": { "permitted": 0.96, "harassment": 0.03 }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(wiremock::matchers::body_string_contains("Replying To: Target"))
+        .and(wiremock::matchers::body_string_contains(
+            "[quoting OtherUser @whstancil.bsky.social (did:plc:7umvpuxe2vbrc3zrzuquzniu):",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "Third-person commiseration & quoted-subject co-reference",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": {
+                "role": "assistant",
+                "content": r#"{"violates": false, "category": null, "confidence": 0.99, "reason": "Author is commiserating with Target about the quoted third party (@whstancil.bsky.social), not attacking Target."}"#
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut ctx = EnrichedContext::empty();
+    ctx.parent_post = Some(ParentPostContext {
+        author_did: target_did.to_string(),
+        text: "Charmin really made a scene over this.".to_string(),
+        cid: Some("bafyparent".to_string()),
+    });
+    ctx.thread_ancestors = vec![
+        ThreadPost {
+            author_did: "did:plc:sailormichael0000000000".to_string(),
+            text: "Look at this thread.".to_string(),
+        },
+        ThreadPost {
+            author_did: target_did.to_string(),
+            text: "Charmin really made a scene over this.".to_string(),
+        },
+    ];
+    ctx.thread_ancestor_quotes = vec![
+        Some(QuotedAncestor {
+            author_did: quoted_did.to_string(),
+            author_handle: Some("whstancil.bsky.social".to_string()),
+            text: "Everyone in my mentions is being unfair to me.".to_string(),
+        }),
+        None,
+    ];
+
+    let mut interaction = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::DirectReply,
+        "at://did:plc:lqvsqsm4bjxqeue3bulyhvwl/app.bsky.feed.post/3n27g24tm3s26",
+        "bafycand",
+        "And now he's super sad this morning because there's a bunch of broads in his mentions reminding him how mediocre he is.",
+    )
+    .with_parent_uri("at://did:plc:mmtjkssv6jeneahkgfdxuy7p/app.bsky.feed.post/3n27fphhcx22b");
+    interaction.enriched_context = Some(ctx);
+
+    let systemone = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    let res_s1 = systemone.classify(&interaction).await.unwrap();
+    assert!(res_s1.is_permitted());
+
+    let ollama = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/api/chat", server.uri()),
+            api_key: None,
+            model: "gemma4:26b".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    let res_ollama = ollama.classify(&interaction).await.unwrap();
+    assert!(res_ollama.is_permitted());
+}
+
+#[tokio::test]
+async fn test_systemone_and_classifier_edge_branches() {
+    use skybouncer::classifier::{Classifier, OllamaChatOptions, Verdict, DEFAULT_OLLAMA_NUM_CTX};
+
+    let opts = OllamaChatOptions::default();
+    assert_eq!(opts.num_ctx, DEFAULT_OLLAMA_NUM_CTX);
+
+    let server = MockServer::start().await;
+
+    // 1. SystemOne non-SystemOne JSON body triggers parse error branch.
+    Mock::given(method("POST"))
+        .and(path("/bad_s1/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"not_answers": 1})))
+        .mount(&server)
+        .await;
+
+    let bad_s1 = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/bad_s1/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    let sample = Interaction::new(
+        "did:plc:a",
+        "did:plc:b",
+        InteractionType::DirectReply,
+        "at://did:plc:a/app.bsky.feed.post/1",
+        "cid1",
+        "hello",
+    );
+    assert!(bad_s1.classify(&sample).await.is_err());
+
+    // 2. Violation choice deriving confidence as `1.0 - permitted` when choice probability is absent.
+    Mock::given(method("POST"))
+        .and(path("/perm_fallback/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "harassment",
+                    "probabilities": { "permitted": 0.08 }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let perm_fallback = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/perm_fallback/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    let v_perm_fb = perm_fallback.classify(&sample).await.unwrap();
+    assert!(v_perm_fb.is_violation());
+    assert!((v_perm_fb.confidence().unwrap() - 0.92).abs() < 1e-6);
+
+    // 3. Permitted choice with empty probabilities and null confidence returns error.
+    Mock::given(method("POST"))
+        .and(path("/perm_empty/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "permitted",
+                    "probabilities": {}
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let perm_empty = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/perm_empty/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(perm_empty.classify(&sample).await.is_err());
+
+    // 4. `Classifier::set_rubric` trait forwarding and substring `sea-lion` category mapping.
+    Mock::given(method("POST"))
+        .and(path("/sealion/v1/classify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "violates": true,
+            "category": "persistent sea-lioning troll",
+            "confidence": 0.91,
+            "reason": "sealion"
+        })))
+        .mount(&server)
+        .await;
+
+    let sealion_clf = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/sealion", server.uri()),
+            api_key: None,
+            model: "custom".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    let trait_clf: &dyn Classifier = &sealion_clf;
+    let custom_rubric = RuleRubric::new(
+        "Strict custom rubric",
+        skybouncer::classifier::Sensitivity::High,
+    );
+    trait_clf.set_rubric(custom_rubric.clone());
+    assert_eq!(sealion_clf.rubric().prompt, custom_rubric.prompt);
+
+    let sealion_verdict = trait_clf.classify(&sample).await.unwrap();
+    assert!(matches!(
+        sealion_verdict,
+        Verdict::Violation {
+            category: ViolationCategory::SeaLioning,
+            ..
+        }
+    ));
+}

@@ -1,6 +1,6 @@
 {
  "source": "synthetic hard thread corpus authored for context experiment",
- "count": 14,
+ "count": 16,
  "cases": [
   {
    "name": "sealioning_repeat_question",
@@ -247,6 +247,38 @@
    "candidate_text": "Because @targetuser is a lying grifter moron who fabricates charts for clout.",
    "expected_violation": true,
    "note": "Sub-thread reply to OtherUser that explicitly names and attacks Target."
+  },
+  {
+   "name": "third_person_commiseration_shared_subject",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:otheruser_a",
+     "text": "Will Stancil is complaining again about women in his mentions pointing out his bad polls."
+    },
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "Charmin really earned that ratio from everyone today."
+    }
+   ],
+   "candidate_text": "And now he's super sad this morning because there's a bunch of women in his mentions reminding him how mediocre he is.",
+   "expected_violation": false,
+   "note": "DirectReply to Target using 3rd-person pronouns to commiserate about a third party already under discussion."
+  },
+  {
+   "name": "third_person_audience_dunk_at_target",
+   "author_did": "did:plc:candidate",
+   "target_did": "did:plc:targetuser",
+   "ancestors": [
+    {
+     "author_did": "did:plc:targetuser",
+     "text": "I think zoning reform is the most practical way to lower urban housing costs over five years."
+    }
+   ],
+   "candidate_text": "Look at this pathetic clown posting nonsense again, he really thought he cooked with this dumb take.",
+   "expected_violation": true,
+   "note": "DirectReply to Target with audience-facing 3rd-person dunk when no third party or quoted user is under discussion."
   }
  ]
 }
