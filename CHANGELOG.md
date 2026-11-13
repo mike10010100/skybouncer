@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.34] - 2026-11-13
+
+### Fixed
+
+- **Standalone Quote-Post Thread Enrichment & Group-Label Quote-Dunk Detection (`src/enricher.rs`, `src/classifier/jev.rs`, `src/classifier/rubric.rs`)**:
+  - Updated `AppViewContextEnricher::enrich` so standalone `InteractionType::Quote` interactions (`parent_uri = None`, `quote_uri = Some(...)`) resolve the quoted post's conversation thread when it has multi-post ancestors (`ancestors.len() > 1`) or embedded quotes (`!quotes.is_empty()`), preventing multi-post debate context above a quoted post from being dropped.
+  - Updated `EnrichedContext::format_for_interaction` to tag standalone quote-post thread focal entries with `[QUOTED POST — Author is quote-posting this post]` instead of `[IMMEDIATE PARENT — Author is replying to this post]`.
+  - Added an explicit `Quoting: Target (...)` framing header in `reply_recipient_line` (`build_candidate_prompt`) and extended both Ollama System-2 (`(1)(c)`/`(2)`/`(3)`) and SystemOne (`harassment`/`permitted`) criteria so standalone quote-posts demeaning `Target` via a group/camp label representing `Target`'s stance in the quoted post/thread are flagged as targeted harassment while external-group agreement and non-abusive policy disagreements remain permitted.
+  - Updated `DEFAULT_RUBRIC_PROMPT` (`quote-posts demeaning the protected user via supporter or group labels` with a streamlined third-party `Permit` clause aligned with `PRESET_BALANCED_PROMPT`) and added `LEGACY_DEFAULT_RUBRIC_PROMPT_V0_2_25` to `LEGACY_PROMPT_UPGRADES` for idempotent startup migration.
+
 ## [0.2.33] - 2026-11-13
 
 ### Fixed

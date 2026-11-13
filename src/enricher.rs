@@ -219,6 +219,7 @@ impl EnrichedContext {
                 .saturating_sub(MAX_RENDERED_THREAD_ANCESTORS);
             let slice = &self.thread_ancestors[start..];
             let last_idx = slice.len().saturating_sub(1);
+            let is_standalone_quote = self.parent_post.is_none() && self.quoted_post.is_some();
             let mut rendered = Vec::new();
             for (offset, ancestor) in slice.iter().enumerate() {
                 let depth = start + offset + 1;
@@ -228,11 +229,19 @@ impl EnrichedContext {
                     .take(THREAD_ANCESTOR_CHAR_CAP)
                     .collect();
                 let is_immediate_parent = roles.is_some()
+                    && !is_standalone_quote
                     && offset == last_idx
                     && self
                         .parent_post
                         .as_ref()
                         .is_none_or(|p| p.author_did == ancestor.author_did);
+                let is_focal_quoted_post = roles.is_some()
+                    && is_standalone_quote
+                    && offset == last_idx
+                    && self
+                        .quoted_post
+                        .as_ref()
+                        .is_some_and(|q| q.author_did == ancestor.author_did);
                 let quote_suffix = match roles {
                     Some((author_did, target_did)) => self
                         .thread_ancestor_quotes
@@ -263,6 +272,12 @@ impl EnrichedContext {
                 if is_immediate_parent {
                     rendered.push(format!(
                         "[{depth}] {}: \"{}\"{quote_suffix} [IMMEDIATE PARENT — Author is replying to this post]",
+                        format_actor(&ancestor.author_did),
+                        snippet
+                    ));
+                } else if is_focal_quoted_post {
+                    rendered.push(format!(
+                        "[{depth}] {}: \"{}\"{quote_suffix} [QUOTED POST — Author is quote-posting this post]",
                         format_actor(&ancestor.author_did),
                         snippet
                     ));
@@ -1076,10 +1091,28 @@ impl ContextEnricher for AppViewContextEnricher {
             }
         };
         let thread_fut = async {
-            match (self.thread_context, interaction.parent_uri.as_ref()) {
-                (true, Some(uri)) => {
+            match (
+                self.thread_context,
+                interaction.parent_uri.as_deref(),
+                interaction.quote_uri.as_deref(),
+            ) {
+                (true, Some(uri), _) => {
                     self.fetch_thread_from_parent(uri, &interaction.author_did, &interaction.text)
                         .await
+                }
+                (true, None, Some(quote_uri)) => {
+                    let (ancestors, quotes) = self
+                        .fetch_thread_from_parent(
+                            quote_uri,
+                            &interaction.author_did,
+                            &interaction.text,
+                        )
+                        .await;
+                    if ancestors.len() > 1 || !quotes.is_empty() {
+                        (ancestors, quotes)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    }
                 }
                 _ => (Vec::new(), Vec::new()),
             }

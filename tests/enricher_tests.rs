@@ -903,3 +903,194 @@ async fn test_quoted_ancestor_target_author_roles_is_empty_and_image_enrich() {
     let enriched = enricher.enrich(&img_interaction).await;
     assert_eq!(enriched.images_base64, vec!["SU1H".to_string()]);
 }
+
+#[tokio::test]
+async fn test_appview_enricher_standalone_quote_resolves_quoted_thread_and_skips_plain_root() {
+    let mock_server = MockServer::start().await;
+    let target_did = "did:plc:mmtjkssv6jeneahkgfdxuy7p";
+    let author_did = "did:plc:qwpty6y2kbyathbxlfcejz2p";
+    let interlocutor_did = "did:plc:vasmwozbxda25bah7d6sb3ja";
+    let quoted_other_did = "did:plc:otherquoted000000000000";
+
+    // Case 1: Multi-post quoted thread (models 3n264mmxavs2v at bottom of Chuck Schumer debate).
+    let thread_quote_uri = "at://did:plc:mmtjkssv6jeneahkgfdxuy7p/app.bsky.feed.post/3n264mmxavs2v";
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPosts"))
+        .and(query_param("uris", thread_quote_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "posts": [{
+                "uri": thread_quote_uri,
+                "cid": "bafyquotedthread",
+                "author": { "did": target_did, "handle": "mike10010100.com" },
+                "record": { "$type": "app.bsky.feed.post", "text": "So just the two things then.\n\nOr will there inevitably be more?" }
+            }]
+        })))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPostThread"))
+        .and(query_param("uri", thread_quote_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "thread": {
+                "$type": "app.bsky.feed.defs#threadViewPost",
+                "post": {
+                    "uri": thread_quote_uri,
+                    "author": { "did": target_did },
+                    "record": { "$type": "app.bsky.feed.post", "text": "So just the two things then.\n\nOr will there inevitably be more?" }
+                },
+                "parent": {
+                    "$type": "app.bsky.feed.defs#threadViewPost",
+                    "post": {
+                        "uri": "at://did:plc:vasmwozbxda25bah7d6sb3ja/app.bsky.feed.post/13",
+                        "author": { "did": interlocutor_did },
+                        "record": { "$type": "app.bsky.feed.post", "text": "So yes I find Schumer uniquely unsatisfactory for the job" }
+                    },
+                    "parent": {
+                        "$type": "app.bsky.feed.defs#threadViewPost",
+                        "post": {
+                            "uri": "at://did:plc:mmtjkssv6jeneahkgfdxuy7p/app.bsky.feed.post/12",
+                            "author": { "did": target_did },
+                            "record": { "$type": "app.bsky.feed.post", "text": "How fascinating, your list of reasons to dislike a very particular politician go back decades!" }
+                        },
+                        "parent": null
+                    }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Case 2: Standalone quote of a single root post that itself embeds a quote (`!quotes.is_empty()`).
+    let nested_quote_uri = "at://did:plc:mmtjkssv6jeneahkgfdxuy7p/app.bsky.feed.post/nestedroot";
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPosts"))
+        .and(query_param("uris", nested_quote_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "posts": [{
+                "uri": nested_quote_uri,
+                "cid": "bafynestedroot",
+                "author": { "did": target_did, "handle": "mike10010100.com" },
+                "record": { "$type": "app.bsky.feed.post", "text": "Charmin." }
+            }]
+        })))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPostThread"))
+        .and(query_param("uri", nested_quote_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "thread": {
+                "$type": "app.bsky.feed.defs#threadViewPost",
+                "post": {
+                    "uri": nested_quote_uri,
+                    "author": { "did": target_did },
+                    "record": { "$type": "app.bsky.feed.post", "text": "Charmin." },
+                    "embed": {
+                        "$type": "app.bsky.embed.record#view",
+                        "record": {
+                            "$type": "app.bsky.embed.record#viewRecord",
+                            "author": { "did": quoted_other_did, "handle": "other.bsky.social" },
+                            "value": { "text": "People are being mean to me." }
+                        }
+                    }
+                },
+                "parent": null
+            }
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    // Case 3: Standalone quote of a plain single root post (no parents, no embedded quote).
+    let plain_root_uri = "at://did:plc:mmtjkssv6jeneahkgfdxuy7p/app.bsky.feed.post/plainroot";
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPosts"))
+        .and(query_param("uris", plain_root_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "posts": [{
+                "uri": plain_root_uri,
+                "cid": "bafyplainroot",
+                "author": { "did": target_did, "handle": "mike10010100.com" },
+                "record": { "$type": "app.bsky.feed.post", "text": "Plain root take." }
+            }]
+        })))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPostThread"))
+        .and(query_param("uri", plain_root_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "thread": {
+                "$type": "app.bsky.feed.defs#threadViewPost",
+                "post": {
+                    "uri": plain_root_uri,
+                    "author": { "did": target_did },
+                    "record": { "$type": "app.bsky.feed.post", "text": "Plain root take." }
+                },
+                "parent": null
+            }
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let enricher =
+        AppViewContextEnricher::with_endpoint(mock_server.uri()).with_thread_context(true);
+
+    // 1. Multi-post quoted thread is retained and tagged `[QUOTED POST]`, NOT `[IMMEDIATE PARENT]`.
+    let thread_quote_interaction = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Quote,
+        "at://did:plc:qwpty6y2kbyathbxlfcejz2p/app.bsky.feed.post/3n27kxiexm22j",
+        "bafy3n27",
+        "Chuck supporters are the dumbest fucks around.",
+    )
+    .with_quote_uri(thread_quote_uri);
+    let ctx_thread = enricher.enrich(&thread_quote_interaction).await;
+    assert_eq!(ctx_thread.thread_ancestors.len(), 3);
+    assert!(ctx_thread.parent_post.is_none());
+    assert!(ctx_thread.quoted_post.is_some());
+    let rendered_thread = ctx_thread.format_for_interaction(author_did, target_did);
+    assert!(rendered_thread.contains("Schumer uniquely unsatisfactory"));
+    assert!(rendered_thread.contains("[QUOTED POST — Author is quote-posting this post]"));
+    assert!(!rendered_thread.contains("[IMMEDIATE PARENT"));
+    assert!(rendered_thread.contains(&format!("Quoted Post (by Target ({target_did})):")));
+
+    // 2. Single root post with a nested quote embed preserves `thread_ancestors` and `[quoting OtherUser ...]`.
+    let nested_quote_interaction = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Quote,
+        "at://did:plc:qwpty6y2kbyathbxlfcejz2p/app.bsky.feed.post/qnested",
+        "bafyqnested",
+        "Look at this guy lol",
+    )
+    .with_quote_uri(nested_quote_uri);
+    let ctx_nested = enricher.enrich(&nested_quote_interaction).await;
+    assert_eq!(ctx_nested.thread_ancestors.len(), 1);
+    assert_eq!(ctx_nested.thread_ancestor_quotes.len(), 1);
+    let rendered_nested = ctx_nested.format_for_interaction(author_did, target_did);
+    assert!(rendered_nested.contains("[quoting OtherUser @other.bsky.social"));
+    assert!(rendered_nested.contains("[QUOTED POST — Author is quote-posting this post]"));
+
+    // 3. Plain single root post omits redundant `thread_ancestors` while preserving `Quoted Post`.
+    let plain_quote_interaction = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Quote,
+        "at://did:plc:qwpty6y2kbyathbxlfcejz2p/app.bsky.feed.post/qplain",
+        "bafyqplain",
+        "Worst take ever.",
+    )
+    .with_quote_uri(plain_root_uri);
+    let ctx_plain = enricher.enrich(&plain_quote_interaction).await;
+    assert!(ctx_plain.thread_ancestors.is_empty());
+    assert!(ctx_plain.thread_ancestor_quotes.is_empty());
+    let rendered_plain = ctx_plain.format_for_interaction(author_did, target_did);
+    assert!(!rendered_plain.contains("Conversation Thread"));
+    assert!(rendered_plain.contains(&format!(
+        "Quoted Post (by Target ({target_did})): \"Plain root take.\""
+    )));
+}
