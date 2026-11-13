@@ -1984,3 +1984,143 @@ async fn test_third_person_commiseration_with_quoted_ancestor_systemone_and_olla
     let res_ollama = ollama.classify(&interaction).await.unwrap();
     assert!(res_ollama.is_permitted());
 }
+
+#[tokio::test]
+async fn test_systemone_and_classifier_edge_branches() {
+    use skybouncer::classifier::{Classifier, OllamaChatOptions, Verdict, DEFAULT_OLLAMA_NUM_CTX};
+
+    let opts = OllamaChatOptions::default();
+    assert_eq!(opts.num_ctx, DEFAULT_OLLAMA_NUM_CTX);
+
+    let server = MockServer::start().await;
+
+    // 1. SystemOne non-SystemOne JSON body triggers parse error branch.
+    Mock::given(method("POST"))
+        .and(path("/bad_s1/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"not_answers": 1})))
+        .mount(&server)
+        .await;
+
+    let bad_s1 = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/bad_s1/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    let sample = Interaction::new(
+        "did:plc:a",
+        "did:plc:b",
+        InteractionType::DirectReply,
+        "at://did:plc:a/app.bsky.feed.post/1",
+        "cid1",
+        "hello",
+    );
+    assert!(bad_s1.classify(&sample).await.is_err());
+
+    // 2. Violation choice deriving confidence as `1.0 - permitted` when choice probability is absent.
+    Mock::given(method("POST"))
+        .and(path("/perm_fallback/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "harassment",
+                    "probabilities": { "permitted": 0.08 }
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let perm_fallback = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/perm_fallback/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    let v_perm_fb = perm_fallback.classify(&sample).await.unwrap();
+    assert!(v_perm_fb.is_violation());
+    assert!((v_perm_fb.confidence().unwrap() - 0.92).abs() < 1e-6);
+
+    // 3. Permitted choice with empty probabilities and null confidence returns error.
+    Mock::given(method("POST"))
+        .and(path("/perm_empty/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "permitted",
+                    "probabilities": {}
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let perm_empty = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/perm_empty/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(perm_empty.classify(&sample).await.is_err());
+
+    // 4. `Classifier::set_rubric` trait forwarding and substring `sea-lion` category mapping.
+    Mock::given(method("POST"))
+        .and(path("/sealion/v1/classify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "violates": true,
+            "category": "persistent sea-lioning troll",
+            "confidence": 0.91,
+            "reason": "sealion"
+        })))
+        .mount(&server)
+        .await;
+
+    let sealion_clf = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/sealion", server.uri()),
+            api_key: None,
+            model: "custom".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    let trait_clf: &dyn Classifier = &sealion_clf;
+    let custom_rubric = RuleRubric::new(
+        "Strict custom rubric",
+        skybouncer::classifier::Sensitivity::High,
+    );
+    trait_clf.set_rubric(custom_rubric.clone());
+    assert_eq!(sealion_clf.rubric().prompt, custom_rubric.prompt);
+
+    let sealion_verdict = trait_clf.classify(&sample).await.unwrap();
+    assert!(matches!(
+        sealion_verdict,
+        Verdict::Violation {
+            category: ViolationCategory::SeaLioning,
+            ..
+        }
+    ));
+}

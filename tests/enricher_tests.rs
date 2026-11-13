@@ -828,3 +828,78 @@ async fn test_appview_enricher_preserves_ancestor_quote_embeds_for_interaction()
     let raw_chain = enricher.fetch_thread_ancestors(parent_uri).await;
     assert_eq!(raw_chain.len(), 3);
 }
+
+#[tokio::test]
+async fn test_quoted_ancestor_target_author_roles_is_empty_and_image_enrich() {
+    use skybouncer::enricher::{EnrichedContext, QuotedAncestor, ThreadPost};
+
+    let target_did = "did:plc:target_role";
+    let author_did = "did:plc:author_role";
+
+    // `is_empty()` treats all-`None` `thread_ancestor_quotes` as empty, and non-`None` as non-empty.
+    let mut ctx = EnrichedContext::empty();
+    ctx.thread_ancestor_quotes = vec![None];
+    assert!(ctx.is_empty());
+
+    ctx.thread_ancestor_quotes = vec![Some(QuotedAncestor {
+        author_did: target_did.to_string(),
+        author_handle: None,
+        text: "Quoted Target without handle".to_string(),
+    })];
+    assert!(!ctx.is_empty());
+
+    // Role formatting covers `Target (did)` (no handle) and `Author @handle (did)` quote labels.
+    ctx.thread_ancestors = vec![
+        ThreadPost {
+            author_did: "did:plc:other".to_string(),
+            text: "First post".to_string(),
+        },
+        ThreadPost {
+            author_did: target_did.to_string(),
+            text: "Second post".to_string(),
+        },
+    ];
+    ctx.thread_ancestor_quotes = vec![
+        Some(QuotedAncestor {
+            author_did: target_did.to_string(),
+            author_handle: None,
+            text: "Quoted Target without handle".to_string(),
+        }),
+        Some(QuotedAncestor {
+            author_did: author_did.to_string(),
+            author_handle: Some("author.bsky.social".to_string()),
+            text: "Quoted Author with handle".to_string(),
+        }),
+    ];
+    let formatted = ctx.format_for_interaction(author_did, target_did);
+    assert!(formatted.contains(&format!(
+        "[quoting Target ({target_did}): \"Quoted Target without handle\"]"
+    )));
+    assert!(formatted.contains(&format!(
+        "[quoting Author @author.bsky.social ({author_did}): \"Quoted Author with handle\"]"
+    )));
+
+    // `AppViewContextEnricher::enrich` exercises image fetching when `interaction.has_images()`.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/img/feed_thumbnail/plain/{author_did}/bafkreiimg@jpeg"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"IMG".to_vec()))
+        .mount(&mock_server)
+        .await;
+
+    let enricher = AppViewContextEnricher::with_endpoints(mock_server.uri(), mock_server.uri());
+    let mut img_interaction = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Mention,
+        "at://did:plc:author_role/app.bsky.feed.post/1",
+        "bafy1",
+        "check this image",
+    );
+    img_interaction.image_cids = vec!["bafkreiimg".to_string()];
+
+    let enriched = enricher.enrich(&img_interaction).await;
+    assert_eq!(enriched.images_base64, vec!["SU1H".to_string()]);
+}

@@ -481,3 +481,66 @@ pub async fn simulate_guest_interaction(
     );
     resp
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_sandbox_limiter_global_window_expiry_and_eviction() {
+        // 1. Global circuit breaker triggers even across distinct IPs.
+        let global_capped = GuestSandboxLimiter::new(5, 2, Duration::from_secs(60));
+        assert!(matches!(
+            global_capped.check_and_record("10.0.0.1"),
+            GuestRateLimitDecision::Allowed { .. }
+        ));
+        assert!(matches!(
+            global_capped.check_and_record("10.0.0.2"),
+            GuestRateLimitDecision::Allowed { .. }
+        ));
+        assert!(matches!(
+            global_capped.check_and_record("10.0.0.3"),
+            GuestRateLimitDecision::RateLimited {
+                retry_after_secs,
+                limit: 5,
+            } if retry_after_secs >= 1
+        ));
+
+        // 2. Global + per-IP entries expire once the sliding window elapses.
+        let short_window = GuestSandboxLimiter::new(1, 10, Duration::from_millis(5));
+        assert!(matches!(
+            short_window.check_and_record("10.0.0.9"),
+            GuestRateLimitDecision::Allowed { remaining: 0, .. }
+        ));
+        std::thread::sleep(Duration::from_millis(12));
+        assert!(matches!(
+            short_window.check_and_record("10.0.0.9"),
+            GuestRateLimitDecision::Allowed { remaining: 0, .. }
+        ));
+
+        // 3. Saturated tracked-IP map evicts an existing bucket when none are expired.
+        let capacity_limiter = GuestSandboxLimiter::new(1, 5000, Duration::from_secs(60));
+        for idx in 0..=GUEST_SANDBOX_MAX_TRACKED_IPS {
+            let key = format!("192.0.2.{idx}");
+            assert!(matches!(
+                capacity_limiter.check_and_record(&key),
+                GuestRateLimitDecision::Allowed { .. }
+            ));
+        }
+
+        // 4. Saturated tracked-IP map prunes expired buckets first when window has elapsed.
+        let prune_limiter = GuestSandboxLimiter::new(1, 5000, Duration::from_millis(4));
+        for idx in 0..GUEST_SANDBOX_MAX_TRACKED_IPS {
+            let key = format!("198.51.100.{idx}");
+            assert!(matches!(
+                prune_limiter.check_and_record(&key),
+                GuestRateLimitDecision::Allowed { .. }
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(matches!(
+            prune_limiter.check_and_record("203.0.113.1"),
+            GuestRateLimitDecision::Allowed { .. }
+        ));
+    }
+}
