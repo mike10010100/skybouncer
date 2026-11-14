@@ -518,10 +518,15 @@ impl JevClassifier {
                 request_builder = request_builder.header("Authorization", format!("Bearer {key}"));
             }
 
-            let images = interaction
+            let candidate_images = interaction
                 .enriched_context
                 .as_ref()
                 .map(|ctx| ctx.images_base64.clone())
+                .filter(|imgs| !imgs.is_empty());
+            let context_images = interaction
+                .enriched_context
+                .as_ref()
+                .map(|ctx| ctx.context_images_base64.clone())
                 .filter(|imgs| !imgs.is_empty());
 
             let capped_text: String = interaction.text.chars().take(4000).collect();
@@ -538,19 +543,27 @@ impl JevClassifier {
                             interaction_type: interaction.interaction_type.as_str().to_string(),
                         },
                         sensitivity: sensitivity_str.clone(),
-                        images,
+                        images: candidate_images,
                     };
                     request_builder.json(&payload).send().await
                 }
                 JevEndpointKind::Ollama => {
-                    let has_images = images
-                        .as_ref()
-                        .map(|imgs| !imgs.is_empty())
-                        .unwrap_or(false);
-                    let modality_guidance = if has_images {
-                        "candidate posts and any attached visual images (including embedded text, screenshots, or graphics)"
-                    } else {
-                        "candidate posts"
+                    let candidate_count = candidate_images.as_ref().map_or(0, Vec::len);
+                    let context_count = context_images.as_ref().map_or(0, Vec::len);
+                    let ollama_images = match (candidate_images, context_images) {
+                        (None, None) => None,
+                        (Some(c), None) => Some(c),
+                        (None, Some(ctx)) => Some(ctx),
+                        (Some(mut c), Some(ctx)) => {
+                            c.extend(ctx);
+                            Some(c)
+                        }
+                    };
+                    let modality_guidance = match (candidate_count, context_count) {
+                        (0, 0) => "candidate posts".to_string(),
+                        (_, 0) => "candidate posts and any attached visual images (including embedded text, screenshots, or graphics)".to_string(),
+                        (0, _) => "candidate posts, using the attached parent/quoted context image(s) ONLY as thread context to identify who or what the conversation is discussing (these context image(s) belong to the parent or quoted post, NOT uploaded by Author — NEVER penalize Author for text or imagery inside context images; inspect names, headlines, screenshots, and subjects in the context image(s) to resolve third-party references in <candidate_content>)".to_string(),
+                        (c, ctx) => format!("candidate posts and attached visual images (the first {c} image(s) were uploaded by Author in the candidate post; the remaining {ctx} image(s) belong to the parent/quoted post as thread context ONLY — NEVER penalize Author for text or imagery inside those context images)"),
                     };
                     let system_prompt = format!(
                         "You are an automated content moderation classifier protecting the Target user on Bluesky. \
@@ -558,10 +571,10 @@ impl JevClassifier {
                         Apply these disambiguation rules unless the rubric explicitly states otherwise: \
                         (1) Directionality & thread referents: distinguish hostility aimed AT the Target user from hostility aimed at OtherUser thread participants, third parties, quoted posters, politicians, or unrelated external groups. Generic rubric terms such as 'harassment', 'personal attacks', 'insults', 'hostile language', or 'sea-lioning' ALWAYS mean abuse directed AT Target — never hostility aimed at OtherUsers or third parties discussed or quoted by Target — unless the rubric explicitly asks to police third-party commentary. Check these labels carefully: \
                         (a) Sub-thread replies: Check the 'Replying To:' header and '[IMMEDIATE PARENT]' marker: when Replying To is OtherUser (a sub-thread thread_reply to another commenter), second-person pronouns ('you', 'your') and insults (e.g. 'can you read', 'you sound insane') address that OtherUser, NOT Target, and MUST be permitted unless <candidate_content> explicitly names, @mentions, or attacks Target (or violates spam/crypto/phishing rules). \
-                        (b) Third-person commiseration & quoted-subject co-reference: In Conversation Thread, check for '[quoting OtherUser ...]' tags and whether Target or an earlier post is criticizing, mocking, or discussing an OtherUser or external third party. Whenever Conversation Thread includes '[quoting OtherUser ...]' (even if Target's own quote caption is brief, sarcastic, or a nickname like \"Charmin.\") OR Target discusses a third party, third-person pronouns ('he', 'him', 'his', 'she', 'her', 'they', 'them') and third-person insults/ridicule in Author's reply refer to that quoted OtherUser or third party — NOT Target — and MUST be permitted (along with defending Target against dogpilers) unless <candidate_content> uses second-person attacks ('you'/'your') or explicitly names/@mentions Target to attack Target. \
+                        (b) Third-person commiseration & quoted-subject co-reference (including rhetorical third-party address and context media): In Conversation Thread, check for '[quoting OtherUser ...]' tags, '[link card: ...]' / '[quoted post link card: ...]' headlines, '[attached ... image(s)]' / '[quoted post has ... attached image(s)]' markers, attached Context Thread Images, and whether Target or an earlier post is criticizing, mocking, or discussing an OtherUser or external third party. Whenever Conversation Thread includes '[quoting OtherUser ...]' (even if Target's own quote caption is brief, sarcastic, or a nickname like \"Charmin.\"), shares a link card/screenshot, OR Target discusses a third party: (i) third-person pronouns ('he', 'him', 'his', 'she', 'her', 'they', 'them') and nameless third-person reactions (e.g. 'what a smug lying prick', 'look at this clown') aimed at that quoted OtherUser, third party, or person depicted in a parent/quoted screenshot/link card refer to that external subject — NOT Target — and MUST be permitted (along with defending Target against dogpilers); AND (ii) rhetorical second-person apostrophe ('shouting at the screen') in Replying To: Target MUST ALSO be permitted when <candidate_content> explicitly addresses a named third-party person or public figure by a real proper name or surname (e.g. 'Just for you Ari, you prick', 'Shut up Chuck, you coward', 'Fuck off Elon, you clown') that does NOT match Target Profile's name or handle, because 'you' addresses that named external figure rather than Target. STRICT GUARDRAILS: Generic insult tropes or slang vocatives — such as 'Karen', 'Bozo', 'Einstein', 'Clown', 'pal', 'buddy', 'bro', 'dude', 'chief', 'champ', or 'kid' (e.g. 'Okay Karen, you prick', 'Listen buddy, you're a fucking moron') — are NEVER third-party proper names and DO address Target as 'harassment'; likewise, unqualified second-person insults without a third-party proper-name vocative (e.g. 'You prick, stop posting this garbage') or attacks that explicitly name/@mention Target MUST violate as 'harassment'. \
                         (c) Standalone quote-posts ('Quoting: Target') & group-label quote-dunks: When the header shows 'Quoting: Target' (a standalone quote-post to Author's audience, with NO 'Replying To: OtherUser'), Author is holding Target's Quoted Post up as an example. If <candidate_content> hurls demeaning intelligence or character insults (e.g. 'dumbest fucks', 'morons', 'worms for brains', 'braindead clowns', 'idiots') at a supporter/camp/faction label ('[X] supporters', '[X] defenders', '[X] bros', 'people/accounts like this'), treat it as targeted harassment AT Target by group-membership implication UNLESS Target's own Quoted Post explicitly criticizes or opposes that exact group (e.g. Target explicitly criticizes MAGA in Quoted Post and Author insults 'MAGA supporters'). In a debate where OtherUser criticizes [X] and Target pushes back or mocks OtherUser's anti-[X] complaints (including via sarcasm like 'You're right... lmao', 'How fascinating... your list of reasons to dislike...', 'So just the two things then'), quoting Target to insult '[X] supporters' IS labeling and insulting Target — NEVER use Target Profile bio ideology labels (such as 'DemSoc') or misread Target's sarcasm to excuse a quote-dunk on Target. Conversely, sharp policy/strategy disagreement in a quote-post without demeaning personal/intelligence insults (e.g. '[X] supporters are misreading Senate leverage') MUST be permitted. \
-                        (2) Targeted harassment: personal attacks, insults, name-calling, mocking nicknames, slurs, threats, or crude demeaning remarks aimed AT Target's intelligence, character, or appearance violate as \"harassment\" — including standalone quote-posts ('Quoting: Target') that demean Target via a group/camp label ('[X] supporters are the dumbest fucks around', 'people like this are morons') whenever Target's Quoted Post is not itself criticizing that group. Third-person audience-facing dunks aimed at Target (e.g. 'its the [insult] back again', 'look at this clown posting nonsense', 'he really thought he cooked') violate ONLY when NO '[quoting OtherUser ...]' and NO third-party subject is under discussion in Conversation Thread (or when <candidate_content> explicitly names/@mentions Target or quote-dunks Target via a camp label). Mild grumbling about an action (such as complaining 'blocked me for some stupid reason') or casual handle references ('that @handle guy') are NOT harassment. \
-                        (3) Benign discourse: casual profanity, sarcasm, blunt disagreement, heated political commentary, quoting Target to argue with someone else, sub-thread replies scolding or insulting an OtherUser commenter, and third-person insults or commiserating ridicule directed at '[quoting OtherUser ...]' subjects, external figures discussed by Target, or opposing external groups explicitly criticized in Target's Quoted Post rather than at Target are permitted. \
+                        (2) Targeted harassment: personal attacks, insults, name-calling, mocking nicknames, slurs, threats, or crude demeaning remarks aimed AT Target's intelligence, character, or appearance violate as \"harassment\" — including unqualified second-person attacks on Target ('You prick, stop posting this'), insults wrapped in generic/slang vocatives ('Okay Karen, you prick', 'Listen buddy, you're a moron'), and standalone quote-posts ('Quoting: Target') that demean Target via a group/camp label ('[X] supporters are the dumbest fucks around', 'people like this are morons') whenever Target's Quoted Post is not itself criticizing that group. Third-person audience-facing dunks aimed at Target (e.g. 'its the [insult] back again', 'look at this clown posting nonsense', 'he really thought he cooked') violate ONLY when NO '[quoting OtherUser ...]', NO parent/quoted image or link card depicts an external target, and NO third-party subject is under discussion in Conversation Thread (or when <candidate_content> explicitly names/@mentions Target or quote-dunks Target via a camp label). Never penalize Author for insults or text inside Context Thread Images belonging to a parent/quoted post. Mild grumbling about an action (such as complaining 'blocked me for some stupid reason') or casual handle references ('that @handle guy') are NOT harassment. \
+                        (3) Benign discourse: casual profanity, sarcasm, blunt disagreement, heated political commentary, quoting Target to argue with someone else, sub-thread replies scolding or insulting an OtherUser commenter, rhetorical second-person apostrophe explicitly addressing a named third-party public figure/person (distinct from Target's name/handle) on a quoted/media/third-party thread, and third-person insults or commiserating ridicule directed at '[quoting OtherUser ...]' subjects, external figures discussed or pictured in link cards/Context Thread Images, or opposing external groups explicitly criticized in Target's Quoted Post rather than at Target are permitted. \
                         Output ONLY a single valid JSON object matching: \
                         {{\"violates\": boolean, \"category\": \"harassment\" | \"sea_lioning\" | \"spam\" | \"crypto_spam\" | \"phishing\" | \"hate_speech\" | \"custom\" | null, \"confidence\": float (0.0 to 1.0), \"reason\": string}}"
                     );
@@ -580,7 +593,7 @@ impl JevClassifier {
                             OllamaChatMessage {
                                 role: "user".to_string(),
                                 content: user_prompt,
-                                images,
+                                images: ollama_images,
                             },
                         ],
                         format: "json".to_string(),
@@ -600,7 +613,7 @@ impl JevClassifier {
                     );
                     criteria.insert(
                         "harassment".to_string(),
-                        "Personal attacks, insults, name-calling, mocking nicknames, slurs, threats, or crude demeaning remarks aimed specifically at the Target user's intelligence, character, or appearance (including explicit attacks naming or @mentioning Target inside a sub-thread, standalone 'Quoting: Target' quote-posts that hurl demeaning intelligence/character insults at a '[X] supporters' / faction / 'people like this' camp label when Target's Quoted Post is NOT explicitly criticizing that group — such as when Target defends [X] or sarcastically pushes back against an OtherUser criticizing [X] — or third-person audience dunks mocking Target themself when NO '[quoting OtherUser ...]' and NO third-party subject appears in Conversation Thread) — NOT non-targeted profanity, NOT sharp policy/strategy disagreement without demeaning insults, NOT 'Quoting: Target' posts that agree with Target by insulting an opposing party/movement that Target explicitly criticizes in Quoted Post, NOT mild grumbling or neutral handle references, NOT defending Target against dogpilers, NOT sub-thread replies where Replying To is OtherUser and second-person 'you'/'your' insults address that OtherUser rather than Target, and NOT third-person ('he'/'him'/'his'/'she'/'they') insults or ridicule aimed at a '[quoting OtherUser ...]' subject, earlier commenter, or external third party discussed in Conversation Thread".to_string(),
+                        "Personal attacks, insults, name-calling, mocking nicknames, slurs, threats, or crude demeaning remarks aimed specifically at the Target user's intelligence, character, or appearance (including explicit attacks naming or @mentioning Target inside a sub-thread, unqualified second-person insults aimed at Target or disguised with generic slang/insult vocatives like 'Okay Karen, you prick' / 'Listen buddy, you're a moron', standalone 'Quoting: Target' quote-posts that hurl demeaning intelligence/character insults at a '[X] supporters' / faction / 'people like this' camp label when Target's Quoted Post is NOT explicitly criticizing that group — such as when Target defends [X] or sarcastically pushes back against an OtherUser criticizing [X] — or third-person audience dunks mocking Target themself when NO '[quoting OtherUser ...]' and NO third-party subject appears in Conversation Thread) — NOT non-targeted profanity, NOT sharp policy/strategy disagreement without demeaning insults, NOT 'Quoting: Target' posts that agree with Target by insulting an opposing party/movement that Target explicitly criticizes in Quoted Post, NOT mild grumbling or neutral handle references, NOT defending Target against dogpilers, NOT sub-thread replies where Replying To is OtherUser and second-person 'you'/'your' insults address that OtherUser rather than Target, NOT rhetorical second-person ('you'/'your') apostrophe explicitly addressing a named third-party person or public figure (a real proper name such as 'Just for you Ari, you prick' or 'Shut up Chuck, you coward' distinct from Target Profile's name/handle — NEVER slang/insult vocatives like 'Karen', 'Bozo', 'Einstein', 'buddy', or 'pal') when Target's post quotes an OtherUser, attaches media/links, or discusses a third party, and NOT third-person ('he'/'him'/'his'/'she'/'they') or nameless reactions aimed at a '[quoting OtherUser ...]' subject, attached link card/image subject, earlier commenter, or external third party discussed in Conversation Thread".to_string(),
                     );
                     criteria.insert(
                         "phishing".to_string(),
@@ -618,7 +631,7 @@ impl JevClassifier {
                     );
                     criteria.insert(
                         "permitted".to_string(),
-                        "Permitted interaction conforming to Active House Rules — including friendly or emphatic agreement, blunt or sarcastic disagreement on substance, non-targeted profanity, heated political commentary, quoting Target to argue with someone else, 'Quoting: Target' posts agreeing with Target by insulting an opposing movement or external group that Target explicitly criticizes in Quoted Post, sub-thread replies where Replying To is OtherUser and 'you'/'your' hostility or insults target that OtherUser without attacking Target, or third-person ('he'/'him'/'his'/'she'/'they') insults, commiseration, and ridicule directed at a '[quoting OtherUser ...]' subject, earlier commenter, third party, unrelated public figure, politician, institution, or unrelated external group (not a 'Quoting: Target' group-label insult labeling Target when Target did not criticize that group) rather than at Target"
+                        "Permitted interaction conforming to Active House Rules — including friendly or emphatic agreement, blunt or sarcastic disagreement on substance, non-targeted profanity, heated political commentary, quoting Target to argue with someone else, 'Quoting: Target' posts agreeing with Target by insulting an opposing movement or external group that Target explicitly criticizes in Quoted Post, sub-thread replies where Replying To is OtherUser and 'you'/'your' hostility or insults target that OtherUser without attacking Target, rhetorical second-person ('you'/'your') apostrophe explicitly addressing a named third-party person or public figure (a real proper name distinct from Target Profile's name/handle, never generic slang/insult vocatives like 'Karen', 'Bozo', 'Einstein', 'buddy', or 'pal') on a thread quoting an OtherUser, attaching media/links, or discussing a third party, or third-person ('he'/'him'/'his'/'she'/'they') insults, commiseration, and ridicule directed at a '[quoting OtherUser ...]' subject, attached link card/screenshot subject, earlier commenter, third party, unrelated public figure, politician, institution, or unrelated external group (not a 'Quoting: Target' group-label insult labeling Target when Target did not criticize that group) rather than at Target"
                             .to_string(),
                     );
                     let mut questions = std::collections::BTreeMap::new();
@@ -642,7 +655,7 @@ impl JevClassifier {
                         // Text-only System-One decision models reject image payloads with HTTP 400,
                         // so images are forwarded only when the configured model supports them.
                         images: if self.config.supports_images {
-                            images
+                            candidate_images
                         } else {
                             None
                         },

@@ -33,6 +33,10 @@ pub const THREAD_ANCESTOR_CHAR_CAP: usize = 300;
 /// gallery posts (10-item UI limit, 20-item protocol max).
 pub const MAX_POST_IMAGES: usize = 20;
 
+/// Maximum number of parent or quoted context image thumbnails lazily fetched on System-2
+/// escalation for visual disambiguation.
+pub const MAX_CONTEXT_IMAGES: usize = 2;
+
 /// Maximum number of protected target profiles cached in memory by [`AppViewContextEnricher`].
 const MAX_TARGET_PROFILE_CACHE_ENTRIES: usize = 1024;
 
@@ -59,6 +63,139 @@ pub struct QuotedAncestor {
     pub author_handle: Option<String>,
     /// Plaintext content of the quoted post.
     pub text: String,
+}
+
+/// Reference to a parent or quoted post's CDN image thumbnail eligible for lazy System-2
+/// visual context inspection when Tier-1 escalates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct ContextImageRef {
+    /// DID of the post author hosting the blob (CDN path owner).
+    pub author_did: String,
+    /// Blob CID of the attached image.
+    pub cid: String,
+}
+
+/// Non-text embed metadata (link cards, image alt text, media counts) extracted from a post
+/// and its embedded quote record without extra network calls.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct PostEmbedSummary {
+    /// Number of images attached directly to the post.
+    #[serde(default)]
+    pub image_count: usize,
+    /// Non-empty alt-text strings on images attached directly to the post.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_alts: Vec<String>,
+    /// External link-card title attached directly to the post.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_title: Option<String>,
+    /// External link-card description attached directly to the post.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_description: Option<String>,
+    /// Number of images attached to the post's embedded quoted post.
+    #[serde(default)]
+    pub quoted_image_count: usize,
+    /// Non-empty alt-text strings on images inside the embedded quoted post.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quoted_image_alts: Vec<String>,
+    /// External link-card title inside the embedded quoted post.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_external_title: Option<String>,
+    /// External link-card description inside the embedded quoted post.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_external_description: Option<String>,
+}
+
+impl PostEmbedSummary {
+    /// Returns `true` when neither the post nor its embedded quote carries link-card or image metadata.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.image_count == 0
+            && self.image_alts.is_empty()
+            && self.external_title.is_none()
+            && self.external_description.is_none()
+            && self.quoted_image_count == 0
+            && self.quoted_image_alts.is_empty()
+            && self.quoted_external_title.is_none()
+            && self.quoted_external_description.is_none()
+    }
+
+    fn format_link_card(label: &str, title: Option<&str>, description: Option<&str>) -> String {
+        let t = title
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(140).collect::<String>());
+        let d = description
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(160).collect::<String>());
+        match (t, d) {
+            (Some(title), Some(desc)) => format!(" [{label}: \"{title}\" — \"{desc}\"]"),
+            (Some(only), None) | (None, Some(only)) => format!(" [{label}: \"{only}\"]"),
+            (None, None) => String::new(),
+        }
+    }
+
+    fn format_image_summary(
+        count: usize,
+        alts: &[String],
+        empty_tag: &str,
+        alt_prefix: &str,
+    ) -> String {
+        if count == 0 {
+            return String::new();
+        }
+        let capped_alts: Vec<String> = alts
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(160).collect())
+            .collect();
+        if capped_alts.is_empty() {
+            format!(" [{empty_tag} (no alt text)]")
+        } else {
+            format!(
+                " [{alt_prefix} {count} image(s); alt: \"{}\"]",
+                capped_alts.join("; ")
+            )
+        }
+    }
+
+    /// Formats link-card and image metadata belonging directly to the ancestor post.
+    #[must_use]
+    pub(crate) fn format_post_media(&self) -> String {
+        let card = Self::format_link_card(
+            "link card",
+            self.external_title.as_deref(),
+            self.external_description.as_deref(),
+        );
+        let imgs = Self::format_image_summary(
+            self.image_count,
+            &self.image_alts,
+            &format!("attached {} image(s)", self.image_count),
+            "attached",
+        );
+        format!("{card}{imgs}")
+    }
+
+    /// Formats link-card and image metadata belonging to the ancestor post's embedded quote.
+    #[must_use]
+    pub(crate) fn format_quoted_media(&self) -> String {
+        let card = Self::format_link_card(
+            "quoted post link card",
+            self.quoted_external_title.as_deref(),
+            self.quoted_external_description.as_deref(),
+        );
+        let imgs = Self::format_image_summary(
+            self.quoted_image_count,
+            &self.quoted_image_alts,
+            &format!(
+                "quoted post has {} attached image(s)",
+                self.quoted_image_count
+            ),
+            "quoted post attached",
+        );
+        format!("{card}{imgs}")
+    }
 }
 
 /// Profile metadata describing the author of an interaction.
@@ -116,6 +253,18 @@ pub struct EnrichedContext {
     /// Base64-encoded image payloads fetched from CDN for attached images.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images_base64: Vec<String>,
+    /// Non-empty alt-text captions attached to the candidate post's images.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_alts: Vec<String>,
+    /// Optional non-text embed summaries corresponding by index to `thread_ancestors`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thread_ancestor_embeds: Vec<Option<PostEmbedSummary>>,
+    /// Deduplicated CDN image references from the focal parent/quoted post for lazy System-2 inspection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_image_refs: Vec<ContextImageRef>,
+    /// Base64-encoded parent/quoted context thumbnails hydrated only on System-2 escalation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_images_base64: Vec<String>,
 }
 
 impl EnrichedContext {
@@ -134,7 +283,11 @@ impl EnrichedContext {
             && self.quoted_post.is_none()
             && self.thread_ancestors.is_empty()
             && self.thread_ancestor_quotes.iter().all(Option::is_none)
+            && self.thread_ancestor_embeds.iter().all(Option::is_none)
             && self.images_base64.is_empty()
+            && self.image_alts.iter().all(|a| a.trim().is_empty())
+            && self.context_image_refs.is_empty()
+            && self.context_images_base64.is_empty()
     }
 
     /// Formats the enriched context into a concise string block for classifier prompt injection.
@@ -269,21 +422,30 @@ impl EnrichedContext {
                         .unwrap_or_default(),
                     None => String::new(),
                 };
+                let embed_suffix = if roles.is_some() {
+                    self.thread_ancestor_embeds
+                        .get(start + offset)
+                        .and_then(Option::as_ref)
+                        .map(|s| format!("{}{}", s.format_post_media(), s.format_quoted_media()))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 if is_immediate_parent {
                     rendered.push(format!(
-                        "[{depth}] {}: \"{}\"{quote_suffix} [IMMEDIATE PARENT — Author is replying to this post]",
+                        "[{depth}] {}: \"{}\"{quote_suffix}{embed_suffix} [IMMEDIATE PARENT — Author is replying to this post]",
                         format_actor(&ancestor.author_did),
                         snippet
                     ));
                 } else if is_focal_quoted_post {
                     rendered.push(format!(
-                        "[{depth}] {}: \"{}\"{quote_suffix} [QUOTED POST — Author is quote-posting this post]",
+                        "[{depth}] {}: \"{}\"{quote_suffix}{embed_suffix} [QUOTED POST — Author is quote-posting this post]",
                         format_actor(&ancestor.author_did),
                         snippet
                     ));
                 } else {
                     rendered.push(format!(
-                        "[{depth}] {}: \"{}\"{quote_suffix}",
+                        "[{depth}] {}: \"{}\"{quote_suffix}{embed_suffix}",
                         format_actor(&ancestor.author_did),
                         snippet
                     ));
@@ -319,10 +481,40 @@ impl EnrichedContext {
             ));
         }
 
+        if roles.is_some() {
+            let formatted_alts: Vec<String> = self
+                .image_alts
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, alt)| {
+                    let trimmed = alt.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        let cap: String = trimmed.chars().take(200).collect();
+                        Some(format!("[{}] \"{}\"", idx + 1, cap))
+                    }
+                })
+                .collect();
+            if !formatted_alts.is_empty() {
+                sections.push(format!(
+                    "Candidate Image Alt Text: {}",
+                    formatted_alts.join("; ")
+                ));
+            }
+        }
+
         if !self.images_base64.is_empty() {
             sections.push(format!(
                 "Image Attachments [{} image(s) attached and decoded for visual inspection]",
                 self.images_base64.len()
+            ));
+        }
+
+        if roles.is_some() && !self.context_images_base64.is_empty() {
+            sections.push(format!(
+                "Context Thread Images [{} thumbnail(s) from the parent/quoted post decoded for visual context — NOT uploaded by Author]",
+                self.context_images_base64.len()
             ));
         }
 
@@ -384,6 +576,16 @@ impl ContextEnricher for NoopContextEnricher {
 /// Mapping of `(target_did, candidate_did)` pairs to `(target_follows_candidate, candidate_follows_target)`.
 type RelationshipMap = HashMap<(String, String), (bool, bool)>;
 
+fn collect_non_empty_alts(alts: &[String]) -> Vec<String> {
+    alts.iter()
+        .take(MAX_POST_IMAGES)
+        .filter_map(|alt| {
+            let trimmed = alt.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect()
+}
+
 /// Mock context enricher for deterministic hermetic testing.
 #[derive(Debug, Default, Clone)]
 pub struct MockContextEnricher {
@@ -393,6 +595,7 @@ pub struct MockContextEnricher {
     quoted_posts: Arc<RwLock<HashMap<String, ParentPostContext>>>,
     handles: Arc<RwLock<HashMap<String, String>>>,
     images: Arc<RwLock<HashMap<(String, String), String>>>,
+    context_image_refs: Arc<RwLock<HashMap<String, Vec<ContextImageRef>>>>,
     relationships: Arc<RwLock<RelationshipMap>>,
 }
 
@@ -441,6 +644,11 @@ impl MockContextEnricher {
             .insert((author_did.into(), cid.into()), base64.into());
     }
 
+    /// Injects context image references for a parent or quoted post AT-URI.
+    pub fn set_context_image_refs(&self, uri: impl Into<String>, refs: Vec<ContextImageRef>) {
+        self.context_image_refs.write().insert(uri.into(), refs);
+    }
+
     /// Injects a mock `(target_follows_candidate, candidate_follows_target)` relationship
     /// for `(target_did, candidate_did)`.
     pub fn set_relationship(
@@ -483,6 +691,14 @@ impl ContextEnricher for MockContextEnricher {
                 }
             }
         }
+        let image_alts = collect_non_empty_alts(&interaction.image_alts);
+        let context_image_refs = interaction
+            .parent_uri
+            .as_deref()
+            .or(interaction.quote_uri.as_deref())
+            .and_then(|uri| self.context_image_refs.read().get(uri).cloned())
+            .map(|refs| refs.into_iter().take(MAX_CONTEXT_IMAGES).collect())
+            .unwrap_or_default();
 
         EnrichedContext {
             author,
@@ -491,7 +707,11 @@ impl ContextEnricher for MockContextEnricher {
             quoted_post,
             thread_ancestors: Vec::new(),
             thread_ancestor_quotes: Vec::new(),
+            thread_ancestor_embeds: Vec::new(),
             images_base64,
+            image_alts,
+            context_image_refs,
+            context_images_base64: Vec::new(),
         }
     }
 
@@ -535,6 +755,23 @@ impl ContextEnricher for MockContextEnricher {
             .copied()
             .unwrap_or((false, false))
     }
+}
+
+#[derive(Debug, Default)]
+struct ExtractedMedia {
+    image_count: usize,
+    image_alts: Vec<String>,
+    external_title: Option<String>,
+    external_description: Option<String>,
+    image_refs: Vec<ContextImageRef>,
+}
+
+#[derive(Debug, Default)]
+struct ThreadFetchResult {
+    ancestors: Vec<ThreadPost>,
+    quotes: Vec<Option<QuotedAncestor>>,
+    embeds: Vec<Option<PostEmbedSummary>>,
+    context_image_refs: Vec<ContextImageRef>,
 }
 
 /// AppView HTTP client resolving author profiles and parent posts via public XRPC endpoints.
@@ -709,8 +946,8 @@ impl AppViewContextEnricher {
         })
     }
 
-    /// Extracts an embedded quote-post summary from a `getPostThread` post `embed` object.
-    fn extract_ancestor_quote(embed: &serde_json::Value) -> Option<QuotedAncestor> {
+    /// Extracts the `app.bsky.embed.record#viewRecord` payload from a post `embed` view object.
+    fn extract_view_record(embed: &serde_json::Value) -> Option<&serde_json::Value> {
         let embed_type = embed.get("$type").and_then(|v| v.as_str())?;
         let record = match embed_type {
             "app.bsky.embed.record#view" => embed.get("record")?,
@@ -722,6 +959,12 @@ impl AppViewContextEnricher {
                 return None;
             }
         }
+        Some(record)
+    }
+
+    /// Extracts an embedded quote-post summary from a `getPostThread` post `embed` object.
+    fn extract_ancestor_quote(embed: &serde_json::Value) -> Option<QuotedAncestor> {
+        let record = Self::extract_view_record(embed)?;
         let author = record.get("author")?;
         let author_did = author
             .get("did")
@@ -747,6 +990,218 @@ impl AppViewContextEnricher {
         })
     }
 
+    fn trimmed_non_empty(val: Option<&str>) -> Option<String> {
+        val.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    fn parse_cdn_plain_ref(url: &str) -> Option<ContextImageRef> {
+        let (_, rest) = url.split_once("/plain/")?;
+        let (did_raw, cid_part) = rest.split_once('/')?;
+        let did = did_raw.trim();
+        if !did.starts_with("did:") {
+            return None;
+        }
+        let cid = cid_part.split(['@', '?', '#', '/']).next()?.trim();
+        if cid.is_empty() {
+            return None;
+        }
+        Some(ContextImageRef {
+            author_did: did.to_string(),
+            cid: cid.to_string(),
+        })
+    }
+
+    fn extract_media_node(author_did: &str, embed: &serde_json::Value) -> ExtractedMedia {
+        let embed_type = embed.get("$type").and_then(|v| v.as_str()).unwrap_or("");
+        let media = match embed_type {
+            "app.bsky.embed.recordWithMedia" | "app.bsky.embed.recordWithMedia#view" => {
+                let Some(m) = embed.get("media") else {
+                    return ExtractedMedia::default();
+                };
+                m
+            }
+            _ => embed,
+        };
+        let media_type = media.get("$type").and_then(|v| v.as_str()).unwrap_or("");
+        let mut out = ExtractedMedia::default();
+
+        let extract_items = |arr: &[serde_json::Value],
+                             out: &mut ExtractedMedia,
+                             blob_key: &str| {
+            for item in arr {
+                out.image_count += 1;
+                if let Some(alt) = Self::trimmed_non_empty(item.get("alt").and_then(|v| v.as_str()))
+                {
+                    out.image_alts.push(alt);
+                }
+                let raw_cid = item
+                    .get(blob_key)
+                    .or_else(|| item.get("image"))
+                    .and_then(|img| img.get("ref"))
+                    .and_then(|r| r.get("$link"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Self::trimmed_non_empty(Some(s)));
+                if let Some(cid) = raw_cid {
+                    if author_did.starts_with("did:") {
+                        out.image_refs.push(ContextImageRef {
+                            author_did: author_did.to_string(),
+                            cid,
+                        });
+                    }
+                } else {
+                    let cdn_ref = item
+                        .get("thumb")
+                        .and_then(|v| v.as_str())
+                        .and_then(Self::parse_cdn_plain_ref)
+                        .or_else(|| {
+                            item.get("fullsize")
+                                .and_then(|v| v.as_str())
+                                .and_then(Self::parse_cdn_plain_ref)
+                        });
+                    if let Some(cref) = cdn_ref {
+                        out.image_refs.push(cref);
+                    }
+                }
+            }
+        };
+
+        if matches!(
+            media_type,
+            "app.bsky.embed.images" | "app.bsky.embed.images#view"
+        ) || (media_type.is_empty() && media.get("images").is_some())
+        {
+            if let Some(arr) = media.get("images").and_then(|v| v.as_array()) {
+                extract_items(arr, &mut out, "image");
+            }
+        } else if matches!(
+            media_type,
+            "app.bsky.embed.gallery" | "app.bsky.embed.gallery#view"
+        ) || (media_type.is_empty() && media.get("items").is_some())
+        {
+            if let Some(arr) = media.get("items").and_then(|v| v.as_array()) {
+                extract_items(arr, &mut out, "item");
+            }
+        } else if matches!(
+            media_type,
+            "app.bsky.embed.external" | "app.bsky.embed.external#view"
+        ) || (media_type.is_empty() && media.get("external").is_some())
+        {
+            if let Some(ext) = media.get("external") {
+                out.external_title =
+                    Self::trimmed_non_empty(ext.get("title").and_then(|v| v.as_str()));
+                out.external_description =
+                    Self::trimmed_non_empty(ext.get("description").and_then(|v| v.as_str()));
+            }
+        }
+
+        out
+    }
+
+    fn merge_raw_and_views(
+        author_did: &str,
+        raw_embed: Option<&serde_json::Value>,
+        view_embeds: &[&serde_json::Value],
+    ) -> ExtractedMedia {
+        let raw = raw_embed
+            .map(|e| Self::extract_media_node(author_did, e))
+            .unwrap_or_default();
+        let mut combined_view = ExtractedMedia::default();
+        for v in view_embeds {
+            let extracted = Self::extract_media_node(author_did, v);
+            if extracted.image_count > combined_view.image_count {
+                combined_view.image_count = extracted.image_count;
+                if !extracted.image_alts.is_empty() {
+                    combined_view.image_alts = extracted.image_alts;
+                }
+                if !extracted.image_refs.is_empty() {
+                    combined_view.image_refs = extracted.image_refs;
+                }
+            } else {
+                if combined_view.image_alts.is_empty() && !extracted.image_alts.is_empty() {
+                    combined_view.image_alts = extracted.image_alts;
+                }
+                if combined_view.image_refs.is_empty() && !extracted.image_refs.is_empty() {
+                    combined_view.image_refs = extracted.image_refs;
+                }
+            }
+            if combined_view.external_title.is_none() {
+                combined_view.external_title = extracted.external_title;
+            }
+            if combined_view.external_description.is_none() {
+                combined_view.external_description = extracted.external_description;
+            }
+        }
+
+        ExtractedMedia {
+            image_count: raw.image_count.max(combined_view.image_count),
+            image_alts: if !raw.image_alts.is_empty() {
+                raw.image_alts
+            } else {
+                combined_view.image_alts
+            },
+            external_title: combined_view.external_title.or(raw.external_title),
+            external_description: combined_view
+                .external_description
+                .or(raw.external_description),
+            image_refs: if !raw.image_refs.is_empty() {
+                raw.image_refs
+            } else {
+                combined_view.image_refs
+            },
+        }
+    }
+
+    fn extract_post_embed_and_refs(
+        author_did: &str,
+        raw_embed: Option<&serde_json::Value>,
+        view_embed: Option<&serde_json::Value>,
+    ) -> (Option<PostEmbedSummary>, Vec<ContextImageRef>) {
+        let view_slice: Vec<&serde_json::Value> = view_embed.into_iter().collect();
+        let own = Self::merge_raw_and_views(author_did, raw_embed, &view_slice);
+
+        let quoted = if let Some(view_rec) = view_embed.and_then(Self::extract_view_record) {
+            let quoted_author = view_rec
+                .get("author")
+                .and_then(|a| a.get("did"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let q_raw = view_rec.get("value").and_then(|v| v.get("embed"));
+            let q_views: Vec<&serde_json::Value> = view_rec
+                .get("embeds")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().collect())
+                .unwrap_or_default();
+            Self::merge_raw_and_views(quoted_author, q_raw, &q_views)
+        } else {
+            ExtractedMedia::default()
+        };
+
+        let summary = PostEmbedSummary {
+            image_count: own.image_count,
+            image_alts: own.image_alts,
+            external_title: own.external_title,
+            external_description: own.external_description,
+            quoted_image_count: quoted.image_count,
+            quoted_image_alts: quoted.image_alts,
+            quoted_external_title: quoted.external_title,
+            quoted_external_description: quoted.external_description,
+        };
+
+        let mut refs = Vec::new();
+        for r in own.image_refs.into_iter().chain(quoted.image_refs) {
+            if !refs.contains(&r) {
+                refs.push(r);
+                if refs.len() >= MAX_CONTEXT_IMAGES {
+                    break;
+                }
+            }
+        }
+
+        ((!summary.is_empty()).then_some(summary), refs)
+    }
+
     /// Resolves the full ancestor chain above `uri` via `app.bsky.feed.getPostThread`
     /// with `depth = 0`, returning posts ordered oldest (thread root) to newest
     /// (immediate parent). Caps the chain at [`MAX_RENDERED_THREAD_ANCESTORS`].
@@ -755,19 +1210,18 @@ impl AppViewContextEnricher {
     pub async fn fetch_thread_ancestors(&self, uri: &str) -> Vec<ThreadPost> {
         self.fetch_thread_chain_with_quotes(uri, false, "", "")
             .await
-            .0
+            .ancestors
     }
 
     /// Resolves the conversation thread anchored at `parent_uri`, including `parent_uri`
-    /// itself as the newest ancestor (along with any embedded quoted posts) when `getPostThread`
-    /// returns the parent post as the focal `thread.post` node (standard AppView behavior
-    /// when querying by `parent_uri`).
+    /// itself as the newest ancestor (along with any embedded quoted posts and embed metadata)
+    /// when `getPostThread` returns the parent post as the focal `thread.post` node.
     async fn fetch_thread_from_parent(
         &self,
         parent_uri: &str,
         candidate_author_did: &str,
         candidate_text: &str,
-    ) -> (Vec<ThreadPost>, Vec<Option<QuotedAncestor>>) {
+    ) -> ThreadFetchResult {
         self.fetch_thread_chain_with_quotes(parent_uri, true, candidate_author_did, candidate_text)
             .await
     }
@@ -778,7 +1232,7 @@ impl AppViewContextEnricher {
         include_focal_when_parent: bool,
         candidate_author_did: &str,
         candidate_text: &str,
-    ) -> (Vec<ThreadPost>, Vec<Option<QuotedAncestor>>) {
+    ) -> ThreadFetchResult {
         #[derive(Deserialize)]
         struct RawAuthor {
             did: String,
@@ -787,6 +1241,8 @@ impl AppViewContextEnricher {
         struct RawRecord {
             #[serde(default)]
             text: String,
+            #[serde(default)]
+            embed: Option<serde_json::Value>,
         }
         #[derive(Deserialize)]
         struct RawPost {
@@ -814,6 +1270,8 @@ impl AppViewContextEnricher {
 
         let mut chain = Vec::new();
         let mut quotes = Vec::new();
+        let mut embeds = Vec::new();
+        let mut post_image_refs: Vec<Vec<ContextImageRef>> = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut current_uri = Some(uri.to_string());
         let mut is_first_hop = true;
@@ -857,7 +1315,15 @@ impl AppViewContextEnricher {
                         }
                     };
                     if is_ancestor {
-                        quotes.push(focal.embed.as_ref().and_then(Self::extract_ancestor_quote));
+                        let quote = focal.embed.as_ref().and_then(Self::extract_ancestor_quote);
+                        let (embed_summary, refs) = Self::extract_post_embed_and_refs(
+                            &focal.author.did,
+                            focal.record.embed.as_ref(),
+                            focal.embed.as_ref(),
+                        );
+                        quotes.push(quote);
+                        embeds.push(embed_summary);
+                        post_image_refs.push(refs);
                         chain.push(ThreadPost {
                             author_did: focal.author.did,
                             text: focal.record.text,
@@ -869,7 +1335,15 @@ impl AppViewContextEnricher {
             let mut cursor = thread.parent;
             while let Some(node) = cursor {
                 if let Some(post) = node.post {
-                    quotes.push(post.embed.as_ref().and_then(Self::extract_ancestor_quote));
+                    let quote = post.embed.as_ref().and_then(Self::extract_ancestor_quote);
+                    let (embed_summary, refs) = Self::extract_post_embed_and_refs(
+                        &post.author.did,
+                        post.record.embed.as_ref(),
+                        post.embed.as_ref(),
+                    );
+                    quotes.push(quote);
+                    embeds.push(embed_summary);
+                    post_image_refs.push(refs);
                     chain.push(ThreadPost {
                         author_did: post.author.did,
                         text: post.record.text,
@@ -897,13 +1371,25 @@ impl AppViewContextEnricher {
         // Walk yields newest-first; reverse to oldest-first.
         chain.reverse();
         quotes.reverse();
+        embeds.reverse();
+        post_image_refs.reverse();
         let start = chain.len().saturating_sub(MAX_RENDERED_THREAD_ANCESTORS);
         let ancestors = chain.split_off(start);
         let mut trimmed_quotes = quotes.split_off(start);
         if trimmed_quotes.iter().all(Option::is_none) {
             trimmed_quotes.clear();
         }
-        (ancestors, trimmed_quotes)
+        let mut trimmed_embeds = embeds.split_off(start);
+        if trimmed_embeds.iter().all(Option::is_none) {
+            trimmed_embeds.clear();
+        }
+        let context_image_refs = post_image_refs.pop().unwrap_or_default();
+        ThreadFetchResult {
+            ancestors,
+            quotes: trimmed_quotes,
+            embeds: trimmed_embeds,
+            context_image_refs,
+        }
     }
 
     /// Fetches initial followed DIDs for an actor from the public AppView (XRPC `app.bsky.graph.getFollows`).
@@ -1101,40 +1587,42 @@ impl ContextEnricher for AppViewContextEnricher {
                         .await
                 }
                 (true, None, Some(quote_uri)) => {
-                    let (ancestors, quotes) = self
+                    let result = self
                         .fetch_thread_from_parent(
                             quote_uri,
                             &interaction.author_did,
                             &interaction.text,
                         )
                         .await;
-                    if ancestors.len() > 1 || !quotes.is_empty() {
-                        (ancestors, quotes)
+                    if result.ancestors.len() > 1
+                        || !result.quotes.is_empty()
+                        || !result.embeds.is_empty()
+                        || !result.context_image_refs.is_empty()
+                    {
+                        result
                     } else {
-                        (Vec::new(), Vec::new())
+                        ThreadFetchResult::default()
                     }
                 }
-                _ => (Vec::new(), Vec::new()),
+                _ => ThreadFetchResult::default(),
             }
         };
 
-        let (
-            author,
-            target,
-            parent_post,
-            quoted_post,
-            images_base64,
-            (thread_ancestors, thread_ancestor_quotes),
-        ) = tokio::join!(author_fut, target_fut, parent_fut, quoted_fut, images_fut, thread_fut);
+        let (author, target, parent_post, quoted_post, images_base64, thread_res) =
+            tokio::join!(author_fut, target_fut, parent_fut, quoted_fut, images_fut, thread_fut);
 
         EnrichedContext {
             author,
             target,
             parent_post,
             quoted_post,
-            thread_ancestors,
-            thread_ancestor_quotes,
+            thread_ancestors: thread_res.ancestors,
+            thread_ancestor_quotes: thread_res.quotes,
+            thread_ancestor_embeds: thread_res.embeds,
             images_base64,
+            image_alts: collect_non_empty_alts(&interaction.image_alts),
+            context_image_refs: thread_res.context_image_refs,
+            context_images_base64: Vec::new(),
         }
     }
 

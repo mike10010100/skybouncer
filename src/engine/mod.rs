@@ -1389,12 +1389,15 @@ impl SkybouncerEngineBuilder {
             self.config.certainty_config
         };
 
+        let enricher = self
+            .enricher
+            .unwrap_or_else(|| Arc::new(NoopContextEnricher));
+
         let classifier: Arc<dyn Classifier> = match fallback_classifier {
-            Some(fallback) => Arc::new(TieredClassifier::new(
-                primary_classifier,
-                fallback,
-                effective_certainty,
-            )),
+            Some(fallback) => Arc::new(
+                TieredClassifier::new(primary_classifier, fallback, effective_certainty)
+                    .with_context_enricher(Arc::clone(&enricher)),
+            ),
             None => primary_classifier,
         };
 
@@ -1521,9 +1524,6 @@ impl SkybouncerEngineBuilder {
                 self.config.rate_limiter_config.clone(),
             ))
         });
-        let enricher = self
-            .enricher
-            .unwrap_or_else(|| Arc::new(NoopContextEnricher));
 
         let mut protected = self.config.protected_dids.clone();
         if let Ok(active) = tenant_registry.list_active() {

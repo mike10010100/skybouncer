@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.35] - 2026-11-14
+
+### Fixed
+
+- **Rhetorical Second-Person Apostrophe, Embed Metadata Enrichment & Lazy System-2 Context Vision (`src/enricher.rs`, `src/classifier/tiered.rs`, `src/classifier/jev.rs`, `src/engine/mod.rs`)**:
+  - Extended `AppViewContextEnricher` to extract zero-extra-RPC embed metadata (`PostEmbedSummary`: external link-card titles/descriptions, image alt texts, and attached media presence markers) plus deduplicated `ContextImageRef` handles for focal parent/quoted posts and their nested quotes (`EnrichedContext::thread_ancestor_embeds`, `EnrichedContext::context_image_refs`, `EnrichedContext::image_alts`), rendered in `EnrichedContext::format_for_interaction` while leaving `format_for_classifier()` unchanged.
+  - Added lazy System-2 context image hydration (`TieredClassifier::with_context_enricher`, wired in `EngineBuilder::build`) so parent/quoted thumbnails (`EnrichedContext::context_images_base64`, up to `MAX_CONTEXT_IMAGES = 2`) are fetched ONLY when Tier-1 already escalates, without forcing image escalation on benign replies.
+  - Updated `JevClassifier` (`Ollama` modality framing + rules `(1)(b)`/`(2)`/`(3)` and `SystemOne` `harassment`/`permitted` criteria) to keep context images strictly separated from Author-uploaded images and to permit rhetorical second-person apostrophe addressing a named third-party person or public figure (e.g. `"Just for you Ari, you prick"`) distinct from `Target` while still flagging slang/insult vocatives (`"Karen"`, `"Bozo"`, `"Einstein"`, `"buddy"`, `"pal"`) and unqualified second-person attacks aimed at `Target`.
+
 ## [0.2.34] - 2026-11-13
 
 ### Fixed

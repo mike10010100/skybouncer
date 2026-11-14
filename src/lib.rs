@@ -67,10 +67,10 @@ pub use bot::{
     DEFAULT_BOT_POLL_INTERVAL, DEFAULT_CHAT_ENDPOINT,
 };
 pub use enricher::{
-    AppViewContextEnricher, AuthorContext, ContextEnricher, EnrichedContext, MockContextEnricher,
-    NoopContextEnricher, ParentPostContext, QuotedAncestor, ThreadPost, DEFAULT_APPVIEW_ENDPOINT,
-    DEFAULT_ENRICHER_TIMEOUT_MS, MAX_POST_IMAGES, MAX_RENDERED_THREAD_ANCESTORS,
-    THREAD_ANCESTOR_CHAR_CAP,
+    AppViewContextEnricher, AuthorContext, ContextEnricher, ContextImageRef, EnrichedContext,
+    MockContextEnricher, NoopContextEnricher, ParentPostContext, PostEmbedSummary, QuotedAncestor,
+    ThreadPost, DEFAULT_APPVIEW_ENDPOINT, DEFAULT_ENRICHER_TIMEOUT_MS, MAX_CONTEXT_IMAGES,
+    MAX_POST_IMAGES, MAX_RENDERED_THREAD_ANCESTORS, THREAD_ANCESTOR_CHAR_CAP,
 };
 pub use limiter::{
     EvaluationRateLimiter, RateLimiterConfig, DEFAULT_MAX_EVALUATIONS_PER_WINDOW,
