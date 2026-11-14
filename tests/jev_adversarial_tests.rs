@@ -2346,3 +2346,169 @@ async fn test_standalone_quote_group_label_dunk_systemone_and_ollama() {
         .expect("other_quote request recorded");
     assert!(!String::from_utf8_lossy(&other_req_body.body).contains("Quoting: Target ("));
 }
+
+#[tokio::test]
+async fn test_rhetorical_apostrophe_and_vocative_guardrail_prompts_systemone_and_ollama() {
+    use skybouncer::classifier::Verdict;
+    use skybouncer::enricher::{EnrichedContext, PostEmbedSummary, QuotedAncestor, ThreadPost};
+
+    let server = MockServer::start().await;
+    let target_did = "did:plc:mmtjkssv6jeneahkgfdxuy7p";
+    let author_did = "did:plc:jbbiqk7nyatsivk2mboyqm6t";
+    let quoted_did = "did:plc:ktc7mkfqnint7hmviye6wizr";
+    let parent_uri = "at://did:plc:mmtjkssv6jeneahkgfdxuy7p/app.bsky.feed.post/3n2bnzagrqk2m";
+
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(wiremock::matchers::body_string_contains(
+            "[quoted post has 1 attached image(s) (no alt text)]",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "Just for you Ari, you prick",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "NEVER slang/insult vocatives like 'Karen', 'Bozo', 'Einstein', 'buddy', or 'pal'",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "permitted",
+                    "probabilities": { "permitted": 0.92, "harassment": 0.08 }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(wiremock::matchers::body_string_contains(
+            "rhetorical second-person apostrophe ('shouting at the screen')",
+        ))
+        .and(wiremock::matchers::body_string_contains("STRICT GUARDRAILS"))
+        .and(wiremock::matchers::body_string_contains("Karen"))
+        .and(wiremock::matchers::body_string_contains("Bozo"))
+        .and(wiremock::matchers::body_string_contains("buddy"))
+        .and(wiremock::matchers::body_string_contains("c3JjX2N0eF9pbWc="))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": {
+                "role": "assistant",
+                "content": r#"{"violates": false, "category": null, "confidence": 0.99, "reason": "Rhetorical second-person apostrophe addressed to Ari Emanuel in quoted screenshot, not Target."}"#
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/karen/api/chat"))
+        .and(wiremock::matchers::body_string_contains("Okay Karen, you prick."))
+        .and(wiremock::matchers::body_string_contains(
+            "unqualified second-person attacks on Target",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": {
+                "role": "assistant",
+                "content": r#"{"violates": true, "category": "harassment", "confidence": 0.99, "reason": "Uses generic slang vocative 'Karen' + second-person insult addressing Target."}"#
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut ctx = EnrichedContext::empty();
+    ctx.thread_ancestors = vec![ThreadPost {
+        author_did: target_did.to_string(),
+        text: "LMAO they're still blaming Buttigieg? Wild.".to_string(),
+    }];
+    ctx.thread_ancestor_quotes = vec![Some(QuotedAncestor {
+        author_did: quoted_did.to_string(),
+        author_handle: Some("pierceah66.bsky.social".to_string()),
+        text: "Rahm’s shady bitch of a brother being very loud & wrong.".to_string(),
+    })];
+    ctx.thread_ancestor_embeds = vec![Some(PostEmbedSummary {
+        quoted_image_count: 1,
+        ..Default::default()
+    })];
+    ctx.context_images_base64 = vec!["c3JjX2N0eF9pbWc=".to_string()];
+
+    let mut ari_reply = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::DirectReply,
+        "at://did:plc:jbbiqk7nyatsivk2mboyqm6t/app.bsky.feed.post/3n2btnssbrs2s",
+        "bafyari",
+        "Just for you Ari, you prick.",
+    )
+    .with_parent_uri(parent_uri);
+    ari_reply.enriched_context = Some(ctx.clone());
+
+    let systemone = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: true,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(systemone.classify(&ari_reply).await.unwrap().is_permitted());
+
+    let ollama = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/api/chat", server.uri()),
+            api_key: None,
+            model: "gemma4:26b".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(ollama.classify(&ari_reply).await.unwrap().is_permitted());
+
+    let karen_ollama = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/karen/api/chat", server.uri()),
+            api_key: None,
+            model: "gemma4:26b".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    let mut karen_reply = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::DirectReply,
+        "at://did:plc:jbbiqk7nyatsivk2mboyqm6t/app.bsky.feed.post/karen1",
+        "bafykaren",
+        "Okay Karen, you prick.",
+    )
+    .with_parent_uri(parent_uri);
+    karen_reply.enriched_context = Some(ctx);
+    let karen_verdict = karen_ollama.classify(&karen_reply).await.unwrap();
+    assert!(matches!(
+        karen_verdict,
+        Verdict::Violation {
+            category: ViolationCategory::Harassment,
+            ..
+        }
+    ));
+
+    // Confirm SystemOne never receives context_images_base64 even when supports_images=true.
+    let reqs = server.received_requests().await.unwrap();
+    let s1_req = reqs
+        .iter()
+        .find(|r| r.url.path() == "/v1/systemone")
+        .expect("SystemOne request recorded");
+    assert!(!String::from_utf8_lossy(&s1_req.body).contains("c3JjX2N0eF9pbWc="));
+}

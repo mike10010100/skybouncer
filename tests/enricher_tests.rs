@@ -1094,3 +1094,443 @@ async fn test_appview_enricher_standalone_quote_resolves_quoted_thread_and_skips
         "Quoted Post (by Target ({target_did})): \"Plain root take.\""
     )));
 }
+
+#[tokio::test]
+async fn test_appview_enricher_ari_nested_view_record_and_format_preservation() {
+    use skybouncer::enricher::ContextImageRef;
+
+    let mock_server = MockServer::start().await;
+    let target_did = "did:plc:mmtjkssv6jeneahkgfdxuy7p";
+    let author_did = "did:plc:jbbiqk7nyatsivk2mboyqm6t";
+    let quoted_did = "did:plc:ktc7mkfqnint7hmviye6wizr";
+    let parent_uri = "at://did:plc:mmtjkssv6jeneahkgfdxuy7p/app.bsky.feed.post/3n2bnzagrqk2m";
+    let screenshot_cid = "bafkreigx7ubyrt2jyulj5e45yb5br3yq4teohelvrm52454gpsnpzto6ti";
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPosts"))
+        .and(query_param("uris", parent_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "posts": [{
+                "uri": parent_uri,
+                "cid": "bafyparent3n2b",
+                "author": { "did": target_did, "handle": "mike10010100.com" },
+                "record": { "$type": "app.bsky.feed.post", "text": "LMAO they're still blaming Buttigieg? Wild." }
+            }]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPostThread"))
+        .and(query_param("uri", parent_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "thread": {
+                "$type": "app.bsky.feed.defs#threadViewPost",
+                "post": {
+                    "uri": parent_uri,
+                    "author": { "did": target_did, "handle": "mike10010100.com" },
+                    "record": {
+                        "$type": "app.bsky.feed.post",
+                        "text": "LMAO they're still blaming Buttigieg? Wild."
+                    },
+                    "embed": {
+                        "$type": "app.bsky.embed.record#view",
+                        "record": {
+                            "$type": "app.bsky.embed.record#viewRecord",
+                            "uri": "at://did:plc:ktc7mkfqnint7hmviye6wizr/app.bsky.feed.post/3n2asybjkpk2p",
+                            "author": {
+                                "did": quoted_did,
+                                "handle": "pierceah66.bsky.social"
+                            },
+                            "value": {
+                                "$type": "app.bsky.feed.post",
+                                "text": "Rahm’s shady bitch of a brother being very loud & wrong.",
+                                "embed": {
+                                    "$type": "app.bsky.embed.images",
+                                    "images": [{
+                                        "alt": "",
+                                        "image": {
+                                            "$type": "blob",
+                                            "ref": { "$link": screenshot_cid }
+                                        }
+                                    }]
+                                }
+                            },
+                            "embeds": [{
+                                "$type": "app.bsky.embed.images#view",
+                                "images": [{
+                                    "thumb": format!("https://cdn.bsky.app/img/feed_thumbnail/plain/{quoted_did}/{screenshot_cid}@jpeg"),
+                                    "fullsize": format!("https://cdn.bsky.app/img/feed_fullsize/plain/{quoted_did}/{screenshot_cid}@jpeg"),
+                                    "alt": ""
+                                }]
+                            }]
+                        }
+                    }
+                },
+                "parent": null
+            }
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let enricher =
+        AppViewContextEnricher::with_endpoint(mock_server.uri()).with_thread_context(true);
+    let interaction = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::DirectReply,
+        "at://did:plc:jbbiqk7nyatsivk2mboyqm6t/app.bsky.feed.post/3n2btnssbrs2s",
+        "bafy3n2b",
+        "Just for you Ari, you prick.",
+    )
+    .with_parent_uri(parent_uri);
+
+    let enriched = enricher.enrich(&interaction).await;
+    assert_eq!(
+        enriched.context_image_refs,
+        vec![ContextImageRef {
+            author_did: quoted_did.to_string(),
+            cid: screenshot_cid.to_string(),
+        }]
+    );
+    assert!(enriched.context_images_base64.is_empty());
+
+    let interaction_fmt = enriched.format_for_interaction(author_did, target_did);
+    assert!(interaction_fmt.contains(&format!(
+        "[quoting OtherUser @pierceah66.bsky.social ({quoted_did}): \"Rahm’s shady bitch of a brother being very loud & wrong.\"]"
+    )));
+    assert!(interaction_fmt.contains("[quoted post has 1 attached image(s) (no alt text)]"));
+    assert!(interaction_fmt.contains("[IMMEDIATE PARENT — Author is replying to this post]"));
+
+    let raw_fmt = enriched.format_for_classifier();
+    assert!(!raw_fmt.contains("[quoted post has"));
+    assert!(!raw_fmt.contains("[quoting"));
+}
+
+#[tokio::test]
+async fn test_appview_enricher_embeds_cards_gallery_cdn_fallback_and_standalone_media_quote() {
+    use skybouncer::enricher::{ContextImageRef, MAX_CONTEXT_IMAGES};
+
+    let mock_server = MockServer::start().await;
+    let target_did = "did:plc:target_embed";
+    let author_did = "did:plc:author_embed";
+    let other_did = "did:plc:other_embed";
+    let quoted_did = "did:plc:quoted_embed";
+    let parent_uri = "at://did:plc:target_embed/app.bsky.feed.post/parent";
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPostThread"))
+        .and(query_param("uri", parent_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "thread": {
+                "$type": "app.bsky.feed.defs#threadViewPost",
+                "post": {
+                    "uri": parent_uri,
+                    "author": { "did": target_did },
+                    "record": {
+                        "$type": "app.bsky.feed.post",
+                        "text": "Look at both screenshots.",
+                        "embed": {
+                            "$type": "app.bsky.embed.recordWithMedia",
+                            "media": {
+                                "$type": "app.bsky.embed.images",
+                                "images": [
+                                    { "alt": "Polling chart showing 60% disapproval", "image": { "ref": { "$link": "bafkreicand1" } } },
+                                    { "alt": "", "image": { "ref": { "$link": "bafkreicand2" } } }
+                                ]
+                            },
+                            "record": { "record": { "uri": "at://did:plc:quoted_embed/app.bsky.feed.post/q" } }
+                        }
+                    },
+                    "embed": {
+                        "$type": "app.bsky.embed.recordWithMedia#view",
+                        "media": {
+                            "$type": "app.bsky.embed.images#view",
+                            "images": [
+                                { "thumb": "https://cdn.bsky.app/img/feed_thumbnail/plain/did:plc:target_embed/bafkreicand1@jpeg", "alt": "Polling chart showing 60% disapproval" },
+                                { "thumb": "https://cdn.bsky.app/img/feed_thumbnail/plain/did:plc:target_embed/bafkreicand2@jpeg", "alt": "" }
+                            ]
+                        },
+                        "record": {
+                            "record": {
+                                "$type": "app.bsky.embed.record#viewRecord",
+                                "author": { "did": quoted_did, "handle": "reporter.bsky.social" },
+                                "value": {
+                                    "text": "Full scoop inside.",
+                                    "embed": {
+                                        "$type": "app.bsky.embed.external",
+                                        "external": {
+                                            "title": "Executive Under Fire",
+                                            "description": "Inside the boardroom revolt."
+                                        }
+                                    }
+                                },
+                                "embeds": [{
+                                    "$type": "app.bsky.embed.images#view",
+                                    "images": [{
+                                        "thumb": "https://cdn.bsky.app/img/feed_thumbnail/plain/did:plc:quoted_embed/bafkreiqimg@jpeg",
+                                        "alt": "Ari Emanuel portrait"
+                                    }]
+                                }]
+                            }
+                        }
+                    }
+                },
+                "parent": {
+                    "$type": "app.bsky.feed.defs#threadViewPost",
+                    "post": {
+                        "uri": "at://did:plc:other_embed/app.bsky.feed.post/gallery_post",
+                        "author": { "did": other_did },
+                        "record": {
+                            "$type": "app.bsky.feed.post",
+                            "text": "Gallery of receipts",
+                            "embed": {
+                                "$type": "app.bsky.embed.gallery",
+                                "items": [{
+                                    "alt": "Receipt item 1",
+                                    "item": { "ref": { "$link": "bafkreigallery1" } }
+                                }]
+                            }
+                        },
+                        "embed": {
+                            "$type": "app.bsky.embed.gallery#view",
+                            "items": [{
+                                "fullsize": format!("https://cdn.bsky.app/img/feed_fullsize/plain/{other_did}/bafkreigallery1@jpeg"),
+                                "alt": "Receipt item 1"
+                            }]
+                        }
+                    },
+                    "parent": {
+                        "$type": "app.bsky.feed.defs#threadViewPost",
+                        "post": {
+                            "uri": "at://did:plc:other_embed/app.bsky.feed.post/root_card",
+                            "author": { "did": other_did },
+                            "record": {
+                                "$type": "app.bsky.feed.post",
+                                "text": "Read this report"
+                            },
+                            "embed": {
+                                "$type": "app.bsky.embed.external#view",
+                                "external": {
+                                    "title": "Senate Hearing Transcript",
+                                    "description": "Verbatim testimony from Tuesday."
+                                }
+                            }
+                        },
+                        "parent": null
+                    }
+                }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let enricher =
+        AppViewContextEnricher::with_endpoint(mock_server.uri()).with_thread_context(true);
+    let reply = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::DirectReply,
+        "at://did:plc:author_embed/app.bsky.feed.post/reply1",
+        "bafyreply1",
+        "What a corrupt disaster",
+    )
+    .with_parent_uri(parent_uri);
+
+    let ctx = enricher.enrich(&reply).await;
+    // Own post has 2 images so MAX_CONTEXT_IMAGES caps before the quoted post's image.
+    assert_eq!(ctx.context_image_refs.len(), MAX_CONTEXT_IMAGES);
+    assert_eq!(
+        ctx.context_image_refs,
+        vec![
+            ContextImageRef {
+                author_did: target_did.to_string(),
+                cid: "bafkreicand1".to_string(),
+            },
+            ContextImageRef {
+                author_did: target_did.to_string(),
+                cid: "bafkreicand2".to_string(),
+            },
+        ]
+    );
+    let formatted = ctx.format_for_interaction(author_did, target_did);
+    assert!(formatted.contains(
+        "[link card: \"Senate Hearing Transcript\" — \"Verbatim testimony from Tuesday.\"]"
+    ));
+    assert!(formatted.contains("[attached 1 image(s); alt: \"Receipt item 1\"]"));
+    assert!(
+        formatted.contains("[attached 2 image(s); alt: \"Polling chart showing 60% disapproval\"]")
+    );
+    assert!(formatted.contains(
+        "[quoted post link card: \"Executive Under Fire\" — \"Inside the boardroom revolt.\"]"
+    ));
+    assert!(formatted.contains("[quoted post attached 1 image(s); alt: \"Ari Emanuel portrait\"]"));
+
+    // Standalone quote of a single root post that has only an image (`#view`-only `fullsize` CDN fallback,
+    // no `record.embed`) retains the thread ancestor, embed summary, and ContextImageRef!
+    let view_only_quote_uri = "at://did:plc:target_embed/app.bsky.feed.post/view_only_root";
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPosts"))
+        .and(query_param("uris", view_only_quote_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "posts": [{
+                "uri": view_only_quote_uri,
+                "cid": "bafyviewonlyroot",
+                "author": { "did": target_did, "handle": "target.bsky.social" },
+                "record": { "$type": "app.bsky.feed.post", "text": "Wild chart." }
+            }]
+        })))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPostThread"))
+        .and(query_param("uri", view_only_quote_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "thread": {
+                "$type": "app.bsky.feed.defs#threadViewPost",
+                "post": {
+                    "uri": view_only_quote_uri,
+                    "author": { "did": target_did },
+                    "record": { "$type": "app.bsky.feed.post", "text": "Wild chart." },
+                    "embed": {
+                        "$type": "app.bsky.embed.images#view",
+                        "images": [{
+                            "fullsize": format!("https://cdn.bsky.app/img/feed_fullsize/plain/{target_did}/bafkreiviewonly@jpeg"),
+                            "alt": ""
+                        }]
+                    }
+                },
+                "parent": null
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let standalone = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Quote,
+        "at://did:plc:author_embed/app.bsky.feed.post/sq1",
+        "bafysq1",
+        "Look at those numbers",
+    )
+    .with_quote_uri(view_only_quote_uri);
+    let ctx_sq = enricher.enrich(&standalone).await;
+    assert_eq!(ctx_sq.thread_ancestors.len(), 1);
+    assert_eq!(
+        ctx_sq.context_image_refs,
+        vec![ContextImageRef {
+            author_did: target_did.to_string(),
+            cid: "bafkreiviewonly".to_string(),
+        }]
+    );
+    let fmt_sq = ctx_sq.format_for_interaction(author_did, target_did);
+    assert!(fmt_sq.contains("[attached 1 image(s) (no alt text)]"));
+    assert!(fmt_sq.contains("[QUOTED POST — Author is quote-posting this post]"));
+}
+
+#[tokio::test]
+async fn test_enricher_new_fields_is_empty_mock_and_interaction_formatting() {
+    use skybouncer::enricher::{
+        ContextImageRef, EnrichedContext, PostEmbedSummary, ThreadPost, MAX_CONTEXT_IMAGES,
+    };
+
+    assert!(PostEmbedSummary::default().is_empty());
+    let non_empty_summary = PostEmbedSummary {
+        external_title: Some("Only Title".to_string()),
+        ..Default::default()
+    };
+    assert!(!non_empty_summary.is_empty());
+
+    // `is_empty()` checks all four new `EnrichedContext` fields accurately.
+    let mut ctx = EnrichedContext::empty();
+    ctx.image_alts = vec!["   ".to_string()];
+    ctx.thread_ancestor_embeds = vec![None];
+    assert!(ctx.is_empty());
+
+    ctx.image_alts = vec!["Tweet screenshot".to_string()];
+    assert!(!ctx.is_empty());
+
+    let mut ctx_embed = EnrichedContext::empty();
+    ctx_embed.thread_ancestors = vec![ThreadPost {
+        author_did: "did:plc:t".to_string(),
+        text: "Quoted card post".to_string(),
+    }];
+    ctx_embed.thread_ancestor_embeds = vec![Some(PostEmbedSummary {
+        quoted_external_description: Some("Quoted description only".to_string()),
+        ..Default::default()
+    })];
+    assert!(!ctx_embed.is_empty());
+    assert!(ctx_embed
+        .format_for_interaction("did:plc:a", "did:plc:t")
+        .contains("[quoted post link card: \"Quoted description only\"]"));
+
+    let mut ctx_ref = EnrichedContext::empty();
+    ctx_ref.context_image_refs = vec![ContextImageRef {
+        author_did: "did:plc:x".to_string(),
+        cid: "bafkreix".to_string(),
+    }];
+    assert!(!ctx_ref.is_empty());
+
+    let mut ctx_b64 = EnrichedContext::empty();
+    ctx_b64.context_images_base64 = vec!["AQID".to_string()];
+    assert!(!ctx_b64.is_empty());
+
+    // `format_for_interaction` renders `Candidate Image Alt Text` and `Context Thread Images`;
+    // `format_for_classifier` omits both and omits embed suffixes.
+    let mut rich = EnrichedContext::empty();
+    rich.thread_ancestors = vec![ThreadPost {
+        author_did: "did:plc:t".to_string(),
+        text: "Thread root".to_string(),
+    }];
+    rich.thread_ancestor_embeds = vec![Some(non_empty_summary.clone())];
+    rich.image_alts = vec!["  ".to_string(), "Alt description for meme".to_string()];
+    rich.context_images_base64 = vec!["AQID".to_string()];
+
+    let inter_fmt = rich.format_for_interaction("did:plc:a", "did:plc:t");
+    assert!(inter_fmt.contains("[link card: \"Only Title\"]"));
+    assert!(inter_fmt.contains("Candidate Image Alt Text: [2] \"Alt description for meme\""));
+    assert!(inter_fmt.contains(
+        "Context Thread Images [1 thumbnail(s) from the parent/quoted post decoded for visual context — NOT uploaded by Author]"
+    ));
+    let raw_fmt = rich.format_for_classifier();
+    assert!(!raw_fmt.contains("Candidate Image Alt Text"));
+    assert!(!raw_fmt.contains("Context Thread Images"));
+    assert!(!raw_fmt.contains("[link card:"));
+
+    // `MockContextEnricher::set_context_image_refs` caps at MAX_CONTEXT_IMAGES and keeps `image_alts`.
+    let mock = MockContextEnricher::new();
+    let p_uri = "at://did:plc:t/app.bsky.feed.post/p1";
+    mock.set_context_image_refs(
+        p_uri,
+        vec![
+            ContextImageRef {
+                author_did: "did:plc:q".to_string(),
+                cid: "cid1".to_string(),
+            },
+            ContextImageRef {
+                author_did: "did:plc:q".to_string(),
+                cid: "cid2".to_string(),
+            },
+            ContextImageRef {
+                author_did: "did:plc:q".to_string(),
+                cid: "cid3".to_string(),
+            },
+        ],
+    );
+    let mut inter = Interaction::new(
+        "did:plc:a",
+        "did:plc:t",
+        InteractionType::DirectReply,
+        "at://did:plc:a/app.bsky.feed.post/r1",
+        "bafyr1",
+        "Reply text",
+    )
+    .with_parent_uri(p_uri);
+    inter.image_alts = vec![" ".to_string(), "Chart screenshot".to_string()];
+    let mocked = mock.enrich(&inter).await;
+    assert_eq!(mocked.context_image_refs.len(), MAX_CONTEXT_IMAGES);
+    assert_eq!(mocked.image_alts, vec!["Chart screenshot".to_string()]);
+    assert!(mocked.context_images_base64.is_empty());
+}

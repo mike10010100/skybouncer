@@ -1099,3 +1099,367 @@ async fn test_tiered_classifier_nuanced_interpersonal_violation_escalates_to_sys
     assert!(verdict_no_esc.is_violation());
     assert_eq!(fallback.call_count(), 1); // unchanged
 }
+
+#[tokio::test]
+async fn test_tiered_classifier_lazy_context_image_hydration_and_skip_on_permitted() {
+    use skybouncer::enricher::{ContextImageRef, MockContextEnricher, MAX_CONTEXT_IMAGES};
+
+    let enricher = Arc::new(MockContextEnricher::new());
+    enricher.set_image_base64("did:plc:quoted1", "cid_1", "Zmlyc3Q=");
+    enricher.set_image_base64("did:plc:quoted2", "cid_2", "c2Vjb25k");
+
+    // 1. When candidate has no images (`has_images() == false`) and Tier-1 resolves `Permitted`
+    // decisively, `context_image_refs` MUST NOT trigger Tier-1 image escalation or CDN fetches.
+    let perm_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "gemma4:26b",
+            "message": { "role": "assistant", "content": "{\"violates\": false, \"category\": null, \"confidence\": 0.99, \"reason\": \"ok\"}" },
+            "done": true
+        })))
+        .expect(0)
+        .mount(&perm_server)
+        .await;
+
+    let perm_primary = Arc::new(MockClassifier::new(Verdict::permitted_with_confidence(
+        "Decisive permit",
+        0.95,
+    )));
+    let perm_fallback = Arc::new(
+        JevClassifier::new(
+            JevConfig {
+                base_url: format!("{}/api/chat", perm_server.uri()),
+                api_key: None,
+                model: "gemma4:26b".to_string(),
+                timeout: Duration::from_millis(1000),
+                max_retries: 0,
+                supports_images: false,
+            },
+            RuleRubric::default(),
+        )
+        .unwrap(),
+    );
+    let tiered_perm = TieredClassifier::new(
+        perm_primary.clone(),
+        perm_fallback,
+        CertaintyConfig::default(),
+    )
+    .with_context_enricher(enricher.clone());
+
+    let mut benign = sample_interaction("Just for you Ari, you prick.");
+    let mut benign_ctx = EnrichedContext::empty();
+    benign_ctx.context_image_refs = vec![ContextImageRef {
+        author_did: "did:plc:quoted1".to_string(),
+        cid: "cid_1".to_string(),
+    }];
+    benign.enriched_context = Some(benign_ctx);
+
+    let res_perm = tiered_perm
+        .evaluate_tiered_with_rubric(&benign, None, true)
+        .await
+        .unwrap();
+    assert!(!res_perm.escalated);
+    assert!(res_perm.final_verdict.is_permitted());
+    assert_eq!(
+        tiered_perm
+            .stats()
+            .image_escalations
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        tiered_perm.stats().primary_resolved.load(Ordering::Relaxed),
+        1
+    );
+
+    // 2. When Tier-1 escalates, TieredClassifier lazily fetches up to `MAX_CONTEXT_IMAGES` refs
+    // (`cid_missing` -> None is skipped gracefully; `cid_1` -> Some base64 is attached to System-2).
+    let esc_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(body_string_contains("Zmlyc3Q="))
+        .and(body_string_contains(
+            "NEVER penalize Author for text or imagery inside context images",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "gemma4:26b",
+            "message": {
+                "role": "assistant",
+                "content": "{\"violates\": false, \"category\": null, \"confidence\": 0.99, \"reason\": \"Addressed Ari in quoted screenshot\"}"
+            },
+            "done": true
+        })))
+        .expect(1)
+        .mount(&esc_server)
+        .await;
+
+    let esc_primary = Arc::new(MockClassifier::new(Verdict::violation(
+        ViolationCategory::Harassment,
+        0.96,
+        "SystemOne harassment",
+    )));
+    let esc_fallback = Arc::new(
+        JevClassifier::new(
+            JevConfig {
+                base_url: format!("{}/api/chat", esc_server.uri()),
+                api_key: None,
+                model: "gemma4:26b".to_string(),
+                timeout: Duration::from_millis(1000),
+                max_retries: 0,
+                supports_images: false,
+            },
+            RuleRubric::default(),
+        )
+        .unwrap(),
+    );
+    let tiered_esc = TieredClassifier::new(esc_primary, esc_fallback, CertaintyConfig::default())
+        .with_context_enricher(enricher.clone());
+
+    let mut escalated_interaction = sample_interaction("Just for you Ari, you prick.");
+    let mut esc_ctx = EnrichedContext::empty();
+    // 3 refs: capped at MAX_CONTEXT_IMAGES (2), so cid_2 is not fetched; cid_missing yields None.
+    assert_eq!(MAX_CONTEXT_IMAGES, 2);
+    esc_ctx.context_image_refs = vec![
+        ContextImageRef {
+            author_did: "did:plc:quoted_missing".to_string(),
+            cid: "cid_missing".to_string(),
+        },
+        ContextImageRef {
+            author_did: "did:plc:quoted1".to_string(),
+            cid: "cid_1".to_string(),
+        },
+        ContextImageRef {
+            author_did: "did:plc:quoted2".to_string(),
+            cid: "cid_2".to_string(),
+        },
+    ];
+    escalated_interaction.enriched_context = Some(esc_ctx);
+
+    let res_esc = tiered_esc
+        .classify_detailed(&escalated_interaction)
+        .await
+        .unwrap();
+    assert!(res_esc.escalated);
+    assert!(res_esc.final_verdict.is_permitted());
+
+    let reqs = esc_server.received_requests().await.unwrap();
+    let body_json_val: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(body_json_val["messages"][1]["images"], json!(["Zmlyc3Q="]));
+
+    // 3. When all `fetch_image_base64` calls return `None`, System-2 still runs cleanly without `images`.
+    let none_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "gemma4:26b",
+            "message": {
+                "role": "assistant",
+                "content": "{\"violates\": false, \"category\": null, \"confidence\": 0.90, \"reason\": \"Permitted text-only fallback\"}"
+            },
+            "done": true
+        })))
+        .expect(1)
+        .mount(&none_server)
+        .await;
+    let none_fallback = Arc::new(
+        JevClassifier::new(
+            JevConfig {
+                base_url: format!("{}/api/chat", none_server.uri()),
+                api_key: None,
+                model: "gemma4:26b".to_string(),
+                timeout: Duration::from_millis(1000),
+                max_retries: 0,
+                supports_images: false,
+            },
+            RuleRubric::default(),
+        )
+        .unwrap(),
+    );
+    let tiered_none = TieredClassifier::new(
+        Arc::new(MockClassifier::new(Verdict::permitted_with_confidence(
+            "Uncertain",
+            0.55,
+        ))),
+        none_fallback,
+        CertaintyConfig::default(),
+    )
+    .with_context_enricher(enricher);
+
+    let mut missing_only = sample_interaction("Just for you Ari, you prick.");
+    let mut missing_ctx = EnrichedContext::empty();
+    missing_ctx.context_image_refs = vec![ContextImageRef {
+        author_did: "did:plc:quoted_missing".to_string(),
+        cid: "cid_missing".to_string(),
+    }];
+    missing_only.enriched_context = Some(missing_ctx);
+    assert!(tiered_none
+        .classify(&missing_only)
+        .await
+        .unwrap()
+        .is_permitted());
+    let none_reqs = none_server.received_requests().await.unwrap();
+    let none_body: serde_json::Value = serde_json::from_slice(&none_reqs[0].body).unwrap();
+    assert!(none_body["messages"][1].get("images").is_none());
+}
+
+#[tokio::test]
+async fn test_jev_classifier_context_vs_candidate_images_and_endpoint_isolation() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "gemma4:26b",
+            "message": {
+                "role": "assistant",
+                "content": "{\"violates\": false, \"category\": null, \"confidence\": 0.95, \"reason\": \"Permitted\"}"
+            },
+            "done": true
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "permitted",
+                    "probabilities": { "permitted": 0.96 }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "violates": false,
+            "category": null,
+            "confidence": 0.96,
+            "reason": "Permitted"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let ollama = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/api/chat", server.uri()),
+            api_key: None,
+            model: "gemma4:26b".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+
+    // 1. Ollama mixed `(candidate + context)` concatenates `[candidate..., context...]`
+    // and includes split-ownership guidance.
+    let mut mixed_interaction = sample_interaction("Look at his quote");
+    let mut mixed_ctx = EnrichedContext::empty();
+    mixed_ctx.images_base64 = vec!["Y2FuZA==".to_string()];
+    mixed_ctx.context_images_base64 = vec!["Y3R4MQ==".to_string(), "Y3R4Mg==".to_string()];
+    mixed_interaction.enriched_context = Some(mixed_ctx);
+    assert!(ollama
+        .classify(&mixed_interaction)
+        .await
+        .unwrap()
+        .is_permitted());
+
+    // 2. Ollama context-only `(0, 1)` sends context image with context-only guidance.
+    let mut ctx_only_interaction = sample_interaction("Just for you Ari, you prick.");
+    let mut ctx_only = EnrichedContext::empty();
+    ctx_only.context_images_base64 = vec!["Y3R4b25seQ==".to_string()];
+    ctx_only_interaction.enriched_context = Some(ctx_only);
+    assert!(ollama
+        .classify(&ctx_only_interaction)
+        .await
+        .unwrap()
+        .is_permitted());
+
+    // 3. SystemOne with `supports_images: true` MUST NOT receive `context_images_base64`.
+    let systemone = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/v1/systemone", server.uri()),
+            api_key: None,
+            model: "clef-flash".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: true,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(systemone
+        .classify(&ctx_only_interaction)
+        .await
+        .unwrap()
+        .is_permitted());
+
+    // 4. StandardJev MUST NOT receive `context_images_base64`.
+    let standard = JevClassifier::new(
+        JevConfig {
+            base_url: server.uri(),
+            api_key: None,
+            model: "jev-system1-mod-v1".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: true,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(standard
+        .classify(&ctx_only_interaction)
+        .await
+        .unwrap()
+        .is_permitted());
+
+    let reqs = server.received_requests().await.unwrap();
+    let chat_reqs: Vec<serde_json::Value> = reqs
+        .iter()
+        .filter(|r| r.url.path() == "/api/chat")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(chat_reqs.len(), 2);
+
+    assert_eq!(
+        chat_reqs[0]["messages"][1]["images"],
+        json!(["Y2FuZA==", "Y3R4MQ==", "Y3R4Mg=="])
+    );
+    let mixed_sys = chat_reqs[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(mixed_sys.contains(
+        "the first 1 image(s) were uploaded by Author in the candidate post; the remaining 2 image(s) belong to the parent/quoted post as thread context ONLY — NEVER penalize Author for text or imagery inside those context images"
+    ));
+
+    assert_eq!(
+        chat_reqs[1]["messages"][1]["images"],
+        json!(["Y3R4b25seQ=="])
+    );
+    let ctx_sys = chat_reqs[1]["messages"][0]["content"].as_str().unwrap();
+    assert!(ctx_sys.contains(
+        "using the attached parent/quoted context image(s) ONLY as thread context to identify who or what the conversation is discussing"
+    ));
+
+    let s1_req = reqs
+        .iter()
+        .find(|r| r.url.path() == "/v1/systemone")
+        .expect("SystemOne request recorded");
+    let s1_body = String::from_utf8_lossy(&s1_req.body);
+    assert!(!s1_body.contains("Y3R4b25seQ=="));
+
+    let std_req = reqs
+        .iter()
+        .find(|r| r.url.path() == "/v1/classify")
+        .expect("StandardJev request recorded");
+    let std_body = String::from_utf8_lossy(&std_req.body);
+    assert!(!std_body.contains("Y3R4b25seQ=="));
+}

@@ -212,6 +212,7 @@ pub struct TieredClassifier {
     primary: Arc<dyn Classifier + Send + Sync>,
     fallback: Arc<dyn Classifier + Send + Sync>,
     certainty: CertaintyConfig,
+    context_enricher: Option<Arc<dyn crate::enricher::ContextEnricher>>,
     stats: Arc<TieredClassifierStats>,
 }
 
@@ -227,8 +228,20 @@ impl TieredClassifier {
             primary,
             fallback,
             certainty,
+            context_enricher: None,
             stats: Arc::new(TieredClassifierStats::default()),
         }
+    }
+
+    /// Attaches a [`ContextEnricher`](crate::enricher::ContextEnricher) so parent/quoted
+    /// context image thumbnails can be lazily hydrated when Tier-1 escalates to System-2.
+    #[must_use]
+    pub fn with_context_enricher(
+        mut self,
+        enricher: Arc<dyn crate::enricher::ContextEnricher>,
+    ) -> Self {
+        self.context_enricher = Some(enricher);
+        self
     }
 
     /// Returns a reference to the primary classifier.
@@ -365,10 +378,39 @@ impl TieredClassifier {
                 ("[Tiered Fallback: uncertainty escalation]", reason)
             };
 
+            // Lazily hydrate parent/quoted context thumbnails only after Tier-1 has already
+            // escalated so benign replies never incur extra CDN fetches or vision cost.
+            let mut hydrated_interaction: Option<Interaction> = None;
+            if let (Some(ref enricher), Some(ref ctx)) =
+                (&self.context_enricher, &interaction.enriched_context)
+            {
+                if ctx.context_images_base64.is_empty() && !ctx.context_image_refs.is_empty() {
+                    let limit = crate::enricher::MAX_CONTEXT_IMAGES.min(
+                        crate::enricher::MAX_POST_IMAGES.saturating_sub(ctx.images_base64.len()),
+                    );
+                    let mut fetched = Vec::with_capacity(limit);
+                    for img_ref in ctx.context_image_refs.iter().take(limit) {
+                        if let Some(b64) = enricher
+                            .fetch_image_base64(&img_ref.author_did, &img_ref.cid)
+                            .await
+                        {
+                            fetched.push(b64);
+                        }
+                    }
+                    if !fetched.is_empty() {
+                        let mut updated_ctx = ctx.clone();
+                        updated_ctx.context_images_base64 = fetched;
+                        hydrated_interaction =
+                            Some(interaction.clone().with_enriched_context(updated_ctx));
+                    }
+                }
+            }
+            let fallback_interaction = hydrated_interaction.as_ref().unwrap_or(interaction);
+
             // 3. Evaluate candidate with the heavier System-2 fallback model
             let fallback_raw = self
                 .fallback
-                .classify_with_rubric(interaction, effective_rubric)
+                .classify_with_rubric(fallback_interaction, effective_rubric)
                 .await?;
             let final_verdict = match fallback_raw.clone() {
                 Verdict::Violation {
