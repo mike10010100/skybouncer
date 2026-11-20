@@ -797,5 +797,111 @@ mod tests {
         })
         .unwrap();
         assert!(err5_cls.classify_storm(&sample_input()).await.is_err());
+
+        // 6. Endpoint dialect normalization + malformed/missing response + API keys + empty bundle fields
+        assert!(LlmStormStanceClassifier::new(JevConfig {
+            base_url: "not a valid url".to_string(),
+            ..Default::default()
+        })
+        .is_err());
+
+        let sys_port = LlmStormStanceClassifier::new(JevConfig {
+            base_url: "http://127.0.0.1:8000".to_string(),
+            api_key: Some("k1".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(sys_port.endpoint_kind(), JevEndpointKind::SystemOne);
+        assert_eq!(
+            sys_port.endpoint_url(),
+            "http://127.0.0.1:8000/v1/systemone"
+        );
+
+        let ollama_api = LlmStormStanceClassifier::new(JevConfig {
+            base_url: "http://127.0.0.1:11434/api".to_string(),
+            api_key: Some("k2".to_string()),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ollama_api.endpoint_kind(), JevEndpointKind::Ollama);
+        assert_eq!(ollama_api.endpoint_url(), "http://127.0.0.1:11434/api/chat");
+
+        let ollama_port = LlmStormStanceClassifier::new(JevConfig {
+            base_url: "http://127.0.0.1:11434".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ollama_port.endpoint_kind(), JevEndpointKind::Ollama);
+        assert_eq!(
+            ollama_port.endpoint_url(),
+            "http://127.0.0.1:11434/api/chat"
+        );
+
+        let ollama_auth = LlmStormStanceClassifier::new(JevConfig {
+            base_url: format!("{}/api/chat", ollama.uri()),
+            api_key: Some("k2".to_string()),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(ollama_auth.classify_storm(&sample_input()).await.is_ok());
+
+        let jev_v1 = LlmStormStanceClassifier::new(JevConfig {
+            base_url: format!("{}/v1", jev.uri()),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(jev_v1.endpoint_url(), format!("{}/v1/classify", jev.uri()));
+
+        // Malformed Ollama JSON + SystemOne fallback confidence / missing key
+        let bad_payloads = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "gemma4:26b",
+                "message": { "role": "assistant", "content": "not json" },
+                "done": true
+            })))
+            .mount(&bad_payloads)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "tev1",
+                "answers": {}
+            })))
+            .mount(&bad_payloads)
+            .await;
+
+        let bad_ol = LlmStormStanceClassifier::new(JevConfig {
+            base_url: format!("{}/api/chat", bad_payloads.uri()),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(bad_ol.classify_storm(&sample_input()).await.is_err());
+
+        let bad_s1 = LlmStormStanceClassifier::new(JevConfig {
+            base_url: format!("{}/v1/systemone", bad_payloads.uri()),
+            api_key: Some("k3".to_string()),
+            max_retries: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(bad_s1.classify_storm(&sample_input()).await.is_err());
+
+        // Minimal bundle without handle, focal_post, quotes, or replies
+        let minimal_prompt = LlmStormStanceClassifier::format_bundle_prompt(&StormStanceInput {
+            target_did: "did:plc:anon".to_string(),
+            target_handle: None,
+            focal_post_uri: "at://did:plc:anon/app.bsky.feed.post/_mentions".to_string(),
+            focal_post: None,
+            top_quotes: vec![],
+            sample_replies: vec![],
+            metrics: StormMetrics::default(),
+        });
+        assert!(minimal_prompt.contains("did:plc:anon"));
     }
 }

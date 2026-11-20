@@ -489,6 +489,12 @@ mod tests {
             parse_owned_post_uri(did, "https://bsky.app/profile/alice.bsky.social/post/3abc")
                 .is_err()
         );
+        assert!(parse_owned_post_uri(did, "https://not a valid url").is_err());
+        assert!(parse_owned_post_uri(did, "https://bsky.app/profile/did:plc:alice").is_err());
+        assert!(
+            parse_owned_post_uri(did, "https://bsky.app/profile/did:plc:alice/post/bad!rkey")
+                .is_err()
+        );
         assert!(parse_owned_post_uri(did, "at://did:plc:alice/app.bsky.graph.list/3abc").is_err());
         assert!(parse_owned_post_uri(did, "bad/rkey").is_err());
         assert!(parse_owned_post_uri(did, "   ").is_err());
@@ -514,6 +520,17 @@ mod tests {
         );
         assert!("bogus".parse::<ThreadgatePolicy>().is_err());
 
+        for pol in [
+            ThreadgatePolicy::FollowingOnly,
+            ThreadgatePolicy::FollowingAndFollowers,
+            ThreadgatePolicy::MentionsOnly,
+            ThreadgatePolicy::Nobody,
+        ] {
+            assert!(!pol.as_str().is_empty());
+            assert!(!pol.display_label().is_empty());
+            assert_eq!(pol.to_string(), pol.as_str());
+        }
+
         assert_eq!(ThreadgatePolicy::FollowingOnly.to_allow_rules().len(), 1);
         assert_eq!(
             ThreadgatePolicy::FollowingAndFollowers
@@ -523,7 +540,6 @@ mod tests {
         );
         assert_eq!(ThreadgatePolicy::MentionsOnly.to_allow_rules().len(), 1);
         assert!(ThreadgatePolicy::Nobody.to_allow_rules().is_empty());
-        assert!(!ThreadgatePolicy::FollowingOnly.display_label().is_empty());
     }
 
     #[tokio::test]
@@ -647,9 +663,104 @@ mod tests {
         let detached = body["record"]["detachedEmbeddingUris"].as_array().unwrap();
         assert_eq!(detached.len(), MAX_DETACHED_EMBEDDING_URIS);
         assert_eq!(detached[0], "at://did:plc:old/app.bsky.feed.post/qt0");
-        assert_eq!(
-            body["record"]["embeddingRules"][0]["$type"],
-            "app.bsky.feed.postgate#disableRule"
+        let mut pg_dup = PostgateRecord::new("at://did:plc:alice/app.bsky.feed.post/3x");
+        pg_dup.merge_detaches(
+            &[
+                "https://not-at-uri".to_string(),
+                "at://did:plc:q1/app.bsky.feed.post/1".to_string(),
+            ],
+            true,
+        );
+        pg_dup.merge_detaches(&["at://did:plc:q1/app.bsky.feed.post/1".to_string()], true);
+        assert_eq!(pg_dup.detached_embedding_uris.len(), 1);
+        assert_eq!(pg_dup.embedding_rules.len(), 1);
+
+        // Fresh postgate (getRecord returns RecordNotFound) + error propagation on 500
+        let err_pds = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.getRecord"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "RecordNotFound",
+                "message": "Record does not exist"
+            })))
+            .mount(&err_pds)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.repo.putRecord"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uri": "at://did:plc:alice/app.bsky.feed.postgate/3fresh",
+                "cid": "bafyfresh"
+            })))
+            .mount(&err_pds)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.repo.deleteRecord"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "RecordNotFound",
+                "message": "Could not locate record"
+            })))
+            .mount(&err_pds)
+            .await;
+
+        let err_client =
+            PdsRepoClient::from_credentials(err_pds.uri(), "did:plc:alice", "tok").unwrap();
+        let (fresh_uri, fresh_cnt) = apply_postgate_detach(
+            &err_client,
+            "did:plc:alice",
+            "3fresh",
+            &["at://did:plc:q/app.bsky.feed.post/1".to_string()],
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(fresh_uri.contains("3fresh"));
+        assert_eq!(fresh_cnt, 1);
+
+        // Propagates deleteRecord failure cleanly as SkybouncerError::Repo
+        assert!(
+            remove_threadgate(&err_client, "did:plc:alice", "3fresh", false)
+                .await
+                .is_err()
+        );
+
+        // 500 errors propagate cleanly as SkybouncerError::Repo
+        let fail_pds = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.getRecord"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&fail_pds)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.repo.putRecord"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&fail_pds)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.repo.deleteRecord"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&fail_pds)
+            .await;
+        let fail_client =
+            PdsRepoClient::from_credentials(fail_pds.uri(), "did:plc:alice", "tok").unwrap();
+        assert!(
+            apply_postgate_detach(&fail_client, "did:plc:alice", "3x", &[], true, false)
+                .await
+                .is_err()
+        );
+        assert!(apply_threadgate(
+            &fail_client,
+            "did:plc:alice",
+            "3x",
+            ThreadgatePolicy::Nobody,
+            false
+        )
+        .await
+        .is_err());
+        assert!(
+            remove_threadgate(&fail_client, "did:plc:alice", "3x", false)
+                .await
+                .is_err()
         );
     }
 }

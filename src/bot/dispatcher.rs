@@ -876,6 +876,32 @@ mod tests {
         });
         assert!(digest_done.contains("Recent @mentions surge"));
         assert!(digest_done.contains("automatically deactivated"));
+
+        // Minimal alert without catalyst, stance, defensive signals, or snippet
+        let minimal_alert = format_storm_alert(&StormNotification {
+            storm: crate::dogpile::StormEvent {
+                id: 9,
+                target_did: "did:plc:alice".to_string(),
+                target_handle: None,
+                focal_post_uri: "at://did:plc:alice/app.bsky.feed.post/3min".to_string(),
+                focal_post_snippet: String::new(),
+                status: crate::dogpile::StormStatus::Active,
+                severity: crate::dogpile::StormSeverity::Elevated,
+                started_at_us: 1,
+                updated_at_us: 1,
+                resolved_at_us: None,
+                metrics: crate::dogpile::StormMetrics::default(),
+                top_catalyst: None,
+                catalyst_qt_uris: vec![],
+                stance: None,
+                bounces_during_storm: 0,
+                threadgate_applied: false,
+                postgate_detaches_applied: 0,
+            },
+            is_escalation: false,
+        });
+        assert!(!minimal_alert.contains("Catalyst QT"));
+        assert!(!minimal_alert.contains("Stance Check"));
     }
 
     #[tokio::test]
@@ -954,5 +980,48 @@ mod tests {
         run_storm_digest_dispatcher(chat_client, digest_rx, cancel_d)
             .await
             .unwrap();
+
+        // Also cover error + cancel + lagged branches cleanly
+        let err_chat = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/chat.bsky.convo.getConvoForMembers"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("chat down"))
+            .mount(&err_chat)
+            .await;
+        let err_client = ChatClient::new(err_chat.uri(), "tok").unwrap();
+        let (s_tx2, s_rx2) = tokio::sync::broadcast::channel(1);
+        let c_a2 = CancellationToken::new();
+        // Fill capacity=1 then send a second to trigger RecvError::Lagged on first recv
+        for id in [10, 11] {
+            let _ = s_tx2.send(StormNotification {
+                storm: crate::dogpile::StormEvent {
+                    id,
+                    target_did: "did:plc:alice".to_string(),
+                    target_handle: None,
+                    focal_post_uri: "at://did:plc:alice/app.bsky.feed.post/_mentions".to_string(),
+                    focal_post_snippet: String::new(),
+                    status: crate::dogpile::StormStatus::Active,
+                    severity: crate::dogpile::StormSeverity::Elevated,
+                    started_at_us: 1,
+                    updated_at_us: 1,
+                    resolved_at_us: None,
+                    metrics: crate::dogpile::StormMetrics::default(),
+                    top_catalyst: None,
+                    catalyst_qt_uris: vec![],
+                    stance: None,
+                    bounces_during_storm: 0,
+                    threadgate_applied: false,
+                    postgate_detaches_applied: 0,
+                },
+                is_escalation: false,
+            });
+        }
+        let c_a2_clone = c_a2.clone();
+        let h_a2 = tokio::spawn(async move {
+            run_storm_alert_dispatcher(err_client.clone(), s_rx2, c_a2_clone).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        c_a2.cancel();
+        h_a2.await.unwrap().unwrap();
     }
 }

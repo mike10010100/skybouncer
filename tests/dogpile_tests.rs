@@ -332,6 +332,32 @@ fn test_sqlite_dogpile_events_crud_and_transitions() {
             .len(),
         1
     );
+
+    // Unscoped list_storms(None, ...) + fallback increment_storm_bounces(did, None, ...)
+    let second_id = cache
+        .upsert_active_storm(&StormEvent {
+            focal_post_uri: "at://did:plc:bob/app.bsky.feed.post/3kbob".to_string(),
+            target_did: "did:plc:bob".to_string(),
+            ..base_event.clone()
+        })
+        .unwrap();
+    cache
+        .increment_storm_bounces("did:plc:bob", None, 2)
+        .unwrap();
+    assert_eq!(
+        cache
+            .get_storm(second_id)
+            .unwrap()
+            .unwrap()
+            .bounces_during_storm,
+        2
+    );
+    assert_eq!(cache.list_storms(None, true, 10).unwrap().len(), 1);
+    assert_eq!(cache.list_storms(None, false, 10).unwrap().len(), 2);
+    assert!(cache
+        .update_storm_status(None, second_id, StormStatus::Resolved, Some(400_000))
+        .unwrap());
+    assert!(cache.list_storms(None, true, 10).unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -724,6 +750,161 @@ async fn test_engine_threadgate_and_postgate_live_and_dry_run() {
         .await
         .unwrap();
     assert!(dry_pds.write_ops.lock().is_empty());
+
+    // Resolved/Dismissed storm fallback lookup in detach_quotes, multi-QT sort + expired storm maintenance,
+    // and failing PDS error counter tracking
+    live_engine
+        .cache()
+        .upsert_active_storm(&StormEvent {
+            id: 0,
+            target_did: alice.to_string(),
+            target_handle: None,
+            focal_post_uri: "at://did:plc:alice/app.bsky.feed.post/3kdiss".to_string(),
+            focal_post_snippet: "old".to_string(),
+            status: StormStatus::Active,
+            severity: StormSeverity::Elevated,
+            started_at_us: 50,
+            updated_at_us: 50,
+            resolved_at_us: None,
+            metrics: StormMetrics::default(),
+            top_catalyst: None,
+            catalyst_qt_uris: vec![stored_qt.to_string()],
+            stance: None,
+            bounces_during_storm: 0,
+            threadgate_applied: false,
+            postgate_detaches_applied: 0,
+        })
+        .unwrap();
+    let diss_id = live_engine
+        .cache()
+        .get_active_storm_by_focal_uri(alice, "at://did:plc:alice/app.bsky.feed.post/3kdiss")
+        .unwrap()
+        .unwrap()
+        .id;
+    live_engine.dismiss_storm(Some(alice), diss_id).unwrap();
+    let (_, _, diss_cnt) = live_engine
+        .detach_quotes(alice, "3kdiss", None, false)
+        .await
+        .unwrap();
+    assert_eq!(diss_cnt, 1);
+
+    // Multi-QT sorting + TTL storm expiration in flush_storm_maintenance
+    let sort_pds = GateMockPds::start().await;
+    let sort_enricher = Arc::new(MockContextEnricher::new());
+    sort_enricher.set_author(
+        "did:plc:cat_big",
+        AuthorContext {
+            handle: Some("catbig.bsky.social".to_string()),
+            followers_count: Some(80_000),
+            ..Default::default()
+        },
+    );
+    sort_enricher.set_post_engagement(PostEngagementSnapshot {
+        uri: "at://did:plc:alice/app.bsky.feed.post/3ksort".to_string(),
+        author_did: alice.to_string(),
+        author_handle: None,
+        author_followers: Some(100),
+        text: "Sort post".to_string(),
+        reply_count: 50,
+        quote_count: 10,
+        like_count: 5,
+        repost_count: 1,
+    });
+    sort_enricher.set_post_engagement(PostEngagementSnapshot {
+        uri: "at://did:plc:cat_small/app.bsky.feed.post/qlow".to_string(),
+        author_did: "did:plc:cat_small".to_string(),
+        author_handle: None,
+        author_followers: Some(200),
+        text: "small qt".to_string(),
+        reply_count: 1,
+        quote_count: 0,
+        like_count: 10,
+        repost_count: 1,
+    });
+    sort_enricher.set_post_engagement(PostEngagementSnapshot {
+        uri: "at://did:plc:cat_big/app.bsky.feed.post/qhigh".to_string(),
+        author_did: "did:plc:cat_big".to_string(),
+        author_handle: None,
+        author_followers: None,
+        text: "big qt".to_string(),
+        reply_count: 40,
+        quote_count: 5,
+        like_count: 1500,
+        repost_count: 200,
+    });
+    let ttl_engine = build_test_engine(
+        alice,
+        &sort_pds,
+        sort_enricher,
+        MockStormStanceClassifier::new(StormStanceVerdict::new(
+            true, 0.9, "dogpile", "hostile", "mock",
+        )),
+        DogpileConfig::default().with_storm_mode_ttl(Duration::from_millis(1)),
+        100,
+        false,
+    );
+    let old_ts = current_time_us().saturating_sub(5_000_000);
+    let ev = ttl_engine
+        .evaluate_storm_candidate(SurgeCandidate {
+            target_did: alice.to_string(),
+            focal_post_uri: "at://did:plc:alice/app.bsky.feed.post/3ksort".to_string(),
+            observed_at_us: old_ts,
+            initial_metrics: StormMetrics {
+                unique_authors_short: 25,
+                unique_oon_authors_short: 24,
+                out_of_network_ratio: 0.96,
+                structural_score: 0.7,
+                ..Default::default()
+            },
+            sample_replies: vec![],
+            recent_quote_uris: vec![
+                "at://did:plc:cat_small/app.bsky.feed.post/qlow".to_string(),
+                "at://did:plc:cat_big/app.bsky.feed.post/qhigh".to_string(),
+            ],
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ev.top_catalyst.as_ref().unwrap().post_uri,
+        "at://did:plc:cat_big/app.bsky.feed.post/qhigh"
+    );
+    ttl_engine.flush_storm_maintenance().unwrap();
+    let after_flush = ttl_engine.cache().get_storm(ev.id).unwrap().unwrap();
+    assert_eq!(after_flush.status, StormStatus::Resolved);
+
+    // PDS failure paths increment errors_encountered on lock/unlock/detach
+    let bad_pds_srv = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("pds err"))
+        .mount(&bad_pds_srv)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("pds err"))
+        .mount(&bad_pds_srv)
+        .await;
+    let err_pds_client = PdsRepoClient::from_credentials(bad_pds_srv.uri(), alice, "tok").unwrap();
+    let cache_err = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let mut protected_set = HashSet::new();
+    protected_set.insert(alice.to_string());
+    let rubric_err = RuleRubric::new("rules", Sensitivity::Medium);
+    let err_engine = SkybouncerEngineBuilder::new(SkybouncerConfig::new(protected_set, rubric_err))
+        .with_cache(Arc::clone(&cache_err))
+        .with_classifier(Arc::new(MockClassifier::new(Verdict::permitted("ok"))))
+        .with_modlist_manager(Arc::new(ModListManager::from_shared_cache(cache_err)))
+        .with_pds_client(Arc::new(err_pds_client))
+        .build()
+        .unwrap();
+    assert!(err_engine
+        .lock_thread(alice, "3err", ThreadgatePolicy::Nobody)
+        .await
+        .is_err());
+    assert!(err_engine.unlock_thread(alice, "3err").await.is_err());
+    assert!(err_engine
+        .detach_quotes(alice, "3err", None, true)
+        .await
+        .is_err());
+    assert!(err_engine.stats().snapshot().errors_encountered >= 3);
 }
 
 #[tokio::test]
@@ -859,6 +1040,59 @@ async fn test_bot_storm_commands_and_authorization() {
 
     let unlocked = bot.handle_command(alice, "unlock latest").await.unwrap();
     assert!(unlocked.contains("Thread replies unlocked"));
+
+    // Error/usage/unauthorized branches across storm bot commands
+    assert!(bot
+        .handle_command("did:plc:stranger", "storm on")
+        .await
+        .unwrap()
+        .contains("active bouncer session"));
+    assert!(bot
+        .handle_command("did:plc:stranger", "unlock")
+        .await
+        .unwrap()
+        .contains("active bouncer session"));
+    assert!(bot
+        .handle_command("did:plc:stranger", "detach")
+        .await
+        .unwrap()
+        .contains("active bouncer session"));
+    assert!(bot
+        .handle_command(
+            alice,
+            "lock https://bsky.app/profile/did:plc:bob/post/3other"
+        )
+        .await
+        .unwrap()
+        .contains("Failed to lock"));
+    assert!(bot
+        .handle_command(
+            alice,
+            "unlock https://bsky.app/profile/did:plc:bob/post/3other"
+        )
+        .await
+        .unwrap()
+        .contains("Failed to unlock"));
+    assert!(bot
+        .handle_command(alice, "detach 3kbottest not-a-url")
+        .await
+        .unwrap()
+        .contains("Expected an `at://`"));
+    assert!(bot
+        .handle_command(alice, "lock followers")
+        .await
+        .unwrap()
+        .contains("Thread replies locked"));
+    assert!(bot
+        .handle_command(alice, "lock mentions")
+        .await
+        .unwrap()
+        .contains("Thread replies locked"));
+
+    // Dry-run lock/unlock/detach messages + fleet admin status output
+    let admin_status = bot.handle_command(alice, "status").await.unwrap();
+    assert!(admin_status.contains("Admin Fleet View"));
+    assert!(admin_status.contains("Dogpiles Detected"));
 }
 
 #[tokio::test]
@@ -1208,6 +1442,143 @@ async fn test_web_api_storms_endpoints_auth_prometheus_and_cli() {
         .await
         .unwrap();
     assert_eq!(bad_dismiss.status(), StatusCode::BAD_REQUEST);
+
+    // 5b. Additional auth & validation branches across /api/storms*
+    for (uri_path, payload) in [
+        ("/api/storms/mode", json!({ "enabled": true })),
+        ("/api/storms/dismiss", json!({ "storm_id": alice_storm_id })),
+        ("/api/storms/lock", json!({ "post_uri": "3x" })),
+        ("/api/storms/unlock", json!({ "post_uri": "3x" })),
+        (
+            "/api/storms/detach",
+            json!({ "post_uri": "3x", "disable_all_quotes": true }),
+        ),
+    ] {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri_path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "401 on {uri_path}");
+    }
+
+    for (uri_path, payload) in [
+        (
+            "/api/storms/mode",
+            json!({ "enabled": true, "target_did": alice }),
+        ),
+        (
+            "/api/storms/unlock",
+            json!({ "post_uri": "3x", "protected_did": alice }),
+        ),
+        (
+            "/api/storms/detach",
+            json!({ "post_uri": "3x", "protected_did": alice, "disable_all_quotes": true }),
+        ),
+    ] {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri_path)
+                    .header(header::AUTHORIZATION, format!("Bearer {bob_tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "403 on {uri_path}");
+    }
+
+    for (uri_path, payload) in [
+        ("/api/storms/lock", json!({ "post_uri": "   " })),
+        ("/api/storms/unlock", json!({ "post_uri": "" })),
+        ("/api/storms/detach", json!({ "post_uri": "   " })),
+    ] {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri_path)
+                    .header(header::AUTHORIZATION, format!("Bearer {alice_tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "400 on {uri_path}");
+    }
+
+    // Admin querying fleet-wide + active_only, and non-existent storm dismiss -> dismissed=false
+    let fleet_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/storms?active_only=true&limit=10")
+                .header(header::AUTHORIZATION, format!("Bearer {alice_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fleet_res.status(), StatusCode::OK);
+
+    let missing_dismiss = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/storms/dismiss")
+                .header(header::AUTHORIZATION, format!("Bearer {alice_tok}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "storm_id": 999_999 })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_dismiss.status(), StatusCode::OK);
+    let missing_body: DismissStormResponse = serde_json::from_slice(
+        &axum::body::to_bytes(missing_dismiss.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!missing_body.dismissed);
+
+    // Detach with nonexistent catalysts -> 400 BAD_REQUEST
+    let no_qt_detach = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/storms/detach")
+                .header(header::AUTHORIZATION, format!("Bearer {alice_tok}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "post_uri": "3unknownpost",
+                        "disable_all_quotes": false
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_qt_detach.status(), StatusCode::BAD_REQUEST);
 
     // 6. Prometheus metrics & Dashboard HTML & CLI summary telemetry
     let metrics_res = app
