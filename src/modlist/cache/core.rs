@@ -182,6 +182,26 @@ impl DeduplicationCache {
                 snapshot_json TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS dogpile_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_did TEXT NOT NULL,
+                target_handle TEXT,
+                focal_post_uri TEXT NOT NULL,
+                focal_post_snippet TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                severity TEXT NOT NULL DEFAULT 'elevated',
+                started_at_us INTEGER NOT NULL,
+                updated_at_us INTEGER NOT NULL,
+                resolved_at_us INTEGER,
+                metrics_json TEXT NOT NULL,
+                catalyst_json TEXT,
+                catalyst_qt_uris_json TEXT NOT NULL DEFAULT '[]',
+                stance_json TEXT,
+                bounces_during_storm INTEGER NOT NULL DEFAULT 0,
+                threadgate_applied INTEGER NOT NULL DEFAULT 0,
+                postgate_detaches_applied INTEGER NOT NULL DEFAULT 0
+            );
             ",
         )
         .map_err(|e| {
@@ -373,6 +393,12 @@ impl DeduplicationCache {
 
             CREATE INDEX IF NOT EXISTS idx_did_handles_updated
                 ON did_handles(updated_at);
+
+            CREATE INDEX IF NOT EXISTS idx_dogpile_events_target_updated
+                ON dogpile_events(target_did, updated_at_us DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_dogpile_events_status_updated
+                ON dogpile_events(status, updated_at_us DESC);
             ",
         )
         .map_err(|e| {

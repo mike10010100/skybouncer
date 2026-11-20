@@ -311,6 +311,81 @@ pub async fn get_prometheus_metrics(State(state): State<ApiState>) -> Response {
 
     let _ = writeln!(
         out,
+        "\n# HELP skybouncer_dogpiles_detected_total Confirmed dogpile storms detected across protected accounts."
+    );
+    let _ = writeln!(out, "# TYPE skybouncer_dogpiles_detected_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_dogpiles_detected_total {}",
+        stats.dogpiles_detected
+    );
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_storm_alerts_emitted_total Proactive dogpile storm and escalation alerts emitted."
+    );
+    let _ = writeln!(out, "# TYPE skybouncer_storm_alerts_emitted_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_storm_alerts_emitted_total {}",
+        stats.storm_alerts_emitted
+    );
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_storm_bounces_digested_total Individual bounces collapsed into Storm Mode digests."
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE skybouncer_storm_bounces_digested_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "skybouncer_storm_bounces_digested_total {}",
+        stats.storm_bounces_digested
+    );
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_defensive_signals_observed_total Target defensive block and postgate detach signals observed on Jetstream."
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE skybouncer_defensive_signals_observed_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "skybouncer_defensive_signals_observed_total {}",
+        stats.defensive_signals_observed
+    );
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_threadgates_applied_total Sovereign ATProto threadgate locks applied via Skybouncer."
+    );
+    let _ = writeln!(out, "# TYPE skybouncer_threadgates_applied_total counter");
+    let _ = writeln!(
+        out,
+        "skybouncer_threadgates_applied_total {}",
+        stats.threadgates_applied
+    );
+
+    let _ = writeln!(
+        out,
+        "\n# HELP skybouncer_postgate_detaches_applied_total Sovereign ATProto quote-post detaches applied via Skybouncer."
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE skybouncer_postgate_detaches_applied_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "skybouncer_postgate_detaches_applied_total {}",
+        stats.postgate_detaches_applied
+    );
+
+    let _ = writeln!(
+        out,
         "\n# HELP skybouncer_protected_users Number of protected accounts currently monitored."
     );
     let _ = writeln!(out, "# TYPE skybouncer_protected_users gauge");

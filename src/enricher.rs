@@ -560,6 +560,21 @@ pub trait ContextEnricher: Send + Sync {
     async fn check_relationship(&self, _target_did: &str, _candidate_did: &str) -> (bool, bool) {
         (false, false)
     }
+
+    /// Fetches batched engagement metadata (likes, reposts, replies, quotes, text) for up to
+    /// 25 post AT-URIs per chunk via `app.bsky.feed.getPosts`.
+    async fn fetch_post_engagements(
+        &self,
+        _uris: &[String],
+    ) -> Vec<crate::dogpile::PostEngagementSnapshot> {
+        Vec::new()
+    }
+
+    /// Resolves an actor's follower count (`followersCount`) via `app.bsky.actor.getProfile`
+    /// or cached target profile metadata.
+    async fn fetch_actor_followers_count(&self, _did: &str) -> Option<u64> {
+        None
+    }
 }
 
 /// Zero-cost no-op enricher returning empty context immediately.
@@ -597,6 +612,7 @@ pub struct MockContextEnricher {
     images: Arc<RwLock<HashMap<(String, String), String>>>,
     context_image_refs: Arc<RwLock<HashMap<String, Vec<ContextImageRef>>>>,
     relationships: Arc<RwLock<RelationshipMap>>,
+    post_engagements: Arc<RwLock<HashMap<String, crate::dogpile::PostEngagementSnapshot>>>,
 }
 
 impl MockContextEnricher {
@@ -662,6 +678,13 @@ impl MockContextEnricher {
             (target_did.into(), candidate_did.into()),
             (target_follows_candidate, candidate_follows_target),
         );
+    }
+
+    /// Injects a mock [`crate::dogpile::PostEngagementSnapshot`] keyed by its AT-URI.
+    pub fn set_post_engagement(&self, snapshot: crate::dogpile::PostEngagementSnapshot) {
+        self.post_engagements
+            .write()
+            .insert(snapshot.uri.clone(), snapshot);
     }
 }
 
@@ -754,6 +777,22 @@ impl ContextEnricher for MockContextEnricher {
             .get(&(target_did.to_string(), candidate_did.to_string()))
             .copied()
             .unwrap_or((false, false))
+    }
+
+    async fn fetch_post_engagements(
+        &self,
+        uris: &[String],
+    ) -> Vec<crate::dogpile::PostEngagementSnapshot> {
+        let guard = self.post_engagements.read();
+        uris.iter().filter_map(|u| guard.get(u).cloned()).collect()
+    }
+
+    async fn fetch_actor_followers_count(&self, did: &str) -> Option<u64> {
+        self.authors
+            .read()
+            .get(did)
+            .and_then(|a| a.followers_count)
+            .or_else(|| self.targets.read().get(did).and_then(|t| t.followers_count))
     }
 }
 
@@ -1541,6 +1580,110 @@ impl AppViewContextEnricher {
 
         None
     }
+
+    /// Fetches batched engagement metadata for up to 25 AT-URIs per AppView `getPosts` request.
+    pub async fn fetch_post_engagements(
+        &self,
+        uris: &[String],
+    ) -> Vec<crate::dogpile::PostEngagementSnapshot> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawAuthor {
+            did: String,
+            #[serde(default)]
+            handle: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct RawRecord {
+            #[serde(default)]
+            text: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawPostView {
+            uri: String,
+            author: RawAuthor,
+            #[serde(default)]
+            record: serde_json::Value,
+            #[serde(default)]
+            reply_count: Option<u64>,
+            #[serde(default)]
+            repost_count: Option<u64>,
+            #[serde(default)]
+            like_count: Option<u64>,
+            #[serde(default)]
+            quote_count: Option<u64>,
+        }
+        #[derive(Deserialize)]
+        struct RawPostsResp {
+            #[serde(default)]
+            posts: Vec<RawPostView>,
+        }
+
+        let mut results = Vec::new();
+        let clean_uris: Vec<&str> = uris
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| s.starts_with("at://"))
+            .collect();
+
+        for chunk in clean_uris.chunks(25) {
+            let query: Vec<(&str, String)> =
+                chunk.iter().map(|u| ("uris", (*u).to_string())).collect();
+            let Ok(resp) = self
+                .client
+                .get::<RawPostsResp>("app.bsky.feed.getPosts", &query)
+                .await
+            else {
+                continue;
+            };
+            for p in resp.posts {
+                let text = serde_json::from_value::<RawRecord>(p.record)
+                    .ok()
+                    .and_then(|r| r.text)
+                    .unwrap_or_default();
+                let author_handle = p
+                    .author
+                    .handle
+                    .as_deref()
+                    .map(crate::util::normalize_handle)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                results.push(crate::dogpile::PostEngagementSnapshot {
+                    uri: p.uri,
+                    author_did: p.author.did,
+                    author_handle,
+                    author_followers: None,
+                    text,
+                    reply_count: p.reply_count.unwrap_or(0),
+                    repost_count: p.repost_count.unwrap_or(0),
+                    like_count: p.like_count.unwrap_or(0),
+                    quote_count: p.quote_count.unwrap_or(0),
+                });
+            }
+        }
+        results
+    }
+
+    /// Resolves an actor's follower count (`followersCount`), using cached target profiles first.
+    pub async fn fetch_actor_followers_count(&self, did: &str) -> Option<u64> {
+        let clean = did.trim();
+        if !clean.starts_with("did:") {
+            return None;
+        }
+        if let Some(followers) = self
+            .target_cache
+            .read()
+            .get(clean)
+            .and_then(|t| t.followers_count)
+        {
+            return Some(followers);
+        }
+        self.fetch_author_profile(clean)
+            .await
+            .and_then(|a| a.followers_count)
+    }
 }
 
 impl Default for AppViewContextEnricher {
@@ -1640,6 +1783,17 @@ impl ContextEnricher for AppViewContextEnricher {
 
     async fn check_relationship(&self, target_did: &str, candidate_did: &str) -> (bool, bool) {
         self.fetch_relationship(target_did, candidate_did).await
+    }
+
+    async fn fetch_post_engagements(
+        &self,
+        uris: &[String],
+    ) -> Vec<crate::dogpile::PostEngagementSnapshot> {
+        self.fetch_post_engagements(uris).await
+    }
+
+    async fn fetch_actor_followers_count(&self, did: &str) -> Option<u64> {
+        self.fetch_actor_followers_count(did).await
     }
 }
 

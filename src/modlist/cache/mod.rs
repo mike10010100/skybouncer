@@ -453,6 +453,7 @@ mod dashboard;
 mod evaluations;
 mod handles;
 mod modlist;
+mod storms;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]

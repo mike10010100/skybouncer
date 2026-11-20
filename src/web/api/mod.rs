@@ -550,11 +550,129 @@ mod auth;
 mod bounces;
 mod resolve;
 mod simulate;
+mod storms;
 mod telemetry;
 mod tenant;
 pub use auth::*;
 pub use bounces::*;
 pub use resolve::*;
 pub use simulate::*;
+pub use storms::*;
 pub use telemetry::*;
 pub use tenant::*;
+
+/// Query parameters for fetching dogpile storms (`GET /api/storms`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct StormsQuery {
+    /// Optional target DID filter (admin-only when targeting another account).
+    #[serde(default)]
+    pub user_did: Option<String>,
+    /// If `true`, returns only currently active storms.
+    #[serde(default)]
+    pub active_only: Option<bool>,
+    /// Maximum number of storms to return (defaults to 20, clamped to `1..=100`).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// Response payload returned by `GET /api/storms`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StormsResponse {
+    /// Whether Storm Mode is currently active for the target account.
+    pub storm_mode_active: bool,
+    /// Matching dogpile storm events ordered newest-first.
+    pub storms: Vec<crate::dogpile::StormEvent>,
+}
+
+/// Request payload to toggle Storm Mode (`POST /api/storms/mode`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StormModeRequest {
+    /// Whether to activate (`true`) or exit (`false`) Storm Mode.
+    pub enabled: bool,
+    /// Optional target DID (admin-only for another user).
+    #[serde(default)]
+    pub target_did: Option<String>,
+}
+
+/// Response payload returned by `POST /api/storms/mode`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StormModeResponse {
+    /// Protected target DID whose Storm Mode state was updated.
+    pub target_did: String,
+    /// Updated Storm Mode state.
+    pub storm_mode_active: bool,
+}
+
+/// Request payload to dismiss a storm event (`POST /api/storms/dismiss`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DismissStormRequest {
+    /// Database identifier of the storm to dismiss.
+    pub storm_id: i64,
+}
+
+/// Response payload returned by `POST /api/storms/dismiss`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DismissStormResponse {
+    /// Database identifier of the dismissed storm.
+    pub storm_id: i64,
+    /// `true` if a matching storm row was updated to dismissed.
+    pub dismissed: bool,
+}
+
+/// Request payload to lock replies on a user's post via `app.bsky.feed.threadgate` (`POST /api/storms/lock`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockThreadRequest {
+    /// Canonical AT-URI, Bluesky web URL, or bare `rkey` of the user's post.
+    pub post_uri: String,
+    /// Optional policy slug (`following`, `followers`, `mentions`, `nobody`; defaults to `following`).
+    #[serde(default)]
+    pub policy: Option<String>,
+    /// Optional protected account DID (admin-only for another user).
+    #[serde(default)]
+    pub protected_did: Option<String>,
+}
+
+/// Request payload to remove a threadgate lock (`POST /api/storms/unlock`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnlockThreadRequest {
+    /// Canonical AT-URI, Bluesky web URL, or bare `rkey` of the user's post.
+    pub post_uri: String,
+    /// Optional protected account DID (admin-only for another user).
+    #[serde(default)]
+    pub protected_did: Option<String>,
+}
+
+/// Request payload to detach quote-posts via `app.bsky.feed.postgate` (`POST /api/storms/detach`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetachQuotesRequest {
+    /// Canonical AT-URI, Bluesky web URL, or bare `rkey` of the user's post.
+    pub post_uri: String,
+    /// Optional explicit catalyst quote-post AT-URIs to detach (defaults to stored catalysts when empty).
+    #[serde(default)]
+    pub qt_uris: Option<Vec<String>>,
+    /// When `true`, also adds `app.bsky.feed.postgate#disableRule` to disable all future quote-posts.
+    #[serde(default)]
+    pub disable_all_quotes: Option<bool>,
+    /// Optional protected account DID (admin-only for another user).
+    #[serde(default)]
+    pub protected_did: Option<String>,
+}
+
+/// Response payload for sovereign PDS shield mutations (`lock`, `unlock`, `detach`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShieldActionResponse {
+    /// Whether the PDS shield mutation succeeded.
+    pub success: bool,
+    /// Action identifier (`"lock"`, `"unlock"`, or `"detach"`).
+    pub action: String,
+    /// Canonical AT-URI of the protected post.
+    pub post_uri: String,
+    /// Canonical AT-URI of the written `threadgate` or `postgate` record, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_uri: Option<String>,
+    /// Total number of detached quote-post URIs currently stored on the `postgate`, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detached_count: Option<usize>,
+    /// Whether the engine executed in dry-run shadow mode without writing to PDS.
+    pub dry_run: bool,
+}

@@ -26,13 +26,16 @@ pub use api::{
     simulate_guest_interaction, AddAllowlistRequest, AddAllowlistResponse, AdminEvaluationsQuery,
     AdminEvaluationsResponse, AdminTenantsResponse, AllowlistQuery, ApiState, AuthActorSuggestion,
     AuthPreviewQuery, AuthPreviewResponse, AuthTypeaheadQuery, AuthTypeaheadResponse,
-    BouncedUserWithHandle, BouncesQuery, EvaluationsQuery, EvaluationsResponse,
-    GuestRateLimitDecision, GuestSandboxLimiter, GuestSimulateRequest, GuestSimulateResponse,
-    HealthResponse, PardonRequest, PardonResponse, RemoveAllowlistResponse, ResolveQuery,
-    ResolveResponse, RulesResponse, SimulateRequest, SimulateResponse, StatusResponse,
-    TenantSummary, ToggleTenantRequest, ToggleTenantResponse, UpdateRulesRequest,
-    UpgradeBounceRequest, UpgradeBounceResponse, UserSessionResponse, GUEST_SANDBOX_GLOBAL_LIMIT,
-    GUEST_SANDBOX_MAX_TEXT_CHARS, GUEST_SANDBOX_PER_IP_LIMIT, GUEST_SANDBOX_WINDOW_SECS,
+    BouncedUserWithHandle, BouncesQuery, DetachQuotesRequest, DismissStormRequest,
+    DismissStormResponse, EvaluationsQuery, EvaluationsResponse, GuestRateLimitDecision,
+    GuestSandboxLimiter, GuestSimulateRequest, GuestSimulateResponse, HealthResponse,
+    LockThreadRequest, PardonRequest, PardonResponse, RemoveAllowlistResponse, ResolveQuery,
+    ResolveResponse, RulesResponse, ShieldActionResponse, SimulateRequest, SimulateResponse,
+    StatusResponse, StormModeRequest, StormModeResponse, StormsQuery, StormsResponse,
+    TenantSummary, ToggleTenantRequest, ToggleTenantResponse, UnlockThreadRequest,
+    UpdateRulesRequest, UpgradeBounceRequest, UpgradeBounceResponse, UserSessionResponse,
+    GUEST_SANDBOX_GLOBAL_LIMIT, GUEST_SANDBOX_MAX_TEXT_CHARS, GUEST_SANDBOX_PER_IP_LIMIT,
+    GUEST_SANDBOX_WINDOW_SECS,
 };
 pub use oauth::{LoginQuery, OAuthState};
 pub use ui::{serve_dashboard, DASHBOARD_HTML};
@@ -180,6 +183,12 @@ pub fn create_web_router(
         .route("/bounces", get(api::get_bounces))
         .route("/bounces/upgrade", post(api::upgrade_bounce))
         .route("/pardon", post(api::pardon_user))
+        .route("/storms", get(api::get_storms))
+        .route("/storms/mode", post(api::toggle_storm_mode))
+        .route("/storms/dismiss", post(api::dismiss_storm))
+        .route("/storms/lock", post(api::lock_thread_handler))
+        .route("/storms/unlock", post(api::unlock_thread_handler))
+        .route("/storms/detach", post(api::detach_quotes_handler))
         .route(
             "/allowlist",
             get(api::get_allowlist).post(api::add_to_allowlist),

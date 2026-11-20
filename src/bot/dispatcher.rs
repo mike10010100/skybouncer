@@ -13,6 +13,7 @@ use crate::bot::render::{
     account_label, bsky_post_or_web_url, bsky_post_url_from_at_uri, bsky_profile_url,
     command_target, send_dm_chunked, truncate_chars,
 };
+use crate::dogpile::{StormDigestNotification, StormNotification};
 use crate::engine::{BounceNotification, ReauthNotification};
 use crate::error::SkybouncerError;
 use crate::tenant::TenantRegistry;
@@ -91,6 +92,167 @@ pub fn format_bounce_alert(notification: &BounceNotification) -> String {
          Or to undo and permanently allowlist:\n\
          pardon and allow {target}{upgrade_section}",
         notification.category,
+    )
+}
+
+/// Formats a proactive ATProto DM alert for a detected or escalated dogpile storm.
+#[must_use]
+pub fn format_storm_alert(notification: &StormNotification) -> String {
+    let storm = &notification.storm;
+    let sev = storm.severity.as_str().to_ascii_uppercase();
+    let header = if notification.is_escalation {
+        format!("🚨 Skybouncer Storm Escalation [{sev}]:")
+    } else {
+        format!("⛈️ Skybouncer Dogpile Alert [{sev}]:")
+    };
+
+    let is_mentions = storm.focal_post_uri.ends_with("/_mentions");
+    let post_section = if is_mentions {
+        "Target: Coordinated @mentions / multi-thread surge".to_string()
+    } else {
+        let post_url = bsky_post_url_from_at_uri(&storm.focal_post_uri)
+            .unwrap_or_else(|| storm.focal_post_uri.clone());
+        let snippet = truncate_chars(storm.focal_post_snippet.trim(), 140);
+        if snippet.is_empty() {
+            format!("Post: {post_url}")
+        } else {
+            format!("Post: {post_url}\nSnippet: \"{snippet}\"")
+        }
+    };
+
+    let m = &storm.metrics;
+    let oon_pct = m.out_of_network_ratio * 100.0;
+    let score_pct = m.composite_score * 100.0;
+    let defensive_line = if m.defensive_blocks > 0 || m.defensive_detaches > 0 {
+        format!(
+            "\nDefensive signals: {} blocks, {} postgate detaches",
+            m.defensive_blocks, m.defensive_detaches
+        )
+    } else {
+        String::new()
+    };
+
+    let catalyst_section = if let Some(ref cat) = storm.top_catalyst {
+        let cat_author = account_label(&cat.author_did, cat.author_handle.as_deref());
+        let cat_url =
+            bsky_post_url_from_at_uri(&cat.post_uri).unwrap_or_else(|| cat.post_uri.clone());
+        let cat_snippet = truncate_chars(cat.text_snippet.trim(), 120);
+        let snippet_line = if cat_snippet.is_empty() {
+            String::new()
+        } else {
+            format!("\nCatalyst Text: \"{cat_snippet}\"")
+        };
+        format!(
+            "\n\nCatalyst QT by {cat_author}: {} likes, {} reposts ({:.1}x root likes)\nCatalyst Post: {cat_url}{snippet_line}",
+            cat.like_count, cat.repost_count, cat.dunk_ratio
+        )
+    } else {
+        String::new()
+    };
+
+    let stance_section = if let Some(ref stance) = storm.stance {
+        let summary = truncate_chars(stance.summary.trim(), 180);
+        format!(
+            "\n\nStance Check: {} ({:.0}% conf) — {}",
+            stance.classification,
+            stance.confidence * 100.0,
+            summary
+        )
+    } else {
+        String::new()
+    };
+
+    let target_arg = if is_mentions {
+        "latest"
+    } else {
+        storm
+            .focal_post_uri
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("latest")
+    };
+
+    let shield_hints = if is_mentions {
+        "Quick commands:\n\
+         • `storms` — View active surge details\n\
+         • `lock <post_url|rkey> following` — Lock replies on a post\n\
+         • `storm off` — Resume per-bounce DMs"
+            .to_string()
+    } else {
+        format!(
+            "Quick shield replies:\n\
+             • `lock {target_arg} following` (or `nobody` / `followers`)\n\
+             • `detach {target_arg}` (or `detach {target_arg} all`)\n\
+             • `storm off` — Resume per-bounce DMs"
+        )
+    };
+
+    format!(
+        "{header}\n\n\
+         {post_section}\n\
+         Velocity: {} out-of-network authors / {} total ({oon_pct:.0}% OON)\n\
+         Signals: direct_ratio={:.2}, dunk_ratio={:.1}x, power={:.1}x, burst_z={:.1}, score={score_pct:.0}%{defensive_line}\
+         {catalyst_section}{stance_section}\n\n\
+         ⚡ Storm Mode is active: individual bounce DMs are batched into periodic digests and evaluation headroom is 3x.\n\n\
+         {shield_hints}",
+        m.unique_oon_authors_short,
+        m.unique_authors_short,
+        m.direct_ratio,
+        m.dunk_ratio,
+        m.power_asymmetry,
+        m.burst_z_score,
+    )
+}
+
+/// Formats a periodic Storm Mode digest DM summarizing aggregated bounces.
+#[must_use]
+pub fn format_storm_digest(digest: &StormDigestNotification) -> String {
+    let focal_line = if digest.focal_post_uri.ends_with("/_mentions") {
+        "Target: Recent @mentions surge".to_string()
+    } else {
+        let url = bsky_post_url_from_at_uri(&digest.focal_post_uri)
+            .unwrap_or_else(|| digest.focal_post_uri.clone());
+        format!("Post: {url}")
+    };
+
+    let mut samples = String::new();
+    for (idx, item) in digest.sample_violators.iter().enumerate() {
+        let label = account_label(&item.violator_did, item.violator_handle.as_deref());
+        if idx > 0 {
+            samples.push('\n');
+        }
+        samples.push_str(&format!("• {label} — **{}**", item.category));
+    }
+
+    let sample_len = u64::try_from(digest.sample_violators.len()).unwrap_or(u64::MAX);
+    let remainder_line = if digest.bounced_count > sample_len {
+        format!(
+            "\n• … and {} more account(s)",
+            digest.bounced_count.saturating_sub(sample_len)
+        )
+    } else {
+        String::new()
+    };
+
+    let sample_block = if samples.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nSample bounced accounts:\n{samples}{remainder_line}")
+    };
+
+    let footer = if digest.storm_still_active {
+        "⚡ Storm Mode remains active. Reply `storms`, `lock latest following`, or `storm off`."
+    } else {
+        "✅ Surge subsided — Storm Mode has automatically deactivated."
+    };
+
+    format!(
+        "📦 Skybouncer Storm Mode Digest ({}s window):\n\n\
+         {focal_line}\n\
+         Bounced during window: **{}** account(s){sample_block}\n\n\
+         {footer}",
+        digest.window_secs, digest.bounced_count
     )
 }
 
@@ -351,6 +513,114 @@ pub async fn run_bounce_alert_dispatcher(
     Ok(())
 }
 
+/// Runs the proactive dogpile storm alert dispatcher worker until `cancel` is triggered.
+///
+/// # Errors
+/// Returns [`SkybouncerError`] if unrecoverable initialization error occurs.
+pub async fn run_storm_alert_dispatcher(
+    client: ChatClient,
+    mut storm_rx: tokio::sync::broadcast::Receiver<StormNotification>,
+    cancel: CancellationToken,
+) -> Result<(), SkybouncerError> {
+    info!("Starting proactive ATProto DM dogpile storm alert dispatcher worker");
+
+    while !cancel.is_cancelled() {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("Storm alert dispatcher received cancellation; shutting down");
+                break;
+            }
+            received = storm_rx.recv() => {
+                match received {
+                    Ok(notification) => {
+                        let target_did = notification.storm.target_did.clone();
+                        let alert_text = format_storm_alert(&notification);
+
+                        debug!(target = %target_did, focal = %notification.storm.focal_post_uri, "Dispatching proactive DM dogpile storm alert");
+
+                        match client.find_or_create_convo_for_did(&target_did).await {
+                            Ok(convo_id) => {
+                                if let Err(e) = send_dm_chunked(&client, &convo_id, &alert_text).await {
+                                    warn!(error = %e, target = %target_did, "Failed to send proactive DM storm alert");
+                                } else {
+                                    info!(target = %target_did, focal = %notification.storm.focal_post_uri, "Proactive DM storm alert delivered successfully");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, target = %target_did, "Could not locate chat conversation to deliver proactive DM storm alert");
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(missed = missed, "Storm alert dispatcher lagged behind event stream");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!("Storm notification channel closed; terminating alert dispatcher");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Runs the proactive Storm Mode digest dispatcher worker until `cancel` is triggered.
+///
+/// # Errors
+/// Returns [`SkybouncerError`] if unrecoverable initialization error occurs.
+pub async fn run_storm_digest_dispatcher(
+    client: ChatClient,
+    mut digest_rx: tokio::sync::broadcast::Receiver<StormDigestNotification>,
+    cancel: CancellationToken,
+) -> Result<(), SkybouncerError> {
+    info!("Starting proactive ATProto DM Storm Mode digest dispatcher worker");
+
+    while !cancel.is_cancelled() {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("Storm digest dispatcher received cancellation; shutting down");
+                break;
+            }
+            received = digest_rx.recv() => {
+                match received {
+                    Ok(digest) => {
+                        let target_did = digest.target_did.clone();
+                        let digest_text = format_storm_digest(&digest);
+
+                        debug!(target = %target_did, count = digest.bounced_count, "Dispatching proactive DM Storm Mode digest");
+
+                        match client.find_or_create_convo_for_did(&target_did).await {
+                            Ok(convo_id) => {
+                                if let Err(e) = send_dm_chunked(&client, &convo_id, &digest_text).await {
+                                    warn!(error = %e, target = %target_did, "Failed to send Storm Mode digest DM");
+                                } else {
+                                    info!(target = %target_did, count = digest.bounced_count, "Storm Mode digest DM delivered successfully");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, target = %target_did, "Could not locate chat conversation to deliver Storm Mode digest DM");
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        warn!(missed = missed, "Storm digest dispatcher lagged behind event stream");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!("Storm digest channel closed; terminating dispatcher");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 mod tests {
@@ -505,5 +775,184 @@ mod tests {
         assert!(!registry
             .is_reauth_notification_pending("did:plc:alice")
             .unwrap());
+    }
+
+    #[test]
+    fn test_format_storm_alert_and_digest_with_link_facets() {
+        let mut storm = crate::dogpile::StormEvent {
+            id: 7,
+            target_did: "did:plc:alice".to_string(),
+            target_handle: Some("alice.bsky.social".to_string()),
+            focal_post_uri: "at://did:plc:alice/app.bsky.feed.post/3kpost".to_string(),
+            focal_post_snippet: "Hot take about widgets".to_string(),
+            status: crate::dogpile::StormStatus::Active,
+            severity: crate::dogpile::StormSeverity::High,
+            started_at_us: 1_000_000,
+            updated_at_us: 2_000_000,
+            resolved_at_us: None,
+            metrics: crate::dogpile::StormMetrics {
+                unique_authors_short: 32,
+                unique_oon_authors_short: 29,
+                out_of_network_ratio: 0.906,
+                direct_ratio: 6.5,
+                dunk_ratio: 18.2,
+                power_asymmetry: 120.0,
+                burst_z_score: 7.4,
+                defensive_blocks: 3,
+                defensive_detaches: 1,
+                composite_score: 0.84,
+                ..Default::default()
+            },
+            top_catalyst: Some(crate::dogpile::CatalystInfo {
+                post_uri: "at://did:plc:bigacct/app.bsky.feed.post/3kqt".to_string(),
+                author_did: "did:plc:bigacct".to_string(),
+                author_handle: Some("bigacct.bsky.social".to_string()),
+                author_followers: Some(95_000),
+                like_count: 1820,
+                repost_count: 240,
+                quote_count: 42,
+                dunk_ratio: 18.2,
+                text_snippet: "Look at this take lol".to_string(),
+            }),
+            catalyst_qt_uris: vec!["at://did:plc:bigacct/app.bsky.feed.post/3kqt".to_string()],
+            stance: Some(crate::dogpile::StormStanceVerdict::new(
+                true,
+                0.91,
+                "dogpile",
+                "Coordinated hostile mockery from quote-post audience",
+                "qwen3.5:9b",
+            )),
+            bounces_during_storm: 4,
+            threadgate_applied: false,
+            postgate_detaches_applied: 0,
+        };
+
+        let notif = StormNotification {
+            storm: storm.clone(),
+            is_escalation: false,
+        };
+        let text = format_storm_alert(&notif);
+        assert!(text.contains("Dogpile Alert [HIGH]"));
+        assert!(text.contains("https://bsky.app/profile/did:plc:alice/post/3kpost"));
+        assert!(text.contains("@bigacct.bsky.social"));
+        assert!(text.contains("https://bsky.app/profile/did:plc:bigacct/post/3kqt"));
+        assert!(text.contains("Defensive signals: 3 blocks, 1 postgate detaches"));
+        assert!(text.contains("lock 3kpost following"));
+        assert!(text.contains("detach 3kpost"));
+        assert_eq!(skybase::lexicon::extract_link_facets(&text).len(), 2);
+
+        storm.focal_post_uri = "at://did:plc:alice/app.bsky.feed.post/_mentions".to_string();
+        storm.severity = crate::dogpile::StormSeverity::Critical;
+        let esc_text = format_storm_alert(&StormNotification {
+            storm,
+            is_escalation: true,
+        });
+        assert!(esc_text.contains("Storm Escalation [CRITICAL]"));
+        assert!(esc_text.contains("lock <post_url|rkey> following"));
+
+        let digest_active = format_storm_digest(&StormDigestNotification {
+            target_did: "did:plc:alice".to_string(),
+            focal_post_uri: "at://did:plc:alice/app.bsky.feed.post/3kpost".to_string(),
+            bounced_count: 5,
+            sample_violators: vec![crate::dogpile::DigestBounceSummary {
+                violator_did: "did:plc:troll1".to_string(),
+                violator_handle: Some("troll1.bsky.social".to_string()),
+                category: "harassment".to_string(),
+            }],
+            window_secs: 300,
+            storm_still_active: true,
+        });
+        assert!(digest_active.contains("Bounced during window: **5** account(s)"));
+        assert!(digest_active.contains("… and 4 more account(s)"));
+        assert!(digest_active.contains("Storm Mode remains active"));
+
+        let digest_done = format_storm_digest(&StormDigestNotification {
+            target_did: "did:plc:alice".to_string(),
+            focal_post_uri: "at://did:plc:alice/app.bsky.feed.post/_mentions".to_string(),
+            bounced_count: 1,
+            sample_violators: vec![],
+            window_secs: 300,
+            storm_still_active: false,
+        });
+        assert!(digest_done.contains("Recent @mentions surge"));
+        assert!(digest_done.contains("automatically deactivated"));
+    }
+
+    #[tokio::test]
+    async fn test_run_storm_alert_and_digest_dispatchers_deliver_and_exit() {
+        let mock_chat = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/chat.bsky.convo.getConvoForMembers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "convo": {
+                    "id": "convo-storm-1",
+                    "rev": "1",
+                    "members": [],
+                    "muted": false,
+                    "unreadCount": 0
+                }
+            })))
+            .mount(&mock_chat)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg-storm-1",
+                "rev": "2",
+                "text": "ok",
+                "sender": { "did": "did:plc:bot" },
+                "sentAt": "2026-11-20T00:00:00Z"
+            })))
+            .expect(2)
+            .mount(&mock_chat)
+            .await;
+
+        let chat_client = ChatClient::new(mock_chat.uri(), "bot-token").unwrap();
+        let (storm_tx, storm_rx) = tokio::sync::broadcast::channel(8);
+        let (digest_tx, digest_rx) = tokio::sync::broadcast::channel(8);
+        let cancel_a = CancellationToken::new();
+        let cancel_d = CancellationToken::new();
+
+        let _ = storm_tx.send(StormNotification {
+            storm: crate::dogpile::StormEvent {
+                id: 1,
+                target_did: "did:plc:alice".to_string(),
+                target_handle: None,
+                focal_post_uri: "at://did:plc:alice/app.bsky.feed.post/3k1".to_string(),
+                focal_post_snippet: "post".to_string(),
+                status: crate::dogpile::StormStatus::Active,
+                severity: crate::dogpile::StormSeverity::Elevated,
+                started_at_us: 1,
+                updated_at_us: 1,
+                resolved_at_us: None,
+                metrics: crate::dogpile::StormMetrics::default(),
+                top_catalyst: None,
+                catalyst_qt_uris: vec![],
+                stance: None,
+                bounces_during_storm: 0,
+                threadgate_applied: false,
+                postgate_detaches_applied: 0,
+            },
+            is_escalation: false,
+        });
+        drop(storm_tx);
+
+        let _ = digest_tx.send(StormDigestNotification {
+            target_did: "did:plc:alice".to_string(),
+            focal_post_uri: "at://did:plc:alice/app.bsky.feed.post/3k1".to_string(),
+            bounced_count: 2,
+            sample_violators: vec![],
+            window_secs: 300,
+            storm_still_active: true,
+        });
+        drop(digest_tx);
+
+        run_storm_alert_dispatcher(chat_client.clone(), storm_rx, cancel_a)
+            .await
+            .unwrap();
+        run_storm_digest_dispatcher(chat_client, digest_rx, cancel_d)
+            .await
+            .unwrap();
     }
 }

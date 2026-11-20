@@ -33,6 +33,7 @@ pub mod crypto;
     feature = "telemetry"
 ))]
 pub mod daemon;
+pub mod dogpile;
 pub mod engine;
 pub mod enricher;
 pub mod env;
@@ -59,8 +60,9 @@ pub use tenant::{
 pub use bot::{
     account_label, account_label_with_url, bsky_post_or_web_url, bsky_post_url,
     bsky_post_url_from_at_uri, bsky_profile_url, command_target, extract_link_facets,
-    format_bounce_alert, format_reauth_alert, format_reauth_alert_with_count, run_bot_poller,
-    run_bounce_alert_dispatcher, run_reauth_alert_dispatcher, AcceptConvoRequest,
+    format_bounce_alert, format_reauth_alert, format_reauth_alert_with_count, format_storm_alert,
+    format_storm_digest, run_bot_poller, run_bounce_alert_dispatcher, run_reauth_alert_dispatcher,
+    run_storm_alert_dispatcher, run_storm_digest_dispatcher, AcceptConvoRequest,
     AcceptConvoResponse, BotCommandHandler, ChatClient, ConvoMember, ConvoView, FacetIndex,
     GetMessagesResponse, ListConvoRequestsResponse, ListConvosResponse, MessageSender, MessageView,
     SendMessagePayload, SendMessageRequest, UpdateReadRequest, BSKY_WEB_ORIGIN,
@@ -82,11 +84,14 @@ pub use stream::{run_jetstream_streamer, StreamConfig, DEFAULT_JETSTREAM_ENDPOIN
 pub use web::{
     create_web_router, get_prometheus_metrics, run_web_server, AddAllowlistRequest,
     AddAllowlistResponse, AllowlistQuery, ApiState, BouncedUserWithHandle, BouncesQuery,
-    EvaluationsQuery, EvaluationsResponse, GuestRateLimitDecision, GuestSandboxLimiter,
-    GuestSimulateRequest, GuestSimulateResponse, LoginQuery, OAuthState, PardonRequest,
+    DetachQuotesRequest, DismissStormRequest, DismissStormResponse, EvaluationsQuery,
+    EvaluationsResponse, GuestRateLimitDecision, GuestSandboxLimiter, GuestSimulateRequest,
+    GuestSimulateResponse, LockThreadRequest, LoginQuery, OAuthState, PardonRequest,
     PardonResponse, RemoveAllowlistResponse, ResolveQuery, ResolveResponse, RulesResponse,
-    SimulateRequest, SimulateResponse, StatusResponse, UpdateRulesRequest, UpgradeBounceRequest,
-    UpgradeBounceResponse, WebServerConfig, DEFAULT_WEB_HOST, DEFAULT_WEB_PORT,
+    ShieldActionResponse, SimulateRequest, SimulateResponse, StatusResponse, StormModeRequest,
+    StormModeResponse, StormsQuery, StormsResponse, UnlockThreadRequest, UpdateRulesRequest,
+    UpgradeBounceRequest, UpgradeBounceResponse, WebServerConfig, DEFAULT_WEB_HOST,
+    DEFAULT_WEB_PORT,
 };
 
 pub use classifier::{
@@ -94,6 +99,16 @@ pub use classifier::{
     DynamicPrimaryStatsSnapshot, HeuristicClassifier, HeuristicRule, JevClassifier, JevConfig,
     MockClassifier, OllamaChatOptions, RuleRubric, Sensitivity, Verdict, ViolationCategory,
     DEFAULT_MULTIMODAL_PRIMARY_MODEL, DEFAULT_OLLAMA_NUM_CTX, DEFAULT_TEXT_ONLY_PRIMARY_MODEL,
+};
+pub use dogpile::{
+    apply_postgate_detach, apply_threadgate, canonical_focal_post_uri, compute_burst_acceleration,
+    compute_composite_score, compute_direct_ratio, compute_dunk_ratio, compute_power_asymmetry,
+    compute_structural_score, parse_owned_post_uri, remove_threadgate, severity_from_score,
+    CatalystInfo, DigestBounceSummary, DogpileConfig, DogpileTracker, LlmStormStanceClassifier,
+    MockStormStanceClassifier, NoopStormStanceClassifier, PostEngagementSnapshot, PostgateRecord,
+    SampleReply, StormDigestNotification, StormEvent, StormMetrics, StormNotification,
+    StormSeverity, StormStanceClassifier, StormStanceInput, StormStanceVerdict, StormStatus,
+    SurgeCandidate, ThreadgatePolicy, ThreadgateRecord, MAX_DETACHED_EMBEDDING_URIS,
 };
 pub use engine::{
     simulate::{SimulateTierStage, SimulationInputs, SimulationResult},

@@ -33,6 +33,10 @@ use crate::classifier::{
     JevClassifier, JevConfig, RuleRubric, Sensitivity, TieredClassifier, Verdict,
     ViolationCategory,
 };
+use crate::dogpile::{
+    DogpileConfig, DogpileTracker, LlmStormStanceClassifier, NoopStormStanceClassifier,
+    StormDigestNotification, StormNotification, StormStanceClassifier,
+};
 use crate::enricher::{ContextEnricher, NoopContextEnricher};
 use crate::error::SkybouncerError;
 use crate::limiter::{EvaluationRateLimiter, RateLimiterConfig};
@@ -159,6 +163,8 @@ pub struct SkybouncerConfig {
     pub hold_queue_on_classifier_unavailable: bool,
     /// Initial retry backoff duration when holding the evaluation queue during classifier outages.
     pub classifier_retry_backoff: Duration,
+    /// Real-time dogpile detection and Storm Mode configuration.
+    pub dogpile_config: DogpileConfig,
 }
 
 impl Default for SkybouncerConfig {
@@ -186,6 +192,7 @@ impl Default for SkybouncerConfig {
             handle_cache_ttl: crate::tenant::DEFAULT_HANDLE_TTL,
             hold_queue_on_classifier_unavailable: false,
             classifier_retry_backoff: DEFAULT_CLASSIFIER_RETRY_BACKOFF,
+            dogpile_config: DogpileConfig::default(),
         }
     }
 }
@@ -338,6 +345,13 @@ impl SkybouncerConfig {
     #[must_use]
     pub fn with_classifier_retry_backoff(mut self, backoff: Duration) -> Self {
         self.classifier_retry_backoff = backoff.max(Duration::from_millis(10));
+        self
+    }
+
+    /// Sets the real-time dogpile detection and Storm Mode configuration.
+    #[must_use]
+    pub fn with_dogpile_config(mut self, config: DogpileConfig) -> Self {
+        self.dogpile_config = config;
         self
     }
 
@@ -521,6 +535,7 @@ impl SkybouncerConfig {
             handle_cache_ttl: crate::tenant::DEFAULT_HANDLE_TTL,
             hold_queue_on_classifier_unavailable,
             classifier_retry_backoff: Duration::from_millis(classifier_retry_backoff_ms.max(10)),
+            dogpile_config: DogpileConfig::from_env(),
         })
     }
 }
@@ -588,6 +603,18 @@ pub struct EngineStats {
     pub sovereign_configs_synced: AtomicU64,
     /// Last ingested Jetstream commit timestamp in microseconds (`time_us`) for replay across restarts.
     pub last_cursor_us: AtomicU64,
+    /// Total distinct dogpile storms detected and persisted.
+    pub dogpiles_detected: AtomicU64,
+    /// Total proactive storm alert/escalation notifications emitted.
+    pub storm_alerts_emitted: AtomicU64,
+    /// Total bounces absorbed into Storm Mode digests instead of individual DMs.
+    pub storm_bounces_digested: AtomicU64,
+    /// Total target defensive distress signals (`block` / `postgate`) observed.
+    pub defensive_signals_observed: AtomicU64,
+    /// Total `app.bsky.feed.threadgate` reply locks applied via Skybouncer.
+    pub threadgates_applied: AtomicU64,
+    /// Total `app.bsky.feed.postgate` quote detaches/disables applied via Skybouncer.
+    pub postgate_detaches_applied: AtomicU64,
 }
 
 impl EngineStats {
@@ -627,6 +654,12 @@ impl EngineStats {
             errors_encountered: AtomicU64::new(snapshot.errors_encountered),
             sovereign_configs_synced: AtomicU64::new(snapshot.sovereign_configs_synced),
             last_cursor_us: AtomicU64::new(snapshot.last_cursor_us),
+            dogpiles_detected: AtomicU64::new(snapshot.dogpiles_detected),
+            storm_alerts_emitted: AtomicU64::new(snapshot.storm_alerts_emitted),
+            storm_bounces_digested: AtomicU64::new(snapshot.storm_bounces_digested),
+            defensive_signals_observed: AtomicU64::new(snapshot.defensive_signals_observed),
+            threadgates_applied: AtomicU64::new(snapshot.threadgates_applied),
+            postgate_detaches_applied: AtomicU64::new(snapshot.postgate_detaches_applied),
         }
     }
 
@@ -666,6 +699,12 @@ impl EngineStats {
             errors_encountered: self.errors_encountered.load(Ordering::Relaxed),
             sovereign_configs_synced: self.sovereign_configs_synced.load(Ordering::Relaxed),
             last_cursor_us: self.last_cursor_us.load(Ordering::Relaxed),
+            dogpiles_detected: self.dogpiles_detected.load(Ordering::Relaxed),
+            storm_alerts_emitted: self.storm_alerts_emitted.load(Ordering::Relaxed),
+            storm_bounces_digested: self.storm_bounces_digested.load(Ordering::Relaxed),
+            defensive_signals_observed: self.defensive_signals_observed.load(Ordering::Relaxed),
+            threadgates_applied: self.threadgates_applied.load(Ordering::Relaxed),
+            postgate_detaches_applied: self.postgate_detaches_applied.load(Ordering::Relaxed),
         }
     }
 }
@@ -741,6 +780,24 @@ pub struct EngineStatsSnapshot {
     /// Last ingested Jetstream commit timestamp in microseconds (`time_us`) for replay across restarts.
     #[serde(default)]
     pub last_cursor_us: u64,
+    /// Total distinct dogpile storms detected and persisted.
+    #[serde(default)]
+    pub dogpiles_detected: u64,
+    /// Total proactive storm alert/escalation notifications emitted.
+    #[serde(default)]
+    pub storm_alerts_emitted: u64,
+    /// Total bounces absorbed into Storm Mode digests instead of individual DMs.
+    #[serde(default)]
+    pub storm_bounces_digested: u64,
+    /// Total target defensive distress signals (`block` / `postgate`) observed.
+    #[serde(default)]
+    pub defensive_signals_observed: u64,
+    /// Total `app.bsky.feed.threadgate` reply locks applied via Skybouncer.
+    #[serde(default)]
+    pub threadgates_applied: u64,
+    /// Total `app.bsky.feed.postgate` quote detaches/disables applied via Skybouncer.
+    #[serde(default)]
+    pub postgate_detaches_applied: u64,
 }
 
 /// Outcome of evaluating an interaction candidate through the moderation pipeline.
@@ -1101,8 +1158,12 @@ pub struct SkybouncerEngine {
     paused: Arc<AtomicBool>,
     bounce_notifier: broadcast::Sender<BounceNotification>,
     reauth_notifier: broadcast::Sender<ReauthNotification>,
+    storm_notifier: broadcast::Sender<StormNotification>,
+    storm_digest_notifier: broadcast::Sender<StormDigestNotification>,
     oauth_client: Arc<RwLock<Option<Arc<AtprotoOAuthClient>>>>,
     handle_cache: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
+    dogpile_tracker: Arc<DogpileTracker>,
+    storm_stance_classifier: Arc<dyn StormStanceClassifier>,
 }
 
 mod accessors;
@@ -1111,6 +1172,7 @@ mod lifecycle;
 mod modlist_ops;
 mod processing;
 pub mod simulate;
+mod storm_ops;
 mod tenant_ops;
 
 /// Builder for constructing [`SkybouncerEngine`] with optional component overrides.
@@ -1129,6 +1191,8 @@ pub struct SkybouncerEngineBuilder {
     rate_limiter: Option<Arc<EvaluationRateLimiter>>,
     enricher: Option<Arc<dyn ContextEnricher>>,
     oauth_client: Option<Arc<AtprotoOAuthClient>>,
+    dogpile_tracker: Option<Arc<DogpileTracker>>,
+    storm_stance_classifier: Option<Arc<dyn StormStanceClassifier>>,
 }
 
 impl SkybouncerEngineBuilder {
@@ -1150,6 +1214,8 @@ impl SkybouncerEngineBuilder {
             rate_limiter: None,
             enricher: None,
             oauth_client: None,
+            dogpile_tracker: None,
+            storm_stance_classifier: None,
         }
     }
 
@@ -1244,6 +1310,23 @@ impl SkybouncerEngineBuilder {
     #[must_use]
     pub fn with_enricher(mut self, enricher: Arc<dyn ContextEnricher>) -> Self {
         self.enricher = Some(enricher);
+        self
+    }
+
+    /// Configures an explicit rolling dogpile tracker.
+    #[must_use]
+    pub fn with_dogpile_tracker(mut self, tracker: Arc<DogpileTracker>) -> Self {
+        self.dogpile_tracker = Some(tracker);
+        self
+    }
+
+    /// Configures an explicit Stage 3 batch storm stance classifier.
+    #[must_use]
+    pub fn with_storm_stance_classifier(
+        mut self,
+        classifier: Arc<dyn StormStanceClassifier>,
+    ) -> Self {
+        self.storm_stance_classifier = Some(classifier);
         self
     }
 
@@ -1537,11 +1620,30 @@ impl SkybouncerEngineBuilder {
         let paused = Arc::new(AtomicBool::new(false));
         let (bounce_notifier, _) = broadcast::channel(256);
         let (reauth_notifier, _) = broadcast::channel(256);
+        let (storm_notifier, _) = broadcast::channel(128);
+        let (storm_digest_notifier, _) = broadcast::channel(128);
         let oauth_client_arc = Arc::new(RwLock::new(self.oauth_client.clone()));
         if let Some(ref oc) = self.oauth_client {
             tenant_registry.set_oauth_client(Arc::clone(oc));
         }
         let handle_cache = Arc::new(RwLock::new(HashMap::new()));
+        let dogpile_tracker = self
+            .dogpile_tracker
+            .unwrap_or_else(|| Arc::new(DogpileTracker::new(self.config.dogpile_config.clone())));
+        let storm_stance_classifier: Arc<dyn StormStanceClassifier> =
+            match self.storm_stance_classifier {
+                Some(c) => c,
+                None if self.config.dogpile_config.enable_llm_stance => {
+                    if let Some(ref fb_cfg) = self.config.fallback_jev_config {
+                        Arc::new(LlmStormStanceClassifier::new(fb_cfg.clone())?)
+                    } else if let Some(ref jev_cfg) = self.config.jev_config {
+                        Arc::new(LlmStormStanceClassifier::new(jev_cfg.clone())?)
+                    } else {
+                        Arc::new(NoopStormStanceClassifier)
+                    }
+                }
+                None => Arc::new(NoopStormStanceClassifier),
+            };
 
         Ok(SkybouncerEngine {
             config: self.config,
@@ -1561,8 +1663,12 @@ impl SkybouncerEngineBuilder {
             paused,
             bounce_notifier,
             reauth_notifier,
+            storm_notifier,
+            storm_digest_notifier,
             oauth_client: oauth_client_arc,
             handle_cache,
+            dogpile_tracker,
+            storm_stance_classifier,
         })
     }
 }

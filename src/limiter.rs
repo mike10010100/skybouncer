@@ -99,6 +99,16 @@ impl EvaluationRateLimiter {
     /// Returns `true` if permitted and recorded, or `false` if the rate limit ceiling is reached.
     #[must_use]
     pub fn check_and_record(&self, target_did: &str) -> bool {
+        self.check_and_record_with_multiplier(target_did, 1)
+    }
+
+    /// Checks whether an evaluation is permitted for `target_did` against
+    /// `config.max_evaluations * multiplier`, recording the attempt if allowed.
+    ///
+    /// Used to grant bounded headroom (e.g. `3x` during Storm Mode) without opening
+    /// an unbounded denial-of-wallet vector.
+    #[must_use]
+    pub fn check_and_record_with_multiplier(&self, target_did: &str, multiplier: usize) -> bool {
         if self.config.max_evaluations == 0 {
             return false;
         }
@@ -106,6 +116,10 @@ impl EvaluationRateLimiter {
             return true;
         }
 
+        let effective_limit = self
+            .config
+            .max_evaluations
+            .saturating_mul(multiplier.max(1));
         let now = Instant::now();
         let idx = self.shard_idx(target_did);
         let mut shard = self.shards[idx].lock();
@@ -116,7 +130,7 @@ impl EvaluationRateLimiter {
         let window = self.config.window_duration;
         timestamps.retain(|&ts| now.saturating_duration_since(ts) < window);
 
-        if timestamps.len() < self.config.max_evaluations {
+        if timestamps.len() < effective_limit {
             timestamps.push(now);
             true
         } else {

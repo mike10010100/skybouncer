@@ -429,7 +429,7 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
 
         // Spawn proactive ATProto DM re-authentication alert dispatcher
         let reauth_rx = engine.subscribe_reauth_alerts();
-        let reauth_client = chat_client;
+        let reauth_client = chat_client.clone();
         let reauth_registry = std::sync::Arc::clone(engine.tenant_registry());
         let cancel_reauth = cancel.clone();
         join_set.spawn(async move {
@@ -450,6 +450,40 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
             Ok(Default::default())
         });
         info!("🔑 Proactive ATProto DM re-authentication alert dispatcher activated");
+
+        // Spawn proactive ATProto DM dogpile storm alert dispatcher
+        let storm_rx = engine.subscribe_storm_alerts();
+        let storm_client = chat_client.clone();
+        let cancel_storm = cancel.clone();
+        join_set.spawn(async move {
+            if let Err(e) =
+                crate::run_storm_alert_dispatcher(storm_client, storm_rx, cancel_storm).await
+            {
+                error!(
+                    error = %e,
+                    "ATProto DM storm alert dispatcher encountered error"
+                );
+            }
+            Ok(Default::default())
+        });
+        info!("⛈️ Proactive ATProto DM dogpile storm alert dispatcher activated");
+
+        // Spawn proactive ATProto DM Storm Mode digest dispatcher
+        let digest_rx = engine.subscribe_storm_digests();
+        let digest_client = chat_client;
+        let cancel_digest = cancel.clone();
+        join_set.spawn(async move {
+            if let Err(e) =
+                crate::run_storm_digest_dispatcher(digest_client, digest_rx, cancel_digest).await
+            {
+                error!(
+                    error = %e,
+                    "ATProto DM storm digest dispatcher encountered error"
+                );
+            }
+            Ok(Default::default())
+        });
+        info!("📦 Proactive ATProto DM Storm Mode digest dispatcher activated");
     } else {
         info!("ℹ️ ATProto DM bot disabled (BOT_APP_PASSWORD / CHAT_ACCESS_TOKEN not configured)");
     }
