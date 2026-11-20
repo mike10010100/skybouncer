@@ -663,6 +663,21 @@ pub fn format_final_telemetry(stats: &crate::engine::EngineStatsSnapshot) -> Str
         stats.bounces_executed
     );
     let _ = writeln!(o, "   Permitted Interactions:       {}", stats.permitted);
+    let _ = writeln!(
+        o,
+        "   Dogpiles Detected:            {}",
+        stats.dogpiles_detected
+    );
+    let _ = writeln!(
+        o,
+        "   Storm Alerts Emitted:         {}",
+        stats.storm_alerts_emitted
+    );
+    let _ = writeln!(
+        o,
+        "   Storm Bounces Digested:       {}",
+        stats.storm_bounces_digested
+    );
     o
 }
 

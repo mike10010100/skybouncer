@@ -37,6 +37,8 @@ impl Default for StreamConfig {
             collections: vec![
                 "app.bsky.feed.post".to_string(),
                 "app.bsky.graph.follow".to_string(),
+                "app.bsky.feed.postgate".to_string(),
+                "app.bsky.graph.block".to_string(),
                 SOVEREIGN_CONFIG_COLLECTION.to_string(),
                 "app.bsky.graph.list".to_string(),
             ],
@@ -132,6 +134,12 @@ mod tests {
         assert!(cfg
             .collections
             .contains(&"app.bsky.graph.follow".to_string()));
+        assert!(cfg
+            .collections
+            .contains(&"app.bsky.feed.postgate".to_string()));
+        assert!(cfg
+            .collections
+            .contains(&"app.bsky.graph.block".to_string()));
         assert!(cfg.collections.contains(&"app.bsky.graph.list".to_string()));
         assert!(cfg
             .collections

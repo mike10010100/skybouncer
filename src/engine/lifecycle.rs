@@ -17,6 +17,7 @@ impl SkybouncerEngine {
     ) -> Result<EngineStatsSnapshot, SkybouncerError> {
         let queue_capacity = self.config.evaluation_queue_capacity.max(100);
         let (eval_tx, mut eval_rx) = mpsc::channel::<Interaction>(queue_capacity);
+        let (storm_tx, mut storm_rx) = mpsc::channel::<crate::dogpile::SurgeCandidate>(64);
         let concurrency = self.config.evaluation_concurrency.max(1);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
@@ -64,20 +65,55 @@ impl SkybouncerEngine {
 
         eval_tasks.spawn(queue_worker);
 
+        // Spawn decoupled dogpile surge enrichment & stance worker (bounded concurrency = 2)
+        let storm_engine = self.clone();
+        let storm_semaphore = Arc::new(tokio::sync::Semaphore::new(2));
+        let storm_worker = async move {
+            let mut active_storms = JoinSet::new();
+            while let Ok(permit) = storm_semaphore.clone().acquire_owned().await {
+                match storm_rx.recv().await {
+                    Some(candidate) => {
+                        let eng = storm_engine.clone();
+                        active_storms.spawn(async move {
+                            let _permit = permit;
+                            if let Err(e) = eng.evaluate_storm_candidate(candidate).await {
+                                warn!(error = %e, "Background storm candidate evaluation failed");
+                            }
+                        });
+                    }
+                    None => {
+                        drop(permit);
+                        break;
+                    }
+                }
+                while let Some(res) = active_storms.try_join_next() {
+                    let _ = res;
+                }
+            }
+            while let Some(res) = active_storms.join_next().await {
+                let _ = res;
+            }
+        };
+        eval_tasks.spawn(storm_worker);
+
         loop {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     debug!("Engine processing loop received cancellation; draining buffered commits");
                     while let Ok(commit) = rx.try_recv() {
-                        let _ = self.process_commit_queued(&commit, &eval_tx).await;
+                        let _ = self
+                            .process_commit_queued_with_storms(&commit, &eval_tx, Some(&storm_tx))
+                            .await;
                     }
                     break;
                 }
                 commit_opt = rx.recv() => {
                     match commit_opt {
                         Some(commit) => {
-                            let _ = self.process_commit_queued(&commit, &eval_tx).await;
+                            let _ = self
+                                .process_commit_queued_with_storms(&commit, &eval_tx, Some(&storm_tx))
+                                .await;
                         }
                         None => {
                             debug!("Commit channel closed; shutting down engine loop");
@@ -88,8 +124,9 @@ impl SkybouncerEngine {
             }
         }
 
-        // Drop eval_tx so queue worker receives None after draining remaining queue items
+        // Drop eval_tx & storm_tx so workers drain remaining queued items and exit cleanly
         drop(eval_tx);
+        drop(storm_tx);
 
         // Wait for queue worker to finish draining (bounded by shutdown timeout)
         let drain_future = async {
@@ -244,6 +281,9 @@ impl SkybouncerEngine {
                         Err(e) => {
                             warn!(error = %e, "Failed to prune DID-to-handle cache in maintenance task");
                         }
+                    }
+                    if let Err(e) = self.flush_storm_maintenance() {
+                        warn!(error = %e, "Failed to flush storm maintenance in maintenance task");
                     }
                 }
             }

@@ -16,8 +16,10 @@ use std::sync::Arc;
 
 use crate::bot::render::{
     account_label_with_url, bsky_post_or_web_url, bsky_post_url_from_at_uri, command_target,
+    truncate_chars,
 };
 use crate::classifier::{BounceDuration, Sensitivity, Verdict};
+use crate::dogpile::ThreadgatePolicy;
 use crate::engine::SkybouncerEngine;
 use crate::error::SkybouncerError;
 use crate::matcher::Interaction;
@@ -322,6 +324,75 @@ impl BotCommandHandler {
             return Ok(self.cmd_status(sender_did));
         }
 
+        if trimmed.eq_ignore_ascii_case("storms")
+            || trimmed.eq_ignore_ascii_case("storm")
+            || trimmed.eq_ignore_ascii_case("storm status")
+        {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_storms(sender_did);
+        }
+
+        if trimmed.eq_ignore_ascii_case("storm on") || trimmed.eq_ignore_ascii_case("storm mode on")
+        {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_storm_mode(sender_did, true);
+        }
+
+        if trimmed.eq_ignore_ascii_case("storm off")
+            || trimmed.eq_ignore_ascii_case("storm mode off")
+        {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_storm_mode(sender_did, false);
+        }
+
+        if trimmed.eq_ignore_ascii_case("lock") {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_lock(sender_did, "").await;
+        }
+
+        if let Some(args) = strip_prefix_ci(trimmed, "lock ") {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_lock(sender_did, args.trim()).await;
+        }
+
+        if trimmed.eq_ignore_ascii_case("unlock") {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_unlock(sender_did, "").await;
+        }
+
+        if let Some(target) = strip_prefix_ci(trimmed, "unlock ") {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_unlock(sender_did, target.trim()).await;
+        }
+
+        if trimmed.eq_ignore_ascii_case("detach") {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_detach(sender_did, "").await;
+        }
+
+        if let Some(args) = strip_prefix_ci(trimmed, "detach ") {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_detach(sender_did, args.trim()).await;
+        }
+
         if trimmed.eq_ignore_ascii_case("test") {
             if !authorized {
                 return Ok(self.unauthorized_response());
@@ -348,23 +419,22 @@ impl BotCommandHandler {
     fn cmd_help(&self) -> String {
         format!(
             "🛡️ Skybouncer Bot Commands:\n\n\
-             • `rules` — View active prompt & sensitivity\n\
-             • `set rules <prompt>` — Update moderation rules\n\
-             • `sensitivity <low|medium|high>` — Set sensitivity\n\
-             • `duration <permanent|24h|7d|30d>` — Block duration\n\
+             • `rules` — View active prompt & rules\n\
+             • `set rules <prompt>` — Update rules\n\
+             • `sensitivity <low|medium|high>` — Sensitivity\n\
+             • `duration <permanent|24h|7d|30d>` — Duration\n\
              • `trust followers <on|off>` — Follower bypass\n\
              • `pause` — Suspend moderation\n\
              • `resume` — Resume moderation\n\
              • `recent` — Last 5 bounced accounts\n\
-             • `pardon <did|@handle>` — Pardon from list\n\
+             • `pardon <did|@handle>` — Unban from list\n\
              • `pardon and allow <did|@handle>` — Pardon & allow\n\
-             • `bounce <did|@handle>` — Bounce/re-bounce\n\
-             • `perm <did|@handle>` — Permanently block\n\
-             • `allow <did|@handle>` — Add to allowlist\n\
-             • `unallow <did|@handle>` — Remove from allowlist\n\
-             • `allowlist` — View allowlist\n\
-             • `status` — View stats\n\
-             • `test <text>` — Dry-run text\n\
+             • `bounce <target>` / `perm <target>` — Block / perm\n\
+             • `allow <target>` / `unallow <target>` / `allowlist`\n\
+             • `storms` / `storm <on|off>` — Dogpile radar & mode\n\
+             • `lock [post] [policy]` / `unlock [post]` — Reply lock\n\
+             • `detach [post] [qt|all]` — Detach quote-posts\n\
+             • `status` / `test <text>` — Telemetry & dry-run\n\
              • `start` / `auth` — Activate ({})\n\
              • `help` — Show commands",
             self.auth_url()
@@ -1007,6 +1077,12 @@ impl BotCommandHandler {
 
     fn cmd_status(&self, sender_did: &str) -> String {
         let stats = self.engine.stats().snapshot();
+        let storm_mode = self.engine.is_storm_mode_active(sender_did);
+        let active_storms = self
+            .engine
+            .list_storms_for(Some(sender_did), true, 10)
+            .map(|v| v.len())
+            .unwrap_or(0);
         let state_label = if self.engine.is_tenant_paused(sender_did) {
             "⏸️ PAUSED"
         } else {
@@ -1017,6 +1093,7 @@ impl BotCommandHandler {
             format!(
                 "📊 Skybouncer Engine Status (Admin Fleet View):\n\n\
                  • State: {}\n\
+                 • Storm Mode: {}\n\
                  • Commits Received: {}\n\
                  • Follows Synced: {}\n\
                  • Interactions Matched: {}\n\
@@ -1030,9 +1107,16 @@ impl BotCommandHandler {
                  • Violations Detected: {}\n\
                  • Bounces Executed on PDS: {}\n\
                  • Permitted Interactions: {}\n\
+                 • Dogpiles Detected: {}\n\
+                 • Storm Bounces Digested: {}\n\
                  • Enrolled Tenants: {}\n\
                  • Dry-Run Mode: {}",
                 state_label,
+                if storm_mode {
+                    "⛈️ Active"
+                } else {
+                    "Normal"
+                },
                 stats.commits_received,
                 stats.follows_synced,
                 stats.interactions_matched,
@@ -1046,6 +1130,8 @@ impl BotCommandHandler {
                 stats.violations_detected,
                 stats.bounces_executed,
                 stats.permitted,
+                stats.dogpiles_detected,
+                stats.storm_bounces_digested,
                 self.engine.tenant_registry().count().unwrap_or(0),
                 if self.engine.is_dry_run() {
                     "Yes (shadow)"
@@ -1068,12 +1154,23 @@ impl BotCommandHandler {
             format!(
                 "📊 Skybouncer Status for Your Account:\n\n\
                  • Defense State: {}\n\
+                 • Storm Mode: {}{}\n\
                  • Sensitivity: {}\n\
                  • Active Prompt: \"{}\"\n\
                  • Accounts Bounced from Your Posts: {}\n\
                  • Allowlisted (Immunized) Accounts: {}\n\
                  • Protection Mode: {}",
                 state_label,
+                if storm_mode {
+                    "⛈️ Active"
+                } else {
+                    "Normal"
+                },
+                if active_storms > 0 {
+                    format!(" ({active_storms} active storm(s))")
+                } else {
+                    String::new()
+                },
                 rubric.sensitivity,
                 rubric.prompt,
                 my_bounces,
@@ -1085,6 +1182,374 @@ impl BotCommandHandler {
                 }
             )
         }
+    }
+
+    fn cmd_storms(&self, sender_did: &str) -> Result<String, SkybouncerError> {
+        let protected_did = match self.authorized_protected(sender_did) {
+            Ok(did) => did,
+            Err(msg) => return Ok(msg),
+        };
+        let storm_mode = self.engine.is_storm_mode_active(&protected_did);
+        let active = self.engine.list_storms_for(Some(&protected_did), true, 5)?;
+        let storm_badge = if storm_mode {
+            "⛈️ **ACTIVE** (digest batching & 3x evaluation headroom)"
+        } else {
+            "🟢 Normal (immediate per-bounce DM alerts)"
+        };
+
+        if active.is_empty() {
+            return Ok(format!(
+                "📡 Skybouncer Storm Radar:\n\n\
+                 • Storm Mode: {storm_badge}\n\
+                 • Active Dogpile Storms: None detected right now.\n\n\
+                 Use `storm on` / `storm off` to toggle Storm Mode manually."
+            ));
+        }
+
+        let mut out = format!(
+            "⛈️ Active Dogpile Storms ({}):\n• Storm Mode: {storm_badge}\n\n",
+            active.len()
+        );
+        for (idx, storm) in active.iter().enumerate() {
+            let num = idx.saturating_add(1);
+            let target_hint = if storm.focal_post_uri.ends_with("/_mentions") {
+                "Aggregate @mentions surge".to_string()
+            } else {
+                bsky_post_url_from_at_uri(&storm.focal_post_uri)
+                    .unwrap_or_else(|| storm.focal_post_uri.clone())
+            };
+            let lock_state = if storm.threadgate_applied {
+                "🔒 Replies Locked"
+            } else {
+                "🔓 Replies Open"
+            };
+            let snippet = truncate_chars(storm.focal_post_snippet.trim(), 90);
+            let snippet_line = if snippet.is_empty() {
+                String::new()
+            } else {
+                format!("\n   Post Snippet: \"{snippet}\"")
+            };
+            out.push_str(&format!(
+                "{num}. [{}] Score {:.0}% • {} OON ({:.0}%) • {} bounced • {lock_state}\n   Target: {target_hint}{snippet_line}\n",
+                storm.severity.as_str().to_ascii_uppercase(),
+                storm.metrics.composite_score * 100.0,
+                storm.metrics.unique_oon_authors_short,
+                storm.metrics.out_of_network_ratio * 100.0,
+                storm.bounces_during_storm,
+            ));
+        }
+
+        out.push_str(
+            "\nShield commands:\n\
+             • `lock latest following` (or `nobody` / `followers`)\n\
+             • `unlock latest` — Remove threadgate lock\n\
+             • `detach latest` (or `detach latest all`) — Detach catalyst QTs\n\
+             • `storm off` — Exit Storm Mode",
+        );
+
+        Ok(out)
+    }
+
+    fn cmd_storm_mode(&self, sender_did: &str, enabled: bool) -> Result<String, SkybouncerError> {
+        let protected_did = match self.authorized_protected(sender_did) {
+            Ok(did) => did,
+            Err(msg) => return Ok(msg),
+        };
+        self.engine.set_storm_mode(&protected_did, enabled);
+        if enabled {
+            Ok("⛈️ **Storm Mode ENABLED.**\n\n\
+                • Individual bounce alerts are now batched into periodic digests.\n\
+                • Evaluation rate-limit headroom has expanded 3x.\n\n\
+                Reply `storms` to inspect active surges or `storm off` to return to normal alerts."
+                .to_string())
+        } else {
+            Ok("🟢 **Storm Mode DISABLED.**\n\n\
+                Resumed immediate per-bounce DM alerts and standard rate limits."
+                .to_string())
+        }
+    }
+
+    async fn cmd_lock(&self, sender_did: &str, raw_args: &str) -> Result<String, SkybouncerError> {
+        let protected_did = match self.authorized_protected(sender_did) {
+            Ok(did) => did,
+            Err(msg) => return Ok(msg),
+        };
+
+        let tokens: Vec<&str> = raw_args.split_whitespace().collect();
+        let (target_arg, policy) = if tokens.is_empty()
+            || (tokens.len() == 1 && tokens[0].eq_ignore_ascii_case("latest"))
+        {
+            ("latest", ThreadgatePolicy::FollowingOnly)
+        } else if tokens.len() == 1 {
+            if !tokens[0].starts_with("at://") && !tokens[0].starts_with("http") {
+                if let Ok(parsed) = tokens[0].parse::<ThreadgatePolicy>() {
+                    ("latest", parsed)
+                } else {
+                    (tokens[0], ThreadgatePolicy::FollowingOnly)
+                }
+            } else {
+                (tokens[0], ThreadgatePolicy::FollowingOnly)
+            }
+        } else {
+            let parsed = match tokens[1].parse::<ThreadgatePolicy>() {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(
+                        "❌ Invalid lock policy. Choose `following`, `followers`, `mentions`, or `nobody`."
+                            .to_string(),
+                    );
+                }
+            };
+            (tokens[0], parsed)
+        };
+
+        let post_target = if target_arg.eq_ignore_ascii_case("latest") {
+            match self.resolve_latest_storm_post(&protected_did)? {
+                Ok(uri) => uri,
+                Err(msg) => return Ok(msg),
+            }
+        } else {
+            match self
+                .resolve_owned_dm_post_arg(&protected_did, target_arg)
+                .await
+            {
+                Ok(v) => v,
+                Err(msg) => return Ok(msg),
+            }
+        };
+
+        if post_target.ends_with("/_mentions") {
+            return Ok(
+                "ℹ️ The latest storm is an aggregate @mentions surge without a single focal post.\n\
+                 Provide your post URL or rkey explicitly: `lock <post_url|rkey> following`"
+                    .to_string(),
+            );
+        }
+
+        match self
+            .engine
+            .lock_thread(&protected_did, &post_target, policy)
+            .await
+        {
+            Ok((_tg_uri, canonical_post)) => {
+                let url = bsky_post_url_from_at_uri(&canonical_post)
+                    .unwrap_or_else(|| canonical_post.clone());
+                let rkey = canonical_post.rsplit('/').next().unwrap_or(&canonical_post);
+                let dry_note = if self.engine.is_dry_run() {
+                    "\n_(Shadow dry-run mode: simulated without writing to PDS)_"
+                } else {
+                    ""
+                };
+                Ok(format!(
+                    "🔒 Thread replies locked (**{}**)\n\
+                     Post: {url}{dry_note}\n\n\
+                     Reply `unlock {rkey}` at any time to restore open replies.",
+                    policy.display_label()
+                ))
+            }
+            Err(e) => Ok(format!("❌ Failed to lock thread replies: {e}")),
+        }
+    }
+
+    async fn cmd_unlock(
+        &self,
+        sender_did: &str,
+        raw_target: &str,
+    ) -> Result<String, SkybouncerError> {
+        let protected_did = match self.authorized_protected(sender_did) {
+            Ok(did) => did,
+            Err(msg) => return Ok(msg),
+        };
+        let target_arg = raw_target.split_whitespace().next().unwrap_or("");
+        let post_target = if target_arg.is_empty() || target_arg.eq_ignore_ascii_case("latest") {
+            match self.resolve_latest_storm_post(&protected_did)? {
+                Ok(uri) => uri,
+                Err(msg) => return Ok(msg),
+            }
+        } else {
+            match self
+                .resolve_owned_dm_post_arg(&protected_did, target_arg)
+                .await
+            {
+                Ok(v) => v,
+                Err(msg) => return Ok(msg),
+            }
+        };
+
+        if post_target.ends_with("/_mentions") {
+            return Ok(
+                "ℹ️ Provide the specific post URL or rkey to unlock: `unlock <post_url|rkey>`"
+                    .to_string(),
+            );
+        }
+
+        match self
+            .engine
+            .unlock_thread(&protected_did, &post_target)
+            .await
+        {
+            Ok(canonical_post) => {
+                let url = bsky_post_url_from_at_uri(&canonical_post)
+                    .unwrap_or_else(|| canonical_post.clone());
+                let dry_note = if self.engine.is_dry_run() {
+                    "\n_(Shadow dry-run mode: simulated without removing PDS record)_"
+                } else {
+                    ""
+                };
+                Ok(format!(
+                    "🔓 Thread replies unlocked — open replies restored.\nPost: {url}{dry_note}"
+                ))
+            }
+            Err(e) => Ok(format!("❌ Failed to unlock thread: {e}")),
+        }
+    }
+
+    async fn cmd_detach(
+        &self,
+        sender_did: &str,
+        raw_args: &str,
+    ) -> Result<String, SkybouncerError> {
+        let protected_did = match self.authorized_protected(sender_did) {
+            Ok(did) => did,
+            Err(msg) => return Ok(msg),
+        };
+
+        let tokens: Vec<&str> = raw_args.split_whitespace().collect();
+        let (target_arg, qt_arg, disable_all) = if tokens.is_empty() {
+            ("latest", None, false)
+        } else if tokens.len() == 1 {
+            if tokens[0].eq_ignore_ascii_case("all") {
+                ("latest", None, true)
+            } else {
+                (tokens[0], None, false)
+            }
+        } else if tokens[1].eq_ignore_ascii_case("all") {
+            (tokens[0], None, true)
+        } else {
+            (tokens[0], Some(tokens[1]), false)
+        };
+
+        let post_target = if target_arg.eq_ignore_ascii_case("latest") {
+            match self.resolve_latest_storm_post(&protected_did)? {
+                Ok(uri) => uri,
+                Err(msg) => return Ok(msg),
+            }
+        } else {
+            match self
+                .resolve_owned_dm_post_arg(&protected_did, target_arg)
+                .await
+            {
+                Ok(v) => v,
+                Err(msg) => return Ok(msg),
+            }
+        };
+
+        if post_target.ends_with("/_mentions") {
+            return Ok(
+                "ℹ️ Provide the specific post URL or rkey to detach quote-posts from: `detach <post_url|rkey> [qt_uri|all]`"
+                    .to_string(),
+            );
+        }
+
+        let explicit_qts = if let Some(raw_qt) = qt_arg {
+            match self.resolve_any_post_at_uri(raw_qt).await {
+                Ok(uri) => Some(vec![uri]),
+                Err(msg) => return Ok(msg),
+            }
+        } else {
+            None
+        };
+
+        match self
+            .engine
+            .detach_quotes(
+                &protected_did,
+                &post_target,
+                explicit_qts.as_deref(),
+                disable_all,
+            )
+            .await
+        {
+            Ok((_pg_uri, canonical_post, total_detached)) => {
+                let url = bsky_post_url_from_at_uri(&canonical_post)
+                    .unwrap_or_else(|| canonical_post.clone());
+                let dry_note = if self.engine.is_dry_run() {
+                    "\n_(Shadow dry-run mode: simulated without writing to PDS)_"
+                } else {
+                    ""
+                };
+                let mode_desc = if disable_all {
+                    "and disabled all future quote-posts".to_string()
+                } else {
+                    format!("({total_detached} detached quote-post(s) total)")
+                };
+                Ok(format!(
+                    "✂️ Updated `app.bsky.feed.postgate` shield {mode_desc}.\nPost: {url}{dry_note}"
+                ))
+            }
+            Err(e) => Ok(format!("❌ Failed to apply postgate shield: {e}")),
+        }
+    }
+
+    fn resolve_latest_storm_post(
+        &self,
+        protected_did: &str,
+    ) -> Result<Result<String, String>, SkybouncerError> {
+        if let Some(active) = self.engine.get_latest_active_storm_for(protected_did)? {
+            return Ok(Ok(active.focal_post_uri));
+        }
+        let recent = self.engine.list_storms_for(Some(protected_did), false, 1)?;
+        if let Some(latest) = recent.into_iter().next() {
+            return Ok(Ok(latest.focal_post_uri));
+        }
+        Ok(Err(
+            "ℹ️ No recent dogpile storm found. Provide a post URL or rkey explicitly.".to_string(),
+        ))
+    }
+
+    async fn resolve_owned_dm_post_arg(
+        &self,
+        _protected_did: &str,
+        raw: &str,
+    ) -> Result<String, String> {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return self.resolve_any_post_at_uri(trimmed).await;
+        }
+        Ok(trimmed.to_string())
+    }
+
+    async fn resolve_any_post_at_uri(&self, raw: &str) -> Result<String, String> {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("at://") {
+            return Ok(trimmed.to_string());
+        }
+        if let Ok(parsed) = url::Url::parse(trimmed) {
+            let segments: Vec<&str> = parsed
+                .path_segments()
+                .map(|s| s.filter(|p| !p.is_empty()).collect())
+                .unwrap_or_default();
+            if segments.len() == 4 && segments[0] == "profile" && segments[2] == "post" {
+                let actor = segments[1];
+                let rkey = segments[3];
+                let did = if actor.starts_with("did:") {
+                    actor.to_string()
+                } else {
+                    match self.engine.resolve_handle(actor).await {
+                        Some(resolved) => resolved,
+                        None => {
+                            return Err(format!(
+                                "❌ Could not resolve Bluesky handle `@{actor}` from URL."
+                            ));
+                        }
+                    }
+                };
+                return Ok(format!("at://{did}/app.bsky.feed.post/{rkey}"));
+            }
+        }
+        Err(format!(
+            "❌ Expected an `at://` post URI or Bluesky post URL (`https://bsky.app/profile/.../post/...`), got `{trimmed}`."
+        ))
     }
 
     fn cmd_onboarding(&self, sender_did: &str) -> String {

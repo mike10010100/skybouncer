@@ -1421,6 +1421,22 @@
         </div>
       </section>
 
+      <!-- Active Dogpile / Storm Mode Banner -->
+      <div id="active-storm-banner" style="display: none; padding: 0.9rem 1.1rem; border-radius: var(--radius); border: 1px solid rgba(239, 68, 68, 0.45); background: rgba(239, 68, 68, 0.08); justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem;">
+        <div style="display: flex; flex-direction: column; gap: 0.25rem; min-width: 0;">
+          <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+            <span class="status-badge badge-warning" id="active-storm-banner-badge">⛈️ Storm Mode Active</span>
+            <strong style="font-size: 0.92rem; color: var(--text-main);" id="active-storm-banner-title">Dogpile surge detected &mdash; digest batching &amp; 3x rate-limit headroom active</strong>
+          </div>
+          <div style="font-size: 0.78rem; color: var(--text-muted);" id="active-storm-banner-summary">Individual bounce DMs are collapsed into periodic digests while your surge subsides.</div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap;">
+          <button type="button" class="btn btn-sm" id="banner-lock-btn" style="display: none;" onclick="lockBannerStormPost()">🔒 Lock Replies</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="banner-detach-btn" style="display: none;" onclick="detachBannerStormPost()">✂️ Detach QTs</button>
+          <button type="button" class="btn btn-secondary btn-sm" id="banner-storm-mode-btn" onclick="toggleStormMode(false)">Exit Storm Mode</button>
+        </div>
+      </div>
+
       <!-- Task Tab Navigation -->
       <div class="workspace-tabs" role="tablist" aria-label="Moderation workspace">
         <button type="button" role="tab" id="tab-btn-activity" aria-selected="true" aria-controls="tab-panel-activity" class="workspace-tab active" onclick="switchWorkspaceTab('activity')">
@@ -1464,6 +1480,38 @@
             <div class="summary-tile-sub" id="summary-bypass-sub">Trusted accounts skip AI checks completely</div>
           </div>
         </div>
+
+        <!-- Dogpile & Storm Radar -->
+        <section class="card" id="storms-card" style="display: none;">
+          <div class="card-header" style="flex-wrap: wrap;">
+            <div class="card-title-group">
+              <div class="section-icon" style="color: var(--warning, #f59e0b);" aria-hidden="true">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M19 16.9A5 5 0 0 0 18 7h-1.26a8 8 0 1 0-11.62 9"/><polyline points="13 11 9 17 15 17 11 23"/>
+                </svg>
+              </div>
+              <div>
+                <h2 class="card-title" id="storms-card-title">
+                  <span>Dogpile &amp; Storm Radar</span>
+                  <span id="storm-mode-status-badge" class="status-badge badge-neutral" style="font-size: 0.68rem;">Normal</span>
+                </h2>
+                <p class="card-subtitle">Detects out-of-network quote/reply surges, catalyst QTs &amp; manages threadgate / postgate shields</p>
+              </div>
+            </div>
+            <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+              <button type="button" class="btn btn-secondary btn-sm" id="storm-mode-toggle-btn" onclick="toggleStormMode(!stormModeActiveState)">Enable Storm Mode</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="loadStorms()">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>
+                </svg>
+                Refresh
+              </button>
+            </div>
+          </div>
+          <div id="storms-list" style="display: flex; flex-direction: column; gap: 0.75rem;">
+            <div style="text-align: center; color: var(--text-muted); padding: 1.25rem; font-size: 0.84rem;">Checking recent storm telemetry...</div>
+          </div>
+        </section>
 
         <!-- Live Audit Feed: Recently Bounced Violators -->
         <section class="card">
@@ -1530,6 +1578,9 @@
           </div>
           <div class="dm-cmd-list">
             <code class="mono-pill">recent</code>
+            <code class="mono-pill">storms</code>
+            <code class="mono-pill">lock latest</code>
+            <code class="mono-pill">detach latest</code>
             <code class="mono-pill">pardon @handle</code>
             <code class="mono-pill">allow @handle</code>
             <code class="mono-pill">rules</code>
@@ -4122,7 +4173,10 @@
           if (bouncesScope) {
             bouncesScope.style.display = data.is_admin ? "inline-flex" : "none";
           }
+          const stormsCard = document.getElementById("storms-card");
+          if (stormsCard) stormsCard.style.display = "flex";
           loadBounces();
+          loadStorms();
         } else {
           currentUser = null;
           renderUnauthenticated();
@@ -4274,6 +4328,10 @@
       if (evalCard) evalCard.style.display = "none";
       const monCard = document.getElementById("kpi-monitored-card");
       if (monCard) monCard.style.display = "none";
+      const stormsCard = document.getElementById("storms-card");
+      if (stormsCard) stormsCard.style.display = "none";
+      const activeStormBanner = document.getElementById("active-storm-banner");
+      if (activeStormBanner) activeStormBanner.style.display = "none";
       const bouncesScope = document.getElementById("bounces-admin-scope-container");
       if (bouncesScope) bouncesScope.style.display = "none";
       const targetHeader = document.getElementById("bounces-target-header");
@@ -4290,6 +4348,11 @@
       localStorage.removeItem("skybouncer_did");
       currentUser = null;
       allBounces = [];
+      allStorms = [];
+      stormModeActiveState = false;
+      currentBannerStorm = null;
+      const stormsList = document.getElementById("storms-list");
+      if (stormsList) stormsList.innerHTML = "";
       const tabBouncesEl = document.getElementById("tab-bounces-count");
       if (tabBouncesEl) tabBouncesEl.innerText = "0";
       const tabAllowEl = document.getElementById("tab-allowlist-count");
@@ -4626,6 +4689,329 @@
         return isNaN(d.getTime()) ? "" : d.toLocaleString();
       } catch (e) {
         return "";
+      }
+    }
+
+    let allStorms = [];
+    let stormModeActiveState = false;
+    let currentBannerStorm = null;
+
+    function atPostUriToBskyUrl(atUri) {
+      if (!atUri || typeof atUri !== "string") return null;
+      const m = atUri.match(/^at:\/\/(did:[^/]+)\/app\.bsky\.feed\.post\/([A-Za-z0-9._:-]+)$/);
+      if (!m) return null;
+      return `https://bsky.app/profile/${encodeURIComponent(m[1])}/post/${encodeURIComponent(m[2])}`;
+    }
+
+    function stormSeverityBadgeClass(severity) {
+      const s = (severity || "").toLowerCase();
+      if (s === "critical" || s === "high") return "badge-warning";
+      return "badge-accent";
+    }
+
+    async function loadStorms() {
+      if (!currentUser) return;
+      try {
+        const res = await fetch("/api/storms?limit=20", { credentials: "same-origin" });
+        if (!res.ok) return;
+        const data = await res.json();
+        stormModeActiveState = !!data.storm_mode_active;
+        allStorms = Array.isArray(data.storms) ? data.storms : [];
+        renderStorms();
+      } catch (e) {
+        console.error("Storms fetch failed", e);
+      }
+    }
+
+    function renderStorms() {
+      const modeBadge = document.getElementById("storm-mode-status-badge");
+      const modeBtn = document.getElementById("storm-mode-toggle-btn");
+      if (modeBadge) {
+        if (stormModeActiveState) {
+          modeBadge.innerText = "⛈️ Storm Mode Active";
+          modeBadge.className = "status-badge badge-warning";
+        } else {
+          modeBadge.innerText = "Normal";
+          modeBadge.className = "status-badge badge-neutral";
+        }
+      }
+      if (modeBtn) {
+        modeBtn.innerText = stormModeActiveState ? "Exit Storm Mode" : "Enable Storm Mode";
+      }
+
+      const activeList = allStorms.filter((s) => (s.status || "").toLowerCase() === "active");
+      currentBannerStorm = activeList.length > 0 ? activeList[0] : null;
+      const bannerEl = document.getElementById("active-storm-banner");
+      if (bannerEl) {
+        if (stormModeActiveState || currentBannerStorm) {
+          bannerEl.style.display = "flex";
+          const titleEl = document.getElementById("active-storm-banner-title");
+          const sumEl = document.getElementById("active-storm-banner-summary");
+          const lockBtn = document.getElementById("banner-lock-btn");
+          const detachBtn = document.getElementById("banner-detach-btn");
+          if (currentBannerStorm) {
+            const sev = (currentBannerStorm.severity || "elevated").toUpperCase();
+            const oon = currentBannerStorm.metrics ? (currentBannerStorm.metrics.unique_oon_authors_short || 0) : 0;
+            if (titleEl) {
+              titleEl.innerText = `[${sev}] Coordinated Surge Detected (${oon} out-of-network accounts)`;
+            }
+            const snippet = (currentBannerStorm.focal_post_snippet || "").trim();
+            if (sumEl) {
+              sumEl.innerText = snippet
+                ? `Focal post: "${snippet.slice(0, 120)}" • Digest batching & 3x headroom active.`
+                : "Individual bounce DMs are collapsed into periodic digests while your surge subsides.";
+            }
+            const isMentions = (currentBannerStorm.focal_post_uri || "").endsWith("/_mentions");
+            if (lockBtn) lockBtn.style.display = isMentions ? "none" : "inline-flex";
+            if (detachBtn) {
+              const hasCats = Array.isArray(currentBannerStorm.catalyst_qt_uris) && currentBannerStorm.catalyst_qt_uris.length > 0;
+              detachBtn.style.display = !isMentions && hasCats ? "inline-flex" : "none";
+            }
+          } else {
+            if (titleEl) titleEl.innerText = "Storm Mode Enabled Manually";
+            if (sumEl) sumEl.innerText = "Individual bounce DMs are batched into periodic digests with 3x evaluation headroom.";
+            if (lockBtn) lockBtn.style.display = "none";
+            if (detachBtn) detachBtn.style.display = "none";
+          }
+        } else {
+          bannerEl.style.display = "none";
+        }
+      }
+
+      const listEl = document.getElementById("storms-list");
+      if (!listEl) return;
+
+      if (!listEl.hasAttribute("data-storm-actions-attached")) {
+        listEl.setAttribute("data-storm-actions-attached", "true");
+        listEl.addEventListener("click", (e) => {
+          const btnLock = e.target.closest(".btn-storm-lock");
+          if (btnLock && btnLock.dataset.postUri) {
+            lockStormThread(btnLock.dataset.postUri, btnLock.dataset.policy || "following", btnLock.dataset.protectedDid);
+            return;
+          }
+          const btnUnlock = e.target.closest(".btn-storm-unlock");
+          if (btnUnlock && btnUnlock.dataset.postUri) {
+            unlockStormThread(btnUnlock.dataset.postUri, btnUnlock.dataset.protectedDid);
+            return;
+          }
+          const btnDetach = e.target.closest(".btn-storm-detach");
+          if (btnDetach && btnDetach.dataset.postUri) {
+            detachStormQuotes(btnDetach.dataset.postUri, btnDetach.dataset.protectedDid, btnDetach.dataset.disableAll === "true");
+            return;
+          }
+          const btnDismiss = e.target.closest(".btn-storm-dismiss");
+          if (btnDismiss && btnDismiss.dataset.stormId) {
+            dismissStormEvent(Number(btnDismiss.dataset.stormId));
+          }
+        });
+      }
+
+      if (allStorms.length === 0) {
+        listEl.innerHTML = `<div style="text-align: center; color: var(--text-muted); padding: 1.25rem; font-size: 0.84rem;">No dogpile surges detected yet. Out-of-network reply/quote spikes will appear here automatically.</div>`;
+        return;
+      }
+
+      listEl.innerHTML = allStorms.map((s) => {
+        const m = s.metrics || {};
+        const oon = m.unique_oon_authors_short || 0;
+        const total = m.unique_authors_short || 0;
+        const oonPct = Math.round((m.out_of_network_ratio || 0) * 100);
+        const directRatio = Number(m.direct_ratio || 0).toFixed(2);
+        const dunkRatio = Number(m.dunk_ratio || 0).toFixed(1);
+        const scorePct = Math.round((m.composite_score || 0) * 100);
+        const isMentions = (s.focal_post_uri || "").endsWith("/_mentions");
+        const postUrl = !isMentions ? atPostUriToBskyUrl(s.focal_post_uri) : null;
+        const sevLabel = escapeHtml((s.severity || "elevated").toUpperCase());
+        const statusLabel = escapeHtml((s.status || "active").toUpperCase());
+
+        let postHtml = isMentions
+          ? `<strong>Aggregate @mentions surge</strong>`
+          : (postUrl
+              ? `<a href="${postUrl}" target="_blank" rel="noopener noreferrer" style="color: var(--accent-text); font-weight: 600;">View Focal Post ↗</a>`
+              : `<code class="mono-pill">${escapeHtml(s.focal_post_uri || "")}</code>`);
+        if (s.focal_post_snippet) {
+          postHtml += ` <span style="color: var(--text-secondary); font-size: 0.82rem;">&ldquo;${escapeHtml(s.focal_post_snippet.slice(0, 140))}&rdquo;</span>`;
+        }
+
+        let catalystHtml = "";
+        if (s.top_catalyst) {
+          const cat = s.top_catalyst;
+          const catAuthor = cat.author_handle ? `@${cat.author_handle.replace(/^@/, "")}` : cat.author_did;
+          const catUrl = atPostUriToBskyUrl(cat.post_uri);
+          const catLink = catUrl ? `<a href="${catUrl}" target="_blank" rel="noopener noreferrer" style="color: var(--accent-text);">QT ↗</a>` : "";
+          catalystHtml = `<div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 0.35rem;">Catalyst: <strong style="color: var(--text-main);">${escapeHtml(catAuthor)}</strong> (${cat.like_count || 0} likes, ${Number(cat.dunk_ratio || 0).toFixed(1)}x root likes) ${catLink}${cat.text_snippet ? ` &mdash; &ldquo;${escapeHtml(cat.text_snippet.slice(0, 100))}&rdquo;` : ""}</div>`;
+        }
+
+        let stanceHtml = "";
+        if (s.stance && s.stance.summary) {
+          const confPct = Math.round((s.stance.confidence || 0) * 100);
+          stanceHtml = `<div style="font-size: 0.78rem; color: var(--text-secondary); margin-top: 0.25rem;">Stance (<strong>${escapeHtml(s.stance.classification || "evaluated")}</strong>, ${confPct}%): ${escapeHtml(s.stance.summary)}</div>`;
+        }
+
+        const defensiveParts = [];
+        if ((m.defensive_blocks || 0) > 0) defensiveParts.push(`${m.defensive_blocks} blocks`);
+        if ((m.defensive_detaches || 0) > 0) defensiveParts.push(`${m.defensive_detaches} detaches`);
+        const defensiveNote = defensiveParts.length > 0 ? ` • Defensive: ${defensiveParts.join(", ")}` : "";
+
+        const hasCatalysts = Array.isArray(s.catalyst_qt_uris) && s.catalyst_qt_uris.length > 0;
+        let actionsHtml = "";
+        if (!isMentions) {
+          if (s.threadgate_applied) {
+            actionsHtml += `<button type="button" class="btn btn-secondary btn-sm btn-storm-unlock" data-post-uri="${escapeHtml(s.focal_post_uri)}" data-protected-did="${escapeHtml(s.target_did)}">🔓 Unlock Replies</button>`;
+          } else {
+            actionsHtml += `<button type="button" class="btn btn-sm btn-storm-lock" data-post-uri="${escapeHtml(s.focal_post_uri)}" data-policy="following" data-protected-did="${escapeHtml(s.target_did)}">🔒 Lock Replies</button>`;
+          }
+          if (hasCatalysts) {
+            actionsHtml += `<button type="button" class="btn btn-secondary btn-sm btn-storm-detach" data-post-uri="${escapeHtml(s.focal_post_uri)}" data-protected-did="${escapeHtml(s.target_did)}" data-disable-all="false">✂️ Detach QTs</button>`;
+          } else {
+            actionsHtml += `<button type="button" class="btn btn-secondary btn-sm btn-storm-detach" data-post-uri="${escapeHtml(s.focal_post_uri)}" data-protected-did="${escapeHtml(s.target_did)}" data-disable-all="true">🚫 Disable Quotes</button>`;
+          }
+        }
+        if ((s.status || "").toLowerCase() === "active") {
+          actionsHtml += `<button type="button" class="btn btn-secondary btn-sm btn-storm-dismiss" data-storm-id="${Number(s.id)}">Dismiss</button>`;
+        }
+
+        return `
+          <div style="padding: 0.85rem 0.95rem; border: 1px solid var(--border-subtle); border-radius: 8px; background: var(--bg-surface-2); display: flex; flex-direction: column; gap: 0.35rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
+              <div style="display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap;">
+                <span class="status-badge ${stormSeverityBadgeClass(s.severity)}">${sevLabel}</span>
+                <span class="status-badge badge-neutral">${statusLabel}</span>
+                <span style="font-size: 0.78rem; color: var(--text-muted);">${formatDate(s.updated_at_us || s.started_at_us)}</span>
+              </div>
+              <div style="display: flex; gap: 0.4rem; flex-wrap: wrap;">${actionsHtml}</div>
+            </div>
+            <div style="font-size: 0.84rem; margin-top: 0.15rem;">${postHtml}</div>
+            <div style="font-size: 0.76rem; color: var(--text-muted);">
+              Score: <strong style="color: var(--text-main);">${scorePct}%</strong> • OON: <strong>${oon}/${total}</strong> (${oonPct}%) • direct_ratio: ${directRatio} • dunk_ratio: ${dunkRatio}x • Bounced: <strong>${s.bounces_during_storm || 0}</strong>${escapeHtml(defensiveNote)}
+            </div>
+            ${catalystHtml}
+            ${stanceHtml}
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function toggleStormMode(enabled) {
+      if (!currentUser) return;
+      try {
+        const res = await fetch("/api/storms/mode", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({ enabled: !!enabled, target_did: currentUser.did })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          stormModeActiveState = !!data.storm_mode_active;
+          showToast(stormModeActiveState ? "⛈️ Storm Mode enabled" : "🟢 Storm Mode disabled");
+          loadStorms();
+        } else {
+          showToast("Failed to update Storm Mode");
+        }
+      } catch (e) {
+        showToast("Network error toggling Storm Mode");
+      }
+    }
+
+    async function dismissStormEvent(stormId) {
+      try {
+        const res = await fetch("/api/storms/dismiss", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({ storm_id: stormId })
+        });
+        if (res.ok) {
+          showToast("Storm dismissed");
+          loadStorms();
+        } else {
+          showToast("Failed to dismiss storm");
+        }
+      } catch (e) {
+        showToast("Network error dismissing storm");
+      }
+    }
+
+    async function lockStormThread(postUri, policy, protectedDid) {
+      try {
+        const res = await fetch("/api/storms/lock", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({
+            post_uri: postUri,
+            policy: policy || "following",
+            protected_did: protectedDid || (currentUser ? currentUser.did : undefined)
+          })
+        });
+        if (res.ok) {
+          showToast("🔒 Thread replies locked on PDS");
+          loadStorms();
+        } else {
+          const msg = await res.text();
+          showToast(`Lock failed: ${msg}`);
+        }
+      } catch (e) {
+        showToast("Network error locking thread");
+      }
+    }
+
+    async function unlockStormThread(postUri, protectedDid) {
+      try {
+        const res = await fetch("/api/storms/unlock", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({
+            post_uri: postUri,
+            protected_did: protectedDid || (currentUser ? currentUser.did : undefined)
+          })
+        });
+        if (res.ok) {
+          showToast("🔓 Threadgate lock removed");
+          loadStorms();
+        } else {
+          showToast("Failed to unlock thread");
+        }
+      } catch (e) {
+        showToast("Network error unlocking thread");
+      }
+    }
+
+    async function detachStormQuotes(postUri, protectedDid, disableAllQuotes) {
+      try {
+        const res = await fetch("/api/storms/detach", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({
+            post_uri: postUri,
+            disable_all_quotes: !!disableAllQuotes,
+            protected_did: protectedDid || (currentUser ? currentUser.did : undefined)
+          })
+        });
+        if (res.ok) {
+          showToast(disableAllQuotes ? "🚫 Quotes disabled on PDS" : "✂️ Catalyst quote-posts detached");
+          loadStorms();
+        } else {
+          const msg = await res.text();
+          showToast(`Postgate update failed: ${msg}`);
+        }
+      } catch (e) {
+        showToast("Network error updating postgate");
+      }
+    }
+
+    function lockBannerStormPost() {
+      if (currentBannerStorm && currentBannerStorm.focal_post_uri) {
+        lockStormThread(currentBannerStorm.focal_post_uri, "following", currentBannerStorm.target_did);
+      }
+    }
+
+    function detachBannerStormPost() {
+      if (currentBannerStorm && currentBannerStorm.focal_post_uri) {
+        detachStormQuotes(currentBannerStorm.focal_post_uri, currentBannerStorm.target_did, false);
       }
     }
 

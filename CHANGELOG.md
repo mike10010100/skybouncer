@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-20
+
+### Added
+
+- **Personal Dogpile Radar (`src/dogpile/`, `src/enricher.rs`, `src/stream.rs`, `src/engine/storm_ops.rs`, `src/engine/processing.rs`)**:
+  - Added reusable, feature-independent `dogpile` subsystem designed for future extraction into a standalone network-wide radar (`skydoppler`): rolling short/medium cascade windows (`DogpileTracker`), pure cascade/ratio math (`compute_direct_ratio`, `compute_dunk_ratio`, `compute_power_asymmetry`, `compute_burst_acceleration`, `compute_structural_score`, `compute_composite_score`), bundled Stage 3 LLM stance classifier (`LlmStormStanceClassifier`, `StormStanceClassifier`), and ATProto PDS gate helpers (`apply_threadgate`, `remove_threadgate`, `apply_postgate_detach`).
+  - Added `app.bsky.feed.getPosts` engagement snapshot & `getProfile` follower-count enrichment on `ContextEnricher` / `AppViewContextEnricher` to identify top amplifying quote-post catalysts (`dunk_ratio`, `power_asymmetry`) without per-reply enrichment calls.
+  - Subscribed Jetstream default collections to `app.bsky.feed.postgate` and `app.bsky.graph.block` so a protected user's manual blocks and postgate detaches boost surge detection as defensive distress signals while filtering routine in-network viral traffic.
+- **Storm Mode & Digests (`src/dogpile/tracker.rs`, `src/modlist/cache/storms.rs`, `src/limiter.rs`, `src/bot/dispatcher.rs`)**:
+  - Persisted active, resolved, and dismissed surge events in SQLite `dogpile_events` and added proactive DM storm & escalation alerts (`run_storm_alert_dispatcher`) with metrics, catalyst links, and stance summaries.
+  - Collapsed individual per-bounce DM alerts into periodic Storm Mode digests (`run_storm_digest_dispatcher`) and expanded Tier-4 evaluation rate-limit headroom 3x (`EvaluationRateLimiter::check_and_record_with_multiplier`) while a storm is active.
+- **Sovereign On-Demand PDS Shields, Bot Commands, Web API & UI (`src/bot/handler.rs`, `src/web/api/storms.rs`, `src/web/api/telemetry.rs`, `src/cli.rs`, `assets/dashboard.html`)**:
+  - Added conversational DM commands (`storms`, `storm on|off`, `lock [post|latest] [policy]`, `unlock [post|latest]`, `detach [post|latest] [qt_uri|all]`) and authenticated Web API routes (`GET /api/storms`, `POST /api/storms/mode`, `POST /api/storms/dismiss`, `POST /api/storms/lock`, `POST /api/storms/unlock`, `POST /api/storms/detach`) enforcing strict tenant ownership.
+  - Added Prometheus counters (`skybouncer_dogpiles_detected_total`, `skybouncer_storm_alerts_emitted_total`, `skybouncer_storm_bounces_digested_total`, `skybouncer_defensive_signals_observed_total`, `skybouncer_threadgates_applied_total`, `skybouncer_postgate_detaches_applied_total`), CLI final telemetry summary counters, and the Dashboard Active Storm Banner & Dogpile Radar card.
+
 ## [0.2.35] - 2026-11-14
 
 ### Fixed

@@ -54,8 +54,13 @@ impl SkybouncerEngine {
         let paused = Arc::new(AtomicBool::new(false));
         let (bounce_notifier, _) = broadcast::channel(256);
         let (reauth_notifier, _) = broadcast::channel(256);
+        let (storm_notifier, _) = broadcast::channel(128);
+        let (storm_digest_notifier, _) = broadcast::channel(128);
         let oauth_client = Arc::new(RwLock::new(None));
         let handle_cache = Arc::new(RwLock::new(HashMap::new()));
+        let dogpile_tracker = Arc::new(DogpileTracker::new(config.dogpile_config.clone()));
+        let storm_stance_classifier: Arc<dyn StormStanceClassifier> =
+            Arc::new(NoopStormStanceClassifier);
 
         if let Ok(loaded_allowlists) = cache.load_all_allowlists() {
             let mut guard = gate.allowlist().write();
@@ -93,8 +98,12 @@ impl SkybouncerEngine {
             paused,
             bounce_notifier,
             reauth_notifier,
+            storm_notifier,
+            storm_digest_notifier,
             oauth_client,
             handle_cache,
+            dogpile_tracker,
+            storm_stance_classifier,
         }
     }
 
@@ -145,13 +154,27 @@ impl SkybouncerEngine {
         commit: &JetstreamCommit,
         eval_tx: &mpsc::Sender<Interaction>,
     ) -> Result<ProcessCommitResult, SkybouncerError> {
+        self.process_commit_queued_with_storms(commit, eval_tx, None)
+            .await
+    }
+
+    /// Evaluates a single Jetstream commit with decoupled evaluation and storm-surge queues.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if cache query or PDS mutation fails.
+    pub(super) async fn process_commit_queued_with_storms(
+        &self,
+        commit: &JetstreamCommit,
+        eval_tx: &mpsc::Sender<Interaction>,
+        storm_tx: Option<&mpsc::Sender<crate::dogpile::SurgeCandidate>>,
+    ) -> Result<ProcessCommitResult, SkybouncerError> {
         match self.dispatch_commit(commit) {
             CommitDispatch::Resolved(result) => Ok(result),
             CommitDispatch::Interactions(interactions) => {
                 let mut outcomes = Vec::with_capacity(interactions.len());
                 for interaction in interactions {
                     outcomes.push(
-                        self.process_interaction_queued(interaction, eval_tx)
+                        self.process_interaction_queued_inner(interaction, eval_tx, storm_tx)
                             .await?,
                     );
                 }
@@ -206,6 +229,72 @@ impl SkybouncerEngine {
             return CommitDispatch::Resolved(ProcessCommitResult::Ignored);
         }
 
+        // Tier 0.7: Defensive Distress Signal Intercepts (blocks & postgate detaches/disables)
+        if commit.collection.as_str() == "app.bsky.graph.block"
+            && commit.operation == CommitOperation::Create
+        {
+            if self.is_protected(&commit.did) && self.config.dogpile_config.enabled {
+                let ts = if commit.time_us > 0 {
+                    commit.time_us
+                } else {
+                    current_time_us()
+                };
+                self.dogpile_tracker.record_defensive_block(&commit.did, ts);
+                self.stats
+                    .defensive_signals_observed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return CommitDispatch::Resolved(ProcessCommitResult::Ignored);
+        }
+
+        if commit.collection.as_str() == "app.bsky.feed.postgate"
+            && matches!(
+                commit.operation,
+                CommitOperation::Create | CommitOperation::Update
+            )
+        {
+            if self.is_protected(&commit.did) && self.config.dogpile_config.enabled {
+                if let Some(ref rec) = commit.record {
+                    let post_uri = rec
+                        .get("post")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            format!("at://{}/app.bsky.feed.post/{}", commit.did, commit.rkey)
+                        });
+                    let detached_count = rec
+                        .get("detachedEmbeddingUris")
+                        .and_then(|v| v.as_array())
+                        .map_or(0, Vec::len);
+                    let disabled_quotes = rec
+                        .get("embeddingRules")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|arr| {
+                            arr.iter().any(|r| {
+                                r.get("$type").and_then(|t| t.as_str())
+                                    == Some("app.bsky.feed.postgate#disableRule")
+                            })
+                        });
+                    let ts = if commit.time_us > 0 {
+                        commit.time_us
+                    } else {
+                        current_time_us()
+                    };
+                    self.dogpile_tracker.record_defensive_postgate(
+                        &commit.did,
+                        &post_uri,
+                        detached_count,
+                        disabled_quotes,
+                        ts,
+                    );
+                    self.stats
+                        .defensive_signals_observed
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return CommitDispatch::Resolved(ProcessCommitResult::Ignored);
+        }
+
         // Tier 1: Post Collection & Operation Filter
         if commit.collection.as_str() != "app.bsky.feed.post"
             || commit.operation != CommitOperation::Create
@@ -241,9 +330,25 @@ impl SkybouncerEngine {
         interaction: Interaction,
         eval_tx: &mpsc::Sender<Interaction>,
     ) -> Result<InteractionOutcome, SkybouncerError> {
+        self.process_interaction_queued_inner(interaction, eval_tx, None)
+            .await
+    }
+
+    async fn process_interaction_queued_inner(
+        &self,
+        interaction: Interaction,
+        eval_tx: &mpsc::Sender<Interaction>,
+        storm_tx: Option<&mpsc::Sender<crate::dogpile::SurgeCandidate>>,
+    ) -> Result<InteractionOutcome, SkybouncerError> {
         let author_did = interaction.author_did.clone();
         let target_did = interaction.target_did.clone();
         let post_uri = interaction.post_uri.clone();
+
+        if let Some(candidate) = self.observe_interaction_for_dogpile(&interaction) {
+            if let Some(tx) = storm_tx {
+                let _ = tx.try_send(candidate);
+            }
+        }
 
         match self.fast_path(&interaction).await? {
             FastPath::Resolved(outcome) => return Ok(outcome),
@@ -331,6 +436,12 @@ impl SkybouncerEngine {
     ) -> Result<InteractionOutcome, SkybouncerError> {
         let target_did = interaction.target_did.clone();
 
+        if let Some(candidate) = self.observe_interaction_for_dogpile(&interaction) {
+            if let Err(e) = self.evaluate_storm_candidate(candidate).await {
+                tracing::warn!(error = %e, target = %target_did, "Inline storm candidate evaluation failed");
+            }
+        }
+
         match self.fast_path(&interaction).await? {
             FastPath::Resolved(outcome) => return Ok(outcome),
             FastPath::Heuristic(outcome, verdict) => {
@@ -366,6 +477,28 @@ impl SkybouncerEngine {
         }
 
         self.evaluate_candidate(interaction).await
+    }
+
+    fn observe_interaction_for_dogpile(
+        &self,
+        interaction: &Interaction,
+    ) -> Option<crate::dogpile::SurgeCandidate> {
+        if !self.config.dogpile_config.enabled || interaction.is_self_interaction() {
+            return None;
+        }
+        let is_in_network = self
+            .follow_graph
+            .is_following(&interaction.target_did, &interaction.author_did)
+            || self
+                .follow_graph
+                .is_followed_by(&interaction.target_did, &interaction.author_did);
+        let ts = if interaction.created_at_us > 0 {
+            interaction.created_at_us
+        } else {
+            current_time_us()
+        };
+        self.dogpile_tracker
+            .record_interaction(interaction, !is_in_network, ts)
     }
 
     /// Runs the per-interaction fast-path tiers shared by the sync and queued processors:
@@ -593,7 +726,16 @@ impl SkybouncerEngine {
         }
 
         // Tier 4: Per-User Evaluation Rate Limiter (Anti-Denial-of-Wallet, PRD §5.2) - checked at dequeue
-        if !self.rate_limiter.check_and_record(&target_did) {
+        // Grants bounded 3x headroom while Storm Mode is active for the target.
+        let rate_multiplier = if self.is_storm_mode_active(&target_did) {
+            3
+        } else {
+            1
+        };
+        if !self
+            .rate_limiter
+            .check_and_record_with_multiplier(&target_did, rate_multiplier)
+        {
             self.stats
                 .rate_limited_evaluations
                 .fetch_add(1, Ordering::Relaxed);
@@ -698,6 +840,19 @@ impl SkybouncerEngine {
             self.stats
                 .violations_detected
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        if self.config.dogpile_config.enabled {
+            let outcome_ts = if interaction.created_at_us > 0 {
+                interaction.created_at_us
+            } else {
+                current_time_us()
+            };
+            self.dogpile_tracker.record_evaluation_outcome(
+                &target_did,
+                &crate::dogpile::canonical_focal_post_uri(&interaction),
+                model_verdict.is_violation(),
+                outcome_ts,
+            );
         }
 
         // Cache the verdict with configured TTL
@@ -865,19 +1020,44 @@ impl SkybouncerEngine {
                             },
                         };
 
-                        // Emit proactive bounce notification for alert dispatchers
-                        let _ = self.bounce_notifier.send(BounceNotification {
-                            target_did: target_did.clone(),
-                            violator_did: author_did.clone(),
-                            violator_handle,
-                            category: category.clone(),
-                            confidence,
-                            reason: reason.clone(),
-                            post_uri: post_uri.clone(),
-                            reply_to_uri: interaction.parent_uri.clone(),
-                            post_snippet: interaction.text.chars().take(200).collect(),
-                            bounce_duration: rubric.bounce_duration,
-                        });
+                        let bounce_ts = if interaction.created_at_us > 0 {
+                            interaction.created_at_us
+                        } else {
+                            current_time_us()
+                        };
+                        let focal_uri = crate::dogpile::canonical_focal_post_uri(interaction);
+                        let digested = self.dogpile_tracker.record_storm_bounce(
+                            &target_did,
+                            Some(&focal_uri),
+                            &author_did,
+                            violator_handle.clone(),
+                            category.as_str(),
+                            bounce_ts,
+                        );
+                        if digested {
+                            self.stats
+                                .storm_bounces_digested
+                                .fetch_add(1, Ordering::Relaxed);
+                            let _ = self.cache.increment_storm_bounces(
+                                &target_did,
+                                Some(&focal_uri),
+                                1,
+                            );
+                        } else {
+                            // Emit proactive bounce notification for alert dispatchers
+                            let _ = self.bounce_notifier.send(BounceNotification {
+                                target_did: target_did.clone(),
+                                violator_did: author_did.clone(),
+                                violator_handle,
+                                category: category.clone(),
+                                confidence,
+                                reason: reason.clone(),
+                                post_uri: post_uri.clone(),
+                                reply_to_uri: interaction.parent_uri.clone(),
+                                post_snippet: interaction.text.chars().take(200).collect(),
+                                bounce_duration: rubric.bounce_duration,
+                            });
+                        }
 
                         Ok(InteractionOutcome::Bounced {
                             author_did,

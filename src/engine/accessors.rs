@@ -121,6 +121,26 @@ impl SkybouncerEngine {
         self.reauth_notifier.subscribe()
     }
 
+    /// Subscribes to real-time dogpile storm detection and escalation alerts.
+    #[must_use]
+    pub fn subscribe_storm_alerts(&self) -> broadcast::Receiver<crate::dogpile::StormNotification> {
+        self.storm_notifier.subscribe()
+    }
+
+    /// Subscribes to periodic Storm Mode bounce summary digests.
+    #[must_use]
+    pub fn subscribe_storm_digests(
+        &self,
+    ) -> broadcast::Receiver<crate::dogpile::StormDigestNotification> {
+        self.storm_digest_notifier.subscribe()
+    }
+
+    /// Returns a reference to the in-memory rolling dogpile tracker.
+    #[must_use]
+    pub fn dogpile_tracker(&self) -> &Arc<crate::dogpile::DogpileTracker> {
+        &self.dogpile_tracker
+    }
+
     /// Returns a copy of the active configuration with the current live rubric.
     #[must_use]
     pub fn config(&self) -> SkybouncerConfig {
