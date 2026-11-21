@@ -1463,3 +1463,96 @@ async fn test_jev_classifier_context_vs_candidate_images_and_endpoint_isolation(
     let std_body = String::from_utf8_lossy(&std_req.body);
     assert!(!std_body.contains("Y3R4b25seQ=="));
 }
+
+#[tokio::test]
+async fn test_tiered_classifier_suspicious_bot_signals_escalate_without_false_positiving_organic_boosters(
+) {
+    use skybouncer::enricher::AuthorActivitySignals;
+
+    let bot_signals = AuthorActivitySignals {
+        reply_latency_ms: Some(816),
+        forged_tid: false,
+        profile_fundraiser_urls: vec!["https://www.chuffed.org/project/191040".to_string()],
+        profile_fundraiser_item_count: 2,
+        recent_distinct_reply_targets: 6,
+        recent_reply_burst_count: 6,
+        repeated_reply_template_count: 2,
+        recent_other_reply_snippets: vec![
+            "Whatever you can give would be deeply appreciated.".to_string()
+        ],
+    };
+    let mut bot_interaction =
+        sample_interaction("We're counting on the kindness of people like you. 🙏");
+    let mut bot_ctx = EnrichedContext::empty();
+    bot_ctx.author_signals = Some(bot_signals);
+    bot_interaction.enriched_context = Some(bot_ctx);
+
+    let organic_signals = AuthorActivitySignals {
+        reply_latency_ms: Some(180_000),
+        forged_tid: false,
+        profile_fundraiser_urls: vec!["https://chuffed.org/project/191040".to_string()],
+        profile_fundraiser_item_count: 1,
+        recent_distinct_reply_targets: 1,
+        recent_reply_burst_count: 1,
+        repeated_reply_template_count: 0,
+        recent_other_reply_snippets: Vec::new(),
+    };
+    let mut organic_interaction =
+        sample_interaction("Good point, Palestinians didn't use that term historically.");
+    let mut org_ctx = EnrichedContext::empty();
+    org_ctx.author_signals = Some(organic_signals);
+    organic_interaction.enriched_context = Some(org_ctx);
+
+    let primary = Arc::new(MockClassifier::new(Verdict::permitted_with_confidence(
+        "Decisive permit on text alone",
+        0.95,
+    )));
+    let fallback = Arc::new(MockClassifier::violation(
+        ViolationCategory::Spam,
+        0.97,
+        "Sub-second stranger reply-bait funneling to chuffed.org/project/191040",
+    ));
+
+    let tiered = TieredClassifier::new(
+        primary.clone(),
+        fallback.clone(),
+        CertaintyConfig::default(),
+    );
+
+    // 1. Suspicious reply-bait bot MUST escalate from Tier-1 Permitted -> System-2 Spam.
+    let bot_res = tiered.classify_detailed(&bot_interaction).await.unwrap();
+    assert!(bot_res.escalated);
+    assert!(matches!(
+        bot_res.final_verdict,
+        Verdict::Violation {
+            category: ViolationCategory::Spam,
+            ..
+        }
+    ));
+    assert!(bot_res
+        .escalation_reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Suspicious automated reply-bait signals"));
+    assert_eq!(fallback.call_count(), 1);
+
+    // 2. Organic mutual-aid booster (no snipe, no blast, 1 reply) MUST NOT escalate.
+    let org_res = tiered
+        .classify_detailed(&organic_interaction)
+        .await
+        .unwrap();
+    assert!(!org_res.escalated);
+    assert!(org_res.final_verdict.is_permitted());
+    assert_eq!(fallback.call_count(), 1);
+
+    // 3. Opting out via `.with_escalate_suspicious_bot_signals(false)` suppresses escalation.
+    let opt_out = TieredClassifier::new(
+        primary,
+        fallback.clone(),
+        CertaintyConfig::default().with_escalate_suspicious_bot_signals(false),
+    );
+    let no_esc = opt_out.classify_detailed(&bot_interaction).await.unwrap();
+    assert!(!no_esc.escalated);
+    assert!(no_esc.final_verdict.is_permitted());
+    assert_eq!(fallback.call_count(), 1);
+}

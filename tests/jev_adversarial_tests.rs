@@ -2512,3 +2512,112 @@ async fn test_rhetorical_apostrophe_and_vocative_guardrail_prompts_systemone_and
         .expect("SystemOne request recorded");
     assert!(!String::from_utf8_lossy(&s1_req.body).contains("c3JjX2N0eF9pbWc="));
 }
+
+#[tokio::test]
+async fn test_adversarial_jev_indirect_reply_bait_bot_and_organic_booster_framing() {
+    use skybouncer::classifier::Verdict;
+    use skybouncer::enricher::{AuthorActivitySignals, AuthorContext, EnrichedContext};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(wiremock::matchers::body_string_contains(
+            "Author Activity Signals [",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "indirect reply-bait bots",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "answers": {
+                "moderation": {
+                    "type": "choice",
+                    "choice": "permitted",
+                    "probabilities": { "permitted": 0.94 }
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(wiremock::matchers::body_string_contains(
+            "(4) Indirect reply-bait & automated solicitation bots",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "STRICT ZERO-FP GUARDRAIL",
+        ))
+        .and(wiremock::matchers::body_string_contains(
+            "Author Activity Signals [sub-human reply latency: 816ms",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": {
+                "role": "assistant",
+                "content": r#"{"violates": true, "category": "spam", "confidence": 0.97, "reason": "Automated reply-bait bot sniping in 816ms to funnel users to Chuffed fundraiser."}"#
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut ctx = EnrichedContext::empty();
+    ctx.author = Some(AuthorContext {
+        handle: Some("liamstatham.bsky.social".to_string()),
+        display_name: Some("Mahmuod".to_string()),
+        description: None,
+        followers_count: Some(7),
+        follows_count: Some(6),
+        created_at: None,
+    });
+    ctx.author_signals = Some(AuthorActivitySignals {
+        reply_latency_ms: Some(816),
+        forged_tid: false,
+        profile_fundraiser_urls: vec!["https://www.chuffed.org/project/191040".to_string()],
+        profile_fundraiser_item_count: 2,
+        recent_distinct_reply_targets: 6,
+        recent_reply_burst_count: 6,
+        repeated_reply_template_count: 0,
+        recent_other_reply_snippets: vec![
+            "Whatever you can give would be deeply appreciated.".to_string()
+        ],
+    });
+
+    let mut inter = sample_interaction("We're counting on the kindness of people like you. 🙏");
+    inter.enriched_context = Some(ctx);
+
+    let systemone = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/v1/systemone", server.uri()),
+            api_key: None,
+            model: "nimble".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    assert!(systemone.classify(&inter).await.unwrap().is_permitted());
+
+    let ollama = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/api/chat", server.uri()),
+            api_key: None,
+            model: "gemma4:26b".to_string(),
+            timeout: Duration::from_millis(1000),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap();
+    let verdict = ollama.classify(&inter).await.unwrap();
+    assert!(matches!(
+        verdict,
+        Verdict::Violation {
+            category: ViolationCategory::Spam,
+            ..
+        }
+    ));
+}

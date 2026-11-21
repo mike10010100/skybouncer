@@ -44,6 +44,331 @@ const MAX_TARGET_PROFILE_CACHE_ENTRIES: usize = 1024;
 /// crosses a `blockedPost` boundary (e.g. a previously bounced troll higher up in the thread).
 const MAX_BLOCKED_THREAD_HOPS: usize = 3;
 
+/// Reply-latency threshold in milliseconds below which a non-followed stranger reply
+/// is treated as a sub-human automated firehose snipe.
+pub const FAST_REPLY_LATENCY_MS: u64 = 2_500;
+
+/// Maximum clock drift in seconds allowed between an ATProto TID `rkey` timestamp and
+/// a commit timestamp before flagging the post as having a forged/backdated TID.
+pub const FORGED_TID_DRIFT_SECS: u64 = 3_600;
+
+/// Number of top non-reply items fetched from `app.bsky.feed.getAuthorFeed` (`posts_no_replies`)
+/// to inspect pinned/reposted fundraiser funnels.
+pub const AUTHOR_FEED_TOP_LIMIT: u8 = 5;
+
+/// Number of recent items fetched from `app.bsky.feed.getAuthorFeed` (`posts_with_replies`)
+/// to detect cross-thread stranger reply blasts and repeated plea templates.
+pub const AUTHOR_FEED_RECENT_LIMIT: u8 = 10;
+
+/// Rolling time window in seconds for counting cross-thread reply-blast bursts.
+pub const REPLY_BLAST_WINDOW_SECS: u64 = 600;
+
+/// Minimum distinct stranger targets replied to within [`REPLY_BLAST_WINDOW_SECS`] to
+/// flag an automated cross-thread reply blast.
+pub const REPLY_BLAST_MIN_DISTINCT_TARGETS: usize = 4;
+
+/// Maximum normalized fundraiser/payment URLs retained in [`AuthorActivitySignals`].
+pub const MAX_PROFILE_FUNDRAISER_URLS: usize = 3;
+
+/// Maximum recent non-self reply snippets to other users retained in [`AuthorActivitySignals`].
+pub const MAX_OTHER_REPLY_SNIPPETS: usize = 3;
+
+const TID_TIMESTAMP_MIN_US: u64 = 1_577_836_800_000_000;
+const TID_TIMESTAMP_MAX_US: u64 = 2_208_988_800_000_000;
+
+/// Extracts the final record key (`rkey`) segment from a canonical `at://did/.../collection/rkey` URI.
+#[must_use]
+pub fn extract_rkey_from_at_uri(uri: &str) -> Option<&str> {
+    let rest = uri.strip_prefix("at://")?;
+    let mut parts = rest.split('/');
+    let did = parts.next()?;
+    let collection = parts.next()?;
+    let rkey = parts.next()?;
+    if parts.next().is_some()
+        || !did.starts_with("did:")
+        || collection.is_empty()
+        || rkey.is_empty()
+    {
+        return None;
+    }
+    Some(rkey)
+}
+
+/// Decodes a 13-character ATProto base32-sortable TID `rkey` into a Unix microsecond timestamp.
+///
+/// Rejects malformed lengths, non-TID characters, top bit set (`1 << 63`), and implausible
+/// timestamps outside 2020-01-01 through 2040-01-01.
+#[must_use]
+pub fn decode_tid_timestamp_us(rkey: &str) -> Option<u64> {
+    if rkey.len() != 13 {
+        return None;
+    }
+    let mut val: u64 = 0;
+    for b in rkey.bytes() {
+        let digit = match b {
+            b'2'..=b'7' => u64::from(b - b'2'),
+            b'a'..=b'z' => u64::from(b - b'a') + 6,
+            _ => return None,
+        };
+        val = (val << 5) | digit;
+    }
+    if (val & (1_u64 << 63)) != 0 {
+        return None;
+    }
+    let ts_us = val >> 10;
+    if !(TID_TIMESTAMP_MIN_US..=TID_TIMESTAMP_MAX_US).contains(&ts_us) {
+        return None;
+    }
+    Some(ts_us)
+}
+
+/// Computes local timing signals (`(reply_latency_ms, forged_tid)`) from a candidate interaction
+/// without any network calls.
+///
+/// Returns `(None, false)` for synthetic/zero-timestamp fixtures prior to 2020.
+#[must_use]
+pub fn compute_reply_timing_signals(interaction: &Interaction) -> (Option<u64>, bool) {
+    if interaction.created_at_us < TID_TIMESTAMP_MIN_US {
+        return (None, false);
+    }
+    let forged_tid = extract_rkey_from_at_uri(&interaction.post_uri)
+        .and_then(decode_tid_timestamp_us)
+        .is_some_and(|post_us| {
+            interaction.created_at_us.abs_diff(post_us) > FORGED_TID_DRIFT_SECS * 1_000_000
+        });
+    let reply_latency_ms = interaction
+        .parent_uri
+        .as_deref()
+        .and_then(extract_rkey_from_at_uri)
+        .and_then(decode_tid_timestamp_us)
+        .and_then(|parent_us| {
+            if parent_us <= interaction.created_at_us.saturating_add(2_000_000) {
+                Some(interaction.created_at_us.saturating_sub(parent_us) / 1_000)
+            } else {
+                None
+            }
+        });
+    (reply_latency_ms, forged_tid)
+}
+
+/// Parses an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS[.fff](Z|+00:00|-00:00)`) into
+/// Unix epoch seconds.
+///
+/// Rejects non-UTC timezone offsets, years before `1970` or after `9999`, and invalid
+/// calendar dates or leap days (e.g. `2025-02-29`). Uses pure integer arithmetic based on
+/// Howard Hinnant's `days_from_civil` algorithm with zero external dependencies.
+#[must_use]
+pub fn parse_iso8601_utc_secs(s: &str) -> Option<u64> {
+    let trimmed = s.trim();
+    let (date_part, time_and_tz) = trimmed.split_once(['T', 't'])?;
+    if date_part.len() != 10 {
+        return None;
+    }
+    let date_bytes = date_part.as_bytes();
+    if date_bytes.get(4).copied() != Some(b'-') || date_bytes.get(7).copied() != Some(b'-') {
+        return None;
+    }
+    let year: i64 = date_part.get(0..4)?.parse().ok()?;
+    let month: u32 = date_part.get(5..7)?.parse().ok()?;
+    let day: u32 = date_part.get(8..10)?.parse().ok()?;
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return None,
+    };
+    if day == 0 || day > max_day {
+        return None;
+    }
+
+    let time_core = time_and_tz
+        .strip_suffix(['Z', 'z'])
+        .or_else(|| time_and_tz.strip_suffix("+00:00"))
+        .or_else(|| time_and_tz.strip_suffix("-00:00"))?;
+
+    let hms = match time_core.split_once('.') {
+        Some((hms_part, frac)) => {
+            if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            hms_part
+        }
+        None => time_core,
+    };
+    if hms.len() != 8 {
+        return None;
+    }
+    let hms_bytes = hms.as_bytes();
+    if hms_bytes.get(2).copied() != Some(b':') || hms_bytes.get(5).copied() != Some(b':') {
+        return None;
+    }
+    let hour: u64 = hms.get(0..2)?.parse().ok()?;
+    let minute: u64 = hms.get(3..5)?.parse().ok()?;
+    let second: u64 = hms.get(6..8)?.parse().ok()?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day)?;
+    let day_secs = days.checked_mul(86_400)?;
+    day_secs.checked_add(hour * 3_600 + minute * 60 + second)
+}
+
+const fn days_from_civil(year: i64, month: u32, day: u32) -> Option<u64> {
+    let m = month as i64;
+    let d = day as i64;
+    let y = if m <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = m + if m > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    if days < 0 {
+        None
+    } else {
+        Some(days as u64)
+    }
+}
+
+/// Temporal, feed-funnel, and cross-thread behavioral signals derived for a candidate author.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct AuthorActivitySignals {
+    /// Elapsed milliseconds between parent post TID creation and the candidate reply commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_latency_ms: Option<u64>,
+    /// Whether the candidate post's TID `rkey` diverges more than [`FORGED_TID_DRIFT_SECS`] from commit time.
+    #[serde(default)]
+    pub forged_tid: bool,
+    /// Normalized donation, crowdfunding, or payment URLs found in the author's bio, top posts, or 1-hop repost quotes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_fundraiser_urls: Vec<String>,
+    /// Number of top author-feed items (pinned posts / reposts) carrying fundraiser URLs.
+    #[serde(default)]
+    pub profile_fundraiser_item_count: usize,
+    /// Number of distinct external account DIDs replied to within [`REPLY_BLAST_WINDOW_SECS`].
+    #[serde(default)]
+    pub recent_distinct_reply_targets: usize,
+    /// Total non-self replies posted within [`REPLY_BLAST_WINDOW_SECS`].
+    #[serde(default)]
+    pub recent_reply_burst_count: usize,
+    /// Highest repetition count among identical normalized reply bodies across recent replies.
+    #[serde(default)]
+    pub repeated_reply_template_count: usize,
+    /// Up to [`MAX_OTHER_REPLY_SNIPPETS`] distinct recent reply snippets sent to other users.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_other_reply_snippets: Vec<String>,
+}
+
+impl AuthorActivitySignals {
+    /// Returns `true` when the reply was posted within [`FAST_REPLY_LATENCY_MS`] of its parent post.
+    #[must_use]
+    pub fn is_fast_snipe(&self) -> bool {
+        self.reply_latency_ms
+            .is_some_and(|ms| ms <= FAST_REPLY_LATENCY_MS)
+    }
+
+    /// Returns `true` when the author replied to at least [`REPLY_BLAST_MIN_DISTINCT_TARGETS`]
+    /// distinct external accounts within [`REPLY_BLAST_WINDOW_SECS`].
+    #[must_use]
+    pub fn is_reply_blast(&self) -> bool {
+        self.recent_distinct_reply_targets >= REPLY_BLAST_MIN_DISTINCT_TARGETS
+    }
+
+    /// Returns `true` when temporal, repetition, or combined funnel+burst signals indicate
+    /// an automated reply-bait bot warranting System-2 contextual verification.
+    ///
+    /// Note: merely having fundraiser URLs on a profile/repost without sniping, forged TIDs,
+    /// repeated templates, or multi-target reply bursts does **not** return `true`.
+    #[must_use]
+    pub fn has_suspicious_bot_signals(&self) -> bool {
+        self.is_fast_snipe()
+            || self.forged_tid
+            || self.is_reply_blast()
+            || self.repeated_reply_template_count >= 2
+            || (!self.profile_fundraiser_urls.is_empty() && self.recent_distinct_reply_targets >= 2)
+    }
+
+    /// Returns `true` when no actionable timing, funnel, burst, or snippet signals are present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.is_fast_snipe()
+            && !self.forged_tid
+            && self.profile_fundraiser_urls.is_empty()
+            && !self.is_reply_blast()
+            && self.repeated_reply_template_count < 2
+            && self.recent_other_reply_snippets.is_empty()
+    }
+
+    /// Formats triggered behavioral signals as a single-line summary for classifier prompts.
+    #[must_use]
+    pub fn format_summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.is_fast_snipe() {
+            if let Some(ms) = self.reply_latency_ms {
+                parts.push(format!("sub-human reply latency: {ms}ms"));
+            }
+        }
+        if self.forged_tid {
+            parts.push("forged/backdated post TID rkey".to_string());
+        }
+        if !self.profile_fundraiser_urls.is_empty() {
+            parts.push(format!(
+                "profile/repost fundraiser funnel ({} item(s)): {}",
+                self.profile_fundraiser_item_count.max(1),
+                self.profile_fundraiser_urls.join(", ")
+            ));
+        }
+        if self.is_reply_blast() {
+            parts.push(format!(
+                "rapid cross-thread reply blast: {} replies to {} distinct strangers within {}m",
+                self.recent_reply_burst_count
+                    .max(self.recent_distinct_reply_targets),
+                self.recent_distinct_reply_targets,
+                REPLY_BLAST_WINDOW_SECS / 60
+            ));
+        } else if !self.profile_fundraiser_urls.is_empty()
+            && self.recent_distinct_reply_targets >= 2
+        {
+            parts.push(format!(
+                "recent stranger replies: {} replies to {} distinct accounts within {}m",
+                self.recent_reply_burst_count
+                    .max(self.recent_distinct_reply_targets),
+                self.recent_distinct_reply_targets,
+                REPLY_BLAST_WINDOW_SECS / 60
+            ));
+        }
+        if self.repeated_reply_template_count >= 2 {
+            parts.push(format!(
+                "repeated identical reply template x{}",
+                self.repeated_reply_template_count
+            ));
+        }
+        if !self.recent_other_reply_snippets.is_empty()
+            && (self.has_suspicious_bot_signals() || !self.profile_fundraiser_urls.is_empty())
+        {
+            let quoted: Vec<String> = self
+                .recent_other_reply_snippets
+                .iter()
+                .take(MAX_OTHER_REPLY_SNIPPETS)
+                .map(|s| format!("\"{}\"", s.replace('"', "'")))
+                .collect();
+            parts.push(format!("recent replies to others: {}", quoted.join("; ")));
+        }
+        (!parts.is_empty()).then(|| format!("Author Activity Signals [{}]", parts.join("; ")))
+    }
+}
+
 /// A single ancestor post resolved from the conversation thread above the candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct ThreadPost {
@@ -265,6 +590,9 @@ pub struct EnrichedContext {
     /// Base64-encoded parent/quoted context thumbnails hydrated only on System-2 escalation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_images_base64: Vec<String>,
+    /// Temporal, feed-funnel, and cross-thread behavioral signals derived for the candidate author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_signals: Option<AuthorActivitySignals>,
 }
 
 impl EnrichedContext {
@@ -274,7 +602,7 @@ impl EnrichedContext {
         Self::default()
     }
 
-    /// Returns `true` if no author, target, parent post, quoted post, thread ancestor, or image context was resolved.
+    /// Returns `true` if no author, target, parent post, quoted post, thread ancestor, image, or author activity context was resolved.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.author.is_none()
@@ -288,6 +616,10 @@ impl EnrichedContext {
             && self.image_alts.iter().all(|a| a.trim().is_empty())
             && self.context_image_refs.is_empty()
             && self.context_images_base64.is_empty()
+            && self
+                .author_signals
+                .as_ref()
+                .is_none_or(AuthorActivitySignals::is_empty)
     }
 
     /// Formats the enriched context into a concise string block for classifier prompt injection.
@@ -518,6 +850,16 @@ impl EnrichedContext {
             ));
         }
 
+        if roles.is_some() {
+            if let Some(summary) = self
+                .author_signals
+                .as_ref()
+                .and_then(AuthorActivitySignals::format_summary)
+            {
+                sections.push(summary);
+            }
+        }
+
         sections.join("\n")
     }
 }
@@ -613,6 +955,7 @@ pub struct MockContextEnricher {
     context_image_refs: Arc<RwLock<HashMap<String, Vec<ContextImageRef>>>>,
     relationships: Arc<RwLock<RelationshipMap>>,
     post_engagements: Arc<RwLock<HashMap<String, crate::dogpile::PostEngagementSnapshot>>>,
+    author_signals: Arc<RwLock<HashMap<String, AuthorActivitySignals>>>,
 }
 
 impl MockContextEnricher {
@@ -686,6 +1029,11 @@ impl MockContextEnricher {
             .write()
             .insert(snapshot.uri.clone(), snapshot);
     }
+
+    /// Injects mock [`AuthorActivitySignals`] for a candidate author DID.
+    pub fn set_author_signals(&self, did: impl Into<String>, signals: AuthorActivitySignals) {
+        self.author_signals.write().insert(did.into(), signals);
+    }
 }
 
 #[async_trait]
@@ -723,6 +1071,26 @@ impl ContextEnricher for MockContextEnricher {
             .map(|refs| refs.into_iter().take(MAX_CONTEXT_IMAGES).collect())
             .unwrap_or_default();
 
+        let author_signals = self
+            .author_signals
+            .read()
+            .get(&interaction.author_did)
+            .cloned()
+            .or_else(|| {
+                let (reply_latency_ms, forged_tid) = compute_reply_timing_signals(interaction);
+                let mut sig = AuthorActivitySignals {
+                    reply_latency_ms,
+                    forged_tid,
+                    ..Default::default()
+                };
+                if let Some(ref auth) = author {
+                    if let Some(ref desc) = auth.description {
+                        sig.profile_fundraiser_urls = extract_fundraiser_urls_from_text(desc);
+                    }
+                }
+                (!sig.is_empty()).then_some(sig)
+            });
+
         EnrichedContext {
             author,
             target,
@@ -735,6 +1103,7 @@ impl ContextEnricher for MockContextEnricher {
             image_alts,
             context_image_refs,
             context_images_base64: Vec::new(),
+            author_signals,
         }
     }
 
@@ -805,6 +1174,133 @@ struct ExtractedMedia {
     image_refs: Vec<ContextImageRef>,
 }
 
+const FUNDRAISER_HOSTS: &[&str] = &[
+    "chuffed.org",
+    "gofundme.com",
+    "gofund.me",
+    "paypal.me",
+    "ko-fi.com",
+    "buymeacoffee.com",
+    "spotfund.com",
+    "givebutter.com",
+    "donorbox.org",
+    "launchgood.com",
+    "fundrazr.com",
+    "gogetfunding.com",
+    "airfunding.net",
+    "whydonate.com",
+    "justgiving.com",
+    "cash.app",
+    "venmo.com",
+    "aidme.site",
+    "bsku.social",
+    "lnan.site",
+    "bske.social",
+];
+
+fn normalize_fundraiser_url(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_start_matches(['"', '\'', '(', '[', '<'])
+        .trim_end_matches(['"', '\'', ')', ']', '>', ',', '.', ';', '!', '?']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_scheme = if trimmed
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || trimmed
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let parsed = url::Url::parse(&with_scheme).ok()?;
+    let raw_host = parsed.host_str()?.to_ascii_lowercase();
+    let match_host = raw_host.strip_prefix("www.").unwrap_or(&raw_host);
+    let path = parsed.path();
+    let is_fundraiser_host = FUNDRAISER_HOSTS
+        .iter()
+        .any(|dom| match_host == *dom || match_host.ends_with(&format!(".{dom}")))
+        || (match_host == "paypal.com"
+            && (path.starts_with("/ncp/")
+                || path.starts_with("/donate")
+                || path.starts_with("/pools")
+                || path.starts_with("/paypalme")));
+    if !is_fundraiser_host {
+        return None;
+    }
+    let clean_path = path.trim_end_matches('/');
+    Some(if clean_path.is_empty() {
+        format!("https://{raw_host}")
+    } else {
+        format!("https://{raw_host}{clean_path}")
+    })
+}
+
+fn push_unique_fundraiser_url(out: &mut Vec<String>, candidate: &str) {
+    if out.len() >= MAX_PROFILE_FUNDRAISER_URLS {
+        return;
+    }
+    if let Some(norm) = normalize_fundraiser_url(candidate) {
+        if !out.contains(&norm) {
+            out.push(norm);
+        }
+    }
+}
+
+/// Extracts normalized donation, crowdfunding, or payment URLs from arbitrary post or bio text.
+#[must_use]
+pub fn extract_fundraiser_urls_from_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in text.split(|c: char| {
+        c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '<' | '>' | '"' | '\'')
+    }) {
+        if out.len() >= MAX_PROFILE_FUNDRAISER_URLS {
+            break;
+        }
+        if token.contains('.') {
+            push_unique_fundraiser_url(&mut out, token);
+        }
+    }
+    out
+}
+
+fn extract_urls_from_record_obj(rec: &serde_json::Value, out: &mut Vec<String>) {
+    if let Some(txt) = rec.get("text").and_then(|v| v.as_str()) {
+        for u in extract_fundraiser_urls_from_text(txt) {
+            push_unique_fundraiser_url(out, &u);
+        }
+    }
+    if let Some(facets) = rec.get("facets").and_then(|v| v.as_array()) {
+        for facet in facets {
+            if let Some(features) = facet.get("features").and_then(|v| v.as_array()) {
+                for feat in features {
+                    if let Some(uri) = feat.get("uri").and_then(|v| v.as_str()) {
+                        push_unique_fundraiser_url(out, uri);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn extract_urls_from_embed_obj(emb: &serde_json::Value, out: &mut Vec<String>) {
+    for candidate in [
+        emb.get("external").and_then(|e| e.get("uri")),
+        emb.get("media")
+            .and_then(|m| m.get("external"))
+            .and_then(|e| e.get("uri")),
+        emb.get("uri"),
+    ] {
+        if let Some(uri) = candidate.and_then(|v| v.as_str()) {
+            push_unique_fundraiser_url(out, uri);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ThreadFetchResult {
     ancestors: Vec<ThreadPost>,
@@ -822,6 +1318,7 @@ struct ThreadFetchResult {
 pub struct AppViewContextEnricher {
     client: skybase::appview::AppViewClient,
     thread_context: bool,
+    author_feed_context: bool,
     target_cache: Arc<RwLock<HashMap<String, AuthorContext>>>,
 }
 
@@ -840,8 +1337,9 @@ impl AppViewContextEnricher {
 
     /// Creates an enricher using the AppView endpoint from `APPVIEW_ENDPOINT` /
     /// `SKYBOUNCER_APPVIEW_ENDPOINT` (falling back to [`DEFAULT_APPVIEW_ENDPOINT`]) and
-    /// enabling full conversation-thread ancestor resolution by default (controlled via
-    /// `THREAD_CONTEXT` / `SKYBOUNCER_THREAD_CONTEXT`).
+    /// enabling full conversation-thread ancestor and author-feed signal resolution by default
+    /// (controlled via `THREAD_CONTEXT` / `SKYBOUNCER_THREAD_CONTEXT` and
+    /// `AUTHOR_FEED_CONTEXT` / `SKYBOUNCER_AUTHOR_FEED_CONTEXT`).
     #[must_use]
     pub fn from_env() -> Self {
         let endpoint = crate::env::var_or(
@@ -850,7 +1348,13 @@ impl AppViewContextEnricher {
         );
         let thread_context =
             crate::env::bool_or(&["THREAD_CONTEXT", "SKYBOUNCER_THREAD_CONTEXT"], true);
-        Self::with_endpoint(endpoint).with_thread_context(thread_context)
+        let author_feed_context = crate::env::bool_or(
+            &["AUTHOR_FEED_CONTEXT", "SKYBOUNCER_AUTHOR_FEED_CONTEXT"],
+            true,
+        );
+        Self::with_endpoint(endpoint)
+            .with_thread_context(thread_context)
+            .with_author_feed_context(author_feed_context)
     }
 
     /// Creates a new [`AppViewContextEnricher`] with custom AppView and CDN endpoints.
@@ -862,6 +1366,7 @@ impl AppViewContextEnricher {
         Self {
             client: skybase::appview::AppViewClient::with_endpoints(appview_endpoint, cdn_endpoint),
             thread_context: false,
+            author_feed_context: false,
             target_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -882,6 +1387,20 @@ impl AppViewContextEnricher {
     #[must_use]
     pub fn thread_context_enabled(&self) -> bool {
         self.thread_context
+    }
+
+    /// Enables or disables bounded `app.bsky.feed.getAuthorFeed` behavioral signal extraction
+    /// (fundraiser funnels, stranger reply blasts, repeated templates) during [`ContextEnricher::enrich`].
+    #[must_use]
+    pub fn with_author_feed_context(mut self, enabled: bool) -> Self {
+        self.author_feed_context = enabled;
+        self
+    }
+
+    /// Returns whether `getAuthorFeed` behavioral signal enrichment is enabled.
+    #[must_use]
+    pub fn author_feed_context_enabled(&self) -> bool {
+        self.author_feed_context
     }
 
     /// Returns the configured AppView base URL.
@@ -1684,6 +2203,208 @@ impl AppViewContextEnricher {
             .await
             .and_then(|a| a.followers_count)
     }
+
+    fn extract_fundraiser_urls_from_feed_item(item: &serde_json::Value) -> Vec<String> {
+        let mut urls = Vec::new();
+        let Some(post) = item.get("post") else {
+            return urls;
+        };
+        if let Some(rec) = post.get("record") {
+            extract_urls_from_record_obj(rec, &mut urls);
+            if let Some(emb) = rec.get("embed") {
+                extract_urls_from_embed_obj(emb, &mut urls);
+            }
+        }
+        if let Some(emb) = post.get("embed") {
+            extract_urls_from_embed_obj(emb, &mut urls);
+            if let Some(view_rec) = Self::extract_view_record(emb) {
+                if let Some(qval) = view_rec.get("value") {
+                    extract_urls_from_record_obj(qval, &mut urls);
+                    if let Some(qemb) = qval.get("embed") {
+                        extract_urls_from_embed_obj(qemb, &mut urls);
+                    }
+                }
+                if let Some(qembeds) = view_rec.get("embeds").and_then(|v| v.as_array()) {
+                    for qemb in qembeds {
+                        extract_urls_from_embed_obj(qemb, &mut urls);
+                    }
+                }
+            }
+        }
+        urls
+    }
+
+    async fn fetch_author_feed(
+        &self,
+        actor: &str,
+        filter: &str,
+        limit: u8,
+    ) -> Vec<serde_json::Value> {
+        #[derive(Deserialize)]
+        struct RawFeedResp {
+            #[serde(default)]
+            feed: Vec<serde_json::Value>,
+        }
+        self.client
+            .get::<RawFeedResp>(
+                "app.bsky.feed.getAuthorFeed",
+                &[
+                    ("actor", actor.to_string()),
+                    ("filter", filter.to_string()),
+                    ("limit", limit.to_string()),
+                ],
+            )
+            .await
+            .map_or_else(|_| Vec::new(), |r| r.feed)
+    }
+
+    async fn fetch_author_feed_signals(&self, interaction: &Interaction) -> AuthorActivitySignals {
+        let mut signals = AuthorActivitySignals::default();
+        if !self.author_feed_context || !interaction.author_did.starts_with("did:") {
+            return signals;
+        }
+        let (top_feed, recent_feed) = tokio::join!(
+            self.fetch_author_feed(
+                &interaction.author_did,
+                "posts_no_replies",
+                AUTHOR_FEED_TOP_LIMIT
+            ),
+            self.fetch_author_feed(
+                &interaction.author_did,
+                "posts_with_replies",
+                AUTHOR_FEED_RECENT_LIMIT
+            ),
+        );
+
+        for item in &top_feed {
+            let item_urls = Self::extract_fundraiser_urls_from_feed_item(item);
+            if !item_urls.is_empty() {
+                signals.profile_fundraiser_item_count += 1;
+                for u in item_urls {
+                    push_unique_fundraiser_url(&mut signals.profile_fundraiser_urls, &u);
+                }
+            }
+        }
+
+        struct ParsedReplyItem {
+            target_did: String,
+            ts_secs: Option<u64>,
+            text: String,
+            post_uri: String,
+        }
+
+        let mut parsed_replies = Vec::new();
+        let mut template_counts: HashMap<String, usize> = HashMap::new();
+        let mut max_ts_secs = if interaction.created_at_us >= TID_TIMESTAMP_MIN_US {
+            interaction.created_at_us / 1_000_000
+        } else {
+            0
+        };
+
+        for item in &recent_feed {
+            if item.get("reason").is_some_and(|v| !v.is_null()) {
+                continue;
+            }
+            let Some(post) = item.get("post") else {
+                continue;
+            };
+            if let Some(adid) = post
+                .get("author")
+                .and_then(|a| a.get("did"))
+                .and_then(|v| v.as_str())
+            {
+                if adid != interaction.author_did {
+                    continue;
+                }
+            }
+            let Some(rec) = post.get("record") else {
+                continue;
+            };
+            let Some(reply) = rec.get("reply").filter(|v| v.is_object()) else {
+                continue;
+            };
+            let Some(parent_uri) = reply
+                .get("parent")
+                .and_then(|p| p.get("uri"))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            let Some(target_did) = crate::matcher::extract_did_from_at_uri(parent_uri) else {
+                continue;
+            };
+            let text = rec
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !text.is_empty() {
+                let norm = text
+                    .replace(['’', '‘'], "'")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase();
+                *template_counts.entry(norm).or_insert(0) += 1;
+            }
+            let ts_secs = post
+                .get("indexedAt")
+                .and_then(|v| v.as_str())
+                .and_then(parse_iso8601_utc_secs)
+                .or_else(|| {
+                    rec.get("createdAt")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_iso8601_utc_secs)
+                });
+            if let Some(ts) = ts_secs {
+                max_ts_secs = max_ts_secs.max(ts);
+            }
+            let post_uri = post
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            parsed_replies.push(ParsedReplyItem {
+                target_did: target_did.to_string(),
+                ts_secs,
+                text,
+                post_uri,
+            });
+        }
+
+        signals.repeated_reply_template_count = template_counts
+            .into_values()
+            .filter(|&c| c >= 2)
+            .max()
+            .unwrap_or(0);
+
+        let mut distinct_targets = std::collections::HashSet::new();
+        for r in &parsed_replies {
+            if r.target_did == interaction.author_did {
+                continue;
+            }
+            let in_window = r
+                .ts_secs
+                .is_some_and(|ts| max_ts_secs.saturating_sub(ts) <= REPLY_BLAST_WINDOW_SECS);
+            if in_window {
+                signals.recent_reply_burst_count += 1;
+                distinct_targets.insert(r.target_did.as_str());
+            }
+            if r.post_uri != interaction.post_uri
+                && r.target_did != interaction.target_did
+                && !r.text.is_empty()
+                && signals.recent_other_reply_snippets.len() < MAX_OTHER_REPLY_SNIPPETS
+            {
+                let snippet: String = r.text.chars().take(100).collect();
+                if !signals.recent_other_reply_snippets.contains(&snippet) {
+                    signals.recent_other_reply_snippets.push(snippet);
+                }
+            }
+        }
+        signals.recent_distinct_reply_targets = distinct_targets.len();
+        signals
+    }
 }
 
 impl Default for AppViewContextEnricher {
@@ -1751,8 +2472,40 @@ impl ContextEnricher for AppViewContextEnricher {
             }
         };
 
-        let (author, target, parent_post, quoted_post, images_base64, thread_res) =
-            tokio::join!(author_fut, target_fut, parent_fut, quoted_fut, images_fut, thread_fut);
+        let author_signals_fut = self.fetch_author_feed_signals(interaction);
+
+        let (
+            author,
+            target,
+            parent_post,
+            quoted_post,
+            images_base64,
+            thread_res,
+            mut author_signals,
+        ) = tokio::join!(
+            author_fut,
+            target_fut,
+            parent_fut,
+            quoted_fut,
+            images_fut,
+            thread_fut,
+            author_signals_fut
+        );
+
+        let (reply_latency_ms, forged_tid) = compute_reply_timing_signals(interaction);
+        author_signals.reply_latency_ms = reply_latency_ms;
+        author_signals.forged_tid = forged_tid;
+        if let Some(desc) = author.as_ref().and_then(|a| a.description.as_deref()) {
+            for u in extract_fundraiser_urls_from_text(desc) {
+                push_unique_fundraiser_url(&mut author_signals.profile_fundraiser_urls, &u);
+            }
+        }
+        if !author_signals.has_suspicious_bot_signals()
+            && author_signals.profile_fundraiser_urls.is_empty()
+        {
+            author_signals.recent_other_reply_snippets.clear();
+        }
+        let author_signals = (!author_signals.is_empty()).then_some(author_signals);
 
         EnrichedContext {
             author,
@@ -1766,6 +2519,7 @@ impl ContextEnricher for AppViewContextEnricher {
             image_alts: collect_non_empty_alts(&interaction.image_alts),
             context_image_refs: thread_res.context_image_refs,
             context_images_base64: Vec::new(),
+            author_signals,
         }
     }
 

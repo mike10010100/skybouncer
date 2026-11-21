@@ -434,9 +434,18 @@ impl SkybouncerConfig {
             true,
         );
 
+        let escalate_suspicious_bot_signals = crate::env::bool_or(
+            &[
+                "ESCALATE_SUSPICIOUS_BOT_SIGNALS",
+                "SKYBOUNCER_ESCALATE_SUSPICIOUS_BOT_SIGNALS",
+            ],
+            true,
+        );
+
         let certainty_config =
             CertaintyConfig::new(uncertainty_min, uncertainty_max, escalate_on_images)
-                .with_escalate_nuanced_violations(escalate_nuanced_violations);
+                .with_escalate_nuanced_violations(escalate_nuanced_violations)
+                .with_escalate_suspicious_bot_signals(escalate_suspicious_bot_signals);
 
         // Optional dynamic Tier-1 multimodal primary: route image-bearing interactions
         // to a multimodal model before falling back to the heavyweight System-2 tier.

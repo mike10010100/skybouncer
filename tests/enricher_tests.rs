@@ -1534,3 +1534,430 @@ async fn test_enricher_new_fields_is_empty_mock_and_interaction_formatting() {
     assert_eq!(mocked.image_alts, vec!["Chart screenshot".to_string()]);
     assert!(mocked.context_images_base64.is_empty());
 }
+
+#[test]
+fn test_tid_decoding_and_reply_timing_signals() {
+    use skybouncer::enricher::{
+        compute_reply_timing_signals, decode_tid_timestamp_us, extract_rkey_from_at_uri,
+        AuthorActivitySignals,
+    };
+
+    assert_eq!(
+        extract_rkey_from_at_uri("at://did:plc:abc/app.bsky.feed.post/3n2tfn2blds22"),
+        Some("3n2tfn2blds22")
+    );
+    assert_eq!(
+        extract_rkey_from_at_uri("at://alice.bsky.social/app.bsky.feed.post/123"),
+        None
+    );
+    assert_eq!(
+        extract_rkey_from_at_uri("at://did:plc:abc/app.bsky.feed.post/"),
+        None
+    );
+    assert_eq!(extract_rkey_from_at_uri("https://bsky.app/foo"), None);
+
+    assert!(decode_tid_timestamp_us("short").is_none());
+    assert!(decode_tid_timestamp_us("3n2tfn2blds2!").is_none());
+    assert!(decode_tid_timestamp_us("zzzzzzzzzzzzz").is_none()); // high bit set
+    assert!(decode_tid_timestamp_us("2222222222222").is_none()); // year 1970 < min
+
+    // Parent TID `3n2tfn2blds22` + reply 816ms later (normal recent TID rkey) vs slow 120s reply vs Wing C forged TID
+    let parent_uri = "at://did:plc:target/app.bsky.feed.post/3n2tfn2blds22";
+    let parent_us = decode_tid_timestamp_us("3n2tfn2blds22").expect("valid real TID");
+    assert_eq!(
+        compute_reply_timing_signals(&Interaction::synthetic(
+            "did:plc:a",
+            "did:plc:t",
+            "hi",
+            InteractionType::DirectReply
+        )),
+        (None, false)
+    );
+
+    let mut snipe = Interaction::new(
+        "did:plc:liam",
+        "did:plc:target",
+        InteractionType::DirectReply,
+        "at://did:plc:liam/app.bsky.feed.post/3n2tfn35xpx2b",
+        "cid_snipe",
+        "We're counting on the kindness of people like you.",
+    )
+    .with_parent_uri(parent_uri);
+    snipe.created_at_us = parent_us + 816_000;
+    let (lat_ms, forged) = compute_reply_timing_signals(&snipe);
+    assert_eq!(lat_ms, Some(816));
+    assert!(!forged);
+
+    let mut slow = snipe.clone();
+    slow.created_at_us = parent_us + 120_000_000;
+    slow.post_uri = "at://did:plc:liam/app.bsky.feed.post/3n2tfn2blds22".to_string();
+    let (slow_ms, slow_forged) = compute_reply_timing_signals(&slow);
+    assert_eq!(slow_ms, Some(120_000));
+    assert!(!slow_forged);
+
+    // Wing C forged historical TID `3lvc72scgy22m` emitted at parent_us + 816ms (> 1 hour drift)
+    let mut forged_inter = snipe.clone();
+    forged_inter.post_uri = "at://did:plc:amal/app.bsky.feed.post/3lvc72scgy22m".to_string();
+    let (f_lat, f_forged) = compute_reply_timing_signals(&forged_inter);
+    assert_eq!(f_lat, Some(816));
+    assert!(f_forged);
+
+    // Future forged parent TID > commit + 2s yields None instead of 0ms false snipe
+    let mut future_parent = snipe.clone();
+    future_parent.created_at_us = parent_us.saturating_sub(10_000_000);
+    assert_eq!(compute_reply_timing_signals(&future_parent).0, None);
+
+    // Normal slow signals with no other flags treat as empty and do not trigger suspicion
+    let normal_sig = AuthorActivitySignals {
+        reply_latency_ms: Some(120_000),
+        ..Default::default()
+    };
+    assert!(normal_sig.is_empty());
+    assert!(!normal_sig.has_suspicious_bot_signals());
+    assert!(normal_sig.format_summary().is_none());
+}
+
+#[tokio::test]
+async fn test_appview_enricher_author_feed_signals_wing_d_v2_paypal_bio_and_organic() {
+    use skybouncer::enricher::decode_tid_timestamp_us;
+
+    let server = MockServer::start().await;
+    let target_did = "did:plc:mmtjkssv6jeneahkgfdxuy7p";
+    let parent_uri = "at://did:plc:mmtjkssv6jeneahkgfdxuy7p/app.bsky.feed.post/3n2tfn2blds22";
+    let parent_us = decode_tid_timestamp_us("3n2tfn2blds22").unwrap();
+
+    // Common target profile + parent post stubs
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .and(query_param("actor", target_did))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": target_did,
+            "handle": "mike10010100.com",
+            "displayName": "Mike"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPosts"))
+        .and(query_param("uris", parent_uri))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "posts": [{
+                "uri": parent_uri,
+                "cid": "cid_p",
+                "author": { "did": target_did, "handle": "mike10010100.com" },
+                "record": { "$type": "app.bsky.feed.post", "text": "Palestinians didn't use this term pre-Duke." }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    // 1. Wing D v2 bot (`@liamstatham.bsky.social`): 2-hop parasitic reposts quoting Chuffed 191040 + 6-stranger rapid blast
+    let liam_did = "did:plc:37vosurzbz3nw7xfrsx46tad";
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .and(query_param("actor", liam_did))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": liam_did,
+            "handle": "liamstatham.bsky.social",
+            "displayName": "Mahmuod",
+            "description": "",
+            "followersCount": 7,
+            "followsCount": 6
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("actor", liam_did))
+        .and(query_param("filter", "posts_no_replies"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "feed": [
+                {
+                    "reason": { "$type": "app.bsky.feed.defs#reasonRepost" },
+                    "post": {
+                        "uri": "at://did:plc:ulj3o6vuxnvsp2bzexwb7p7o/app.bsky.feed.post/3n2jugxgj722k",
+                        "author": { "did": "did:plc:ulj3o6vuxnvsp2bzexwb7p7o", "handle": "katevasey.bsky.social" },
+                        "record": { "$type": "app.bsky.feed.post", "text": "Please help if you can, or repost if you can't." },
+                        "embed": {
+                            "$type": "app.bsky.embed.record#view",
+                            "record": {
+                                "$type": "app.bsky.embed.record#viewRecord",
+                                "author": { "did": "did:plc:jwsylb6dmzjkikmnjncrjc4f" },
+                                "value": {
+                                    "text": "every bit adds up. www.chuffed.org/project/191040?utm_source=bsky",
+                                    "facets": [{
+                                        "features": [{ "$type": "app.bsky.richtext.facet#link", "uri": "https://www.chuffed.org/project/191040?utm_source=bsky" }]
+                                    }]
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("actor", liam_did))
+        .and(query_param("filter", "posts_with_replies"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "feed": [
+                {
+                    "post": {
+                        "uri": "at://did:plc:37vosurzbz3nw7xfrsx46tad/app.bsky.feed.post/3n2tfl4p54f2k",
+                        "author": { "did": liam_did },
+                        "indexedAt": "2026-11-21T15:19:14.341Z",
+                        "record": {
+                            "text": "Whatever you can give would be deeply appreciated.",
+                            "reply": { "parent": { "uri": "at://did:plc:stranger1/app.bsky.feed.post/1" }, "root": { "uri": "at://did:plc:root1/app.bsky.feed.post/1" } }
+                        }
+                    }
+                },
+                {
+                    "post": {
+                        "uri": "at://did:plc:37vosurzbz3nw7xfrsx46tad/app.bsky.feed.post/3n2tfl2uwo52c",
+                        "author": { "did": liam_did },
+                        "indexedAt": "2026-11-21T15:19:12.341Z",
+                        "record": {
+                            "text": "Whatever you can give would be deeply appreciated.",
+                            "reply": { "parent": { "uri": "at://did:plc:stranger2/app.bsky.feed.post/2" }, "root": { "uri": "at://did:plc:root2/app.bsky.feed.post/2" } }
+                        }
+                    }
+                },
+                {
+                    "post": {
+                        "uri": "at://did:plc:37vosurzbz3nw7xfrsx46tad/app.bsky.feed.post/3n2tfgdukwf2c",
+                        "author": { "did": liam_did },
+                        "indexedAt": "2026-11-21T15:16:34.007Z",
+                        "record": {
+                            "text": "We hope you'll stand beside us during this difficult time.",
+                            "reply": { "parent": { "uri": "at://did:plc:stranger3/app.bsky.feed.post/3" }, "root": { "uri": "at://did:plc:root3/app.bsky.feed.post/3" } }
+                        }
+                    }
+                },
+                {
+                    "post": {
+                        "uri": "at://did:plc:37vosurzbz3nw7xfrsx46tad/app.bsky.feed.post/3n2tfg6xzqq2t",
+                        "author": { "did": liam_did },
+                        "indexedAt": "2026-11-21T15:16:28.880Z",
+                        "record": {
+                            "text": "Please, my children need your kindness and support.",
+                            "reply": { "parent": { "uri": "at://did:plc:stranger4/app.bsky.feed.post/4" }, "root": { "uri": "at://did:plc:root4/app.bsky.feed.post/4" } }
+                        }
+                    }
+                },
+                {
+                    "post": {
+                        "uri": "at://did:plc:37vosurzbz3nw7xfrsx46tad/app.bsky.feed.post/3n2tfdqrruv2d",
+                        "author": { "did": liam_did },
+                        "indexedAt": "2026-11-21T15:15:06.880Z",
+                        "record": {
+                            "text": "Your support could mean so much to us.",
+                            "reply": { "parent": { "uri": "at://did:plc:stranger5/app.bsky.feed.post/5" }, "root": { "uri": "at://did:plc:root5/app.bsky.feed.post/5" } }
+                        }
+                    }
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let enricher =
+        AppViewContextEnricher::with_endpoint(server.uri()).with_author_feed_context(true);
+    assert!(enricher.author_feed_context_enabled());
+    assert!(!AppViewContextEnricher::new().author_feed_context_enabled());
+    assert!(AppViewContextEnricher::from_env().author_feed_context_enabled());
+
+    let mut liam_inter = Interaction::new(
+        liam_did,
+        target_did,
+        InteractionType::DirectReply,
+        "at://did:plc:37vosurzbz3nw7xfrsx46tad/app.bsky.feed.post/3n2tfn35xpx2b",
+        "cid_liam",
+        "We're counting on the kindness of people like you. 🙏",
+    )
+    .with_parent_uri(parent_uri);
+    liam_inter.created_at_us = parent_us + 816_000;
+
+    let liam_ctx = enricher.enrich(&liam_inter).await;
+    let sig = liam_ctx.author_signals.as_ref().expect("liam signals");
+    assert_eq!(sig.reply_latency_ms, Some(816));
+    assert_eq!(
+        sig.profile_fundraiser_urls,
+        vec!["https://www.chuffed.org/project/191040".to_string()]
+    );
+    assert_eq!(sig.profile_fundraiser_item_count, 1);
+    assert_eq!(sig.recent_distinct_reply_targets, 5);
+    assert_eq!(sig.recent_reply_burst_count, 5);
+    assert_eq!(sig.repeated_reply_template_count, 2);
+    assert_eq!(sig.recent_other_reply_snippets.len(), 3);
+    assert!(sig.has_suspicious_bot_signals());
+
+    let inter_prompt = liam_ctx.format_for_interaction(liam_did, target_did);
+    assert!(inter_prompt.contains("Author Activity Signals ["));
+    assert!(inter_prompt.contains("816ms"));
+    assert!(inter_prompt.contains("https://www.chuffed.org/project/191040"));
+    assert!(inter_prompt.contains("5 distinct strangers"));
+    assert!(!liam_ctx
+        .format_for_classifier()
+        .contains("Author Activity Signals"));
+
+    // 2. Bio-only PayPal NCP extraction even when `getAuthorFeed` returns 500
+    let paypal_did = "did:plc:gm2qla4s65lve4ajbwozz376";
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .and(query_param("actor", paypal_did))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": paypal_did,
+            "handle": "oikoedwin.bsky.social",
+            "description": "Help via https://www.paypal.com/ncp/payment/5SE9EQFREC2Q2 please",
+            "followersCount": 14
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("actor", paypal_did))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let mut paypal_inter = liam_inter.clone();
+    paypal_inter.author_did = paypal_did.to_string();
+    paypal_inter.created_at_us = parent_us + 90_000_000;
+    let paypal_ctx = enricher.enrich(&paypal_inter).await;
+    let ps = paypal_ctx.author_signals.as_ref().expect("paypal signals");
+    assert_eq!(
+        ps.profile_fundraiser_urls,
+        vec!["https://www.paypal.com/ncp/payment/5SE9EQFREC2Q2".to_string()]
+    );
+
+    // 3. Organic booster control (1 fundraiser repost, slow 180s reply, 1 normal reply)
+    let org_did = "did:plc:organicbooster1";
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .and(query_param("actor", org_did))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": org_did,
+            "handle": "katevasey.bsky.social",
+            "description": "Regular person posting gardening & mutual aid",
+            "followersCount": 420
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("actor", org_did))
+        .and(query_param("filter", "posts_no_replies"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "feed": [{
+                "post": {
+                    "uri": "at://did:plc:organicbooster1/app.bsky.feed.post/3n2abc",
+                    "author": { "did": org_did },
+                    "record": { "text": "Boosting https://chuffed.org/project/191040" }
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("actor", org_did))
+        .and(query_param("filter", "posts_with_replies"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "feed": [{
+                "post": {
+                    "uri": "at://did:plc:organicbooster1/app.bsky.feed.post/3n2old",
+                    "author": { "did": org_did },
+                    "indexedAt": "2026-11-21T15:15:00Z",
+                    "record": {
+                        "text": "Haha love that tomato variety",
+                        "reply": { "parent": { "uri": "at://did:plc:friend1/app.bsky.feed.post/1" }, "root": { "uri": "at://did:plc:friend1/app.bsky.feed.post/1" } }
+                    }
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+    let mut org_inter = liam_inter.clone();
+    org_inter.author_did = org_did.to_string();
+    org_inter.created_at_us = parent_us + 180_000_000;
+    let org_ctx = enricher.enrich(&org_inter).await;
+    let org_sig = org_ctx.author_signals.as_ref().expect("has fundraiser url");
+    assert!(!org_sig.has_suspicious_bot_signals());
+    assert_eq!(org_sig.recent_distinct_reply_targets, 1);
+
+    // 4. Plain benign commenter with slow reply & 1 unrelated friend reply drops snippet for privacy
+    let plain_did = "did:plc:plaincommenter";
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .and(query_param("actor", plain_did))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": plain_did,
+            "handle": "friend.bsky.social",
+            "followersCount": 250
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("actor", plain_did))
+        .and(query_param("filter", "posts_no_replies"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "feed": [] })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("actor", plain_did))
+        .and(query_param("filter", "posts_with_replies"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "feed": [{
+                "post": {
+                    "uri": "at://did:plc:plaincommenter/app.bsky.feed.post/3n2p1",
+                    "author": { "did": plain_did },
+                    "indexedAt": "2026-11-21T15:18:00Z",
+                    "record": {
+                        "text": "Private dinner plans tonight?",
+                        "reply": { "parent": { "uri": "at://did:plc:spouse/app.bsky.feed.post/1" }, "root": { "uri": "at://did:plc:spouse/app.bsky.feed.post/1" } }
+                    }
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+    let mut plain_inter = liam_inter.clone();
+    plain_inter.author_did = plain_did.to_string();
+    plain_inter.created_at_us = parent_us + 180_000_000;
+    let plain_ctx = enricher.enrich(&plain_inter).await;
+    assert!(plain_ctx.author_signals.is_none());
+}
+
+#[test]
+fn parse_iso8601_utc_secs_handles_valid_and_invalid_inputs() {
+    use skybouncer::enricher::parse_iso8601_utc_secs;
+
+    assert_eq!(parse_iso8601_utc_secs("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(
+        parse_iso8601_utc_secs("2024-02-29T12:34:56+00:00"),
+        Some(1_709_210_096)
+    );
+    assert_eq!(
+        parse_iso8601_utc_secs("2026-11-21T15:20:19.747Z"),
+        Some(1_795_274_419)
+    );
+    assert_eq!(
+        parse_iso8601_utc_secs("  2026-11-21t00:00:00.123456-00:00  "),
+        Some(1_795_219_200)
+    );
+
+    assert_eq!(parse_iso8601_utc_secs("2025-02-29T00:00:00Z"), None);
+    assert_eq!(parse_iso8601_utc_secs("1969-12-31T23:59:59Z"), None);
+    assert_eq!(parse_iso8601_utc_secs("2026-13-01T00:00:00Z"), None);
+    assert_eq!(parse_iso8601_utc_secs("2026-04-31T00:00:00Z"), None);
+    assert_eq!(parse_iso8601_utc_secs("2026-11-21T24:00:00Z"), None);
+    assert_eq!(parse_iso8601_utc_secs("2026-11-21T12:60:00Z"), None);
+    assert_eq!(parse_iso8601_utc_secs("2026-11-21T12:00:60Z"), None);
+    assert_eq!(parse_iso8601_utc_secs("2026-11-21T12:00:00+02:00"), None);
+    assert_eq!(parse_iso8601_utc_secs("2026-11-21T12:00:00.Z"), None);
+    assert_eq!(parse_iso8601_utc_secs("not-a-timestamp"), None);
+}

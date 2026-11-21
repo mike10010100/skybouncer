@@ -69,10 +69,15 @@ pub use bot::{
     DEFAULT_BOT_POLL_INTERVAL, DEFAULT_CHAT_ENDPOINT,
 };
 pub use enricher::{
-    AppViewContextEnricher, AuthorContext, ContextEnricher, ContextImageRef, EnrichedContext,
+    compute_reply_timing_signals, decode_tid_timestamp_us, extract_fundraiser_urls_from_text,
+    extract_rkey_from_at_uri, parse_iso8601_utc_secs, AppViewContextEnricher,
+    AuthorActivitySignals, AuthorContext, ContextEnricher, ContextImageRef, EnrichedContext,
     MockContextEnricher, NoopContextEnricher, ParentPostContext, PostEmbedSummary, QuotedAncestor,
-    ThreadPost, DEFAULT_APPVIEW_ENDPOINT, DEFAULT_ENRICHER_TIMEOUT_MS, MAX_CONTEXT_IMAGES,
-    MAX_POST_IMAGES, MAX_RENDERED_THREAD_ANCESTORS, THREAD_ANCESTOR_CHAR_CAP,
+    ThreadPost, AUTHOR_FEED_RECENT_LIMIT, AUTHOR_FEED_TOP_LIMIT, DEFAULT_APPVIEW_ENDPOINT,
+    DEFAULT_ENRICHER_TIMEOUT_MS, FAST_REPLY_LATENCY_MS, FORGED_TID_DRIFT_SECS, MAX_CONTEXT_IMAGES,
+    MAX_OTHER_REPLY_SNIPPETS, MAX_POST_IMAGES, MAX_PROFILE_FUNDRAISER_URLS,
+    MAX_RENDERED_THREAD_ANCESTORS, REPLY_BLAST_MIN_DISTINCT_TARGETS, REPLY_BLAST_WINDOW_SECS,
+    THREAD_ANCESTOR_CHAR_CAP,
 };
 pub use limiter::{
     EvaluationRateLimiter, RateLimiterConfig, DEFAULT_MAX_EVALUATIONS_PER_WINDOW,

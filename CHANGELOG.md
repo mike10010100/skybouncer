@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-21
+
+### Fixed
+
+- **Reply-Bait Bot Behavioral Enrichment, Timing Signals & System-2 Escalation (`src/enricher.rs`, `src/classifier/tiered.rs`, `src/classifier/jev.rs`, `src/lib.rs`)**:
+  - Added zero-dependency UTC ISO-8601 timestamp parsing (`parse_iso8601_utc_secs`), strict ATProto TID decoding (`extract_rkey_from_at_uri`, `decode_tid_timestamp_us`), and zero-cost reply latency / forged-TID detection (`compute_reply_timing_signals`, `FAST_REPLY_LATENCY_MS = 2_500`, `FORGED_TID_DRIFT_SECS = 3_600`).
+  - Added `AuthorActivitySignals` (`EnrichedContext::author_signals`) and opt-in `app.bsky.feed.getAuthorFeed` enrichment in `AppViewContextEnricher::from_env()` (`AUTHOR_FEED_CONTEXT=true` default, disabled in `AppViewContextEnricher::new()` for hermetic callers) to surface 1-hop reposted/quoted/bio fundraiser funnels (`chuffed.org`, `gofund.me`, `paypal.com/ncp/`, etc.), 10-minute stranger reply blasts (`REPLY_BLAST_MIN_DISTINCT_TARGETS = 4`), repeated reply templates, and up to 3 other-reply snippets while preserving zero-leakage privacy on benign accounts.
+  - Added `CertaintyConfig::escalate_suspicious_bot_signals` (default `true`) and `CertaintyConfig::should_escalate_interaction` so `TieredClassifier` escalates Tier-1 `Permitted` verdicts to System-2 whenever `AuthorActivitySignals::has_suspicious_bot_signals()` triggers, without escalating benign organic mutual-aid boosters.
+  - Extended `JevClassifier` (`Ollama` rule `(4)` and `SystemOne` `spam`/`permitted` criteria) to classify linkless automated reply-bait appeals backed by sniping, bursts, or fundraiser funnels as `"spam"` while explicitly permitting substantive on-topic replies from organic users who share fundraiser links on their profile.
+
 ## [0.3.0] - 2026-11-20
 
 ### Added
