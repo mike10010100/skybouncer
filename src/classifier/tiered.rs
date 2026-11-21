@@ -49,6 +49,11 @@ pub struct CertaintyConfig {
     /// contextual verification before bouncing an account.
     #[serde(default = "default_true")]
     pub escalate_nuanced_violations: bool,
+    /// Whether suspicious automated reply-bait signals (sub-second sniping, forged TIDs,
+    /// rapid cross-thread stranger bursts, repeated plea templates) escalate Tier-1 `Permitted`
+    /// verdicts to Tier-2 with enriched feed/funnel context.
+    #[serde(default = "default_true")]
+    pub escalate_suspicious_bot_signals: bool,
 }
 
 impl Default for CertaintyConfig {
@@ -58,6 +63,7 @@ impl Default for CertaintyConfig {
             max_confidence: DEFAULT_UNCERTAINTY_MAX_CONFIDENCE,
             escalate_on_images: true,
             escalate_nuanced_violations: true,
+            escalate_suspicious_bot_signals: true,
         }
     }
 }
@@ -81,6 +87,7 @@ impl CertaintyConfig {
             max_confidence: max.max(min),
             escalate_on_images,
             escalate_nuanced_violations: true,
+            escalate_suspicious_bot_signals: true,
         }
     }
 
@@ -96,6 +103,14 @@ impl CertaintyConfig {
     #[must_use]
     pub const fn with_escalate_nuanced_violations(mut self, escalate: bool) -> Self {
         self.escalate_nuanced_violations = escalate;
+        self
+    }
+
+    /// Overrides whether suspicious automated reply-bait author activity signals escalate
+    /// Tier-1 `Permitted` verdicts to Tier-2 for contextual inspection.
+    #[must_use]
+    pub const fn with_escalate_suspicious_bot_signals(mut self, escalate: bool) -> Self {
+        self.escalate_suspicious_bot_signals = escalate;
         self
     }
 
@@ -139,6 +154,26 @@ impl CertaintyConfig {
             Some(conf) => self.is_uncertain(conf),
             None => false,
         }
+    }
+
+    /// Determines whether a candidate interaction should escalate to Tier-2, checking both
+    /// [`Self::should_escalate`] and enriched suspicious reply-bait bot activity signals.
+    #[must_use]
+    pub fn should_escalate_interaction(
+        &self,
+        primary_verdict: &Verdict,
+        interaction: &Interaction,
+    ) -> bool {
+        if self.should_escalate(primary_verdict, interaction.has_images()) {
+            return true;
+        }
+        self.escalate_suspicious_bot_signals
+            && primary_verdict.is_permitted()
+            && interaction
+                .enriched_context
+                .as_ref()
+                .and_then(|c| c.author_signals.as_ref())
+                .is_some_and(crate::enricher::AuthorActivitySignals::has_suspicious_bot_signals)
     }
 }
 
@@ -316,12 +351,26 @@ impl TieredClassifier {
         let has_images = interaction.has_images();
 
         // 2. Check escalation criteria
-        if self.certainty.should_escalate(&primary_verdict, has_images) {
+        if self
+            .certainty
+            .should_escalate_interaction(&primary_verdict, interaction)
+        {
             if record_stats {
                 self.stats
                     .fallback_escalated
                     .fetch_add(1, Ordering::Relaxed);
             }
+
+            let suspicious_bot_signal = self.certainty.escalate_suspicious_bot_signals
+                && !self.certainty.should_escalate(&primary_verdict, has_images)
+                && primary_verdict.is_permitted()
+                && interaction
+                    .enriched_context
+                    .as_ref()
+                    .and_then(|c| c.author_signals.as_ref())
+                    .is_some_and(
+                        crate::enricher::AuthorActivitySignals::has_suspicious_bot_signals,
+                    );
 
             let (escalation_prefix, escalation_reason) = if has_images
                 && self.certainty.escalate_on_images
@@ -337,6 +386,21 @@ impl TieredClassifier {
                 (
                     "[Tiered Fallback: visual image]",
                     "Attached visual media requires multimodal inspection".to_string(),
+                )
+            } else if suspicious_bot_signal {
+                if record_stats {
+                    self.stats
+                        .uncertainty_escalations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                debug!(
+                    post_uri = %interaction.post_uri,
+                    "Escalating candidate to System-2 due to suspicious automated reply-bait signals"
+                );
+                (
+                    "[Tiered Fallback: behavioral signals]",
+                    "Suspicious automated reply-bait signals escalated for System-2 verification"
+                        .to_string(),
                 )
             } else {
                 if record_stats {
