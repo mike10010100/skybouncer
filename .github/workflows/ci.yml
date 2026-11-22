@@ -132,7 +132,7 @@ jobs:
       - name: Enable Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "mutants"
+          shared-key: "mutants-lean"
           cache-all-crates: true
           cache-on-failure: true
 
@@ -142,9 +142,9 @@ jobs:
           tool: cargo-nextest,cargo-mutants
 
       - name: 7. Mutation Testing Smoke Test (cargo-mutants)
-        # Reuses cached target/ in-place and compiles only the library unit-test target
-        # (avoiding relinking all 34 integration test binaries per mutant).
-        run: cargo mutants --in-place --cargo-arg --lib --file src/time.rs --file src/util.rs
+        # Reuses cached target/ in-place on lean-core unit tests (--no-default-features)
+        # while covering 100% of mutants in src/time.rs and src/util.rs.
+        run: cargo mutants --in-place --cargo-arg --no-default-features --cargo-arg --lib --file src/time.rs --file src/util.rs
 
   quality-gate:
     name: Rust Quality Gate
@@ -191,6 +191,12 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Enable Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "publish"
+          cache-on-failure: true
 
       - name: Extract Current Version & Name
         id: pkg_info
