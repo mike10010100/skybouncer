@@ -3,6 +3,14 @@
 # Sovereign Auto-Moderation & Bouncer Service for AT Protocol & Bluesky
 # ==============================================================================
 
+# Stage 0: Normalize package version in manifests so version bumps (e.g. 0.3.1 -> 0.3.2)
+# produce identical manifest checksums and preserve the compiled dependency layer cache.
+FROM debian:bookworm-slim AS manifest-prep
+WORKDIR /manifests
+COPY Cargo.toml Cargo.lock ./
+RUN sed -i '0,/^version = ".*"/s//version = "0.0.1"/' Cargo.toml && \
+    sed -i '/^name = "skybouncer"$/{n;s/^version = ".*"/version = "0.0.1"/;}' Cargo.lock
+
 # ------------------------------------------------------------------------------
 # Stage 1: Build Release Binary
 # ------------------------------------------------------------------------------
@@ -10,15 +18,25 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /build
 
-# Copy manifests; sibling crates (skybase, skyauth) are fetched from crates.io.
-COPY Cargo.toml Cargo.lock ./
+# Copy version-normalized manifests; sibling crates (skybase, skyauth) are fetched from crates.io.
+COPY --from=manifest-prep /manifests/Cargo.toml /manifests/Cargo.lock ./
 
-# Copy application source and embedded assets
+# Pre-build third-party dependencies using dummy sources so app edits & version bumps reuse this layer.
+RUN mkdir -p src && \
+    echo "pub fn main() {}" > src/main.rs && \
+    echo "" > src/lib.rs && \
+    cargo build --release --locked --bin skybouncer && \
+    rm -rf src
+
+# Copy real manifests, application source, and embedded assets
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY assets ./assets
 
-# Build optimized production binary and strip debug symbols
-RUN cargo build --release --locked --bin skybouncer && \
+# Build optimized production binary (clean dummy crate artifacts so real code is compiled) and strip debug symbols
+RUN rm -rf target/release/deps/skybouncer* target/release/deps/libskybouncer* \
+           target/release/skybouncer* target/release/.fingerprint/skybouncer-* && \
+    cargo build --release --locked --bin skybouncer && \
     strip /build/target/release/skybouncer
 
 # ------------------------------------------------------------------------------
@@ -64,7 +82,7 @@ ENV HOST=0.0.0.0 \
 EXPOSE 3000
 
 # Container healthcheck: verify web dashboard and REST status endpoint
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=5s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:3000/healthz || exit 1
 
 ENTRYPOINT ["/usr/local/bin/skybouncer"]

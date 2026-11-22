@@ -76,14 +76,14 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --lib --no-default-features -- -D warnings
 
-# 4. Run all unit, integration, and doc test suites
-cargo test --all-targets
+# 4. Run unit, integration, coverage (>= 92%) & doc tests in one pass
+cargo llvm-cov clean --workspace
+cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info
+cargo llvm-cov report --fail-under-lines 92
+rm -f lcov.info
 cargo test --doc
 
-# 5. Enforce >= 92% line test coverage (ensure all new branches/error paths are tested)
-cargo llvm-cov --all-targets --fail-under-lines 92 --summary-only
-
-# 6. Dependency security, advisory & policy scans
+# 5. Dependency security, advisory & policy scans
 cargo deny check
 cargo audit
 ```

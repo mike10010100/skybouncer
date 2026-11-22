@@ -36,7 +36,7 @@ services:
       - skybouncer_data:/data:rw
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
-      interval: 30s
+      interval: 5s
       timeout: 5s
       retries: 3
       start_period: 15s
