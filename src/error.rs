@@ -49,6 +49,20 @@ impl From<rusqlite::Error> for SkybouncerError {
 }
 
 impl SkybouncerError {
+    /// Returns `true` if this error represents a per-request classifier timeout
+    /// (as distinct from a hard connection refusal or upstream 5xx outage).
+    #[must_use]
+    pub fn is_classifier_timeout(&self) -> bool {
+        match self {
+            Self::Http(err) => err.is_timeout(),
+            Self::Classifier(msg) => {
+                let lower = msg.to_ascii_lowercase();
+                lower.contains("timed out") || lower.contains("timeout")
+            }
+            _ => false,
+        }
+    }
+
     /// Returns `true` if this error represents a transient classifier unavailability
     /// (such as a network connection drop, timeout, or upstream 5xx server error)
     /// where a queued candidate should be held and retried once the classifier recovers.
@@ -57,7 +71,9 @@ impl SkybouncerError {
         match self {
             Self::Http(_) => true,
             Self::Classifier(msg) => {
-                msg.contains("network error") || msg.contains("server error (HTTP 5")
+                self.is_classifier_timeout()
+                    || msg.contains("network error")
+                    || msg.contains("server error (HTTP 5")
             }
             _ => false,
         }
@@ -179,18 +195,32 @@ mod tests {
 
     #[test]
     fn transient_classifier_error_detection_covers_all_variants() {
-        assert!(
-            SkybouncerError::Classifier("Jev API network error: timeout".into())
-                .is_transient_classifier_error()
-        );
-        assert!(
-            SkybouncerError::Classifier("Jev API server error (HTTP 502): Bad Gateway".into())
-                .is_transient_classifier_error()
-        );
-        assert!(!SkybouncerError::Classifier(
-            "Jev API client error (HTTP 400): bad request".into()
-        )
-        .is_transient_classifier_error());
-        assert!(!SkybouncerError::Config("cfg".into()).is_transient_classifier_error());
+        let timed_out =
+            SkybouncerError::Classifier("Jev API request timed out after 60000ms: timeout".into());
+        assert!(timed_out.is_classifier_timeout());
+        assert!(timed_out.is_transient_classifier_error());
+
+        let net_timeout = SkybouncerError::Classifier("Jev API network error: timeout".into());
+        assert!(net_timeout.is_classifier_timeout());
+        assert!(net_timeout.is_transient_classifier_error());
+
+        let conn_refused =
+            SkybouncerError::Classifier("Jev API network error: connection refused".into());
+        assert!(!conn_refused.is_classifier_timeout());
+        assert!(conn_refused.is_transient_classifier_error());
+
+        let server_502 =
+            SkybouncerError::Classifier("Jev API server error (HTTP 502): Bad Gateway".into());
+        assert!(!server_502.is_classifier_timeout());
+        assert!(server_502.is_transient_classifier_error());
+
+        let client_400 =
+            SkybouncerError::Classifier("Jev API client error (HTTP 400): bad request".into());
+        assert!(!client_400.is_classifier_timeout());
+        assert!(!client_400.is_transient_classifier_error());
+
+        let cfg_err = SkybouncerError::Config("cfg".into());
+        assert!(!cfg_err.is_classifier_timeout());
+        assert!(!cfg_err.is_transient_classifier_error());
     }
 }

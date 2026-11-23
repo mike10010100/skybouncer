@@ -81,6 +81,15 @@ pub const DEFAULT_CLASSIFIER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 /// Maximum backoff cap between queued candidate retries when the classifier is unreachable (15 seconds).
 pub const MAX_CLASSIFIER_RETRY_BACKOFF: Duration = Duration::from_secs(15);
 
+/// Default HTTP timeout in milliseconds for the Tier-2 fallback multimodal classifier (`120000` ms = 120s).
+pub const DEFAULT_FALLBACK_TIMEOUT_MS: u64 = 120_000;
+
+/// Default maximum outer queue retries per candidate when a classifier request times out.
+///
+/// Caps per-post timeout retries so a single slow prompt cannot stall the worker permit forever
+/// while still retrying hard connection/5xx outages indefinitely until recovery.
+pub const DEFAULT_MAX_CLASSIFIER_TIMEOUT_RETRIES: usize = 2;
+
 /// Loads persisted cumulative telemetry counters, falling back to a zeroed [`EngineStats`].
 fn load_persisted_stats(cache: &DeduplicationCache) -> EngineStats {
     match cache.load_dashboard_stats::<EngineStatsSnapshot>() {
@@ -163,6 +172,8 @@ pub struct SkybouncerConfig {
     pub hold_queue_on_classifier_unavailable: bool,
     /// Initial retry backoff duration when holding the evaluation queue during classifier outages.
     pub classifier_retry_backoff: Duration,
+    /// Maximum outer queue retries per candidate when a classifier request times out.
+    pub max_classifier_timeout_retries: usize,
     /// Real-time dogpile detection and Storm Mode configuration.
     pub dogpile_config: DogpileConfig,
 }
@@ -192,6 +203,7 @@ impl Default for SkybouncerConfig {
             handle_cache_ttl: crate::tenant::DEFAULT_HANDLE_TTL,
             hold_queue_on_classifier_unavailable: false,
             classifier_retry_backoff: DEFAULT_CLASSIFIER_RETRY_BACKOFF,
+            max_classifier_timeout_retries: DEFAULT_MAX_CLASSIFIER_TIMEOUT_RETRIES,
             dogpile_config: DogpileConfig::default(),
         }
     }
@@ -348,6 +360,13 @@ impl SkybouncerConfig {
         self
     }
 
+    /// Sets the maximum outer queue retries per candidate on classifier request timeouts.
+    #[must_use]
+    pub const fn with_max_classifier_timeout_retries(mut self, max_retries: usize) -> Self {
+        self.max_classifier_timeout_retries = max_retries;
+        self
+    }
+
     /// Sets the real-time dogpile detection and Storm Mode configuration.
     #[must_use]
     pub fn with_dogpile_config(mut self, config: DogpileConfig) -> Self {
@@ -397,7 +416,8 @@ impl SkybouncerConfig {
                 "http://localhost:11434",
             );
             let fb_key = crate::env::var(&["FALLBACK_API_KEY"]);
-            let fb_timeout_ms = crate::env::parsed_or(&["FALLBACK_TIMEOUT_MS"], 5000_u64);
+            let fb_timeout_ms =
+                crate::env::parsed_or(&["FALLBACK_TIMEOUT_MS"], DEFAULT_FALLBACK_TIMEOUT_MS);
             let fb_max_retries = crate::env::parsed_or(&["FALLBACK_MAX_RETRIES"], 1_usize);
             Some(JevConfig {
                 base_url: fb_base,
@@ -521,6 +541,14 @@ impl SkybouncerConfig {
             u64::try_from(DEFAULT_CLASSIFIER_RETRY_BACKOFF.as_millis()).unwrap_or(2000),
         );
 
+        let max_classifier_timeout_retries = crate::env::parsed_or(
+            &[
+                "MAX_CLASSIFIER_TIMEOUT_RETRIES",
+                "SKYBOUNCER_MAX_CLASSIFIER_TIMEOUT_RETRIES",
+            ],
+            DEFAULT_MAX_CLASSIFIER_TIMEOUT_RETRIES,
+        );
+
         Ok(Self {
             protected_dids,
             rubric,
@@ -544,6 +572,7 @@ impl SkybouncerConfig {
             handle_cache_ttl: crate::tenant::DEFAULT_HANDLE_TTL,
             hold_queue_on_classifier_unavailable,
             classifier_retry_backoff: Duration::from_millis(classifier_retry_backoff_ms.max(10)),
+            max_classifier_timeout_retries,
             dogpile_config: DogpileConfig::from_env(),
         })
     }
@@ -1725,7 +1754,8 @@ mod tests {
             .with_admin_did("did:plc:admin")
             .with_handle_cache_ttl(Duration::from_secs(30))
             .with_hold_queue_on_classifier_unavailable(true)
-            .with_classifier_retry_backoff(Duration::from_millis(250));
+            .with_classifier_retry_backoff(Duration::from_millis(250))
+            .with_max_classifier_timeout_retries(4);
 
         // with_admin_did also inserts the admin into protected_dids.
         assert_eq!(cfg.protected_dids.len(), 3);
@@ -1747,6 +1777,11 @@ mod tests {
         assert_eq!(cfg.handle_cache_ttl, Duration::from_secs(30));
         assert!(cfg.hold_queue_on_classifier_unavailable);
         assert_eq!(cfg.classifier_retry_backoff, Duration::from_millis(250));
+        assert_eq!(cfg.max_classifier_timeout_retries, 4);
+        assert_eq!(
+            SkybouncerConfig::default().max_classifier_timeout_retries,
+            DEFAULT_MAX_CLASSIFIER_TIMEOUT_RETRIES
+        );
     }
 
     #[test]

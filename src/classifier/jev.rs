@@ -224,6 +224,10 @@ pub struct OllamaChatRequest {
     pub format: String,
     /// Whether to stream partial tokens (always `false` for classification).
     pub stream: bool,
+    /// Optional thinking-mode override for reasoning-capable Ollama models (e.g. `Some(false)`
+    /// disables chain-of-thought reasoning; `None` defers to the model's default behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
     /// Runtime inference options (e.g. `num_ctx` context window size).
     #[serde(default)]
     pub options: OllamaChatOptions,
@@ -302,6 +306,7 @@ pub struct JevClassifier {
     classify_url: String,
     endpoint_kind: JevEndpointKind,
     num_ctx: usize,
+    ollama_think: Option<bool>,
 }
 
 impl JevClassifier {
@@ -389,6 +394,14 @@ impl JevClassifier {
         )
         .max(1024);
 
+        let ollama_think =
+            crate::env::var(&["OLLAMA_THINK", "SKYBOUNCER_OLLAMA_THINK", "FALLBACK_THINK"])
+                .and_then(|val| match val.to_ascii_lowercase().as_str() {
+                    "true" | "1" => Some(true),
+                    "false" | "0" => Some(false),
+                    _ => None,
+                });
+
         Ok(Self {
             config,
             rubric: Arc::new(RwLock::new(rubric)),
@@ -396,6 +409,7 @@ impl JevClassifier {
             classify_url,
             endpoint_kind,
             num_ctx,
+            ollama_think,
         })
     }
 
@@ -413,6 +427,20 @@ impl JevClassifier {
     #[must_use]
     pub const fn num_ctx(&self) -> usize {
         self.num_ctx
+    }
+
+    /// Overrides the optional Ollama `think` parameter (`Some(true)`, `Some(false)`, or `None`
+    /// to omit the field and defer to the model's default behavior).
+    #[must_use]
+    pub const fn with_ollama_think(mut self, think: Option<bool>) -> Self {
+        self.ollama_think = think;
+        self
+    }
+
+    /// Returns the configured Ollama `think` override, if any.
+    #[must_use]
+    pub const fn ollama_think(&self) -> Option<bool> {
+        self.ollama_think
     }
 
     /// Creates a [`JevClassifier`] by loading configuration from environment variables.
@@ -570,7 +598,7 @@ impl JevClassifier {
                         Evaluate {modality_guidance} against the Target's rubric: \"{rubric_prompt}\". \
                         Apply these disambiguation rules unless the rubric explicitly states otherwise: \
                         (1) Directionality & thread referents: distinguish hostility aimed AT the Target user from hostility aimed at OtherUser thread participants, third parties, quoted posters, politicians, or unrelated external groups. Generic rubric terms such as 'harassment', 'personal attacks', 'insults', 'hostile language', or 'sea-lioning' ALWAYS mean abuse directed AT Target — never hostility aimed at OtherUsers or third parties discussed or quoted by Target — unless the rubric explicitly asks to police third-party commentary. Check these labels carefully: \
-                        (a) Sub-thread replies: Check the 'Replying To:' header and '[IMMEDIATE PARENT]' marker: when Replying To is OtherUser (a sub-thread thread_reply to another commenter), second-person pronouns ('you', 'your') and insults (e.g. 'can you read', 'you sound insane') address that OtherUser, NOT Target, and MUST be permitted unless <candidate_content> explicitly names, @mentions, or attacks Target (or violates spam/crypto/phishing rules). \
+                        (a) Sub-thread replies: Check the 'Replying To:' header and '[IMMEDIATE PARENT]' marker: when Replying To is OtherUser (a sub-thread thread_reply to another commenter), second-person pronouns ('you', 'your') and insults (e.g. 'can you read', 'you sound insane') address that OtherUser, NOT Target, and MUST be permitted unless <candidate_content> explicitly names, @mentions, or attacks Target (or violates spam/crypto/phishing rules). Conversely, when Replying To is Author (a self-reply / thread continuation), Author is NOT insulting themselves — trace who Author was replying to in Conversation Thread; if Author is continuing a reply chain to Target, second-person pronouns ('you', 'your') and insults STILL target Target and violate as 'harassment'. \
                         (b) Third-person commiseration & quoted-subject co-reference (including rhetorical third-party address and context media): In Conversation Thread, check for '[quoting OtherUser ...]' tags, '[link card: ...]' / '[quoted post link card: ...]' headlines, '[attached ... image(s)]' / '[quoted post has ... attached image(s)]' markers, attached Context Thread Images, and whether Target or an earlier post is criticizing, mocking, or discussing an OtherUser or external third party. Whenever Conversation Thread includes '[quoting OtherUser ...]' (even if Target's own quote caption is brief, sarcastic, or a nickname like \"Charmin.\"), shares a link card/screenshot, OR Target discusses a third party: (i) third-person pronouns ('he', 'him', 'his', 'she', 'her', 'they', 'them') and nameless third-person reactions (e.g. 'what a smug lying prick', 'look at this clown') aimed at that quoted OtherUser, third party, or person depicted in a parent/quoted screenshot/link card refer to that external subject — NOT Target — and MUST be permitted (along with defending Target against dogpilers); AND (ii) rhetorical second-person apostrophe ('shouting at the screen') in Replying To: Target MUST ALSO be permitted when <candidate_content> explicitly addresses a named third-party person or public figure by a real proper name or surname (e.g. 'Just for you Ari, you prick', 'Shut up Chuck, you coward', 'Fuck off Elon, you clown') that does NOT match Target Profile's name or handle, because 'you' addresses that named external figure rather than Target. STRICT GUARDRAILS: Generic insult tropes or slang vocatives — such as 'Karen', 'Bozo', 'Einstein', 'Clown', 'pal', 'buddy', 'bro', 'dude', 'chief', 'champ', or 'kid' (e.g. 'Okay Karen, you prick', 'Listen buddy, you're a fucking moron') — are NEVER third-party proper names and DO address Target as 'harassment'; likewise, unqualified second-person insults without a third-party proper-name vocative (e.g. 'You prick, stop posting this garbage') or attacks that explicitly name/@mention Target MUST violate as 'harassment'. \
                         (c) Standalone quote-posts ('Quoting: Target') & group-label quote-dunks: When the header shows 'Quoting: Target' (a standalone quote-post to Author's audience, with NO 'Replying To: OtherUser'), Author is holding Target's Quoted Post up as an example. If <candidate_content> hurls demeaning intelligence or character insults (e.g. 'dumbest fucks', 'morons', 'worms for brains', 'braindead clowns', 'idiots') at a supporter/camp/faction label ('[X] supporters', '[X] defenders', '[X] bros', 'people/accounts like this'), treat it as targeted harassment AT Target by group-membership implication UNLESS Target's own Quoted Post explicitly criticizes or opposes that exact group (e.g. Target explicitly criticizes MAGA in Quoted Post and Author insults 'MAGA supporters'). In a debate where OtherUser criticizes [X] and Target pushes back or mocks OtherUser's anti-[X] complaints (including via sarcasm like 'You're right... lmao', 'How fascinating... your list of reasons to dislike...', 'So just the two things then'), quoting Target to insult '[X] supporters' IS labeling and insulting Target — NEVER use Target Profile bio ideology labels (such as 'DemSoc') or misread Target's sarcasm to excuse a quote-dunk on Target. Conversely, sharp policy/strategy disagreement in a quote-post without demeaning personal/intelligence insults (e.g. '[X] supporters are misreading Senate leverage') MUST be permitted. \
                         (2) Targeted harassment: personal attacks, insults, name-calling, mocking nicknames, slurs, threats, or crude demeaning remarks aimed AT Target's intelligence, character, or appearance violate as \"harassment\" — including unqualified second-person attacks on Target ('You prick, stop posting this'), insults wrapped in generic/slang vocatives ('Okay Karen, you prick', 'Listen buddy, you're a moron'), and standalone quote-posts ('Quoting: Target') that demean Target via a group/camp label ('[X] supporters are the dumbest fucks around', 'people like this are morons') whenever Target's Quoted Post is not itself criticizing that group. Third-person audience-facing dunks aimed at Target (e.g. 'its the [insult] back again', 'look at this clown posting nonsense', 'he really thought he cooked') violate ONLY when NO '[quoting OtherUser ...]', NO parent/quoted image or link card depicts an external target, and NO third-party subject is under discussion in Conversation Thread (or when <candidate_content> explicitly names/@mentions Target or quote-dunks Target via a camp label). Never penalize Author for insults or text inside Context Thread Images belonging to a parent/quoted post. Mild grumbling about an action (such as complaining 'blocked me for some stupid reason') or casual handle references ('that @handle guy') are NOT harassment. \
@@ -599,6 +627,7 @@ impl JevClassifier {
                         ],
                         format: "json".to_string(),
                         stream: false,
+                        think: self.ollama_think,
                         options: OllamaChatOptions {
                             num_ctx: self.num_ctx,
                             temperature: 0.0,
@@ -668,10 +697,18 @@ impl JevClassifier {
             let response = match send_result {
                 Ok(resp) => resp,
                 Err(err) => {
-                    tracing::warn!(attempt, %err, "Jev API network error");
-                    last_err = Some(SkybouncerError::Classifier(format!(
-                        "Jev API network error: {err}"
-                    )));
+                    if err.is_timeout() {
+                        let timeout_ms = self.config.timeout.as_millis();
+                        tracing::warn!(attempt, timeout_ms, %err, "Jev API request timed out");
+                        last_err = Some(SkybouncerError::Classifier(format!(
+                            "Jev API request timed out after {timeout_ms}ms: {err}"
+                        )));
+                    } else {
+                        tracing::warn!(attempt, %err, "Jev API network error");
+                        last_err = Some(SkybouncerError::Classifier(format!(
+                            "Jev API network error: {err}"
+                        )));
+                    }
                     continue;
                 }
             };
@@ -935,7 +972,9 @@ fn reply_recipient_line(interaction: &Interaction) -> String {
     if parent_did == interaction.target_did {
         format!("Replying To: Target ({parent_did})\n")
     } else if parent_did == interaction.author_did {
-        format!("Replying To: Author ({parent_did}) [self-reply / thread continuation]\n")
+        format!(
+            "Replying To: Author ({parent_did}) [self-reply / thread continuation] — trace back in Conversation Thread; if Author was replying to Target, second-person 'you'/'your' still addresses Target\n"
+        )
     } else if interaction.interaction_type == InteractionType::ThreadReply {
         format!(
             "Replying To: OtherUser ({parent_did}) [NOT Target — sub-thread reply to another commenter; second-person 'you'/'your' addresses this OtherUser unless Target is explicitly named or @mentioned]\n"

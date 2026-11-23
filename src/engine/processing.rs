@@ -777,6 +777,7 @@ impl SkybouncerEngine {
         let target_rubric = self.rubric_for(&target_did);
         let interaction = interaction.with_rubric(target_rubric.clone());
         let mut retry_delay = self.config.classifier_retry_backoff;
+        let mut timeout_retries: usize = 0;
         let detailed_eval = loop {
             match self
                 .classifier
@@ -797,12 +798,33 @@ impl SkybouncerEngine {
                     if cancel_token.is_cancelled() {
                         return Err(e);
                     }
-                    warn!(
-                        error = %e,
-                        post_uri = %post_uri,
-                        backoff = ?retry_delay,
-                        "Classifier endpoint unreachable; holding evaluation queue and retrying when back online"
-                    );
+                    if e.is_classifier_timeout() {
+                        if timeout_retries >= self.config.max_classifier_timeout_retries {
+                            warn!(
+                                error = %e,
+                                post_uri = %post_uri,
+                                timeout_retries,
+                                "Classifier request timed out repeatedly for candidate; releasing evaluation queue permit to prevent head-of-line blocking"
+                            );
+                            return Err(e);
+                        }
+                        timeout_retries += 1;
+                        warn!(
+                            error = %e,
+                            post_uri = %post_uri,
+                            timeout_retry = timeout_retries,
+                            max_timeout_retries = self.config.max_classifier_timeout_retries,
+                            backoff = ?retry_delay,
+                            "Classifier request timed out; retrying candidate after backoff"
+                        );
+                    } else {
+                        warn!(
+                            error = %e,
+                            post_uri = %post_uri,
+                            backoff = ?retry_delay,
+                            "Classifier endpoint unreachable; holding evaluation queue and retrying when back online"
+                        );
+                    }
                     tokio::select! {
                         biased;
                         _ = cancel_token.cancelled() => {

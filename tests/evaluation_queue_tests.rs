@@ -531,3 +531,145 @@ async fn test_queue_holds_and_retries_candidates_while_classifier_offline_then_d
         "All 3 queued candidates must be evaluated and bounced once classifier recovers"
     );
 }
+
+#[tokio::test]
+async fn test_queue_caps_per_candidate_timeout_retries_without_head_of_line_blocking() {
+    let pds = MockPdsServer::start().await;
+    let server = MockServer::start().await;
+    let slow_calls = Arc::new(AtomicUsize::new(0));
+    let slow_calls_clone = Arc::clone(&slow_calls);
+    let fast_calls = Arc::new(AtomicUsize::new(0));
+    let fast_calls_clone = Arc::clone(&fast_calls);
+
+    // Post 1 always stalls past the 50ms client timeout.
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .and(wiremock::matchers::body_string_contains("slow_poison_post"))
+        .respond_with(move |_req: &wiremock::Request| {
+            slow_calls_clone.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(250))
+                .set_body_json(json!({
+                    "violates": false,
+                    "category": null,
+                    "confidence": 0.99,
+                    "reason": "Too slow"
+                }))
+        })
+        .mount(&server)
+        .await;
+
+    // Post 2 responds immediately with an actionable violation.
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .and(wiremock::matchers::body_string_contains(
+            "fast_followup_post",
+        ))
+        .respond_with(move |_req: &wiremock::Request| {
+            fast_calls_clone.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "violates": true,
+                "category": "spam",
+                "confidence": 0.96,
+                "reason": "Fast spam evaluation after slow post released permit"
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist_manager = Arc::new(
+        ModListManager::from_shared_cache(Arc::clone(&cache))
+            .with_rubric(rubric.clone())
+            .with_dry_run(true),
+    );
+    let pds_client = Arc::new(pds.pds_client("did:plc:alice"));
+    let jev_config = JevConfig {
+        base_url: server.uri(),
+        api_key: None,
+        model: "jev-test".to_string(),
+        timeout: Duration::from_millis(50),
+        max_retries: 0,
+        supports_images: false,
+    };
+    let classifier = Arc::new(JevClassifier::new(jev_config, rubric.clone()).unwrap());
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+
+    let config = SkybouncerConfig::new(protected_dids, rubric)
+        .with_evaluation_queue_capacity(32)
+        .with_evaluation_concurrency(1)
+        .with_hold_queue_on_classifier_unavailable(true)
+        .with_classifier_retry_backoff(Duration::from_millis(10))
+        .with_max_classifier_timeout_retries(1)
+        .with_dry_run(true);
+
+    let engine = SkybouncerEngine::new(
+        config,
+        follow_graph,
+        gate,
+        classifier,
+        modlist_manager,
+        pds_client,
+    );
+
+    let (commit_tx, commit_rx) = tokio::sync::mpsc::channel(100);
+    let cancel = CancellationToken::new();
+
+    let mut join_set = JoinSet::new();
+    let eng_clone = engine.clone();
+    let cancel_clone = cancel.clone();
+    join_set.spawn(async move { eng_clone.run(commit_rx, cancel_clone).await });
+
+    // Enqueue the stalling post first, then a fast follow-up post behind it.
+    commit_tx
+        .send(make_reply_commit(
+            "did:plc:slow_author",
+            "did:plc:alice",
+            "slow_post_1",
+            "root_1",
+            "slow_poison_post that times out",
+        ))
+        .await
+        .unwrap();
+    commit_tx
+        .send(make_reply_commit(
+            "did:plc:fast_author",
+            "did:plc:alice",
+            "fast_post_2",
+            "root_1",
+            "fast_followup_post spam behind slow post",
+        ))
+        .await
+        .unwrap();
+
+    // Poll bounded wait until both queued candidates finish processing (1 initial + 1 timeout retry = 2 calls).
+    for _ in 0..80 {
+        if engine.stats().snapshot().eval_queue_processed >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    cancel.cancel();
+    SkybouncerEngine::drain_and_shutdown(&mut join_set, &cancel, Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    let final_stats = engine.stats().snapshot();
+    assert_eq!(final_stats.eval_queue_enqueued, 2);
+    assert_eq!(final_stats.eval_queue_processed, 2);
+    assert_eq!(
+        slow_calls.load(Ordering::SeqCst),
+        2,
+        "1 initial timeout + 1 timeout retry before releasing worker permit"
+    );
+    assert_eq!(fast_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(final_stats.bounces_executed, 1);
+    assert!(final_stats.errors_encountered >= 2);
+}
