@@ -414,6 +414,7 @@ impl StormStanceClassifier for LlmStormStanceClassifier {
                         ],
                         format: "json".to_string(),
                         stream: false,
+                        think: Some(false),
                         options: OllamaChatOptions {
                             num_ctx: self.num_ctx,
                             temperature: 0.0,
@@ -710,6 +711,9 @@ mod tests {
         assert!(v.collective_hostility);
         assert_eq!(v.classification, "dogpile");
         assert!((v.confidence - 0.93).abs() < 1e-6);
+        let ollama_reqs = ollama.received_requests().await.unwrap();
+        let req_json: serde_json::Value = serde_json::from_slice(&ollama_reqs[0].body).unwrap();
+        assert_eq!(req_json["think"], serde_json::json!(false));
 
         // 2. SystemOne dialect
         let sys1 = MockServer::start().await;

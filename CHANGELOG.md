@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-11-23
+
+### Fixed
+
+- **Bounded Classifier Timeout Retries, Self-Reply Prompt Disambiguation & Ollama Configuration (`src/classifier/jev.rs`, `src/dogpile/stance.rs`, `src/error.rs`, `src/engine/mod.rs`, `src/engine/processing.rs`, `.env.example`, `deploy/systemd/skybouncer.env.example`)**:
+  - Added `SkybouncerError::is_classifier_timeout` and `JevClassifier` timeout error formatting (`"Jev API request timed out after ...ms"`) so per-request timeouts are distinguished from hard connection/5xx outages.
+  - Added `SkybouncerConfig::max_classifier_timeout_retries` (`DEFAULT_MAX_CLASSIFIER_TIMEOUT_RETRIES = 2`, configurable via `MAX_CLASSIFIER_TIMEOUT_RETRIES` / `SKYBOUNCER_MAX_CLASSIFIER_TIMEOUT_RETRIES`) and bounded per-candidate timeout retries in `evaluate_candidate_inner` so a slow prompt cannot hold the single worker permit indefinitely while offline/5xx outages still hold and retry.
+  - Added explicit self-reply disambiguation guidance in `JevClassifier` (both `system_prompt` rule `(1)(a)` and `reply_recipient_line` for `Replying To: Author`) so reasoning-capable Tier-2 models resolve `Replying To: Author` continuations against the conversation thread promptly without looping.
+  - Raised `DEFAULT_FALLBACK_TIMEOUT_MS` to `120_000` (120s), exposed optional `OllamaChatRequest::think` (`OLLAMA_THINK` / `SKYBOUNCER_OLLAMA_THINK` / `FALLBACK_THINK`, `JevClassifier::with_ollama_think`), and set `think: Some(false)` on `LlmStormStanceClassifier` Ollama requests.
+- Updated `skybase` dependency (`0.1.11` -> `0.1.12`) to pick up the persistent Jetstream idle read deadline fix.
+
 ## [0.3.2] - 2026-11-22
 
 ### Changed

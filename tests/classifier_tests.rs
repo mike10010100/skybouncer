@@ -302,7 +302,9 @@ async fn test_jev_classifier_timeout() {
     let interaction = sample_interaction("Hello");
     let err = classifier.classify(&interaction).await.unwrap_err();
 
-    assert!(err.to_string().contains("network error") || err.to_string().contains("timed out"));
+    assert!(err.to_string().contains("timed out"));
+    assert!(err.is_classifier_timeout());
+    assert!(err.is_transient_classifier_error());
 }
 
 #[test]
@@ -1054,6 +1056,100 @@ async fn test_jev_classifier_ollama_sends_num_ctx_options() {
         .unwrap()
         .with_num_ctx(12_288);
     assert_eq!(custom.num_ctx(), 12_288);
+}
+
+#[tokio::test]
+async fn test_jev_classifier_ollama_think_override_and_self_reply_prompt() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "gemma4:26b",
+            "message": {
+                "role": "assistant",
+                "content": "{\"violates\": true, \"category\": \"harassment\", \"confidence\": 0.99, \"reason\": \"Targeted insult in self-reply chain\"}"
+            },
+            "done": true
+        })))
+        .expect(5)
+        .mount(&server)
+        .await;
+
+    std::env::remove_var("OLLAMA_THINK");
+    std::env::remove_var("SKYBOUNCER_OLLAMA_THINK");
+    std::env::remove_var("FALLBACK_THINK");
+
+    let cfg = JevConfig {
+        base_url: format!("{}/api/chat", server.uri()),
+        api_key: None,
+        model: "gemma4:26b".to_string(),
+        timeout: Duration::from_millis(1000),
+        max_retries: 0,
+        supports_images: false,
+    };
+    let rubric = RuleRubric::new("Block harassment", Sensitivity::Medium);
+
+    // Self-reply interaction where Author continues replying to their own prior post.
+    let mut self_reply = sample_interaction("you silly stupid dope");
+    self_reply.interaction_type = InteractionType::ThreadReply;
+    self_reply.parent_uri =
+        Some("at://did:plc:spammer123/app.bsky.feed.post/prev_self".to_string());
+
+    // 1. Default (`None`) omits `think` and includes self-reply disambiguation guidance.
+    let c_none = JevClassifier::new(cfg.clone(), rubric.clone()).unwrap();
+    assert_eq!(c_none.ollama_think(), None);
+    assert!(c_none.classify(&self_reply).await.unwrap().is_violation());
+
+    // 2. Explicit builder overrides (`Some(false)` and `Some(true)`).
+    let c_false = JevClassifier::new(cfg.clone(), rubric.clone())
+        .unwrap()
+        .with_ollama_think(Some(false));
+    assert_eq!(c_false.ollama_think(), Some(false));
+    assert!(c_false.classify(&self_reply).await.unwrap().is_violation());
+
+    let c_true = JevClassifier::new(cfg.clone(), rubric.clone())
+        .unwrap()
+        .with_ollama_think(Some(true));
+    assert_eq!(c_true.ollama_think(), Some(true));
+    assert!(c_true.classify(&self_reply).await.unwrap().is_violation());
+
+    // 3. Environment variable parsing (`OLLAMA_THINK=false` / `1`).
+    std::env::set_var("OLLAMA_THINK", "false");
+    let c_env_false = JevClassifier::new(cfg.clone(), rubric.clone()).unwrap();
+    assert_eq!(c_env_false.ollama_think(), Some(false));
+    assert!(c_env_false
+        .classify(&self_reply)
+        .await
+        .unwrap()
+        .is_violation());
+
+    std::env::set_var("OLLAMA_THINK", "1");
+    let c_env_true = JevClassifier::new(cfg, rubric).unwrap();
+    assert_eq!(c_env_true.ollama_think(), Some(true));
+    assert!(c_env_true
+        .classify(&self_reply)
+        .await
+        .unwrap()
+        .is_violation());
+    std::env::remove_var("OLLAMA_THINK");
+
+    let reqs = server.received_requests().await.unwrap();
+    let bodies: Vec<serde_json::Value> = reqs
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert!(bodies[0].get("think").is_none());
+    let sys_prompt = bodies[0]["messages"][0]["content"].as_str().unwrap();
+    let user_prompt = bodies[0]["messages"][1]["content"].as_str().unwrap();
+    assert!(sys_prompt.contains("when Replying To is Author"));
+    assert!(user_prompt.contains(
+        "Replying To: Author (did:plc:spammer123) [self-reply / thread continuation] — trace back in Conversation Thread"
+    ));
+    assert_eq!(bodies[1]["think"], json!(false));
+    assert_eq!(bodies[2]["think"], json!(true));
+    assert_eq!(bodies[3]["think"], json!(false));
+    assert_eq!(bodies[4]["think"], json!(true));
 }
 
 #[tokio::test]
