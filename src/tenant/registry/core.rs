@@ -1,5 +1,53 @@
 use super::*;
 
+const TENANT_SCHEMA_VERSION: u16 = 1;
+
+struct ImmediateTxGuard<'a> {
+    conn: &'a Connection,
+    committed: bool,
+}
+
+impl<'a> ImmediateTxGuard<'a> {
+    fn begin(conn: &'a Connection) -> Result<Self, SkybouncerError> {
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| {
+            SkybouncerError::Database(format!("Failed to start tenant migration tx: {e}"))
+        })?;
+        Ok(Self {
+            conn,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) -> Result<(), SkybouncerError> {
+        self.conn.execute_batch("COMMIT;").map_err(|e| {
+            SkybouncerError::Database(format!("Failed to commit tenant migration tx: {e}"))
+        })?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ImmediateTxGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.conn.execute_batch("ROLLBACK;");
+        }
+    }
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, SkybouncerError> {
+    let sql = format!("PRAGMA table_info({table});");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl TenantRegistry {
     /// Opens or creates a persistent SQLite tenant registry at the given filesystem path.
     ///
@@ -32,11 +80,13 @@ impl TenantRegistry {
             conn: Arc::new(Mutex::new(conn)),
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
             client_epochs: Arc::new(RwLock::new(HashMap::new())),
+            meta_cache: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
             cipher,
             refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
         };
         registry.migrate_encrypted_secrets(legacy_cipher.as_ref())?;
+        let _ = registry.list_summaries();
         Ok(registry)
     }
 
@@ -57,11 +107,13 @@ impl TenantRegistry {
             conn: Arc::new(Mutex::new(conn)),
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
             client_epochs: Arc::new(RwLock::new(HashMap::new())),
+            meta_cache: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
             cipher,
             refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
         };
         registry.migrate_encrypted_secrets(legacy_cipher.as_ref())?;
+        let _ = registry.list_summaries();
         Ok(registry)
     }
 
@@ -100,11 +152,13 @@ impl TenantRegistry {
             conn,
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
             client_epochs: Arc::new(RwLock::new(HashMap::new())),
+            meta_cache: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
             cipher,
             refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
         };
         registry.migrate_encrypted_secrets(legacy_cipher.as_ref())?;
+        let _ = registry.list_summaries();
         Ok(registry)
     }
 
@@ -131,6 +185,33 @@ impl TenantRegistry {
     }
 
     pub(super) fn init_schema(conn: &Connection) -> Result<(), SkybouncerError> {
+        let uv: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        let (tenant_ver, cache_ver) = crate::util::unpack_schema_versions(uv);
+
+        if tenant_ver >= TENANT_SCHEMA_VERSION {
+            // Fast read-only check so repeated opens don't acquire unnecessary write locks,
+            // while still upgrading any legacy prompt rows if present.
+            for &(legacy, upgraded) in crate::classifier::rubric::LEGACY_PROMPT_UPGRADES {
+                let has_legacy: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM tenants WHERE rubric_prompt = ?1 LIMIT 1;",
+                        params![legacy],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if has_legacy {
+                    conn.execute(
+                        "UPDATE tenants SET rubric_prompt = ?1 WHERE rubric_prompt = ?2;",
+                        params![upgraded, legacy],
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+
+        let tx = ImmediateTxGuard::begin(conn)?;
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS tenants (
@@ -149,12 +230,6 @@ impl TenantRegistry {
                 reauth_notified_at INTEGER,
                 reauth_notify_count INTEGER NOT NULL DEFAULT 0
             );
-
-            CREATE INDEX IF NOT EXISTS idx_tenants_handle
-                ON tenants(handle);
-
-            CREATE INDEX IF NOT EXISTS idx_tenants_active
-                ON tenants(is_active);
 
             CREATE TABLE IF NOT EXISTS web_sessions (
                 token TEXT PRIMARY KEY,
@@ -180,54 +255,78 @@ impl TenantRegistry {
             SkybouncerError::Database(format!("Failed to initialize tenants schema: {e}"))
         })?;
 
-        // Idempotent column migrations for existing databases
-        let _ = conn.execute("ALTER TABLE tenants ADD COLUMN bounce_duration TEXT;", []);
-        let _ = conn.execute(
-            "ALTER TABLE tenants ADD COLUMN bypass_followers INTEGER;",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE tenants ADD COLUMN handle_updated_at INTEGER;",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE tenants ADD COLUMN reauth_required INTEGER NOT NULL DEFAULT 0;",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE tenants ADD COLUMN reauth_notified_at INTEGER;",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE tenants ADD COLUMN reauth_notify_count INTEGER NOT NULL DEFAULT 0;",
-            [],
-        );
+        // Idempotent column migrations for existing databases via PRAGMA table_info
+        let alter_migrations: &[(&str, &str)] = &[
+            (
+                "bounce_duration",
+                "ALTER TABLE tenants ADD COLUMN bounce_duration TEXT;",
+            ),
+            (
+                "bypass_followers",
+                "ALTER TABLE tenants ADD COLUMN bypass_followers INTEGER;",
+            ),
+            (
+                "handle_updated_at",
+                "ALTER TABLE tenants ADD COLUMN handle_updated_at INTEGER;",
+            ),
+            (
+                "reauth_required",
+                "ALTER TABLE tenants ADD COLUMN reauth_required INTEGER NOT NULL DEFAULT 0;",
+            ),
+            (
+                "reauth_notified_at",
+                "ALTER TABLE tenants ADD COLUMN reauth_notified_at INTEGER;",
+            ),
+            (
+                "reauth_notify_count",
+                "ALTER TABLE tenants ADD COLUMN reauth_notify_count INTEGER NOT NULL DEFAULT 0;",
+            ),
+        ];
+        for &(col, sql) in alter_migrations {
+            if !column_exists(conn, "tenants", col)? {
+                conn.execute(sql, [])?;
+            }
+        }
+
+        conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_tenants_handle
+                ON tenants(handle);
+
+            CREATE INDEX IF NOT EXISTS idx_tenants_handle_lower
+                ON tenants(LOWER(handle));
+
+            CREATE INDEX IF NOT EXISTS idx_tenants_active
+                ON tenants(is_active);
+            ",
+        )
+        .map_err(|e| SkybouncerError::Database(format!("Failed to create tenant indexes: {e}")))?;
+
         // Backfill notification count for rows that already received their initial re-auth DM
         // prior to the weekly reminder counter column.
-        let _ = conn.execute(
+        conn.execute(
             "UPDATE tenants SET reauth_notify_count = 1 WHERE reauth_notified_at IS NOT NULL AND reauth_notify_count = 0;",
             [],
-        );
+        )?;
         // Backfill handle freshness for rows predating the column so TTL lookups
         // do not treat existing handle mappings as permanently stale.
-        let _ = conn.execute(
+        conn.execute(
             "UPDATE tenants SET handle_updated_at = updated_at WHERE handle_updated_at IS NULL;",
             [],
-        );
+        )?;
         // Upgrade unmodified legacy default and preset rubric strings to target-scoped
         // wording while preserving any customized tenant rubric prompts verbatim.
         for &(legacy, upgraded) in crate::classifier::rubric::LEGACY_PROMPT_UPGRADES {
-            let _ = conn.execute(
+            conn.execute(
                 "UPDATE tenants SET rubric_prompt = ?1 WHERE rubric_prompt = ?2;",
                 params![upgraded, legacy],
-            );
+            )?;
         }
 
         // Zero-logout web_sessions migration:
         // 1. Prefix existing 64-char lowercase hex SHA-256 digests with `sha256:`.
         // 2. Purge expired unprefixed rows, then hash any remaining legacy plaintext tokens in place.
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
+        conn.execute(
             "UPDATE web_sessions
              SET token = 'sha256:' || token
              WHERE token NOT LIKE 'sha256:%'
@@ -236,13 +335,13 @@ impl TenantRegistry {
             [],
         )?;
         let now_i64 = us_to_i64(current_time_us());
-        tx.execute(
+        conn.execute(
             "DELETE FROM web_sessions WHERE token NOT LIKE 'sha256:%' AND expires_at < ?1;",
             params![now_i64],
         )?;
         let legacy_tokens: Vec<String> = {
             let mut stmt =
-                tx.prepare("SELECT token FROM web_sessions WHERE token NOT LIKE 'sha256:%';")?;
+                conn.prepare("SELECT token FROM web_sessions WHERE token NOT LIKE 'sha256:%';")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             let mut tokens = Vec::new();
             for row in rows {
@@ -255,13 +354,19 @@ impl TenantRegistry {
                 "{WEB_SESSION_HASH_PREFIX}{}",
                 hash_session_token(&raw_token)
             );
-            tx.execute(
+            conn.execute(
                 "UPDATE web_sessions SET token = ?1 WHERE token = ?2;",
                 params![prefixed, raw_token],
             )?;
         }
-        tx.commit()?;
 
+        let new_uv = crate::util::pack_schema_versions(TENANT_SCHEMA_VERSION, cache_ver);
+        conn.pragma_update(None, "user_version", new_uv)
+            .map_err(|e| {
+                SkybouncerError::Database(format!("Failed to update user_version: {e}"))
+            })?;
+
+        tx.commit()?;
         Ok(())
     }
 

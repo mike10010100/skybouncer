@@ -83,11 +83,13 @@ impl DeduplicationCache {
 
     /// Purges all expired evaluation records from the cache, returning the count of deleted rows.
     ///
-    /// Also prunes the historical evaluation audit log to prevent unbounded database growth.
+    /// Also prunes `evaluation_log` per `target_did` to retain at most 5,000 recent evaluations
+    /// per protected user, guarded by a fast `GROUP BY target_did HAVING COUNT(*) > 5000` check.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if the delete query fails.
     pub fn prune_expired_evaluations(&self) -> Result<usize, SkybouncerError> {
+        const MAX_EVAL_LOGS_PER_TARGET: i64 = 5_000;
         let now_us = current_time_us();
         let now_i64 = us_to_i64(now_us);
 
@@ -96,13 +98,34 @@ impl DeduplicationCache {
             conn.prepare_cached("DELETE FROM evaluation_cache WHERE expires_at <= ?1;")?;
         let deleted = stmt.execute(params![now_i64])?;
 
-        // Prune evaluation log table to retain at most 5,000 recent evaluations
-        let mut prune_logs_stmt = conn.prepare_cached(
-            "DELETE FROM evaluation_log WHERE id NOT IN (
-                SELECT id FROM evaluation_log ORDER BY timestamp_us DESC, id DESC LIMIT 5000
-             );",
-        )?;
-        let _ = prune_logs_stmt.execute([]);
+        // Fast index-covered check: only prune targets that actually exceed 5,000 rows.
+        let over_cap_targets: Vec<String> = {
+            let mut count_stmt = conn.prepare_cached(
+                "SELECT target_did FROM evaluation_log GROUP BY target_did HAVING COUNT(*) > ?1;",
+            )?;
+            let rows = count_stmt.query_map(params![MAX_EVAL_LOGS_PER_TARGET], |row| row.get(0))?;
+            let mut targets = Vec::new();
+            for row in rows {
+                targets.push(row?);
+            }
+            targets
+        };
+
+        if !over_cap_targets.is_empty() {
+            let mut prune_target_stmt = conn.prepare_cached(
+                "DELETE FROM evaluation_log
+                 WHERE target_did = ?1
+                   AND id NOT IN (
+                       SELECT id FROM evaluation_log
+                       WHERE target_did = ?1
+                       ORDER BY timestamp_us DESC, id DESC
+                       LIMIT ?2
+                   );",
+            )?;
+            for target_did in over_cap_targets {
+                let _ = prune_target_stmt.execute(params![target_did, MAX_EVAL_LOGS_PER_TARGET]);
+            }
+        }
 
         Ok(deleted)
     }
@@ -196,33 +219,7 @@ impl DeduplicationCache {
         let clean_source = source.filter(|s| !s.trim().is_empty() && *s != "all");
         let conn = self.conn.lock();
 
-        let mut query = String::from(
-            "SELECT id, timestamp_us, source, post_uri, post_text,
-                    author_did, author_handle, target_did, target_handle,
-                    has_images, primary_model, primary_action, primary_confidence,
-                    primary_category, primary_reason, escalated, escalation_reason,
-                    fallback_model, fallback_action, fallback_confidence,
-                    fallback_category, fallback_reason, final_action, final_confidence,
-                    outcome
-             FROM evaluation_log WHERE 1=1",
-        );
-
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(t) = clean_target {
-            query.push_str(" AND target_did = ?");
-            params_vec.push(Box::new(t.to_string()));
-        }
-        if let Some(s) = clean_source {
-            query.push_str(" AND source = ?");
-            params_vec.push(Box::new(s.to_string()));
-        }
-        query.push_str(" ORDER BY timestamp_us DESC, id DESC LIMIT ? OFFSET ?;");
-        params_vec.push(Box::new(limit_i64));
-        params_vec.push(Box::new(offset_i64));
-
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(AsRef::as_ref).collect();
-        let mut stmt = conn.prepare(&query)?;
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<EvaluationLogEntry> {
             let id: i64 = row.get(0)?;
             let ts_i64: i64 = row.get(1)?;
             let timestamp_us = i64_to_us(ts_i64);
@@ -277,11 +274,81 @@ impl DeduplicationCache {
                 final_confidence,
                 outcome,
             })
-        })?;
+        };
 
         let mut list = Vec::new();
-        for r in rows {
-            list.push(r?);
+        match (clean_target, clean_source) {
+            (Some(t), Some(s)) => {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT id, timestamp_us, source, post_uri, post_text,
+                            author_did, author_handle, target_did, target_handle,
+                            has_images, primary_model, primary_action, primary_confidence,
+                            primary_category, primary_reason, escalated, escalation_reason,
+                            fallback_model, fallback_action, fallback_confidence,
+                            fallback_category, fallback_reason, final_action, final_confidence,
+                            outcome
+                     FROM evaluation_log
+                     WHERE target_did = ?1 AND source = ?2
+                     ORDER BY timestamp_us DESC, id DESC LIMIT ?3 OFFSET ?4;",
+                )?;
+                let rows = stmt.query_map(params![t, s, limit_i64, offset_i64], map_row)?;
+                for r in rows {
+                    list.push(r?);
+                }
+            }
+            (Some(t), None) => {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT id, timestamp_us, source, post_uri, post_text,
+                            author_did, author_handle, target_did, target_handle,
+                            has_images, primary_model, primary_action, primary_confidence,
+                            primary_category, primary_reason, escalated, escalation_reason,
+                            fallback_model, fallback_action, fallback_confidence,
+                            fallback_category, fallback_reason, final_action, final_confidence,
+                            outcome
+                     FROM evaluation_log
+                     WHERE target_did = ?1
+                     ORDER BY timestamp_us DESC, id DESC LIMIT ?2 OFFSET ?3;",
+                )?;
+                let rows = stmt.query_map(params![t, limit_i64, offset_i64], map_row)?;
+                for r in rows {
+                    list.push(r?);
+                }
+            }
+            (None, Some(s)) => {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT id, timestamp_us, source, post_uri, post_text,
+                            author_did, author_handle, target_did, target_handle,
+                            has_images, primary_model, primary_action, primary_confidence,
+                            primary_category, primary_reason, escalated, escalation_reason,
+                            fallback_model, fallback_action, fallback_confidence,
+                            fallback_category, fallback_reason, final_action, final_confidence,
+                            outcome
+                     FROM evaluation_log
+                     WHERE source = ?1
+                     ORDER BY timestamp_us DESC, id DESC LIMIT ?2 OFFSET ?3;",
+                )?;
+                let rows = stmt.query_map(params![s, limit_i64, offset_i64], map_row)?;
+                for r in rows {
+                    list.push(r?);
+                }
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT id, timestamp_us, source, post_uri, post_text,
+                            author_did, author_handle, target_did, target_handle,
+                            has_images, primary_model, primary_action, primary_confidence,
+                            primary_category, primary_reason, escalated, escalation_reason,
+                            fallback_model, fallback_action, fallback_confidence,
+                            fallback_category, fallback_reason, final_action, final_confidence,
+                            outcome
+                     FROM evaluation_log
+                     ORDER BY timestamp_us DESC, id DESC LIMIT ?1 OFFSET ?2;",
+                )?;
+                let rows = stmt.query_map(params![limit_i64, offset_i64], map_row)?;
+                for r in rows {
+                    list.push(r?);
+                }
+            }
         }
         Ok(list)
     }
@@ -302,20 +369,28 @@ impl DeduplicationCache {
         let clean_source = source.filter(|s| !s.trim().is_empty() && *s != "all");
         let conn = self.conn.lock();
 
-        let mut query = String::from("SELECT COUNT(*) FROM evaluation_log WHERE 1=1");
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(t) = clean_target {
-            query.push_str(" AND target_did = ?");
-            params_vec.push(Box::new(t.to_string()));
-        }
-        if let Some(s) = clean_source {
-            query.push_str(" AND source = ?");
-            params_vec.push(Box::new(s.to_string()));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(AsRef::as_ref).collect();
-        let mut stmt = conn.prepare(&query)?;
-        let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
+        let count: i64 = match (clean_target, clean_source) {
+            (Some(t), Some(s)) => {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT COUNT(*) FROM evaluation_log WHERE target_did = ?1 AND source = ?2;",
+                )?;
+                stmt.query_row(params![t, s], |row| row.get(0))?
+            }
+            (Some(t), None) => {
+                let mut stmt = conn
+                    .prepare_cached("SELECT COUNT(*) FROM evaluation_log WHERE target_did = ?1;")?;
+                stmt.query_row(params![t], |row| row.get(0))?
+            }
+            (None, Some(s)) => {
+                let mut stmt =
+                    conn.prepare_cached("SELECT COUNT(*) FROM evaluation_log WHERE source = ?1;")?;
+                stmt.query_row(params![s], |row| row.get(0))?
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare_cached("SELECT COUNT(*) FROM evaluation_log;")?;
+                stmt.query_row([], |row| row.get(0))?
+            }
+        };
         Ok(usize::try_from(count.max(0)).unwrap_or(0))
     }
 

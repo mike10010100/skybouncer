@@ -1,5 +1,53 @@
 use super::*;
 
+const CACHE_SCHEMA_VERSION: u16 = 1;
+
+struct ImmediateTxGuard<'a> {
+    conn: &'a Connection,
+    committed: bool,
+}
+
+impl<'a> ImmediateTxGuard<'a> {
+    fn begin(conn: &'a Connection) -> Result<Self, SkybouncerError> {
+        conn.execute_batch("BEGIN IMMEDIATE;").map_err(|e| {
+            SkybouncerError::Database(format!("Failed to start migration transaction: {e}"))
+        })?;
+        Ok(Self {
+            conn,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) -> Result<(), SkybouncerError> {
+        self.conn.execute_batch("COMMIT;").map_err(|e| {
+            SkybouncerError::Database(format!("Failed to commit migration transaction: {e}"))
+        })?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ImmediateTxGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.conn.execute_batch("ROLLBACK;");
+        }
+    }
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, SkybouncerError> {
+    let sql = format!("PRAGMA table_info({table});");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl DeduplicationCache {
     /// Opens or creates a persistent SQLite cache database at the specified filesystem path.
     ///
@@ -73,6 +121,35 @@ impl DeduplicationCache {
     }
 
     pub(super) fn init_schema(conn: &Connection) -> Result<(), SkybouncerError> {
+        let uv: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        let (tenant_ver, cache_ver) = crate::util::unpack_schema_versions(uv);
+        if cache_ver >= CACHE_SCHEMA_VERSION {
+            conn.pragma_update(None, "foreign_keys", "ON")
+                .map_err(|e| {
+                    SkybouncerError::Database(format!("Failed to set foreign_keys ON: {e}"))
+                })?;
+            return Ok(());
+        }
+
+        // `PRAGMA foreign_keys` cannot be modified inside a SQLite transaction.
+        conn.pragma_update(None, "foreign_keys", "OFF")
+            .map_err(|e| {
+                SkybouncerError::Database(format!("Failed to set foreign_keys OFF: {e}"))
+            })?;
+
+        let migration_res = Self::run_v1_migration(conn, tenant_ver);
+
+        let restore_fk = conn
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| SkybouncerError::Database(format!("Failed to set foreign_keys ON: {e}")));
+
+        migration_res?;
+        restore_fk
+    }
+
+    fn run_v1_migration(conn: &Connection, tenant_ver: u16) -> Result<(), SkybouncerError> {
+        let tx = ImmediateTxGuard::begin(conn)?;
+
         // 1. Base tables
         conn.execute_batch(
             "
@@ -116,10 +193,11 @@ impl DeduplicationCache {
             CREATE TABLE IF NOT EXISTS bounced_user_rkeys (
                 protected_did TEXT NOT NULL DEFAULT '',
                 subject_did TEXT NOT NULL,
-                listitem_rkey TEXT NOT NULL PRIMARY KEY,
+                listitem_rkey TEXT NOT NULL,
                 listitem_uri TEXT NOT NULL,
                 listitem_cid TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (protected_did, listitem_rkey)
             );
 
             CREATE TABLE IF NOT EXISTS evaluation_cache (
@@ -211,34 +289,48 @@ impl DeduplicationCache {
         })?;
 
         // 2. Ensure backward-compatible columns exist on legacy tables BEFORE creating indexes on them
-        let _ = conn.execute(
-            "ALTER TABLE bounced_users ADD COLUMN protected_did TEXT NOT NULL DEFAULT '';",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE bounced_users ADD COLUMN post_text TEXT NOT NULL DEFAULT '';",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE bounced_user_rkeys ADD COLUMN protected_did TEXT NOT NULL DEFAULT '';",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE evaluation_log ADD COLUMN source TEXT NOT NULL DEFAULT 'live';",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE bounced_users ADD COLUMN expires_at INTEGER;",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE bounced_users ADD COLUMN reply_to_uri TEXT;",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE did_handles ADD COLUMN handle_verified INTEGER NOT NULL DEFAULT 0;",
-            [],
-        );
+        let alter_migrations: &[(&str, &str, &str)] = &[
+            (
+                "bounced_users",
+                "protected_did",
+                "ALTER TABLE bounced_users ADD COLUMN protected_did TEXT NOT NULL DEFAULT '';",
+            ),
+            (
+                "bounced_users",
+                "post_text",
+                "ALTER TABLE bounced_users ADD COLUMN post_text TEXT NOT NULL DEFAULT '';",
+            ),
+            (
+                "bounced_user_rkeys",
+                "protected_did",
+                "ALTER TABLE bounced_user_rkeys ADD COLUMN protected_did TEXT NOT NULL DEFAULT '';",
+            ),
+            (
+                "evaluation_log",
+                "source",
+                "ALTER TABLE evaluation_log ADD COLUMN source TEXT NOT NULL DEFAULT 'live';",
+            ),
+            (
+                "bounced_users",
+                "expires_at",
+                "ALTER TABLE bounced_users ADD COLUMN expires_at INTEGER;",
+            ),
+            (
+                "bounced_users",
+                "reply_to_uri",
+                "ALTER TABLE bounced_users ADD COLUMN reply_to_uri TEXT;",
+            ),
+            (
+                "did_handles",
+                "handle_verified",
+                "ALTER TABLE did_handles ADD COLUMN handle_verified INTEGER NOT NULL DEFAULT 0;",
+            ),
+        ];
+        for &(table, col, sql) in alter_migrations {
+            if !column_exists(conn, table, col)? {
+                conn.execute(sql, [])?;
+            }
+        }
 
         // 3. Migrate legacy bounced_users table from single-column PK (subject_did) to composite PK (protected_did, subject_did)
         let needs_pk_migration: bool = {
@@ -293,7 +385,8 @@ impl DeduplicationCache {
             })?;
         }
 
-        // 3.5. Migrate legacy bounced_user_rkeys table if it has a foreign key referencing bounced_users
+        // 3.5. Migrate legacy bounced_user_rkeys table if it has a foreign key referencing
+        // bounced_users OR uses the legacy single-column PK (listitem_rkey).
         let has_legacy_rkeys_fk: bool = {
             let mut stmt = conn.prepare("PRAGMA foreign_key_list(bounced_user_rkeys);")?;
             let mut rows = stmt.query([])?;
@@ -308,16 +401,35 @@ impl DeduplicationCache {
             found
         };
 
-        if has_legacy_rkeys_fk {
+        let needs_rkeys_pk_migration: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info(bounced_user_rkeys);")?;
+            let mut pk_count = 0;
+            let mut rkey_is_pk = false;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                let pk: i64 = row.get(5)?;
+                if pk > 0 {
+                    pk_count += 1;
+                    if name == "listitem_rkey" {
+                        rkey_is_pk = true;
+                    }
+                }
+            }
+            pk_count == 1 && rkey_is_pk
+        };
+
+        if has_legacy_rkeys_fk || needs_rkeys_pk_migration {
             conn.execute_batch(
                 "
                 CREATE TABLE bounced_user_rkeys_v2 (
                     protected_did TEXT NOT NULL DEFAULT '',
                     subject_did TEXT NOT NULL,
-                    listitem_rkey TEXT NOT NULL PRIMARY KEY,
+                    listitem_rkey TEXT NOT NULL,
                     listitem_uri TEXT NOT NULL,
                     listitem_cid TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (protected_did, listitem_rkey)
                 );
                 INSERT OR IGNORE INTO bounced_user_rkeys_v2 (protected_did, subject_did, listitem_rkey, listitem_uri, listitem_cid, created_at)
                     SELECT COALESCE(protected_did, ''), subject_did, listitem_rkey, listitem_uri, listitem_cid, created_at FROM bounced_user_rkeys;
@@ -326,21 +438,24 @@ impl DeduplicationCache {
                 ",
             )
             .map_err(|e| {
-                SkybouncerError::Database(format!("Failed to migrate bounced_user_rkeys FK: {e}"))
+                SkybouncerError::Database(format!("Failed to migrate bounced_user_rkeys PK/FK: {e}"))
             })?;
         }
 
-        // 4. Dependent indexes
+        // 4. Dependent indexes, redundant index cleanup, and backfills
         conn.execute_batch(
             "
+            DROP INDEX IF EXISTS idx_bounced_users_protected;
+            DROP INDEX IF EXISTS idx_allowlist_protected;
+
             CREATE INDEX IF NOT EXISTS idx_bounced_users_bounced_at
                 ON bounced_users(bounced_at);
 
+            CREATE INDEX IF NOT EXISTS idx_bounced_users_protected_at
+                ON bounced_users(protected_did, bounced_at DESC);
+
             CREATE INDEX IF NOT EXISTS idx_bounced_users_subject
                 ON bounced_users(subject_did);
-
-            CREATE INDEX IF NOT EXISTS idx_bounced_users_protected
-                ON bounced_users(protected_did);
 
             CREATE INDEX IF NOT EXISTS idx_bounced_users_expires
                 ON bounced_users(expires_at) WHERE expires_at IS NOT NULL;
@@ -394,28 +509,65 @@ impl DeduplicationCache {
             CREATE INDEX IF NOT EXISTS idx_evaluation_log_source
                 ON evaluation_log(source);
 
-            CREATE INDEX IF NOT EXISTS idx_allowlist_protected
-                ON allowlist(protected_did);
+            CREATE INDEX IF NOT EXISTS idx_evaluation_log_target_source_ts
+                ON evaluation_log(target_did, source, timestamp_us DESC, id DESC);
 
             CREATE INDEX IF NOT EXISTS idx_did_handles_updated
                 ON did_handles(updated_at);
+
+            CREATE INDEX IF NOT EXISTS idx_did_handles_handle_nocase
+                ON did_handles(handle COLLATE NOCASE, updated_at DESC);
 
             CREATE INDEX IF NOT EXISTS idx_dogpile_events_target_updated
                 ON dogpile_events(target_did, updated_at_us DESC);
 
             CREATE INDEX IF NOT EXISTS idx_dogpile_events_status_updated
                 ON dogpile_events(status, updated_at_us DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_dogpile_events_target_focal_status
+                ON dogpile_events(target_did, focal_post_uri, status);
             ",
         )
         .map_err(|e| {
             SkybouncerError::Database(format!("Failed to initialize cache schema indexes: {e}"))
         })?;
 
-        conn.pragma_update(None, "foreign_keys", "ON")
+        let new_uv = crate::util::pack_schema_versions(tenant_ver, CACHE_SCHEMA_VERSION);
+        conn.pragma_update(None, "user_version", new_uv)
             .map_err(|e| {
-                SkybouncerError::Database(format!("Failed to set foreign_keys ON: {e}"))
+                SkybouncerError::Database(format!("Failed to update user_version: {e}"))
             })?;
 
+        tx.commit()
+    }
+
+    /// Runs `PRAGMA wal_checkpoint(TRUNCATE)` to fold WAL frames back into the main database file.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the checkpoint fails.
+    pub fn checkpoint_wal_truncate(&self) -> Result<(), SkybouncerError> {
+        let conn = self.conn.lock();
+        let _: (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(|e| {
+                SkybouncerError::Database(format!("Failed to checkpoint WAL (TRUNCATE): {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// Runs `PRAGMA incremental_vacuum(pages)` followed by `PRAGMA optimize` to reclaim freed pages
+    /// and refresh SQLite query-planner statistics.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if either pragma fails.
+    pub fn run_incremental_vacuum_and_optimize(&self, pages: u32) -> Result<(), SkybouncerError> {
+        let conn = self.conn.lock();
+        let sql = format!("PRAGMA incremental_vacuum({pages}); PRAGMA optimize;");
+        conn.execute_batch(&sql).map_err(|e| {
+            SkybouncerError::Database(format!("Failed to run incremental_vacuum/optimize: {e}"))
+        })?;
         Ok(())
     }
 }

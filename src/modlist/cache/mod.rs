@@ -1424,4 +1424,222 @@ mod tests {
             Some("alice.bsky.social")
         );
     }
+
+    #[test]
+    fn test_pr3_indexes_query_plans_retention_and_composite_rkey_pk() {
+        let dir = std::env::temp_dir();
+        let db_path = dir.join(format!(
+            "skybouncer_pr3_cache_test_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        let cache = DeduplicationCache::open(&db_path).unwrap();
+
+        // 1. Composite PK `(protected_did, listitem_rkey)` allows shared rkeys across tenants.
+        let mut b1 = bounce_fixture("did:plc:tenant1", "did:plc:spammer");
+        b1.listitem_rkey = "shared_rkey_1".to_string();
+        let mut b2 = bounce_fixture("did:plc:tenant2", "did:plc:spammer");
+        b2.listitem_rkey = "shared_rkey_1".to_string();
+        cache.record_bounce(&b1).unwrap();
+        cache.record_bounce(&b2).unwrap();
+        assert_eq!(
+            cache
+                .get_all_bounced_rkeys_for("did:plc:tenant1", "did:plc:spammer")
+                .unwrap(),
+            vec!["shared_rkey_1".to_string()]
+        );
+        assert_eq!(
+            cache
+                .get_all_bounced_rkeys_for("did:plc:tenant2", "did:plc:spammer")
+                .unwrap(),
+            vec!["shared_rkey_1".to_string()]
+        );
+
+        // 2. EXPLAIN QUERY PLAN verifies index usage across all PR 3 indexes.
+        {
+            let conn = cache.conn.lock();
+            let explain = |sql: &str| -> String {
+                conn.query_row(&format!("EXPLAIN QUERY PLAN {sql}"), [], |r| r.get(3))
+                    .unwrap()
+            };
+            assert!(
+                explain("SELECT did FROM did_handles WHERE handle = 'a.bsky.social' COLLATE NOCASE ORDER BY updated_at DESC")
+                    .contains("idx_did_handles_handle_nocase")
+            );
+            assert!(
+                explain("SELECT subject_did FROM bounced_users WHERE protected_did = 'did:plc:t' ORDER BY bounced_at DESC LIMIT 10")
+                    .contains("idx_bounced_users_protected_at")
+            );
+            assert!(
+                explain("SELECT id FROM evaluation_log WHERE target_did = 'did:plc:t' AND source = 'live' ORDER BY timestamp_us DESC, id DESC LIMIT 10")
+                    .contains("idx_evaluation_log_target_source_ts")
+            );
+            assert!(
+                explain("SELECT id FROM dogpile_events WHERE target_did = 'did:plc:t' AND focal_post_uri = 'at://u' AND status = 'active'")
+                    .contains("idx_dogpile_events_target_focal_status")
+            );
+        }
+
+        // 3. Per-target evaluation_log 5,000-row cap inside prune_expired_evaluations isolates target_did buckets cleanly.
+        {
+            let mut conn = cache.conn.lock();
+            let tx = conn.transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO evaluation_log (
+                            timestamp_us, source, post_uri, post_text, author_did, author_handle,
+                            target_did, target_handle, has_images, primary_model, primary_action,
+                            primary_confidence, primary_category, primary_reason, escalated,
+                            escalation_reason, fallback_model, fallback_action, fallback_confidence,
+                            fallback_category, fallback_reason, final_action, final_confidence, outcome
+                        ) VALUES (
+                            ?1, 'live', ?2, 'txt', 'did:plc:a', '', ?3, '', 0, 'm', 'allow',
+                            0.9, 'none', 'ok', 0, NULL, NULL, NULL, NULL, NULL, NULL, 'allow', 0.9, 'Permitted'
+                        );",
+                    )
+                    .unwrap();
+                for i in 0..5_003_i64 {
+                    stmt.execute(params![
+                        10_000 + i,
+                        format!("at://did:plc:a/app.bsky.feed.post/{i}"),
+                        "did:plc:target_a"
+                    ])
+                    .unwrap();
+                }
+                for i in 0..2_i64 {
+                    stmt.execute(params![
+                        20_000 + i,
+                        format!("at://did:plc:b/app.bsky.feed.post/{i}"),
+                        "did:plc:target_b"
+                    ])
+                    .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let _ = cache.prune_expired_evaluations().unwrap();
+        assert_eq!(
+            cache
+                .count_evaluation_logs(Some("did:plc:target_a"), None)
+                .unwrap(),
+            5_000,
+            "target_a must be capped at 5,000 rows"
+        );
+        assert_eq!(
+            cache
+                .count_evaluation_logs(Some("did:plc:target_b"), None)
+                .unwrap(),
+            2,
+            "target_b must not be evicted by target_a's volume"
+        );
+
+        // 4. Resolved storm & bounce_history pruning + incremental_vacuum/optimize + WAL truncate.
+        let storm = crate::dogpile::StormEvent {
+            id: 0,
+            target_did: "did:plc:tenant1".to_string(),
+            target_handle: Some("t1.bsky.social".to_string()),
+            focal_post_uri: "at://did:plc:tenant1/app.bsky.feed.post/s1".to_string(),
+            focal_post_snippet: "storm post".to_string(),
+            status: crate::dogpile::StormStatus::Active,
+            severity: crate::dogpile::StormSeverity::Elevated,
+            started_at_us: 100,
+            updated_at_us: 200,
+            resolved_at_us: None,
+            metrics: crate::dogpile::StormMetrics::default(),
+            top_catalyst: None,
+            catalyst_qt_uris: Vec::new(),
+            stance: None,
+            bounces_during_storm: 0,
+            threadgate_applied: false,
+            postgate_detaches_applied: 0,
+        };
+        let storm_id = cache.upsert_active_storm(&storm).unwrap();
+        assert!(cache
+            .update_storm_status(
+                Some("did:plc:tenant1"),
+                storm_id,
+                crate::dogpile::StormStatus::Resolved,
+                Some(500),
+            )
+            .unwrap());
+        assert_eq!(cache.prune_resolved_storms(1000).unwrap(), 1);
+
+        // Removing bounces archives into bounce_history; prune_bounce_history deletes old entries.
+        let _ = cache
+            .remove_bounce_for("did:plc:tenant1", "did:plc:spammer")
+            .unwrap();
+        let _ = cache
+            .remove_bounce_for("did:plc:tenant2", "did:plc:spammer")
+            .unwrap();
+        assert_eq!(cache.prune_bounce_history(u64::MAX).unwrap(), 2);
+
+        cache.run_incremental_vacuum_and_optimize(16).unwrap();
+        cache.checkpoint_wal_truncate().unwrap();
+        drop(cache);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn test_pr3_user_version_legacy_rkeys_migration_and_rollback_safety() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE bounced_users (
+                protected_did TEXT NOT NULL DEFAULT '',
+                subject_did TEXT NOT NULL,
+                listitem_uri TEXT NOT NULL,
+                listitem_rkey TEXT NOT NULL,
+                listitem_cid TEXT NOT NULL,
+                category TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                reason TEXT NOT NULL,
+                post_uri TEXT NOT NULL,
+                post_text TEXT NOT NULL DEFAULT '',
+                reply_to_uri TEXT,
+                bounced_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                PRIMARY KEY (protected_did, subject_did)
+            );
+            CREATE TABLE bounced_user_rkeys (
+                subject_did TEXT NOT NULL,
+                listitem_rkey TEXT NOT NULL PRIMARY KEY,
+                listitem_uri TEXT NOT NULL,
+                listitem_cid TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO bounced_user_rkeys VALUES ('did:plc:s1', 'rk1', 'at://u', 'cid1', 100);
+            ",
+        )
+        .unwrap();
+
+        // Migrate from user_version=0 -> preserves existing rkey row and adds composite PK.
+        DeduplicationCache::init_schema(&conn).unwrap();
+        let ver: i32 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap();
+        let (_, cache_ver) = crate::util::unpack_schema_versions(ver);
+        assert!(cache_ver >= 1);
+        let fk_restored: i64 = conn
+            .query_row("PRAGMA foreign_keys;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk_restored, 1);
+
+        // Two tenants can now insert identical listitem_rkey.
+        conn.execute(
+            "INSERT INTO bounced_user_rkeys (protected_did, subject_did, listitem_rkey, listitem_uri, listitem_cid, created_at)
+             VALUES ('did:plc:t1', 'did:plc:s2', 'rk_dup', 'at://1', 'c1', 200);",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bounced_user_rkeys (protected_did, subject_did, listitem_rkey, listitem_uri, listitem_cid, created_at)
+             VALUES ('did:plc:t2', 'did:plc:s2', 'rk_dup', 'at://2', 'c2', 200);",
+            [],
+        )
+        .unwrap();
+    }
 }

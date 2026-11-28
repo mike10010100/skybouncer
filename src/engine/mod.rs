@@ -72,8 +72,8 @@ pub const DEFAULT_DID_HANDLE_CACHE_TTL: Duration = Duration::from_secs(30 * 24 *
 /// Default upper bound on retained DID-to-handle cache entries.
 pub const DEFAULT_DID_HANDLE_CACHE_MAX_ENTRIES: usize = 50_000;
 
-/// Default graceful shutdown timeout (5 seconds).
-pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default graceful shutdown timeout (20 seconds).
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Default initial backoff before retrying a queued candidate when the classifier is unreachable (2 seconds).
 pub const DEFAULT_CLASSIFIER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
@@ -1152,6 +1152,13 @@ enum FastPath {
     /// A heuristic violation was acted upon; the sync caller emits an audit log
     /// (including for errors) carrying the raw verdict before returning the outcome.
     Heuristic(Result<InteractionOutcome, SkybouncerError>, Verdict),
+    /// A fast-path tier produced a terminal verdict whose PDS side effects should run on a background worker.
+    DeferredAction {
+        /// Verdict from evaluation cache hit or heuristic pre-filter.
+        verdict: Verdict,
+        /// Whether the verdict came from the heuristic pre-filter (needs audit log emission).
+        is_heuristic: bool,
+    },
     /// No fast-path tier resolved the interaction; the caller must evaluate or enqueue.
     Continue,
 }
@@ -1711,19 +1718,30 @@ impl SkybouncerEngineBuilder {
             None => Arc::new(TenantRegistry::from_connection(cache.connection())?),
         };
 
-        // 7.5. Seed per-user incoming-follower bypass flags into the in-memory gate.
-        // Config-level protected DIDs inherit the engine default rubric; enrolled tenants
-        // override with their own per-user sovereign flag.
+        let mut protected = self.config.protected_dids.clone();
+        if let Some(ref admin) = self.config.admin_did {
+            let clean = admin.trim();
+            if !clean.is_empty() {
+                protected.insert(clean.to_string());
+                gate.set_bypass_incoming_followers(
+                    clean,
+                    self.config.rubric.bypass_incoming_followers,
+                );
+            }
+        }
         for did in &self.config.protected_dids {
             gate.set_bypass_incoming_followers(did, self.config.rubric.bypass_incoming_followers);
         }
-        if let Ok(active) = tenant_registry.list_active() {
-            for tenant in active {
-                if let Some(ref rubric) = tenant.rubric {
-                    gate.set_bypass_incoming_followers(
-                        &tenant.did,
-                        rubric.bypass_incoming_followers,
-                    );
+        if let Ok(summaries) = tenant_registry.list_summaries() {
+            for tenant in summaries {
+                if tenant.is_active {
+                    protected.insert(tenant.did.clone());
+                    if let Some(ref rubric) = tenant.rubric {
+                        gate.set_bypass_incoming_followers(
+                            &tenant.did,
+                            rubric.bypass_incoming_followers,
+                        );
+                    }
                 }
             }
         }
@@ -1734,12 +1752,6 @@ impl SkybouncerEngineBuilder {
             ))
         });
 
-        let mut protected = self.config.protected_dids.clone();
-        if let Ok(active) = tenant_registry.list_active() {
-            for t in active {
-                protected.insert(t.did);
-            }
-        }
         let protected_dids = Arc::new(RwLock::new(protected));
         let rubric = Arc::new(RwLock::new(self.config.rubric.clone()));
         let stats = Arc::new(load_persisted_stats(&cache));

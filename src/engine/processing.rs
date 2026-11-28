@@ -32,9 +32,24 @@ impl SkybouncerEngine {
             modlist_manager
         };
         let mut protected = config.protected_dids.clone();
-        if let Ok(active) = tenant_registry.list_active() {
-            for t in active {
-                protected.insert(t.did);
+        if let Some(ref admin) = config.admin_did {
+            let clean = admin.trim();
+            if !clean.is_empty() {
+                protected.insert(clean.to_string());
+                gate.set_bypass_incoming_followers(clean, config.rubric.bypass_incoming_followers);
+            }
+        }
+        for did in &config.protected_dids {
+            gate.set_bypass_incoming_followers(did, config.rubric.bypass_incoming_followers);
+        }
+        if let Ok(summaries) = tenant_registry.list_summaries() {
+            for t in summaries {
+                if t.is_active {
+                    protected.insert(t.did.clone());
+                    if let Some(ref r) = t.rubric {
+                        gate.set_bypass_incoming_followers(&t.did, r.bypass_incoming_followers);
+                    }
+                }
             }
         }
         let protected_dids = Arc::new(RwLock::new(protected));
@@ -53,23 +68,22 @@ impl SkybouncerEngine {
         let handle_cache = Arc::new(RwLock::new(HashMap::new()));
         let dogpile_tracker = Arc::new(DogpileTracker::new(config.dogpile_config.clone()));
         let storm_stance_classifier: Arc<dyn StormStanceClassifier> =
-            Arc::new(NoopStormStanceClassifier);
+            if config.dogpile_config.enable_llm_stance {
+                if let Some(ref fb_cfg) = config.fallback_jev_config {
+                    Arc::new(LlmStormStanceClassifier::new(fb_cfg.clone())?)
+                } else if let Some(ref jev_cfg) = config.jev_config {
+                    Arc::new(LlmStormStanceClassifier::new(jev_cfg.clone())?)
+                } else {
+                    Arc::new(NoopStormStanceClassifier)
+                }
+            } else {
+                Arc::new(NoopStormStanceClassifier)
+            };
 
         if let Ok(loaded_allowlists) = cache.load_all_allowlists() {
             let mut guard = gate.allowlist().write();
             for (prot, authors) in loaded_allowlists {
                 guard.entry(prot).or_default().extend(authors);
-            }
-        }
-
-        for did in &config.protected_dids {
-            gate.set_bypass_incoming_followers(did, config.rubric.bypass_incoming_followers);
-        }
-        if let Ok(active_tenants) = tenant_registry.list_active() {
-            for t in active_tenants {
-                if let Some(ref r) = t.rubric {
-                    gate.set_bypass_incoming_followers(&t.did, r.bypass_incoming_followers);
-                }
             }
         }
 
@@ -133,7 +147,18 @@ impl SkybouncerEngine {
             CommitDispatch::Interactions(interactions) => {
                 let mut outcomes = Vec::with_capacity(interactions.len());
                 for interaction in interactions {
-                    outcomes.push(self.process_interaction(interaction).await?);
+                    match self.process_interaction(interaction).await {
+                        Ok(outcome) => outcomes.push(outcome),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "Per-target interaction evaluation failed; continuing remaining targets"
+                            );
+                            self.stats
+                                .errors_encountered
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
                 Ok(ProcessCommitResult::InteractionsProcessed(outcomes))
             }
@@ -144,39 +169,56 @@ impl SkybouncerEngine {
     ///
     /// Fast-path operations (follow graph sync, non-post filtering, self/followed gate checks,
     /// dedup cache hits, and evaluation cache hits) are completed immediately (<1µs to <50µs).
-    /// Candidates requiring model evaluation are enqueued to `eval_tx` without blocking the caller.
+    /// Candidates requiring model evaluation or remote PDS side effects are enqueued without blocking the caller.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError`] if cache query or PDS mutation fails.
+    /// Returns [`SkybouncerError`] if cache query fails.
     #[instrument(skip(self, commit, eval_tx), fields(collection = %commit.collection, did = %commit.did, rkey = %commit.rkey))]
     pub async fn process_commit_queued(
         &self,
         commit: &JetstreamCommit,
         eval_tx: &mpsc::Sender<Interaction>,
     ) -> Result<ProcessCommitResult, SkybouncerError> {
-        self.process_commit_queued_with_storms(commit, eval_tx, None)
+        self.process_commit_queued_with_storms(commit, eval_tx, None, None)
             .await
     }
 
-    /// Evaluates a single Jetstream commit with decoupled evaluation and storm-surge queues.
+    /// Evaluates a single Jetstream commit with decoupled evaluation, deferred fast-action, and storm-surge queues.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError`] if cache query or PDS mutation fails.
+    /// Returns [`SkybouncerError`] if cache query fails.
     pub(super) async fn process_commit_queued_with_storms(
         &self,
         commit: &JetstreamCommit,
         eval_tx: &mpsc::Sender<Interaction>,
         storm_tx: Option<&mpsc::Sender<crate::dogpile::SurgeCandidate>>,
+        fast_action_tx: Option<&mpsc::Sender<(Interaction, Verdict, bool)>>,
     ) -> Result<ProcessCommitResult, SkybouncerError> {
         match self.dispatch_commit(commit) {
             CommitDispatch::Resolved(result) => Ok(result),
             CommitDispatch::Interactions(interactions) => {
                 let mut outcomes = Vec::with_capacity(interactions.len());
                 for interaction in interactions {
-                    outcomes.push(
-                        self.process_interaction_queued_inner(interaction, eval_tx, storm_tx)
-                            .await?,
-                    );
+                    match self
+                        .process_interaction_queued_inner(
+                            interaction,
+                            eval_tx,
+                            storm_tx,
+                            fast_action_tx,
+                        )
+                        .await
+                    {
+                        Ok(outcome) => outcomes.push(outcome),
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "Per-target queued interaction failed; continuing remaining targets"
+                            );
+                            self.stats
+                                .errors_encountered
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
                 Ok(ProcessCommitResult::InteractionsProcessed(outcomes))
             }
@@ -322,8 +364,57 @@ impl SkybouncerEngine {
         interaction: Interaction,
         eval_tx: &mpsc::Sender<Interaction>,
     ) -> Result<InteractionOutcome, SkybouncerError> {
-        self.process_interaction_queued_inner(interaction, eval_tx, None)
+        self.process_interaction_queued_inner(interaction, eval_tx, None, None)
             .await
+    }
+
+    fn record_heuristic_log(
+        &self,
+        interaction: &Interaction,
+        outcome: &Result<InteractionOutcome, SkybouncerError>,
+        verdict: &Verdict,
+    ) {
+        let outcome_str = match outcome {
+            Ok(InteractionOutcome::Bounced { .. }) => "Bounced (Regex Pre-filter)",
+            Ok(InteractionOutcome::BelowThreshold { .. }) => "Below Threshold (Regex Pre-filter)",
+            Ok(other) => other.label(),
+            Err(_) => "Error (Regex Pre-filter)",
+        };
+        let target_handle = self.target_handle(&interaction.target_did);
+        let log_entry = crate::modlist::cache::NewEvaluationLog::heuristic(
+            interaction,
+            &interaction.post_uri,
+            verdict,
+            crate::modlist::EvaluationLogContext {
+                source: "live",
+                outcome: outcome_str,
+            },
+            String::new(),
+            target_handle,
+        );
+        if let Err(e) = self.cache.record_evaluation_log(&log_entry) {
+            tracing::warn!(error = %e, "Failed to record evaluation log in cache");
+            self.stats
+                .errors_encountered
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Executes a deferred fast-path verdict (`eval_cache` hit or heuristic violation) on a background worker.
+    pub(super) async fn execute_deferred_action(
+        &self,
+        interaction: Interaction,
+        verdict: Verdict,
+        is_heuristic: bool,
+    ) -> Result<InteractionOutcome, SkybouncerError> {
+        if !is_heuristic {
+            self.stats.eval_cache_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        let outcome = self.act_on_verdict(&interaction, verdict.clone()).await;
+        if is_heuristic {
+            self.record_heuristic_log(&interaction, &outcome, &verdict);
+        }
+        outcome
     }
 
     async fn process_interaction_queued_inner(
@@ -331,6 +422,7 @@ impl SkybouncerEngine {
         interaction: Interaction,
         eval_tx: &mpsc::Sender<Interaction>,
         storm_tx: Option<&mpsc::Sender<crate::dogpile::SurgeCandidate>>,
+        fast_action_tx: Option<&mpsc::Sender<(Interaction, Verdict, bool)>>,
     ) -> Result<InteractionOutcome, SkybouncerError> {
         let author_did = interaction.author_did.clone();
         let target_did = interaction.target_did.clone();
@@ -348,36 +440,50 @@ impl SkybouncerEngine {
             }
         }
 
-        match self.fast_path(&interaction).await? {
+        match self.fast_path(&interaction, true).await? {
             FastPath::Resolved(outcome) => return Ok(outcome),
             FastPath::Heuristic(outcome, verdict) => {
-                let outcome_str = match &outcome {
-                    Ok(InteractionOutcome::Bounced { .. }) => "Bounced (Regex Pre-filter)",
-                    Ok(InteractionOutcome::BelowThreshold { .. }) => {
-                        "Below Threshold (Regex Pre-filter)"
-                    }
-                    Ok(other) => other.label(),
-                    Err(_) => "Error (Regex Pre-filter)",
-                };
-                let target_handle = self.target_handle(&target_did);
-                let log_entry = crate::modlist::cache::NewEvaluationLog::heuristic(
-                    &interaction,
-                    &interaction.post_uri,
-                    &verdict,
-                    crate::modlist::EvaluationLogContext {
-                        source: "live",
-                        outcome: outcome_str,
-                    },
-                    String::new(),
-                    target_handle,
-                );
-                if let Err(e) = self.cache.record_evaluation_log(&log_entry) {
-                    tracing::warn!(error = %e, "Failed to record evaluation log in cache");
-                    self.stats
-                        .errors_encountered
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+                self.record_heuristic_log(&interaction, &outcome, &verdict);
                 return outcome;
+            }
+            FastPath::DeferredAction {
+                verdict,
+                is_heuristic,
+            } => {
+                if let Some(action_tx) = fast_action_tx {
+                    match action_tx.try_send((interaction, verdict, is_heuristic)) {
+                        Ok(()) => {
+                            self.stats
+                                .eval_queue_enqueued
+                                .fetch_add(1, Ordering::Relaxed);
+                            return Ok(InteractionOutcome::QueuedForEvaluation {
+                                author_did,
+                                target_did,
+                                post_uri,
+                            });
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            self.stats
+                                .eval_queue_overflows
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                author = %author_did,
+                                target = %target_did,
+                                "Fast-action queue saturated; shedding load to preserve Jetstream throughput"
+                            );
+                            return Ok(InteractionOutcome::QueueOverflow {
+                                author_did,
+                                target_did,
+                                post_uri,
+                            });
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            return Err(SkybouncerError::Ingestion(
+                                "Fast-action queue channel closed".to_string(),
+                            ));
+                        }
+                    }
+                }
             }
             FastPath::Continue => {}
         }
@@ -440,36 +546,19 @@ impl SkybouncerEngine {
             }
         }
 
-        match self.fast_path(&interaction).await? {
+        match self.fast_path(&interaction, false).await? {
             FastPath::Resolved(outcome) => return Ok(outcome),
             FastPath::Heuristic(outcome, verdict) => {
-                let outcome_str = match &outcome {
-                    Ok(InteractionOutcome::Bounced { .. }) => "Bounced (Regex Pre-filter)",
-                    Ok(InteractionOutcome::BelowThreshold { .. }) => {
-                        "Below Threshold (Regex Pre-filter)"
-                    }
-                    Ok(other) => other.label(),
-                    Err(_) => "Error (Regex Pre-filter)",
-                };
-                let target_handle = self.target_handle(&target_did);
-                let log_entry = crate::modlist::cache::NewEvaluationLog::heuristic(
-                    &interaction,
-                    &interaction.post_uri,
-                    &verdict,
-                    crate::modlist::EvaluationLogContext {
-                        source: "live",
-                        outcome: outcome_str,
-                    },
-                    String::new(),
-                    target_handle,
-                );
-                if let Err(e) = self.cache.record_evaluation_log(&log_entry) {
-                    tracing::warn!(error = %e, "Failed to record evaluation log in cache");
-                    self.stats
-                        .errors_encountered
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+                self.record_heuristic_log(&interaction, &outcome, &verdict);
                 return outcome;
+            }
+            FastPath::DeferredAction {
+                verdict,
+                is_heuristic,
+            } => {
+                return self
+                    .execute_deferred_action(interaction, verdict, is_heuristic)
+                    .await;
             }
             FastPath::Continue => {}
         }
@@ -503,7 +592,11 @@ impl SkybouncerEngine {
     /// [`FastPath::Heuristic`] when a heuristic violation was acted upon (so the sync
     /// caller can emit its audit log), or [`FastPath::Continue`] when the caller must
     /// proceed to model evaluation (sync) or enqueueing (queued).
-    async fn fast_path(&self, interaction: &Interaction) -> Result<FastPath, SkybouncerError> {
+    async fn fast_path(
+        &self,
+        interaction: &Interaction,
+        defer_remote_io: bool,
+    ) -> Result<FastPath, SkybouncerError> {
         let author_did = interaction.author_did.clone();
         let target_did = interaction.target_did.clone();
         let post_uri = interaction.post_uri.clone();
@@ -571,6 +664,13 @@ impl SkybouncerEngine {
         let eval_cache_key = format!("{}:{}", post_uri, target_did);
         let cached_verdict = self.cache.get_evaluation(&eval_cache_key)?;
         if let Some(verdict) = cached_verdict {
+            if defer_remote_io {
+                debug!("Evaluation cache hit for post; deferring verdict action to worker queue");
+                return Ok(FastPath::DeferredAction {
+                    verdict,
+                    is_heuristic: false,
+                });
+            }
             self.stats.eval_cache_hits.fetch_add(1, Ordering::Relaxed);
             debug!("Evaluation cache hit for post; reusing verdict");
             return Ok(FastPath::Resolved(
@@ -604,6 +704,13 @@ impl SkybouncerEngine {
                 &heuristic_verdict,
                 self.config.evaluation_ttl,
             );
+
+            if defer_remote_io {
+                return Ok(FastPath::DeferredAction {
+                    verdict: heuristic_verdict,
+                    is_heuristic: true,
+                });
+            }
 
             let outcome = self
                 .act_on_verdict(interaction, heuristic_verdict.clone())
@@ -677,6 +784,19 @@ impl SkybouncerEngine {
                 author_did,
                 target_did,
             });
+        }
+
+        // Handle deferred Tier-5 cache hits and Tier-6 heuristic matches enqueued via eval_tx
+        // without performing AppView relationship queries or LLM calls.
+        let eval_cache_key = format!("{post_uri}:{target_did}");
+        if let Some(verdict) = self.cache.get_evaluation(&eval_cache_key)? {
+            let is_heuristic = self
+                .heuristic_classifier
+                .evaluate(&interaction)
+                .is_violation();
+            return self
+                .execute_deferred_action(interaction, verdict, is_heuristic)
+                .await;
         }
 
         // Pre-enricher non-consuming rate-limit check: when already exhausted, fail closed

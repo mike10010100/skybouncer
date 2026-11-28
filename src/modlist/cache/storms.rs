@@ -416,4 +416,22 @@ impl DeduplicationCache {
         };
         Ok(updated > 0)
     }
+
+    /// Prunes resolved or dismissed dogpile storm events older than `older_than_us`.
+    ///
+    /// Active storms (`status = 'active'`) are never deleted by retention pruning.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if deletion fails.
+    pub fn prune_resolved_storms(&self, older_than_us: u64) -> Result<usize, SkybouncerError> {
+        let cutoff_i64 = us_to_i64(older_than_us);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(
+            "DELETE FROM dogpile_events
+             WHERE status != 'active'
+               AND COALESCE(resolved_at_us, updated_at_us) < ?1;",
+        )?;
+        let deleted = stmt.execute(params![cutoff_i64])?;
+        Ok(deleted)
+    }
 }

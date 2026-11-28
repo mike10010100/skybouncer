@@ -80,7 +80,7 @@ impl DeduplicationCache {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         tx.execute(
-            "DELETE FROM did_handles WHERE LOWER(handle) = LOWER(?1) AND did != ?2;",
+            "DELETE FROM did_handles WHERE handle = ?1 COLLATE NOCASE AND did != ?2;",
             params![clean_handle, clean_did],
         )?;
         tx.execute(

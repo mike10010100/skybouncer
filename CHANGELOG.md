@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-11-28
+
+### Changed
+
+- **SQLite Performance, Migrations, Indexes & Lock Elimination (`src/util.rs`, `src/modlist/cache/`, `src/tenant/registry/`, `src/engine/`, `src/web/api/`)**:
+  - Updated `apply_common_pragmas` to apply `busy_timeout` before `journal_mode = WAL`, enable `auto_vacuum = INCREMENTAL`, and set `journal_size_limit` to 64 MiB (`67_108_864`).
+  - Implemented non-colliding bit-packed `PRAGMA user_version` transactional migrations (`(tenant_ver << 16) | cache_ver`, `BEGIN IMMEDIATE ... COMMIT`, toggling `PRAGMA foreign_keys = OFF` outside the transaction), inspected `PRAGMA table_info` instead of ignoring `ALTER TABLE` errors, migrated `bounced_user_rkeys` PK to `(protected_did, listitem_rkey)` with matching `ON CONFLICT(protected_did, listitem_rkey) DO NOTHING`, added 5 composite/expression indexes (`idx_did_handles_handle_nocase`, `idx_tenants_handle_lower`, `idx_bounced_users_protected_at`, `idx_evaluation_log_target_source_ts`, `idx_dogpile_events_target_focal_status`), dropped redundant PK-prefix indexes (`idx_bounced_users_protected`, `idx_allowlist_protected`), and switched `list_evaluation_logs` / `count_evaluation_logs` to static `prepare_cached` arms.
+  - Added per-`target_did` `evaluation_log` 5,000-row retention cap guarded by `GROUP BY target_did HAVING COUNT(*) > ?1`, added retention pruning for resolved `dogpile_events` and `bounce_history`, and ran periodic `PRAGMA incremental_vacuum` + `PRAGMA optimize` via `tokio::task::spawn_blocking`.
+  - Added `TenantMeta` / `TenantSummary` + `RwLock<HashMap<String, TenantMeta>>` cache and lightweight SQL projections (`get_status`, `get_rubric`, `get_handle`, single-query `list_summaries`) on `TenantRegistry`, eliminating hot-path SQLite locks and AES-GCM decryptions/PEM parsing across engine ingestion, daemon startup, and web endpoints.
+- **Modularized `src/enricher/` & AppView/CDN Hardening (`src/enricher/{mod,timing,fundraiser,appview,mock}.rs`)**:
+  - Split `src/enricher.rs` into `src/enricher/{mod,timing,fundraiser,appview,mock}.rs` while preserving all public/`pub(crate)` exports and `--no-default-features` compilation.
+  - Passed `depth=0` and `parentHeight=12` to `app.bsky.feed.getPostThread` and extracted `parent_post` (with `cid`) / `quoted_post` directly from `focal_post` (eliminating duplicate `getPosts` RPCs).
+  - Parallelized CDN image fetching (`buffer_unordered(4)`) with a 6 MiB aggregate batch budget, strict `Content-Type: image/*` and magic-byte validation (`JPEG`/`PNG`/`WebP`/`GIF`), and strict ASCII `did:` / `cid` validation rejecting path traversal.
+  - Reused a single `IdentityResolver` on `AppViewContextEnricher`, added a 20-minute TTL to `target_cache`, and excluded self-replies before counting `repeated_reply_template_count`.
+- **Memory Bounds, Graph & Radar Optimization (`src/engine/handles.rs`, `src/matcher/`, `src/dogpile/tracker.rs`)**:
+  - Normalized `handle_cache` keys (including `invalidate_handle`) to ASCII lowercase, capped at 10,000 entries, and pruned expired entries during maintenance.
+  - Updated `FollowGraph::hydrate_followers` to populate `followers` under a single write lock without inserting `incoming_rkey_index` entries, cleaned empty outer map keys on unfollow, kept mutual protected-to-protected follow/unfollow edges consistent, and routed `hydrate_follows` / `hydrate_follow_records` through `FollowGraph::hydrate_batch`.
+  - Added zero-allocation `&serde_json::Value` 4-vector DID probing in `TargetMatcher::match_all_interactions` before deserializing `PostRecord`.
+  - Sharded `DogpileTracker` by `target_did`, bounded per-bucket deques/windows, and maintained incremental short-window author refcounts plus a lock-ordered `active_storms` index for O(1) commit ingestion and `is_storm_mode_active`.
+
+### Fixed
+
+- **Daemon `SIGTERM`, Shutdown Drain, `fast_path` Offload & CLI/Engine Polish (`src/daemon.rs`, `src/engine/`, `src/app.rs`, `src/tenant/registry/sessions.rs`)**:
+  - Added Unix `SignalKind::terminate()` (`SIGTERM`) and `join_set.join_next()` task-crash monitoring to `daemon::run`, aligned drain timeout to 20s, added `PRAGMA wal_checkpoint(TRUNCATE)` on clean exit, and bounded `hydrate_cold_start` concurrency with cancellation checks.
+  - Stopped dequeuing new items in `queue_worker` and `storm_worker` (and skipped `rx.try_recv()` drain) on cancellation so in-flight PDS writes finish cleanly; skipped `reauth_required` tenants in `prune_expired_bounces` and `get_pds_client`.
+  - Offloaded `fast_path` remote I/O (`act_on_verdict`) onto the background worker queue and continued multi-target interaction loops on per-target errors.
+  - Required `commit.rkey == "self"` on sovereign config `Create | Update` and `purpose == "app.bsky.graph.defs#modlist"` on `handle_list_commit`; aligned `SkybouncerEngine::new` with `Builder::build`, deduplicated heuristic logging, surfaced daemon HTTP errors and `--image <URL>` offline in `run_cli_simulate`, and URL-encoded `--handle` queries in `run_cli_pardon`.
+
 ## [0.3.5] - 2026-11-28
 
 ### Security

@@ -37,8 +37,13 @@ pub fn shard_index(key: &str, shards: usize) -> usize {
     (hasher.finish() as usize) % shards
 }
 
-/// Applies the pragmas shared by every Skybouncer SQLite connection: WAL journaling,
-/// `NORMAL` synchronous mode, and a bounded busy timeout.
+/// Applies the pragmas shared by every Skybouncer SQLite connection: busy timeout,
+/// incremental auto-vacuum, WAL journaling, `NORMAL` synchronous mode, and a 64 MiB
+/// journal size limit.
+///
+/// `busy_timeout` is configured **first** so subsequent pragmas (such as `journal_mode = WAL`)
+/// wait up to `busy_timeout_ms` rather than failing immediately with `SQLITE_BUSY` when
+/// opening a contended database.
 ///
 /// Callers remain responsible for connection-specific pragmas (e.g. `foreign_keys`,
 /// `temp_store`, `mmap_size`).
@@ -50,13 +55,40 @@ pub fn apply_common_pragmas(
     busy_timeout_ms: u32,
 ) -> Result<(), crate::error::SkybouncerError> {
     use crate::error::SkybouncerError;
+    conn.pragma_update(None, "busy_timeout", busy_timeout_ms)
+        .map_err(|e| SkybouncerError::Database(format!("Failed to set busy_timeout: {e}")))?;
+    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+        .map_err(|e| {
+            SkybouncerError::Database(format!("Failed to set auto_vacuum INCREMENTAL: {e}"))
+        })?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| SkybouncerError::Database(format!("Failed to set journal_mode WAL: {e}")))?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| SkybouncerError::Database(format!("Failed to set synchronous NORMAL: {e}")))?;
-    conn.pragma_update(None, "busy_timeout", busy_timeout_ms)
-        .map_err(|e| SkybouncerError::Database(format!("Failed to set busy_timeout: {e}")))?;
+    conn.pragma_update(None, "journal_size_limit", 67_108_864_i64)
+        .map_err(|e| SkybouncerError::Database(format!("Failed to set journal_size_limit: {e}")))?;
     Ok(())
+}
+
+/// Unpacks SQLite's 32-bit `PRAGMA user_version` into `(tenant_schema_ver, cache_schema_ver)`.
+///
+/// The low 16 bits store `DeduplicationCache`'s schema version and bits `16..=30` store
+/// `TenantRegistry`'s schema version so both subsystems can share one SQLite file without
+/// colliding. Negative `user_version` values clamp to `(0, 0)`.
+#[must_use]
+pub(crate) fn unpack_schema_versions(user_version: i32) -> (u16, u16) {
+    let raw = u32::try_from(user_version.max(0)).unwrap_or(0);
+    let cache_ver = u16::try_from(raw & 0xFFFF).unwrap_or(0);
+    let tenant_ver = u16::try_from((raw >> 16) & 0x7FFF).unwrap_or(0);
+    (tenant_ver, cache_ver)
+}
+
+/// Packs `(tenant_schema_ver, cache_schema_ver)` into a non-negative 32-bit `PRAGMA user_version`.
+#[must_use]
+pub(crate) fn pack_schema_versions(tenant_ver: u16, cache_ver: u16) -> i32 {
+    let t = i32::from(tenant_ver & 0x7FFF);
+    let c = i32::from(cache_ver);
+    (t << 16) + c
 }
 
 /// Validates that a tenant/protected DID argument is non-empty after trimming whitespace,
@@ -166,6 +198,60 @@ mod tests {
             .pragma_query_value(None, "synchronous", |r| r.get(0))
             .expect("synchronous");
         assert_eq!(sync_mode, 1);
+
+        let auto_vacuum: i64 = conn
+            .pragma_query_value(None, "auto_vacuum", |r| r.get(0))
+            .expect("auto_vacuum");
+        assert_eq!(auto_vacuum, 2);
+    }
+
+    #[test]
+    fn apply_common_pragmas_file_backed_sets_wal_auto_vacuum_and_journal_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("pragmas.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("open file db");
+        apply_common_pragmas(&conn, 5123).expect("pragmas apply");
+
+        let busy: i64 = conn
+            .pragma_query_value(None, "busy_timeout", |r| r.get(0))
+            .expect("busy_timeout");
+        assert_eq!(busy, 5123);
+
+        let auto_vacuum: i64 = conn
+            .pragma_query_value(None, "auto_vacuum", |r| r.get(0))
+            .expect("auto_vacuum");
+        assert_eq!(auto_vacuum, 2, "INCREMENTAL auto_vacuum == 2");
+
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .expect("journal_mode");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+        let sync_mode: i64 = conn
+            .pragma_query_value(None, "synchronous", |r| r.get(0))
+            .expect("synchronous");
+        assert_eq!(sync_mode, 1);
+
+        let journal_size_limit: i64 = conn
+            .pragma_query_value(None, "journal_size_limit", |r| r.get(0))
+            .expect("journal_size_limit");
+        assert_eq!(journal_size_limit, 67_108_864);
+    }
+
+    #[test]
+    fn schema_version_pack_unpack_roundtrips_without_collision() {
+        assert_eq!(unpack_schema_versions(0), (0, 0));
+        assert_eq!(unpack_schema_versions(-1), (0, 0));
+        assert_eq!(unpack_schema_versions(i32::MIN), (0, 0));
+
+        let packed = pack_schema_versions(3, 5);
+        assert_eq!(packed, (3 << 16) | 5);
+        assert_eq!(unpack_schema_versions(packed), (3, 5));
+
+        // Tenant version masks to 15 bits so packed user_version stays non-negative.
+        let masked = pack_schema_versions(0xFFFF, 42);
+        assert!(masked >= 0);
+        assert_eq!(unpack_schema_versions(masked), (0x7FFF, 42));
     }
 
     #[test]

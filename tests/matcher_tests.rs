@@ -940,8 +940,8 @@ fn test_follow_graph_incoming_synthetic_follower_fallback_prunes_set() {
     let protected = "did:plc:alice";
     let follower = "did:plc:bob";
 
-    // Hydrate an incoming follower with a synthetic `hydrate_in_0` rkey.
-    graph.hydrate_followers(protected, [follower]);
+    // Add an incoming follower with a synthetic `hydrate_in_0` rkey via `add_follower`.
+    graph.add_follower(protected, follower, "hydrate_in_0");
     assert!(graph.is_followed_by(protected, follower));
     assert_eq!(graph.follower_count(protected), 1);
 
@@ -1280,4 +1280,126 @@ fn test_target_matcher_preserves_quote_uri_across_quote_and_reply_vectors() {
         Some(quoted_third_uri),
         "Quoted post URI must also be preserved on DirectReply interactions"
     );
+}
+
+#[test]
+fn test_pr3_follow_graph_hydrate_followers_omits_rkey_index_and_syncs_protected_pairs() {
+    let graph = FollowGraph::new();
+    let alice = PROTECTED_ALICE;
+    let bob = "did:plc:protected_bob";
+    let follower = "did:plc:follower_1";
+    let mut protected = HashSet::new();
+    protected.insert(alice.to_string());
+    protected.insert(bob.to_string());
+
+    // Hydrating followers does NOT populate incoming_rkey_index, yet incoming lookup works.
+    graph.hydrate_followers(alice, [follower]);
+    assert!(graph.is_followed_by(alice, follower));
+    assert_eq!(graph.follower_count(alice), 1);
+
+    // Empty iterators do not create dangling empty buckets.
+    graph.hydrate_batch(bob, std::iter::empty::<(String, String)>());
+    assert_eq!(graph.follow_count(bob), 0);
+
+    // Protected Alice follows Protected Bob -> updates BOTH outgoing (Alice->Bob) AND incoming (Bob<-Alice).
+    let follow_commit = JetstreamCommit {
+        did: alice.to_string(),
+        time_us: 1_700_000_000_000_000,
+        operation: CommitOperation::Create,
+        collection: "app.bsky.graph.follow".to_string(),
+        rkey: "3abcrkey_ab".to_string(),
+        cid: Some("bafyab".to_string()),
+        record: Some(serde_json::json!({
+            "$type": "app.bsky.graph.follow",
+            "subject": bob,
+            "createdAt": "2026-11-28T00:00:00Z"
+        })),
+    };
+    assert!(matches!(
+        graph.handle_commit(&follow_commit, &protected),
+        FollowSyncEvent::FollowAdded { .. }
+    ));
+    assert!(graph.is_following(alice, bob));
+    assert!(graph.is_followed_by(bob, alice));
+
+    // Unfollow removes both outgoing and incoming edges and prunes empty outer keys.
+    let unfollow_commit = make_follow_delete_commit(alice, "3abcrkey_ab");
+    assert!(matches!(
+        graph.handle_commit(&unfollow_commit, &protected),
+        FollowSyncEvent::FollowRemoved { .. }
+    ));
+    assert!(!graph.is_following(alice, bob));
+    assert!(!graph.is_followed_by(bob, alice));
+    assert_eq!(graph.follow_count(alice), 0);
+    assert_eq!(graph.follower_count(bob), 0);
+}
+
+#[test]
+fn test_pr3_target_matcher_zero_alloc_did_probing_all_vectors_and_non_matching() {
+    let mut protected = HashSet::new();
+    protected.insert(PROTECTED_ALICE.to_string());
+
+    // Non-matching post skips cleanly before deserialization.
+    let unrelated = make_reply_commit(
+        SPAMMER_CHARLIE,
+        "did:plc:someone_else",
+        "unrel1",
+        "root1",
+        "Not targeting Alice",
+    );
+    assert!(TargetMatcher::match_all_interactions(&unrelated, &protected).is_empty());
+
+    // Vector 1: Reply; Vector 2: Quote; Vector 3: EmbedWithMedia; Vector 4: Mention facet.
+    let multi_vector_commit = JetstreamCommit {
+        did: SPAMMER_CHARLIE.to_string(),
+        time_us: 1_700_000_000_000_000,
+        operation: CommitOperation::Create,
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "multivector".to_string(),
+        cid: Some("bafymv".to_string()),
+        record: Some(serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Hey @alice",
+            "createdAt": "2026-11-28T00:00:00Z",
+            "facets": [{
+                "index": { "byteStart": 4, "byteEnd": 10 },
+                "features": [{
+                    "$type": "app.bsky.richtext.facet#mention",
+                    "did": PROTECTED_ALICE
+                }]
+            }]
+        })),
+    };
+    let mention_hits = TargetMatcher::match_all_interactions(&multi_vector_commit, &protected);
+    assert_eq!(mention_hits.len(), 1);
+    assert_eq!(mention_hits[0].interaction_type, InteractionType::Mention);
+
+    // RecordWithMedia vector targeting PROTECTED_ALICE.
+    let rwm_commit = JetstreamCommit {
+        did: SPAMMER_CHARLIE.to_string(),
+        time_us: 1_700_000_000_000_001,
+        operation: CommitOperation::Create,
+        collection: "app.bsky.feed.post".to_string(),
+        rkey: "rwm1".to_string(),
+        cid: Some("bafyrwm1".to_string()),
+        record: Some(serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "Look at this",
+            "createdAt": "2026-11-28T00:00:00Z",
+            "embed": {
+                "$type": "app.bsky.embed.recordWithMedia",
+                "record": {
+                    "$type": "app.bsky.embed.record",
+                    "record": {
+                        "uri": format!("at://{PROTECTED_ALICE}/app.bsky.feed.post/p1"),
+                        "cid": "bafyp1"
+                    }
+                },
+                "media": { "$type": "app.bsky.embed.images", "images": [] }
+            }
+        })),
+    };
+    let rwm_hits = TargetMatcher::match_all_interactions(&rwm_commit, &protected);
+    assert_eq!(rwm_hits.len(), 1);
+    assert_eq!(rwm_hits[0].interaction_type, InteractionType::Quote);
 }

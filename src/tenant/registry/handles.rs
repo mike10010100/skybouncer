@@ -58,16 +58,30 @@ impl TenantRegistry {
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if SQLite update query fails.
     pub fn invalidate_handle(&self, handle: &str) -> Result<bool, SkybouncerError> {
-        let clean = crate::util::normalize_handle(handle);
+        let clean = crate::util::normalize_handle(handle).to_ascii_lowercase();
+        let at_clean = format!("@{clean}");
         let now_us = current_time_us();
         let now_i64 = us_to_i64(now_us);
 
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare_cached(
-            "UPDATE tenants SET handle = NULL, handle_updated_at = ?1, updated_at = ?1
-             WHERE LOWER(handle) = LOWER(?2) OR LOWER(handle) = LOWER(?3);",
-        )?;
-        let count = stmt.execute(params![now_i64, clean, format!("@{clean}")])?;
+        let count = {
+            let conn = self.conn.lock();
+            let mut stmt = conn.prepare_cached(
+                "UPDATE tenants SET handle = NULL, handle_updated_at = ?1, updated_at = ?1
+                 WHERE LOWER(handle) = LOWER(?2) OR LOWER(handle) = LOWER(?3);",
+            )?;
+            stmt.execute(params![now_i64, clean, at_clean])?
+        };
+        if count > 0 {
+            let mut cache = self.meta_cache.write();
+            for entry in cache.values_mut() {
+                if entry.handle.as_deref().is_some_and(|h| {
+                    h.eq_ignore_ascii_case(&clean) || h.eq_ignore_ascii_case(&at_clean)
+                }) {
+                    entry.handle = None;
+                    entry.updated_at = now_us;
+                }
+            }
+        }
         Ok(count > 0)
     }
 
@@ -82,21 +96,43 @@ impl TenantRegistry {
         if clean.is_empty() || clean == "handle.invalid" {
             return Ok(false);
         }
+        let at_clean = format!("@{clean}");
         let now_us = current_time_us();
         let now_i64 = us_to_i64(now_us);
 
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE tenants SET handle = NULL, handle_updated_at = ?1, updated_at = ?1
-             WHERE (LOWER(handle) = LOWER(?2) OR LOWER(handle) = LOWER(?3)) AND did != ?4;",
-            params![now_i64, clean, format!("@{clean}"), did],
-        )?;
-        let count = tx.execute(
-            "UPDATE tenants SET handle = ?1, handle_updated_at = ?2, updated_at = ?2 WHERE did = ?3;",
-            params![clean, now_i64, did],
-        )?;
-        tx.commit()?;
+        let count = {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE tenants SET handle = NULL, handle_updated_at = ?1, updated_at = ?1
+                 WHERE (LOWER(handle) = LOWER(?2) OR LOWER(handle) = LOWER(?3)) AND did != ?4;",
+                params![now_i64, clean, at_clean, did],
+            )?;
+            let count = tx.execute(
+                "UPDATE tenants SET handle = ?1, handle_updated_at = ?2, updated_at = ?2 WHERE did = ?3;",
+                params![clean, now_i64, did],
+            )?;
+            tx.commit()?;
+            count
+        };
+
+        let mut cache = self.meta_cache.write();
+        for (entry_did, entry) in cache.iter_mut() {
+            if entry_did != did
+                && entry.handle.as_deref().is_some_and(|h| {
+                    h.eq_ignore_ascii_case(&clean) || h.eq_ignore_ascii_case(&at_clean)
+                })
+            {
+                entry.handle = None;
+                entry.updated_at = now_us;
+            }
+        }
+        if count > 0 {
+            if let Some(entry) = cache.get_mut(did) {
+                entry.handle = Some(clean);
+                entry.updated_at = now_us;
+            }
+        }
         Ok(count > 0)
     }
 }

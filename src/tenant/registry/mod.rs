@@ -111,6 +111,39 @@ impl Tenant {
     }
 }
 
+/// Lightweight in-memory metadata projection for an enrolled tenant (excluding OAuth secrets).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TenantMeta {
+    /// Decentralized identifier (DID) of the enrolled user (e.g. `did:plc:...`).
+    pub did: String,
+    /// ATProto handle if known (e.g. `alice.bsky.social`).
+    pub handle: Option<String>,
+    /// Custom moderation rule rubric, if configured specifically for this tenant.
+    pub rubric: Option<RuleRubric>,
+    /// Whether automated moderation actions are active for this tenant.
+    pub is_active: bool,
+    /// Whether this tenant's OAuth session requires manual re-authentication.
+    pub reauth_required: bool,
+    /// Whether a non-empty encrypted OAuth session is persisted in SQLite.
+    pub has_session: bool,
+    /// Microsecond Unix timestamp when this tenant was first registered.
+    pub created_at: u64,
+    /// Microsecond Unix timestamp when this tenant was last updated.
+    pub updated_at: u64,
+}
+
+/// Summary view of an enrolled tenant returned by single-query projections.
+pub type TenantSummary = TenantMeta;
+
+/// Lightweight activation and re-authentication status for an enrolled tenant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantStatus {
+    /// Whether automated moderation actions are active for this tenant.
+    pub is_active: bool,
+    /// Whether this tenant's OAuth session requires manual re-authentication.
+    pub reauth_required: bool,
+}
+
 /// Thread-safe embedded SQLite registry managing multi-tenant enrollment and PDS clients.
 #[derive(Clone)]
 pub struct TenantRegistry {
@@ -118,6 +151,7 @@ pub struct TenantRegistry {
     /// In-memory cache of authenticated [`PdsRepoClient`] instances indexed by tenant DID.
     pub pds_clients: Arc<RwLock<HashMap<String, Arc<PdsRepoClient>>>>,
     client_epochs: Arc<RwLock<HashMap<String, u64>>>,
+    meta_cache: Arc<RwLock<HashMap<String, TenantMeta>>>,
     oauth_client: Arc<RwLock<Option<Arc<AtprotoOAuthClient>>>>,
     cipher: SessionCipher,
     refresh_locks: Arc<crate::modlist::manager::StripedAsyncLocks>,
@@ -1813,5 +1847,88 @@ mod tests {
         let cur_epoch = registry.client_epochs.read().get(did).copied().unwrap_or(0);
         registry.insert_pds_client_if_epoch_matches(did, cur_epoch, &pds_client);
         assert!(registry.pds_clients.read().contains_key(did));
+    }
+
+    #[test]
+    fn test_pr3_tenant_meta_cache_zero_decrypt_projections_and_handle_index() {
+        let registry = test_registry();
+        let did = "did:plc:metacache_user";
+        let rubric = RuleRubric::new("Strict anti-spam", crate::classifier::Sensitivity::High);
+        let session = OAuthSession::new(
+            did,
+            "secret-at",
+            Some("secret-rt".to_string()),
+            "DPoP",
+            None,
+            Some(3600),
+            DPoPKey::generate(),
+            Some("https://pds.example".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        let tenant = Tenant::new(did)
+            .with_handle("MetaUser.Bsky.Social")
+            .with_rubric(rubric)
+            .with_session(session);
+        registry.register_or_update(&tenant).unwrap();
+
+        // Corrupt ciphertext in SQLite directly: full get() would fail decrypt, while zero-decrypt
+        // metadata projections & meta_cache succeed cleanly!
+        {
+            let conn = registry.conn.lock();
+            conn.execute(
+                "UPDATE tenants SET session_json = 'enc:v1:corrupted-ciphertext' WHERE did = ?1",
+                params![did],
+            )
+            .unwrap();
+        }
+        assert!(registry.get(did).is_err());
+
+        let status = registry.get_status(did).unwrap().expect("status cached");
+        assert!(status.is_active);
+        assert!(!status.reauth_required);
+        assert_eq!(
+            registry.get_handle(did).unwrap().as_deref(),
+            Some("MetaUser.Bsky.Social")
+        );
+        assert_eq!(
+            registry.get_rubric(did).unwrap().unwrap().prompt,
+            "Strict anti-spam"
+        );
+        let summaries = registry.list_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].has_session);
+
+        // Mutations keep meta_cache coherent.
+        registry.set_active(did, false).unwrap();
+        assert!(!registry.get_status(did).unwrap().unwrap().is_active);
+        registry.mark_reauth_required(did).unwrap();
+        assert!(registry.get_status(did).unwrap().unwrap().reauth_required);
+        registry.update_handle(did, "Renamed.Bsky.Social").unwrap();
+        assert_eq!(
+            registry.get_handle(did).unwrap().as_deref(),
+            Some("renamed.bsky.social")
+        );
+        registry.invalidate_handle("renamed.bsky.social").unwrap();
+        assert_eq!(registry.get_handle(did).unwrap(), None);
+
+        // Verify idx_tenants_handle_lower is used in SQLite query plan.
+        let plan_detail: String = {
+            let conn = registry.conn.lock();
+            conn.query_row(
+                "EXPLAIN QUERY PLAN SELECT did FROM tenants WHERE LOWER(handle) = LOWER(?1)",
+                params!["metauser.bsky.social"],
+                |r| r.get(3),
+            )
+            .unwrap()
+        };
+        assert!(
+            plan_detail.contains("idx_tenants_handle_lower"),
+            "expected idx_tenants_handle_lower in EXPLAIN QUERY PLAN, got: {plan_detail}"
+        );
+
+        registry.remove(did).unwrap();
+        assert!(registry.get_status(did).unwrap().is_none());
     }
 }

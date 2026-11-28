@@ -5,9 +5,6 @@ use parking_lot::Mutex;
 
 use super::*;
 
-/// Maximum size of a URL-fetched simulation image (2 MiB).
-const MAX_SIMULATION_IMAGE_BYTES: usize = 2 * 1024 * 1024;
-
 /// Maximum characters accepted in a guest sandbox evaluation.
 pub const GUEST_SANDBOX_MAX_TEXT_CHARS: usize = 500;
 
@@ -239,8 +236,7 @@ fn resolve_guest_preset(
 /// Fetches a simulation image through `skyauth`'s SSRF-hardened HTTP client, which
 /// enforces scheme/host/IP validation, DNS pinning, redirect bounds, and a body size cap.
 async fn fetch_simulation_image(url_str: &str) -> Result<Vec<u8>, (StatusCode, String)> {
-    skyauth::ssrf::SsrfFilter::default()
-        .safe_get(url_str, MAX_SIMULATION_IMAGE_BYTES)
+    crate::engine::simulate::fetch_simulation_image_bytes(url_str)
         .await
         .map_err(|e| map_ssrf_error(&e))
 }

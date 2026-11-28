@@ -39,14 +39,11 @@ impl SkybouncerEngine {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let target = protected_did.into();
-        let mut count: usize = 0;
-        for (idx, did) in dids.into_iter().enumerate() {
-            let rkey = format!("hydrate_{idx}");
-            self.follow_graph.add_follow(&target, rkey, did.into());
-            count = count.saturating_add(1);
-        }
-        count
+        let records = dids
+            .into_iter()
+            .enumerate()
+            .map(|(idx, did)| (format!("hydrate_{idx}"), did.into()));
+        self.follow_graph.hydrate_batch(protected_did, records)
     }
 
     /// Pre-seeds followed DIDs with real repository rkeys on cold start.
@@ -60,14 +57,10 @@ impl SkybouncerEngine {
         K: Into<String>,
         S: Into<String>,
     {
-        let target = protected_did.into();
-        let mut count: usize = 0;
-        for (rkey, did) in records {
-            self.follow_graph
-                .add_follow(&target, rkey.into(), did.into());
-            count = count.saturating_add(1);
-        }
-        count
+        let mapped = records
+            .into_iter()
+            .map(|(rkey, did)| (rkey.into(), did.into()));
+        self.follow_graph.hydrate_batch(protected_did, mapped)
     }
 
     /// Pre-seeds incoming follower DIDs for a protected user on cold start.

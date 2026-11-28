@@ -1999,7 +1999,6 @@ async fn test_pr2_dogpile_stale_commit_clock_and_heuristic_prefilter_recording()
 
     // Pre-seed heuristic pre-filter bounce on `focal` BEFORE the surge commits run so
     // `dogpile_tracker.eval_outcomes` holds the recorded heuristic violation when surge triggers!
-    let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(16);
     let heur_inter = skybouncer::matcher::Interaction {
         post_uri: "at://did:plc:heur/app.bsky.feed.post/h1".to_string(),
         post_cid: Some("cidh1".to_string()),
@@ -2016,10 +2015,7 @@ async fn test_pr2_dogpile_stale_commit_clock_and_heuristic_prefilter_recording()
         enriched_context: None,
         rubric: None,
     };
-    let fast_out = engine
-        .process_interaction_queued(heur_inter, &ev_tx)
-        .await
-        .unwrap();
+    let fast_out = engine.process_interaction(heur_inter).await.unwrap();
     assert!(fast_out.is_bounced());
 
     // Now feed additional replies with stale 2022 timestamps (time_us = 1_650_000_000_000_000):

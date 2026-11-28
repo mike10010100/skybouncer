@@ -82,7 +82,7 @@ impl SkybouncerEngine {
         if protected.len() > 1 {
             return false;
         }
-        let Ok(tenants) = self.tenant_registry.list_all() else {
+        let Ok(tenants) = self.tenant_registry.list_summaries() else {
             return false;
         };
         if tenants.len() > 1 {
@@ -124,10 +124,8 @@ impl SkybouncerEngine {
         if self.is_paused() {
             return true;
         }
-        match self.tenant_registry.get(did) {
-            Ok(Some(tenant)) => {
-                !tenant.is_active || self.tenant_registry.is_reauth_required(did).unwrap_or(true)
-            }
+        match self.tenant_registry.get_status(did) {
+            Ok(Some(status)) => !status.is_active || status.reauth_required,
             Ok(None) => false,
             Err(e) => {
                 tracing::warn!(did = %did, error = %e, "Failed to query tenant status; failing closed (paused)");
@@ -139,10 +137,8 @@ impl SkybouncerEngine {
     /// Retrieves the moderation rubric for a specific protected user, falling back to engine default rubric.
     #[must_use]
     pub fn rubric_for(&self, did: &str) -> RuleRubric {
-        if let Ok(Some(tenant)) = self.tenant_registry.get(did) {
-            if let Some(rubric) = tenant.rubric {
-                return rubric;
-            }
+        if let Ok(Some(rubric)) = self.tenant_registry.get_rubric(did) {
+            return rubric;
         }
         self.rubric()
     }
@@ -195,12 +191,7 @@ impl SkybouncerEngine {
                 .is_reauth_notification_pending(did)
                 .unwrap_or(false)
         {
-            let handle = self
-                .tenant_registry
-                .get(did)
-                .ok()
-                .flatten()
-                .and_then(|t| t.handle);
+            let handle = self.tenant_registry.get_handle(did).ok().flatten();
             let _ = self.reauth_notifier.send(ReauthNotification {
                 target_did: did.to_string(),
                 handle,
@@ -271,7 +262,19 @@ impl SkybouncerEngine {
     /// Skips tenants already flagged as requiring manual re-authentication (`reauth_required = 1`).
     /// Returns the number of tenant sessions refreshed.
     pub async fn refresh_expiring_tenant_sessions(&self) -> usize {
-        if self.oauth_client.read().is_none() {
+        let cancel = CancellationToken::new();
+        self.refresh_expiring_tenant_sessions_with_cancel(&cancel)
+            .await
+    }
+
+    /// Cancellable variant of [`Self::refresh_expiring_tenant_sessions`].
+    ///
+    /// Stops iterating additional tenants as soon as `cancel` fires during shutdown.
+    pub async fn refresh_expiring_tenant_sessions_with_cancel(
+        &self,
+        cancel: &CancellationToken,
+    ) -> usize {
+        if cancel.is_cancelled() || self.oauth_client.read().is_none() {
             return 0;
         }
         let tenants = match self.tenant_registry.list_active() {
@@ -287,6 +290,9 @@ impl SkybouncerEngine {
 
         let mut refreshed = 0;
         for tenant in tenants {
+            if cancel.is_cancelled() {
+                break;
+            }
             if self
                 .tenant_registry
                 .is_reauth_required(&tenant.did)
@@ -454,6 +460,9 @@ impl SkybouncerEngine {
     ) -> ProcessCommitResult {
         match commit.operation {
             CommitOperation::Create | CommitOperation::Update => {
+                if commit.rkey != crate::modlist::SOVEREIGN_CONFIG_RKEY {
+                    return ProcessCommitResult::Ignored;
+                }
                 if let Some(ref record_val) = commit.record {
                     match serde_json::from_value::<crate::modlist::SovereignConfigRecord>(
                         record_val.clone(),
@@ -552,6 +561,11 @@ impl SkybouncerEngine {
         }
 
         if let Some(ref record_val) = commit.record {
+            if record_val.get("purpose").and_then(|p| p.as_str())
+                != Some("app.bsky.graph.defs#modlist")
+            {
+                return ProcessCommitResult::Ignored;
+            }
             if let Some(desc) = record_val.get("description").and_then(|d| d.as_str()) {
                 if let Some(rubric) = crate::modlist::extract_rubric_from_list_description(desc) {
                     self.gate.set_bypass_incoming_followers(

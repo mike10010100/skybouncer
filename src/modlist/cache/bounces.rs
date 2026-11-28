@@ -181,7 +181,7 @@ impl DeduplicationCache {
                 "INSERT INTO bounced_user_rkeys (
                     protected_did, subject_did, listitem_rkey, listitem_uri, listitem_cid, created_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(listitem_rkey) DO NOTHING;",
+                 ON CONFLICT(protected_did, listitem_rkey) DO NOTHING;",
             )?;
 
             rkey_stmt.execute(params![
@@ -666,5 +666,17 @@ impl DeduplicationCache {
         let mut stmt = conn.prepare_cached("SELECT COUNT(*) FROM bounced_users;")?;
         let count: i64 = stmt.query_row([], |row| row.get(0))?;
         Ok(usize::try_from(count.max(0)).unwrap_or(0))
+    }
+
+    /// Prunes archived `bounce_history` rows strictly older than `older_than_us`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if deletion fails.
+    pub fn prune_bounce_history(&self, older_than_us: u64) -> Result<usize, SkybouncerError> {
+        let cutoff_i64 = us_to_i64(older_than_us);
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached("DELETE FROM bounce_history WHERE archived_at < ?1;")?;
+        let deleted = stmt.execute(params![cutoff_i64])?;
+        Ok(deleted)
     }
 }

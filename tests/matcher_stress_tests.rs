@@ -1105,12 +1105,9 @@ fn test_dynamic_follow_sync_concurrency_stream() {
     assert_eq!(graph.follow_count(PROTECTED_ALICE), 0);
     assert_eq!(graph.total_follows_count(), 0);
 
-    // Note on FollowGraph invariant:
-    // When all follows are removed, total_follows_count() is 0.
-    // However, graph.is_empty() checks guard.follows.is_empty(), which remains false
-    // because guard.follows retains an empty HashSet for PROTECTED_ALICE until clear() is called.
-    // Calling clear() resets both maps completely.
-    assert!(!graph.is_empty());
+    // PR 3 memory hygiene: when all follows are removed, empty outer keys are pruned
+    // automatically so `graph.is_empty()` is already `true` before `clear()`.
+    assert!(graph.is_empty());
     graph.clear();
     assert!(graph.is_empty());
 }

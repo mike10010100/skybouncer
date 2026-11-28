@@ -209,11 +209,10 @@ async fn test_rapid_follow_unfollow_single_account_oscillations() {
     assert_eq!(graph.follow_count(PROTECTED_ALICE), 0);
     assert_eq!(graph.total_follows_count(), 0);
 
-    // Architectural observation: FollowGraph retains the outer key for Alice in guard.follows
-    // even when its inner HashSet is empty. Thus total_protected_users() remains 1 and is_empty()
-    // is false until clear() is explicitly called.
-    assert_eq!(graph.total_protected_users(), 1);
-    assert!(!graph.is_empty());
+    // PR 3 memory hygiene: FollowGraph removes empty outer keys in `guard.follows` once all
+    // edges for a protected user are unfollowed, keeping memory proportional to active follows.
+    assert_eq!(graph.total_protected_users(), 0);
+    assert!(graph.is_empty());
 
     graph.clear();
     assert!(graph.is_empty());
