@@ -1,13 +1,12 @@
 [package]
 name = "skybouncer"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 rust-version = "1.89"
 authors = ["Michael Paulauski <mike10010100@gmail.com>"]
 description = "Sovereign, Rule-Driven Auto-Moderation & Bouncer Service for AT Protocol and Bluesky"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mike10010100/skybouncer"
-homepage = "https://github.com/mike10010100/skybouncer"
 documentation = "https://docs.rs/skybouncer"
 keywords = ["atproto", "bluesky", "moderation", "bouncer", "jev"]
 categories = ["web-programming", "asynchronous"]
@@ -27,7 +26,7 @@ default = ["web", "stream", "bot", "telemetry"]
 # Axum HTTP API, dashboard, and OAuth callback endpoints.
 web = ["dep:axum", "dep:tower-http", "dep:tower", "dep:hyper", "dep:hyper-util", "dep:ipnet", "skyauth/axum"]
 # Jetstream firehose WebSocket ingestion.
-stream = ["dep:tokio-tungstenite"]
+stream = []
 # ATProto Chat/DM bot command handling.
 bot = ["dep:unicode-segmentation"]
 # `tracing-subscriber` initialization helper for binaries.
@@ -40,7 +39,7 @@ skyauth = "0.3.14"
 
 # HTTP Web Framework & Networking
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "query", "tokio", "macros", "http1"] }
-tower-http = { version = "0.6", optional = true, default-features = false, features = ["cors", "trace", "timeout", "limit"] }
+tower-http = { version = "0.6", optional = true, default-features = false, features = ["cors", "trace", "timeout", "limit", "compression-gzip", "compression-br"] }
 tower = { version = "0.5", optional = true, default-features = false, features = ["limit", "util"] }
 hyper = { version = "1", optional = true, default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", optional = true, default-features = false, features = ["tokio", "server", "server-graceful", "http1", "service"] }
@@ -77,8 +76,7 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["env-filter", "fmt", "ansi"] }
 
-# WebSocket Stream Ingestion for Live Daemon
-tokio-tungstenite = { version = "0.30", optional = true, features = ["rustls-tls-native-roots"] }
+# Streaming combinators
 futures-util = { version = "0.3", features = ["sink"] }
 
 

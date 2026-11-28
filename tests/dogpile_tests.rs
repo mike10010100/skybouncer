@@ -43,7 +43,7 @@ use skybouncer::modlist::{DeduplicationCache, ModListManager};
 use skybouncer::time::current_time_us;
 use skybouncer::web::{
     create_web_router, DismissStormResponse, ShieldActionResponse, StormModeResponse,
-    StormsResponse, DASHBOARD_HTML,
+    StormsResponse, DASHBOARD_HTML, DASHBOARD_JS,
 };
 use skybouncer::BotCommandHandler;
 
@@ -1624,7 +1624,7 @@ async fn test_web_api_storms_endpoints_auth_prometheus_and_cli() {
 
     assert!(DASHBOARD_HTML.contains("active-storm-banner"));
     assert!(DASHBOARD_HTML.contains("storms-card"));
-    assert!(DASHBOARD_HTML.contains("loadStorms"));
+    assert!(DASHBOARD_JS.contains("loadStorms"));
 
     let summary = format_final_telemetry(&EngineStatsSnapshot {
         dogpiles_detected: 2,

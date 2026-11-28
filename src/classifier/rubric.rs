@@ -282,7 +282,11 @@ impl FromStr for BounceDuration {
                 Ok(Self::Timeout30d)
             }
             _ => {
-                if let Ok(secs) = normalized.parse::<u64>() {
+                let secs_str = normalized
+                    .strip_suffix('s')
+                    .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+                    .unwrap_or(&normalized);
+                if let Ok(secs) = secs_str.parse::<u64>() {
                     match secs {
                         0 => Ok(Self::Permanent),
                         86_400 => Ok(Self::Cooldown24h),
@@ -899,6 +903,25 @@ mod tests {
             "3600".parse::<BounceDuration>().unwrap(),
             BounceDuration::Custom(3600)
         );
+        assert_eq!(
+            "3600s".parse::<BounceDuration>().unwrap(),
+            BounceDuration::Custom(3600)
+        );
+        assert_eq!(
+            "86400s".parse::<BounceDuration>().unwrap(),
+            BounceDuration::Cooldown24h
+        );
+        assert_eq!(
+            "0s".parse::<BounceDuration>().unwrap(),
+            BounceDuration::Permanent
+        );
+        assert_eq!(
+            serde_json::from_str::<BounceDuration>("\"3600s\"").unwrap(),
+            BounceDuration::Custom(3600)
+        );
+        assert!("3600ms".parse::<BounceDuration>().is_err());
+        assert!("s".parse::<BounceDuration>().is_err());
+        assert!("-5s".parse::<BounceDuration>().is_err());
         assert!("nonsense".parse::<BounceDuration>().is_err());
         assert!(Sensitivity::Medium.threshold() > Sensitivity::High.threshold());
     }

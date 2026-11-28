@@ -26,7 +26,7 @@ pub use api::{
     simulate_guest_interaction, AddAllowlistRequest, AddAllowlistResponse, AdminEvaluationsQuery,
     AdminEvaluationsResponse, AdminTenantsResponse, AllowlistQuery, ApiState, AuthActorSuggestion,
     AuthPreviewQuery, AuthPreviewResponse, AuthTypeaheadQuery, AuthTypeaheadResponse,
-    BouncedUserWithHandle, BouncesQuery, DetachQuotesRequest, DismissStormRequest,
+    BouncedUserWithHandle, BouncesQuery, BouncesResponse, DetachQuotesRequest, DismissStormRequest,
     DismissStormResponse, EvaluationsQuery, EvaluationsResponse, GuestRateLimitDecision,
     GuestSandboxLimiter, GuestSimulateRequest, GuestSimulateResponse, HealthResponse,
     LockThreadRequest, PardonRequest, PardonResponse, RemoveAllowlistResponse, ResolveQuery,
@@ -38,7 +38,10 @@ pub use api::{
     GUEST_SANDBOX_WINDOW_SECS,
 };
 pub use oauth::{LoginQuery, OAuthState};
-pub use ui::{serve_dashboard, DASHBOARD_HTML};
+pub use ui::{
+    serve_dashboard, serve_dashboard_css, serve_dashboard_js, serve_theme_init_js, DASHBOARD_CSS,
+    DASHBOARD_HTML, DASHBOARD_JS, THEME_INIT_JS,
+};
 
 use crate::engine::SkybouncerEngine;
 use crate::error::SkybouncerError;
@@ -374,6 +377,9 @@ pub fn create_web_router_with_config(
 
     Router::new()
         .route("/", get(ui::serve_dashboard))
+        .route("/assets/dashboard.css", get(ui::serve_dashboard_css))
+        .route("/assets/theme-init.js", get(ui::serve_theme_init_js))
+        .route("/assets/dashboard.js", get(ui::serve_dashboard_js))
         .route("/auth", get(oauth::auth_redirect))
         .route(
             "/healthz",
@@ -400,6 +406,7 @@ pub fn create_web_router_with_config(
             DEFAULT_WEB_CONCURRENCY_LIMIT,
         ))
         .layer(cors)
+        .layer(tower_http::compression::CompressionLayer::new())
         .layer(axum::middleware::from_fn_with_state(
             is_https,
             security_headers_middleware,
@@ -482,7 +489,7 @@ async fn security_headers_middleware(
     headers.insert(
         header::HeaderName::from_static("content-security-policy"),
         axum::http::HeaderValue::from_static(
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none';",
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; connect-src 'self'; form-action 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none';",
         ),
     );
     if is_api_path {

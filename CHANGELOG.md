@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.8] - 2026-11-28
+
+### Added
+
+- **Split Static Dashboard Assets, `ETag`/`304`, Compression & Pagination (`assets/{dashboard.css,theme-init.js,dashboard.js}`, `src/web/{ui,mod}.rs`, `src/web/api/{mod,bounces}.rs`, `src/modlist/cache/bounces.rs`, `src/engine/modlist_ops.rs`)**:
+  - Split `assets/dashboard.html` into embedded static `/assets/dashboard.css`, `/assets/theme-init.js`, and `/assets/dashboard.js` routes served with deterministic SHA-256 `ETag` + `If-None-Match` (`304 Not Modified`) and `tower-http` `CompressionLayer` (`gzip` + `br`).
+  - Added `offset` query parameter and `BouncesResponse { total, bounces }` pagination envelope to `GET /api/bounces` (`list_recent_bounces_paginated` + `count_bounced`), plus Prev/Next pagination controls in the dashboard for both Bounces and Evaluation Log.
+  - Added `.github/dependabot.yml` Cargo ecosystem monitoring and CI `msrv` (`1.89`), `shellcheck`, and `docker-smoke` checks.
+
+### Changed
+
+- **Strict CSP (`'self'`), SPA Reliability & WCAG 2.1 Accessibility (`assets/*`, `src/web/mod.rs`, `src/classifier/rubric.rs`)**:
+  - Removed all 73 inline `on*=` attributes and all inline `style="..."` attributes across static HTML and JS templates, tightening `Content-Security-Policy` to `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; connect-src 'self'; form-action 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none';`.
+  - Fixed custom `BounceDuration` saving (`Number(norm)` in JS and optional trailing `'s'` support in `BounceDuration::from_str`), `formatModListUrl` non-list AT-URI safety, sample-chip rapid-click button corruption, `checkUserSession()` `localStorage` overwrite, Admin Storms view scoping (`user_did` sync, `target_handle` pills, Exit Storm Mode targeting), `AbortController` + explicit error/retry states on all 5 data loaders, toast timer/boolean checks, visibility-paused `/api/status` polling, debounced `filterBounces`, and negative `/api/resolve` DID TTL cache.
+  - Migrated login modal to native `<dialog closedby="any">` with `.showModal()` / `.close()`, Safari `closedby` fallback, scroll containment, native `<button>` saved-account rows with sibling forget controls, ARIA combobox, roving-`tabindex` arrow-key `tablist`, `aria-pressed` toggle groups, `:focus-visible` outlines, per-component `prefers-reduced-motion`, coarse-pointer 44px targets, and `375px` responsive layout wrapping.
+- **Reverse Proxies, Dependencies, CI & Docs (`deploy/{nginx/skybouncer.conf,caddy/Caddyfile}`, `Cargo.toml`, `deny.toml`, `.github/workflows/ci.yml`, `scripts/deploy.sh`, `README.md`, `docs/DEPLOYMENT.md`, `PRD.md`)**:
+  - Hardened Nginx/Caddy configs (`10m`/`10MB` body cap, `130s` timeouts, `map` upgrade header, `CF-Connecting-IP` stripping, loopback-only `/metrics`, removed duplicate security headers).
+  - Removed unused direct `tokio-tungstenite` dependency (`stream = []`) and redundant `package.homepage`, tightened `deny.toml` (`wildcards`/`unknown-registry`/`unknown-git = "deny"`), updated `.dockerignore`/`.gitignore`, converted `COMPOSE_CMD` in `scripts/deploy.sh` to a bash array for `shellcheck`, pinned all CI GitHub Actions by full commit SHA, added `version-bump-check` + `--no-default-features` test gate, scoped GitHub Release notes to the current version's `CHANGELOG.md` section, and refreshed project documentation.
+
 ## [0.3.7] - 2026-11-28
 
 ### Added

@@ -3,8 +3,13 @@
 **/.github
 **/.agents
 **/.env
+**/.env.*
 **/*.db
 **/*.db-shm
 **/*.db-wal
 **/*.log
 **/.DS_Store
+**/mutants.out*
+**/docs
+**/tests
+**/examples
