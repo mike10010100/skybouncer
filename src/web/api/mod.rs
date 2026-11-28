@@ -201,8 +201,19 @@ pub struct UpdateRulesRequest {
 pub struct BouncesQuery {
     /// Maximum number of records to return (defaults to 50, maximum 200).
     pub limit: Option<usize>,
+    /// Pagination offset (defaults to 0).
+    pub offset: Option<usize>,
     /// Optional protected DID to filter bounces for a specific user.
     pub user_did: Option<String>,
+}
+
+/// Paginated response payload for `GET /api/bounces`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BouncesResponse {
+    /// Total number of bounced records matching the query filter.
+    pub total: usize,
+    /// Page of bounced user records enriched with handles.
+    pub bounces: Vec<BouncedUserWithHandle>,
 }
 
 /// Request payload to pardon and remove a user from the moderation list.

@@ -34,10 +34,10 @@ use skybouncer::matcher::{FollowGraph, NonFollowedGate};
 use skybouncer::modlist::cache::NewEvaluationLog;
 use skybouncer::modlist::{AllowlistEntry, BouncedUser, DeduplicationCache, ModListManager};
 use skybouncer::web::{
-    create_web_router, run_web_server, AddAllowlistResponse, BouncedUserWithHandle,
-    EvaluationsResponse, GuestSimulateResponse, PardonResponse, RemoveAllowlistResponse,
-    ResolveResponse, RulesResponse, SimulateResponse, StatusResponse, UpgradeBounceResponse,
-    WebServerConfig, DASHBOARD_HTML,
+    create_web_router, run_web_server, AddAllowlistResponse, BouncesResponse, EvaluationsResponse,
+    GuestSimulateResponse, PardonResponse, RemoveAllowlistResponse, ResolveResponse, RulesResponse,
+    SimulateResponse, StatusResponse, UpgradeBounceResponse, WebServerConfig, DASHBOARD_CSS,
+    DASHBOARD_HTML, DASHBOARD_JS, THEME_INIT_JS,
 };
 
 // =============================================================================
@@ -113,6 +113,7 @@ async fn test_serve_dashboard_html() {
     let (_engine, _cache, _pds, app) = setup_test_web_environment("did:plc:protected123").await;
 
     let response = app
+        .clone()
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
         .await
         .unwrap();
@@ -133,20 +134,38 @@ async fn test_serve_dashboard_html() {
     assert!(body_str.contains("Skybouncer"));
     assert!(body_str.contains("Sovereign"));
     assert!(body_str.contains("color-scheme"));
+    assert!(body_str.contains("/assets/dashboard.css"));
+    assert!(body_str.contains("/assets/theme-init.js"));
+    assert!(body_str.contains("/assets/dashboard.js"));
     assert!(body_str.contains("Simulator"));
     assert!(body_str.contains("Recently Bounced"));
     assert!(body_str.contains("Evaluation Queue"));
     assert!(body_str.contains("Queue Overflows"));
     assert!(body_str.contains("Users Monitored"));
     assert!(body_str.contains("kpi-monitored-card"));
-    assert!(body_str.contains("bskyProfileUrl"));
-    assert!(body_str.contains("bskyPostUrl"));
-    assert!(body_str.contains("formatDid"));
     assert!(body_str.contains("allowlist-card"));
     assert!(body_str.contains("bounces-search-input"));
-    assert!(body_str.contains("applyRubricPreset"));
-    assert!(body_str.contains("btn-pardon-allow"));
     assert!(body_str.contains("total-allowlisted"));
+
+    let js_resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/assets/dashboard.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(js_resp.status(), StatusCode::OK);
+    let js_bytes = axum::body::to_bytes(js_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let js_str = String::from_utf8_lossy(&js_bytes);
+    assert!(js_str.contains("bskyProfileUrl"));
+    assert!(js_str.contains("bskyPostUrl"));
+    assert!(js_str.contains("formatDid"));
+    assert!(js_str.contains("applyRubricPreset"));
+    assert!(js_str.contains("btn-pardon-allow"));
 }
 
 #[tokio::test]
@@ -669,10 +688,11 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
     let bytes = axum::body::to_bytes(bounces_resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let bounces: Vec<BouncedUser> = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(bounces.len(), 1);
-    assert_eq!(bounces[0].subject_did, violator_did);
-    assert_eq!(bounces[0].reason, "Targeted harassment");
+    let bounces_page: BouncesResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(bounces_page.total, 1);
+    assert_eq!(bounces_page.bounces.len(), 1);
+    assert_eq!(bounces_page.bounces[0].user.subject_did, violator_did);
+    assert_eq!(bounces_page.bounces[0].user.reason, "Targeted harassment");
 
     // 2. POST /api/pardon pardons the violator
     let pardon_payload = json!({ "subject_did": violator_did });
@@ -724,8 +744,9 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
     let empty_bytes = axum::body::to_bytes(empty_resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let empty_bounces: Vec<BouncedUser> = serde_json::from_slice(&empty_bytes).unwrap();
-    assert!(empty_bounces.is_empty());
+    let empty_bounces: BouncesResponse = serde_json::from_slice(&empty_bytes).unwrap();
+    assert_eq!(empty_bounces.total, 0);
+    assert!(empty_bounces.bounces.is_empty());
 }
 
 #[tokio::test]
@@ -2131,15 +2152,16 @@ async fn test_prometheus_metrics_endpoint() {
 #[test]
 fn test_ui_dom_and_javascript_contract_validation() {
     let html = DASHBOARD_HTML;
+    let js = DASHBOARD_JS;
 
-    // 1. Verify all document.getElementById calls in JavaScript reference valid DOM IDs
+    // 1. Verify all literal document.getElementById calls in JavaScript reference valid DOM IDs
     let mut get_elem_idx = 0;
-    while let Some(start) = html[get_elem_idx..].find("document.getElementById(\"") {
+    while let Some(start) = js[get_elem_idx..].find("document.getElementById(\"") {
         let abs_start = get_elem_idx + start + "document.getElementById(\"".len();
-        let end = html[abs_start..]
+        let end = js[abs_start..]
             .find('"')
             .expect("valid closing quote for getElementById");
-        let id = &html[abs_start..abs_start + end];
+        let id = &js[abs_start..abs_start + end];
         let id_needle = format!("id=\"{id}\"");
         assert!(
             html.contains(&id_needle),
@@ -2148,40 +2170,40 @@ fn test_ui_dom_and_javascript_contract_validation() {
         get_elem_idx = abs_start + end;
     }
 
-    // 2. Verify all setSensitivity calls pass valid Sensitivity enum strings
+    // 2. Verify all data-sensitivity attributes in HTML pass valid Sensitivity enum strings
     let mut sens_idx = 0;
-    while let Some(start) = html[sens_idx..].find("setSensitivity('") {
-        let abs_start = sens_idx + start + "setSensitivity('".len();
+    while let Some(start) = html[sens_idx..].find("data-sensitivity=\"") {
+        let abs_start = sens_idx + start + "data-sensitivity=\"".len();
         let end = html[abs_start..]
-            .find('\'')
-            .expect("closing quote for setSensitivity");
+            .find('"')
+            .expect("closing quote for data-sensitivity");
         let sens_str = &html[abs_start..abs_start + end];
         let parsed = sens_str.parse::<Sensitivity>();
         assert!(
             parsed.is_ok(),
-            "DOM contract failure: setSensitivity('{sens_str}') is not a valid Sensitivity variant!"
+            "DOM contract failure: data-sensitivity=\"{sens_str}\" is not a valid Sensitivity variant!"
         );
         sens_idx = abs_start + end;
     }
 
-    // 3. Verify all setBounceDuration calls pass valid BounceDuration enum strings
+    // 3. Verify all data-duration attributes in HTML pass valid BounceDuration enum strings
     let mut dur_idx = 0;
-    while let Some(start) = html[dur_idx..].find("setBounceDuration('") {
-        let abs_start = dur_idx + start + "setBounceDuration('".len();
+    while let Some(start) = html[dur_idx..].find("data-duration=\"") {
+        let abs_start = dur_idx + start + "data-duration=\"".len();
         let end = html[abs_start..]
-            .find('\'')
-            .expect("closing quote for setBounceDuration");
+            .find('"')
+            .expect("closing quote for data-duration");
         let dur_str = &html[abs_start..abs_start + end];
         let parsed = dur_str.parse::<BounceDuration>();
         assert!(
             parsed.is_ok(),
-            "DOM contract failure: setBounceDuration('{dur_str}') cannot be parsed as BounceDuration!"
+            "DOM contract failure: data-duration=\"{dur_str}\" cannot be parsed as BounceDuration!"
         );
         let serde_deser: Result<BounceDuration, _> =
             serde_json::from_str(&format!("\"{dur_str}\""));
         assert!(
             serde_deser.is_ok(),
-            "DOM contract failure: setBounceDuration('{dur_str}') cannot be deserialized by serde into BounceDuration!"
+            "DOM contract failure: data-duration=\"{dur_str}\" cannot be deserialized by serde into BounceDuration!"
         );
         dur_idx = abs_start + end;
     }
@@ -2193,23 +2215,23 @@ fn test_ui_dom_and_javascript_contract_validation() {
         "DOM contract failure: incoming-follower bypass toggle missing from dashboard HTML!"
     );
     assert!(
-        html.contains("rubric.bypass_incoming_followers !== false"),
+        js.contains("rubric.bypass_incoming_followers !== false"),
         "DOM contract failure: renderRulesAuthenticated must reflect bypass_incoming_followers!"
     );
     assert!(
-        html.contains("bypass_incoming_followers: bypassIncomingFollowers"),
+        js.contains("bypass_incoming_followers: bypassIncomingFollowers"),
         "DOM contract failure: saveRules must submit bypass_incoming_followers!"
     );
 
     // 4. Verify all preset buttons invoke defined RUBRIC_PRESETS and match Rust constants
     let presets_marker = "const RUBRIC_PRESETS = {";
-    let presets_start = html
+    let presets_start = js
         .find(presets_marker)
         .expect("RUBRIC_PRESETS defined in UI");
-    let presets_end_rel = html[presets_start..]
+    let presets_end_rel = js[presets_start..]
         .find("const RUBRIC_PRESET_LABELS")
         .expect("RUBRIC_PRESET_LABELS follows RUBRIC_PRESETS");
-    let presets_block = &html[presets_start..presets_start + presets_end_rel];
+    let presets_block = &js[presets_start..presets_start + presets_end_rel];
 
     for expected_prompt in [
         skybouncer::classifier::PRESET_BALANCED_PROMPT,
@@ -2224,16 +2246,16 @@ fn test_ui_dom_and_javascript_contract_validation() {
     }
 
     let mut preset_idx = 0;
-    while let Some(start) = html[preset_idx..].find("applyRubricPreset('") {
-        let abs_start = preset_idx + start + "applyRubricPreset('".len();
+    while let Some(start) = html[preset_idx..].find("data-rubric-preset=\"") {
+        let abs_start = preset_idx + start + "data-rubric-preset=\"".len();
         let end = html[abs_start..]
-            .find('\'')
-            .expect("closing quote for applyRubricPreset");
+            .find('"')
+            .expect("closing quote for data-rubric-preset");
         let preset_key = &html[abs_start..abs_start + end];
         let key_needle = format!("{preset_key}: {{");
         assert!(
             presets_block.contains(&key_needle),
-            "DOM contract failure: applyRubricPreset('{preset_key}') referenced in button but '{key_needle}' not found in RUBRIC_PRESETS!"
+            "DOM contract failure: data-rubric-preset=\"{preset_key}\" referenced in button but '{key_needle}' not found in RUBRIC_PRESETS!"
         );
         preset_idx = abs_start + end;
     }
@@ -2454,50 +2476,51 @@ fn test_allowlist_entry_alias_deserialization() {
 #[test]
 fn test_ui_dom_allowlist_and_timestamp_contract_validation() {
     let html = DASHBOARD_HTML;
+    let js = DASHBOARD_JS;
 
     // 1. Verify loadAllowlist reads subject_did (not isolated allowed_did)
     assert!(
-        html.contains("e.subject_did || e.allowed_did"),
+        js.contains("e.subject_did || e.allowed_did"),
         "DOM contract failure: loadAllowlist must read e.subject_did || e.allowed_did!"
     );
 
-    // 2. Verify timestamp parsing & formatting functions exist in dashboard HTML
+    // 2. Verify timestamp parsing & formatting functions exist in dashboard JavaScript
     assert!(
-        html.contains("function parseTimestampToMs(val)"),
+        js.contains("function parseTimestampToMs(val)"),
         "DOM contract failure: parseTimestampToMs must be defined in dashboard JavaScript!"
     );
     assert!(
-        html.contains("function formatDate(val)"),
+        js.contains("function formatDate(val)"),
         "DOM contract failure: formatDate must be defined in dashboard JavaScript!"
     );
     assert!(
-        html.contains("function formatFullDate(val)"),
+        js.contains("function formatFullDate(val)"),
         "DOM contract failure: formatFullDate must be defined in dashboard JavaScript!"
     );
 
     // 3. Verify formatAccountCell and progressive handle resolution contracts
     assert!(
-        html.contains("function formatAccountCell(did, knownHandle, rawProfileUrl)"),
+        js.contains("function formatAccountCell(did, knownHandle, rawProfileUrl)"),
         "DOM contract failure: formatAccountCell must be defined in dashboard JavaScript!"
     );
     assert!(
-        html.contains("function resolveDidToHandle(did)"),
+        js.contains("function resolveDidToHandle(did)"),
         "DOM contract failure: resolveDidToHandle must be defined in dashboard JavaScript!"
     );
     assert!(
-        html.contains("function enhanceUnresolvedAccountCells(container)"),
+        js.contains("function enhanceUnresolvedAccountCells(container)"),
         "DOM contract failure: enhanceUnresolvedAccountCells must be defined in dashboard JavaScript!"
     );
     assert!(
-        html.contains("formatAccountCell(did, e.handle)"),
+        js.contains("formatAccountCell(did, e.handle)"),
         "DOM contract failure: allowlist table must format account cells using formatAccountCell!"
     );
     assert!(
-        html.contains("formatAccountCell(b.subject_did, b.handle)"),
+        js.contains("formatAccountCell(b.subject_did, b.handle)"),
         "DOM contract failure: bounces table must format account cells using formatAccountCell!"
     );
     assert!(
-        html.contains("data-did=\"${escapeHtml(did)}\""),
+        js.contains("data-did=\"${escapeHtml(did)}\""),
         "DOM contract failure: allowlist remove button must use resolved did!"
     );
     assert!(
@@ -2652,17 +2675,19 @@ async fn test_api_bounces_and_allowlist_handle_enrichment() {
         .await
         .unwrap();
 
-    // Verify both BouncedUserWithHandle and BouncedUser deserialize seamlessly
-    let enriched: Vec<BouncedUserWithHandle> = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(enriched.len(), 1);
-    assert_eq!(enriched[0].user.subject_did, violator_did);
-    assert_eq!(enriched[0].handle.as_deref(), Some(violator_handle));
+    // Verify both BouncesResponse and BouncedUserWithHandle deserialize seamlessly
+    let page: BouncesResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.bounces.len(), 1);
+    assert_eq!(page.bounces[0].user.subject_did, violator_did);
+    assert_eq!(page.bounces[0].handle.as_deref(), Some(violator_handle));
     assert_eq!(
-        enriched[0].protected_handle.as_deref(),
+        page.bounces[0].protected_handle.as_deref(),
         Some("alice.bsky.social")
     );
 
-    let standard: Vec<BouncedUser> = serde_json::from_slice(&bytes).unwrap();
+    let raw_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let standard: Vec<BouncedUser> = serde_json::from_value(raw_json["bounces"].clone()).unwrap();
     assert_eq!(standard.len(), 1);
     assert_eq!(standard[0].subject_did, violator_did);
 
@@ -3850,7 +3875,7 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
     assert!(DASHBOARD_HTML.contains("never sees your password"));
     assert!(DASHBOARD_HTML.contains("No domain included"));
     assert!(DASHBOARD_HTML.contains("Bluesky or AT Protocol (Atmosphere) Handle"));
-    assert!(DASHBOARD_HTML.contains("Forget account on this device"));
+    assert!(DASHBOARD_JS.contains("Forget account on this device"));
 
     // 2a. Short typeahead query (< 2 chars) returns empty list immediately without network I/O
     let typeahead_resp = app
@@ -4477,10 +4502,11 @@ async fn test_api_simulate_draft_rubric_override_without_mutating_saved_rules() 
 #[test]
 fn test_ui_onboarding_workspace_tabs_and_admin_gating_contract() {
     let html = DASHBOARD_HTML;
+    let js = DASHBOARD_JS;
     assert!(html.contains("id=\"onboarding-view\""));
     assert!(html.contains("id=\"workspace-view\""));
-    assert!(html.contains("/api/simulate/guest"));
-    assert!(html.contains("function switchWorkspaceTab(tab)"));
+    assert!(js.contains("/api/simulate/guest"));
+    assert!(js.contains("function switchWorkspaceTab("));
     assert!(html.contains("id=\"operator-drawer\""));
 
     // Verify admin-fleet-card is hidden by default AND positioned inside operator-drawer
@@ -4488,7 +4514,7 @@ fn test_ui_onboarding_workspace_tabs_and_admin_gating_contract() {
         .find("id=\"operator-drawer\"")
         .expect("operator-drawer must exist");
     let fleet_pos = html
-        .find("id=\"admin-fleet-card\" style=\"display: none;\"")
+        .find("class=\"card is-hidden\" id=\"admin-fleet-card\"")
         .expect("admin-fleet-card must start hidden");
     let main_end_pos = html.find("</main>").expect("</main> must exist");
     assert!(
@@ -6197,4 +6223,347 @@ async fn test_healthz_db_probe_body_limits_and_live_listener_connect_info() {
 
     cancel.cancel();
     srv_task.await.unwrap().unwrap();
+}
+
+// =============================================================================
+// PR 5 (v0.3.8) Dedicated Split-SPA, Strict-CSP, ETag, Compression & Pagination Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_pr5_split_assets_strict_csp_etag_and_compression() {
+    let (_engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+
+    // 1. Static asset endpoints return 200, expected Content-Type, ETag, and strict CSP.
+    for (path_uri, expected_ct, expected_body) in [
+        ("/", "text/html", DASHBOARD_HTML),
+        ("/assets/dashboard.css", "text/css", DASHBOARD_CSS),
+        (
+            "/assets/theme-init.js",
+            "application/javascript",
+            THEME_INIT_JS,
+        ),
+        (
+            "/assets/dashboard.js",
+            "application/javascript",
+            DASHBOARD_JS,
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "path={path_uri}");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            ct.contains(expected_ct),
+            "path={path_uri} expected {expected_ct}, got {ct}"
+        );
+
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            csp.contains("script-src 'self'"),
+            "path={path_uri} csp={csp}"
+        );
+        assert!(
+            csp.contains("style-src 'self'"),
+            "path={path_uri} csp={csp}"
+        );
+        assert!(
+            csp.contains("form-action 'self'"),
+            "path={path_uri} csp={csp}"
+        );
+        assert!(
+            !csp.contains("'unsafe-inline'"),
+            "CSP must not contain 'unsafe-inline' on {path_uri}: {csp}"
+        );
+
+        let etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(!etag.is_empty(), "missing ETag on {path_uri}");
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body_bytes.as_ref(), expected_body.as_bytes());
+
+        // 2. Conditional GET with matching ETag returns 304 Not Modified.
+        let not_mod = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path_uri)
+                    .header("if-none-match", &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            not_mod.status(),
+            StatusCode::NOT_MODIFIED,
+            "path={path_uri}"
+        );
+        assert_eq!(
+            not_mod.headers().get("etag").and_then(|v| v.to_str().ok()),
+            Some(etag.as_str())
+        );
+    }
+
+    // 3. Verify CompressionLayer negotiates gzip and br on /assets/dashboard.js.
+    for enc in ["gzip", "br"] {
+        let comp_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/dashboard.js")
+                    .header("accept-encoding", enc)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(comp_resp.status(), StatusCode::OK);
+        assert_eq!(
+            comp_resp
+                .headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some(enc),
+            "expected content-encoding={enc}"
+        );
+        let compressed_bytes = axum::body::to_bytes(comp_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !compressed_bytes.is_empty() && compressed_bytes.len() < DASHBOARD_JS.len(),
+            "compressed {enc} payload should be smaller than raw JS"
+        );
+    }
+
+    // 4. Verify DASHBOARD_HTML & DASHBOARD_JS contain zero inline on*= or style= attributes.
+    assert!(!DASHBOARD_HTML.contains("<style"));
+    assert!(!DASHBOARD_HTML.contains("style=\""));
+    assert!(!DASHBOARD_JS.contains("style=\""));
+    for handler_attr in [
+        "onclick=",
+        "oninput=",
+        "onchange=",
+        "onsubmit=",
+        "onkeydown=",
+    ] {
+        assert!(
+            !DASHBOARD_HTML.contains(handler_attr),
+            "DASHBOARD_HTML must not contain {handler_attr}"
+        );
+        assert!(
+            !DASHBOARD_JS.contains(handler_attr),
+            "DASHBOARD_JS must not contain {handler_attr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_pr5_custom_bounce_duration_roundtrip_and_trailing_s() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let tok = create_test_session(&engine, "did:plc:alice");
+
+    // 1. Numeric custom seconds (3600) round-trips cleanly.
+    let resp_num = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rules")
+                .header("cookie", format!("skybouncer_session={tok}"))
+                .header("origin", "http://127.0.0.1:3000")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "prompt": "Block spam",
+                        "sensitivity": "medium",
+                        "bounce_duration": 3600
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_num.status(), StatusCode::OK);
+    let saved_num: RulesResponse = serde_json::from_slice(
+        &axum::body::to_bytes(resp_num.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved_num.bounce_duration, BounceDuration::Custom(3600));
+
+    // 2. Trailing-s string ("7200s") also parses and persists cleanly.
+    let resp_str = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rules")
+                .header("cookie", format!("skybouncer_session={tok}"))
+                .header("origin", "http://127.0.0.1:3000")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "prompt": "Block spam",
+                        "sensitivity": "medium",
+                        "bounce_duration": "7200s"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_str.status(), StatusCode::OK);
+    let saved_str: RulesResponse = serde_json::from_slice(
+        &axum::body::to_bytes(resp_str.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved_str.bounce_duration, BounceDuration::Custom(7200));
+
+    let get_resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/rules")
+                .header("cookie", format!("skybouncer_session={tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let fetched: RulesResponse = serde_json::from_slice(
+        &axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fetched.bounce_duration, BounceDuration::Custom(7200));
+}
+
+#[tokio::test]
+async fn test_pr5_api_bounces_pagination_and_tenant_scoping() {
+    let (engine, cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let admin_tok = create_test_session(&engine, "did:plc:alice");
+
+    // Seed 3 bounces for alice and 2 for bob across distinct timestamps.
+    for i in 0..5u64 {
+        let protected = if i < 3 {
+            "did:plc:alice"
+        } else {
+            "did:plc:bob"
+        };
+        cache
+            .record_bounce(&BouncedUser {
+                subject_did: format!("did:plc:violator{i}"),
+                protected_did: protected.to_string(),
+                listitem_uri: format!("at://{protected}/app.bsky.graph.listitem/item{i}"),
+                listitem_rkey: format!("item{i}"),
+                listitem_cid: format!("bafy{i}"),
+                category: "Spam".to_string(),
+                confidence: 0.95,
+                reason: format!("Reason {i}"),
+                post_uri: format!("at://did:plc:violator{i}/app.bsky.feed.post/p{i}"),
+                post_text: format!("Spam {i}"),
+                reply_to_uri: None,
+                bounced_at: 1_720_000_000_000_000 + i * 1_000,
+                expires_at: None,
+            })
+            .unwrap();
+    }
+
+    // 1. Fleet-wide page 1 (limit=2, offset=0) -> total 5, returns newest 2 (4, 3).
+    let p1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/bounces?limit=2&offset=0")
+                .header("cookie", format!("skybouncer_session={admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(p1.status(), StatusCode::OK);
+    let r1: BouncesResponse = serde_json::from_slice(
+        &axum::body::to_bytes(p1.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(r1.total, 5);
+    assert_eq!(r1.bounces.len(), 2);
+    assert_eq!(r1.bounces[0].user.subject_did, "did:plc:violator4");
+
+    // 2. Fleet-wide final page (limit=2, offset=4) -> total 5, returns oldest 1 (0).
+    let p3 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/bounces?limit=2&offset=4")
+                .header("cookie", format!("skybouncer_session={admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(p3.status(), StatusCode::OK);
+    let r3: BouncesResponse = serde_json::from_slice(
+        &axum::body::to_bytes(p3.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(r3.total, 5);
+    assert_eq!(r3.bounces.len(), 1);
+    assert_eq!(r3.bounces[0].user.subject_did, "did:plc:violator0");
+
+    // 3. Tenant-scoped pagination (user_did=did:plc:bob, limit=1, offset=1) -> total 2, returns 1.
+    let bob_p2 = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/bounces?user_did=did:plc:bob&limit=1&offset=1")
+                .header("cookie", format!("skybouncer_session={admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bob_p2.status(), StatusCode::OK);
+    let bob_res: BouncesResponse = serde_json::from_slice(
+        &axum::body::to_bytes(bob_p2.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bob_res.total, 2);
+    assert_eq!(bob_res.bounces.len(), 1);
+    assert_eq!(bob_res.bounces[0].user.protected_did, "did:plc:bob");
+    assert_eq!(bob_res.bounces[0].user.subject_did, "did:plc:violator3");
 }

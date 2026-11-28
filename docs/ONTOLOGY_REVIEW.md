@@ -1,5 +1,8 @@
 # Skybouncer ATProto Moderation Service: Comprehensive Ontology Review & Type System Invariants
 
+> [!NOTE]
+> **Archived Historical Snapshot:** This document is preserved as a point-in-time architecture and ontology audit captured against `skybouncer v0.1.12`. For current implementation behavior, see [`README.md`](../README.md), [`PRD.md`](../PRD.md), and [`CHANGELOG.md`](../CHANGELOG.md).
+
 **Document Version:** 1.0.0 (Publication-Grade Audit)  
 **Target Repository:** `skybouncer v0.1.12`  
 **Reference Standards:** `AGENTS.md`, `PRD.md`, `rust-best-practices`, ATProto Specifications (`atproto.com/specs/lexicon`, `atproto.com/specs/repository`)  

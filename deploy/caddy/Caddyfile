@@ -1,23 +1,45 @@
 # ==============================================================================
 # Caddy Reverse Proxy Configuration for Skybouncer
 # Automatic HTTPS via Let's Encrypt / ZeroSSL
+# Note: Use 127.0.0.1:3031 for Docker Compose deployments or 127.0.0.1:3000 for systemd.
 # ==============================================================================
 
 moderation.example.com {
+    # Allow 8 MiB /api/simulate image payloads plus JSON overhead
+    request_body {
+        max_size 10MB
+    }
+
+    # Restrict Prometheus metrics endpoints to loopback scrapers
+    @metrics path /metrics /api/metrics
+    handle @metrics {
+        @allowed_metrics remote_ip 127.0.0.1 ::1
+        handle @allowed_metrics {
+            reverse_proxy 127.0.0.1:3000 {
+                header_up Host {host}
+                header_up X-Real-IP {remote_host}
+                header_up X-Forwarded-For {remote_host}
+                header_up X-Forwarded-Proto {scheme}
+                header_up -CF-Connecting-IP
+            }
+        }
+        respond "Forbidden" 403
+    }
+
+    # Security headers (HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy)
+    # are emitted directly by Skybouncer's Axum security_headers_middleware to avoid duplicates.
+
     # Reverse proxy to local Skybouncer Web Dashboard & OAuth API
+    # (Change 127.0.0.1:3000 to 127.0.0.1:3031 for Docker Compose)
     reverse_proxy 127.0.0.1:3000 {
         header_up Host {host}
         header_up X-Real-IP {remote_host}
         header_up X-Forwarded-For {remote_host}
         header_up X-Forwarded-Proto {scheme}
-    }
-
-    # Essential HTTP Security Headers
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
-        Referrer-Policy "strict-origin-when-cross-origin"
+        header_up -CF-Connecting-IP
+        transport http {
+            read_timeout 130s
+        }
     }
 
     # Structured JSON Access Logging

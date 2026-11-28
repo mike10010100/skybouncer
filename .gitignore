@@ -5,6 +5,8 @@
 
 # Local environment & SQLite databases
 .env
+.env.*
+!.env.example
 *.db
 *.db-shm
 *.db-wal

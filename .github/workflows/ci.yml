@@ -26,7 +26,7 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - name: Checkout repository with full history
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -43,23 +43,24 @@ jobs:
       RUSTFLAGS: "-D warnings"
     steps:
       - name: Checkout skybouncer
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
       - name: Enable Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: "lint"
           cache-on-failure: true
 
       - name: Install CI Cargo Utilities
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
           tool: cargo-deny,cargo-audit
 
@@ -69,14 +70,77 @@ jobs:
       - name: 2. Enforce Strict Clippy Lints
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: 2b. Enforce Lean Core Build (no default features)
-        run: cargo clippy --lib --no-default-features -- -D warnings
+      - name: 2b. Enforce Lean Core Build & Tests (no default features)
+        run: |
+          cargo clippy --lib --no-default-features -- -D warnings
+          cargo test --lib --no-default-features
 
       - name: 3. Dependency Policy Governance (cargo-deny)
         run: cargo deny check
 
       - name: 4. Security Vulnerability Scan (cargo-audit)
         run: cargo audit
+
+  msrv:
+    name: MSRV Check (Rust 1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout skybouncer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.89 Toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.89"
+
+      - name: Enable Rust Cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: "msrv-1.89"
+          cache-on-failure: true
+
+      - name: Verify MSRV Compilation
+        run: cargo check --all-targets --locked
+
+  shellcheck:
+    name: ShellCheck Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout skybouncer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install ShellCheck
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: shellcheck
+
+      - name: Run ShellCheck on Shell Scripts
+        run: shellcheck scripts/*.sh deploy/systemd/install.sh
+
+  docker-smoke:
+    name: Docker Build Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout skybouncer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build Docker Image (Smoke)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   coverage-and-tests:
     name: Test Suite & Coverage (>= 92%)
@@ -86,22 +150,23 @@ jobs:
       CARGO_LLVM_COV_TARGET_DIR: target
     steps:
       - name: Checkout skybouncer
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: stable
           components: llvm-tools-preview
 
       - name: Install CI Cargo Utilities
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
           tool: cargo-nextest,cargo-llvm-cov
 
       - name: Enable Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: "coverage"
           cache-all-crates: true
@@ -122,22 +187,24 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - name: Checkout skybouncer
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
 
       - name: Enable Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: "mutants-lean"
           cache-all-crates: true
           cache-on-failure: true
 
       - name: Install cargo-nextest & cargo-mutants
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
           tool: cargo-nextest,cargo-mutants
 
@@ -150,19 +217,48 @@ jobs:
     name: Rust Quality Gate
     runs-on: ubuntu-latest
     if: always()
-    needs: [lint-and-audit, coverage-and-tests, mutants-smoke]
+    needs: [version-bump-check, lint-and-audit, msrv, shellcheck, docker-smoke, coverage-and-tests, mutants-smoke]
     steps:
       - name: Verify All Parallel Quality Gate Jobs Succeeded
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          VERSION_RESULT: ${{ needs.version-bump-check.result }}
           LINT_RESULT: ${{ needs.lint-and-audit.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          SHELLCHECK_RESULT: ${{ needs.shellcheck.result }}
+          DOCKER_RESULT: ${{ needs.docker-smoke.result }}
           COV_RESULT: ${{ needs.coverage-and-tests.result }}
           MUTANTS_RESULT: ${{ needs.mutants-smoke.result }}
         run: |
+          echo "version-bump-check: ${VERSION_RESULT}"
           echo "lint-and-audit    : ${LINT_RESULT}"
+          echo "msrv              : ${MSRV_RESULT}"
+          echo "shellcheck        : ${SHELLCHECK_RESULT}"
+          echo "docker-smoke      : ${DOCKER_RESULT}"
           echo "coverage-and-tests: ${COV_RESULT}"
           echo "mutants-smoke     : ${MUTANTS_RESULT}"
+          if [[ "${EVENT_NAME}" == "pull_request" && "${VERSION_RESULT}" != "success" ]]; then
+            echo "::error::version-bump-check failed (${VERSION_RESULT})"
+            exit 1
+          fi
+          if [[ "${EVENT_NAME}" != "pull_request" && "${VERSION_RESULT}" != "success" && "${VERSION_RESULT}" != "skipped" ]]; then
+            echo "::error::version-bump-check failed (${VERSION_RESULT})"
+            exit 1
+          fi
           if [[ "${LINT_RESULT}" != "success" ]]; then
             echo "::error::lint-and-audit failed (${LINT_RESULT})"
+            exit 1
+          fi
+          if [[ "${MSRV_RESULT}" != "success" ]]; then
+            echo "::error::msrv failed (${MSRV_RESULT})"
+            exit 1
+          fi
+          if [[ "${SHELLCHECK_RESULT}" != "success" ]]; then
+            echo "::error::shellcheck failed (${SHELLCHECK_RESULT})"
+            exit 1
+          fi
+          if [[ "${DOCKER_RESULT}" != "success" ]]; then
+            echo "::error::docker-smoke failed (${DOCKER_RESULT})"
             exit 1
           fi
           if [[ "${COV_RESULT}" != "success" ]]; then
@@ -185,15 +281,17 @@ jobs:
       checks: read
     steps:
       - name: Checkout skybouncer
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
 
       - name: Enable Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: "publish"
           cache-on-failure: true
@@ -267,21 +365,31 @@ jobs:
         if: steps.check_published.outputs.published == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: "${{ steps.pkg_info.outputs.version }}"
           TAG_NAME: "v${{ steps.pkg_info.outputs.version }}"
         run: |
           if ! gh release view "${TAG_NAME}" >/dev/null 2>&1; then
             echo "Creating GitHub Release ${TAG_NAME}..."
+            NOTES_FILE=$(mktemp)
             if [ -f CHANGELOG.md ]; then
+              awk -v ver="${VERSION}" '
+                index($0, "## [" ver "]") == 1 { in_sec=1; print; next }
+                index($0, "## [") == 1 && in_sec { exit }
+                in_sec { print }
+              ' CHANGELOG.md > "${NOTES_FILE}"
+            fi
+            if [ -s "${NOTES_FILE}" ]; then
               gh release create "${TAG_NAME}" \
                 --target "${GITHUB_SHA}" \
                 --title "${TAG_NAME} - Production Release" \
-                --notes-file CHANGELOG.md
+                --notes-file "${NOTES_FILE}"
             else
               gh release create "${TAG_NAME}" \
                 --target "${GITHUB_SHA}" \
                 --title "${TAG_NAME} - Production Release" \
                 --generate-notes
             fi
+            rm -f "${NOTES_FILE}"
           else
             echo "GitHub Release ${TAG_NAME} already exists."
           fi

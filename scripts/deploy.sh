@@ -12,13 +12,13 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
 # Locate docker compose command
-COMPOSE_CMD=""
+COMPOSE_CMD=()
 if docker compose version >/dev/null 2>&1; then
-    COMPOSE_CMD="docker compose"
+    COMPOSE_CMD=(docker compose)
 elif command -v docker-compose >/dev/null 2>&1; then
-    COMPOSE_CMD="docker-compose"
+    COMPOSE_CMD=(docker-compose)
 elif [[ -x "/home/linuxbrew/.linuxbrew/bin/docker-compose" ]]; then
-    COMPOSE_CMD="/home/linuxbrew/.linuxbrew/bin/docker-compose"
+    COMPOSE_CMD=(/home/linuxbrew/.linuxbrew/bin/docker-compose)
 else
     echo "Error: Neither 'docker compose' nor 'docker-compose' found!" >&2
     exit 1
@@ -43,10 +43,10 @@ echo "======================================================================"
 
 # Build versioned image
 export IMAGE_TAG
-${COMPOSE_CMD} build skybouncer
+"${COMPOSE_CMD[@]}" build skybouncer
 
 # Launch the stack
-${COMPOSE_CMD} up -d skybouncer
+"${COMPOSE_CMD[@]}" up -d skybouncer
 
 # Wait for skybouncer to pass healthcheck
 echo "⏳ Waiting for Skybouncer to pass healthcheck..."

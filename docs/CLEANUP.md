@@ -1,5 +1,8 @@
 # Skybouncer Refactoring & Cleanup Plan
 
+> [!NOTE]
+> **Archived Historical Snapshot:** This document is preserved as a historical refactoring checklist from `skybouncer v0.1.20`. For current quality gates and release history, see [`AGENTS.md`](../AGENTS.md) and [`CHANGELOG.md`](../CHANGELOG.md).
+
 > Living document. Work items are ordered by phase (risk-adjusted ROI).
 > Each item records exact locations, the intended change, the verification
 > performed, and a status marker. Update the status row as work lands.

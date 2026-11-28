@@ -41,6 +41,30 @@ impl SkybouncerEngine {
         self.cache.list_recent_bounces_for(protected_did, limit)
     }
 
+    /// Lists recently bounced violators filtered by an optional protected user DID with
+    /// pagination (`limit` and `offset`), ordered by most recent bounce timestamp descending.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is `Some` with whitespace,
+    /// or [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn list_recent_bounces_paginated(
+        &self,
+        protected_did: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<BouncedUser>, SkybouncerError> {
+        self.cache
+            .list_recent_bounces_paginated(protected_did, limit, offset)
+    }
+
+    /// Counts total bounced violators recorded across all tenants via SQL `COUNT(*)`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn count_bounced(&self) -> Result<usize, SkybouncerError> {
+        self.cache.count_bounced()
+    }
+
     /// Counts total bounced violators recorded for `protected_did` via SQL `COUNT(*)`.
     ///
     /// # Errors

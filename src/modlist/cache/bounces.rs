@@ -317,11 +317,30 @@ impl DeduplicationCache {
         protected_did: Option<&str>,
         limit: usize,
     ) -> Result<Vec<BouncedUser>, SkybouncerError> {
+        self.list_recent_bounces_paginated(protected_did, limit, 0)
+    }
+
+    /// Lists recently bounced users filtered by an optional protected user DID with
+    /// pagination (`limit` and `offset`), ordered by most recent bounce timestamp descending.
+    ///
+    /// Strictly isolates tenant moderation data: when `protected_did` is `Some`,
+    /// it must be non-empty and only bounces for that exact tenant are returned.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Config`] if `Some` contains an empty/whitespace DID,
+    /// or [`SkybouncerError::Database`] if the SQLite query fails.
+    pub fn list_recent_bounces_paginated(
+        &self,
+        protected_did: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<BouncedUser>, SkybouncerError> {
         let scoped_target = match protected_did {
             Some(raw) => Some(crate::util::require_non_empty_did(raw, "protected_did")?),
             None => None,
         };
         let limit_i64 = i64::try_from(limit).unwrap_or(50);
+        let offset_i64 = i64::try_from(offset).unwrap_or(i64::MAX);
         let conn = self.conn.lock();
         let mut list = Vec::new();
 
@@ -331,10 +350,10 @@ impl DeduplicationCache {
                  FROM bounced_users
                  WHERE protected_did = ?1
                  ORDER BY bounced_at DESC
-                 LIMIT ?2;"
+                 LIMIT ?2 OFFSET ?3;"
             ))?;
 
-            let rows = stmt.query_map(params![target, limit_i64], map_bounced_user)?;
+            let rows = stmt.query_map(params![target, limit_i64, offset_i64], map_bounced_user)?;
 
             for r in rows {
                 list.push(r?);
@@ -344,10 +363,10 @@ impl DeduplicationCache {
                 "SELECT {BOUNCED_USER_COLUMNS}
                  FROM bounced_users
                  ORDER BY bounced_at DESC
-                 LIMIT ?1;"
+                 LIMIT ?1 OFFSET ?2;"
             ))?;
 
-            let rows = stmt.query_map(params![limit_i64], map_bounced_user)?;
+            let rows = stmt.query_map(params![limit_i64, offset_i64], map_bounced_user)?;
 
             for r in rows {
                 list.push(r?);

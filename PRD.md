@@ -14,7 +14,7 @@
 | **The Solution** | `skybouncer` allows any Bluesky user to define personalized, natural-language moderation rules (e.g., *"Block crypto scam bots, harassment, and aggressive sea-lioning"*). An interaction watcher monitors incoming mentions, replies, and quotes directed at enrolled users via the Jetstream firehose, evaluates interactions using low-latency System-1 classifiers (**Jev** / lightweight LLMs), and automatically appends offending accounts to each user's sovereign ATProto Moderation List (`app.bsky.graph.listitem`). The user subscribes to their own list, natively muting or blocking violators across the entire Bluesky network. |
 | **Dual UX Topologies** | **1. Public DM Bot Interface (`chat.bsky.convo.*`)**: Conversational onboarding and self-service management for anyone on Bluesky. Unenrolled users receive a friendly greeting and 1-click authorization link; enrolled users configure rules, view recent actions, or adjust sensitivity.<br/>**2. Sovereign Web Portal (`skyauth`)**: Web UI powered by ATProto OAuth 2.0 with PKCE and DPoP cryptographic proofs, featuring multi-tenant onboarding, live rule playground, and audit stream. |
 | **The Sovereign Multi-Tenant Model** | Moderation rules and lists are published directly to each user's sovereign repository on their PDS (e.g., as custom ATProto records or encoded list metadata). The service operates in a **sovereign, multi-tenant mode**—storing only encrypted OAuth DPoP sessions and caching interaction evaluations, with zero platform lock-in. |
-| **Underlying Engine & Release** | Published on crates.io (`skybouncer v0.1.6`), built in 100% Safe Rust (`#![forbid(unsafe_code)]`), powered directly by sibling crates [`skybase`] (Jetstream ingestion, SQLite caching, DPoP PDS write client) and [`skyauth`] (OAuth 2.0 PKCE + DPoP session lifecycle). |
+| **Underlying Engine & Release** | Published on crates.io (`skybouncer v0.3.8`), built in 100% Safe Rust (`#![forbid(unsafe_code)]`), powered directly by sibling crates [`skybase`] (Jetstream ingestion, SQLite caching, DPoP PDS write client) and [`skyauth`] (OAuth 2.0 PKCE + DPoP session lifecycle). |
 
 ---
 
@@ -180,13 +180,13 @@ Unlike centralized Web2 moderation bots that require a database of user accounts
   * Any user on Bluesky can message `@skybouncer.bot`.
   * If the sender is **not yet enrolled**, the bot replies with an introduction and a 1-click authorization link (`https://skybouncer.example.com/auth`) to activate protection on their account.
 * **Management Commands (For Enrolled Users)**:
-  * `rules`: Display the user's active moderation rubric.
-  * `set rules <text>`: Update the user's rule rubric and sync to their sovereign PDS.
-  * `status`: Show user's protection state (Active/Paused), bounced account count, and modlist link.
-  * `recent`: List the last 5 accounts added with violation category and snippet.
-  * `pardon @handle` or `pardon <did>`: Remove an account from their personal moderation list on their PDS.
-  * `pause` / `resume`: Temporarily disable or enable automated actions for their account.
-  * `sensitivity <low|medium|high>`: Adjust the user's confidence threshold.
+  * `rules` / `set rules <text>`: View or update your active moderation rubric and sync to your sovereign PDS.
+  * `sensitivity <low|medium|high>` / `duration <permanent|24h|7d|30d>` / `trust followers <on|off>`: Tune threshold, timeout TTL, and follower bypass.
+  * `pause` / `resume`: Temporarily disable or enable automated actions for your account.
+  * `recent` / `status` / `test <text>`: View recent bounces, live telemetry, or dry-run evaluation.
+  * `pardon <@handle|did>` / `pardon and allow <@handle|did>` / `bounce <target>` / `perm <target>`: Manage list entries.
+  * `allow <target>` / `unallow <target>` / `allowlist [page]`: Manage trusted allowlist entries.
+  * `storms` / `storm <on|off>` / `lock [post] [policy]` / `unlock [post]` / `detach [post] [qt|all]`: Dogpile radar & sovereign threadgate/postgate shields.
 
 #### Mode 2: Sovereign Web Portal & OAuth 2.1 Gateway (`skyauth`)
 * Public web service hosted at `https://skybouncer.example.com`.
@@ -248,6 +248,8 @@ Adhering to [`AGENTS.md`](AGENTS.md) and [`rust-best-practices`](https://github.
 | **M14: Tenant-Scoped Evaluation Audit Log** | Isolated `GET /api/evaluations` scoped by caller DID, real-time telemetry card, and fleet-wide admin oversight. | ✅ **Completed & Published (`v0.1.11`)** |
 | **M15: Production Observability & Prometheus Metrics** | Native `GET /metrics` and `GET /api/metrics` exposing Prometheus 0.0.4 text format telemetry for commits, gate bypasses, cache hits, model evaluations, and queue depth. | ✅ **Completed & Published (`v0.1.11`)** |
 | **M16: Dashboard Presets & Real-Time Search Filtering** | Quick-select rubric templates (*Balanced Defense*, *Zero Crypto*, *Anti-Hostility*, *Anti-Ragebait*) and client-side real-time search filtering on Recently Bounced table. | ✅ **Completed & Published (`v0.1.11`)** |
+| **M17: Tiered Multimodal Escalation & Dogpile Storm Radar** | System-1/System-2 tiered arbitration, dynamic multimodal primary routing, Stage 3 stance classification, Storm Mode digest batching, and sovereign threadgate/postgate shields. | ✅ **Completed & Published (`v0.2.x`–`v0.3.5`)** |
+| **M18: Production Security, Performance, DM Reliability & Strict-CSP SPA** | Zero-logout `web_sessions` & `.skybouncer.key` migrations, SQLite lock/index optimizations, single-RPC `getPostThread`, `SIGTERM` drain, DM poller/rate-limit/ops hardening, split static SPA assets with `ETag`/`304`, gzip/br compression, strict `'self'` CSP, and WCAG 2.1 accessibility. | ✅ **Completed (`v0.3.4`–`v0.3.8`)** |
 
 
 ---
@@ -265,7 +267,7 @@ Adhering to [`AGENTS.md`](AGENTS.md) and [`rust-best-practices`](https://github.
 ## 8. Disambiguation & Namespace Verification
 
 * **Crate Name**: `skybouncer`
-* **Crates.io Status**: ✅ **Published & Active** ([`skybouncer 0.1.0`](https://crates.io/api/v1/crates/skybouncer/0.1.0) and [`skybase 0.1.0`](https://crates.io/api/v1/crates/skybase/0.1.0) are live on crates.io).
+* **Crates.io Status**: ✅ **Published & Active** ([`skybouncer`](https://crates.io/crates/skybouncer), [`skybase`](https://crates.io/crates/skybase), and [`skyauth`](https://crates.io/crates/skyauth) are live on crates.io; current release `v0.3.8`).
 * **Bluesky Handle Status**: Verified completely free (`@skybouncer` and `@skybouncer.bsky.social` have 0 users).
 * **Prior Art Disambiguation**:
   * Distinct from `@skysentry.bsky.social` (an existing manual blocklist curator).

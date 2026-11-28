@@ -17,7 +17,7 @@ fn resolve_bounce_target_did(
     }
 }
 
-/// Handler for `GET /api/bounces`: returns recent bounced violators.
+/// Handler for `GET /api/bounces`: returns paginated recent bounced violators.
 ///
 /// Authentication is strictly required. Non-admin users are restricted to viewing
 /// only bounces on their own posts; admins may view fleet-wide or specify a target DID.
@@ -25,7 +25,7 @@ pub async fn get_bounces(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<BouncesQuery>,
-) -> Result<Json<Vec<BouncedUserWithHandle>>, (StatusCode, String)> {
+) -> Result<Json<BouncesResponse>, (StatusCode, String)> {
     let caller_did = extract_authenticated_caller(&headers, &state.engine).ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
@@ -34,6 +34,7 @@ pub async fn get_bounces(
     })?;
 
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0);
     let is_admin = state.engine.is_admin(&caller_did);
     let requested_user = query
         .user_did
@@ -55,9 +56,21 @@ pub async fn get_bounces(
         Some(caller_did.as_str())
     };
 
+    let total = match filter_did {
+        Some(did) => state.engine.count_bounced_for(did),
+        None => state.engine.count_bounced(),
+    }
+    .map_err(|e| {
+        tracing::error!(error = %e, "Failed to count recent bounces");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load recent bounces".to_string(),
+        )
+    })?;
+
     let bounces = state
         .engine
-        .list_recent_bounces_for(filter_did, limit)
+        .list_recent_bounces_paginated(filter_did, limit, offset)
         .map_err(|e| {
             tracing::error!(error = %e, "Failed to list recent bounces");
             (
@@ -87,7 +100,10 @@ pub async fn get_bounces(
             }
         })
         .collect();
-    Ok(Json(enriched))
+    Ok(Json(BouncesResponse {
+        total,
+        bounces: enriched,
+    }))
 }
 
 /// Handler for `POST /api/pardon`: unbans a user and removes their listitem from PDS.
