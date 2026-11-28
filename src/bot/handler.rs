@@ -12,7 +12,12 @@
 //! - `status`: View engine operational telemetry and bounce counts.
 //! - `test <text>`: Dry-run evaluation on sample text.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
+use tokio::sync::Semaphore;
 
 use crate::bot::render::{
     account_label_with_url, bsky_post_or_web_url, bsky_post_url_from_at_uri, command_target,
@@ -22,8 +27,134 @@ use crate::classifier::{BounceDuration, Sensitivity, Verdict};
 use crate::dogpile::ThreadgatePolicy;
 use crate::engine::SkybouncerEngine;
 use crate::error::SkybouncerError;
+use crate::limiter::{EvaluationRateLimiter, RateLimiterConfig};
 use crate::matcher::Interaction;
 use crate::modlist::ManualBounceOutcome;
+
+/// Default maximum DM commands accepted per sender DID per minute before throttling.
+const DEFAULT_DM_RATE_LIMIT_PER_MIN: usize = 20;
+
+/// Default DM rate-limit rolling window.
+const DEFAULT_DM_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Default cooldown between consecutive unknown-command replies to the same sender.
+const DEFAULT_UNKNOWN_CMD_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Default maximum `test` dry-run commands per sender DID per minute.
+const DEFAULT_DM_TEST_RATE_LIMIT_PER_MIN: usize = 10;
+
+/// Default maximum concurrent `test` evaluations across DM bot commands.
+const DEFAULT_DM_TEST_CONCURRENCY: usize = 2;
+
+/// Maximum text length accepted by the DM `test` command.
+const MAX_DM_TEST_TEXT_CHARS: usize = 2000;
+
+/// Maximum allowlist entries displayed per DM `allowlist [page]` response.
+const ALLOWLIST_PAGE_SIZE: usize = 10;
+
+/// Maximum characters echoed back for an unrecognized DM command.
+const MAX_UNKNOWN_CMD_ECHO_CHARS: usize = 60;
+
+/// Maximum tracked sender buckets in [`DmSenderLimiter`].
+const MAX_TRACKED_DM_SENDERS: usize = 2048;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmRateDecision {
+    Allowed,
+    NotifyOnce,
+    Suppress,
+}
+
+#[derive(Debug)]
+struct DmSenderLimiterState {
+    window: Duration,
+    max_per_window: usize,
+    unknown_cooldown: Duration,
+    hits: HashMap<String, (VecDeque<Instant>, bool)>,
+    unknown_last: HashMap<String, Instant>,
+}
+
+impl DmSenderLimiterState {
+    fn new(max_per_window: usize, window: Duration, unknown_cooldown: Duration) -> Self {
+        Self {
+            window,
+            max_per_window: max_per_window.max(1),
+            unknown_cooldown,
+            hits: HashMap::new(),
+            unknown_last: HashMap::new(),
+        }
+    }
+
+    fn check_rate(&mut self, sender_did: &str, now: Instant) -> DmRateDecision {
+        if !self.hits.contains_key(sender_did) && self.hits.len() >= MAX_TRACKED_DM_SENDERS {
+            let window = self.window;
+            self.hits.retain(|_, (q, _)| {
+                while let Some(&front) = q.front() {
+                    if now.saturating_duration_since(front) >= window {
+                        q.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                !q.is_empty()
+            });
+            if self.hits.len() >= MAX_TRACKED_DM_SENDERS {
+                if let Some(evict) = self.hits.keys().next().cloned() {
+                    self.hits.remove(&evict);
+                }
+            }
+        }
+
+        let (queue, notified) = self
+            .hits
+            .entry(sender_did.to_string())
+            .or_insert_with(|| (VecDeque::new(), false));
+        while let Some(&front) = queue.front() {
+            if now.saturating_duration_since(front) >= self.window {
+                queue.pop_front();
+                *notified = false;
+            } else {
+                break;
+            }
+        }
+
+        if queue.len() >= self.max_per_window {
+            if !*notified {
+                *notified = true;
+                return DmRateDecision::NotifyOnce;
+            }
+            return DmRateDecision::Suppress;
+        }
+
+        queue.push_back(now);
+        DmRateDecision::Allowed
+    }
+
+    fn allow_unknown_reply(&mut self, sender_did: &str, now: Instant) -> bool {
+        if self.unknown_cooldown.is_zero() {
+            return true;
+        }
+        if !self.unknown_last.contains_key(sender_did)
+            && self.unknown_last.len() >= MAX_TRACKED_DM_SENDERS
+        {
+            let cooldown = self.unknown_cooldown;
+            self.unknown_last
+                .retain(|_, ts| now.saturating_duration_since(*ts) < cooldown);
+            if self.unknown_last.len() >= MAX_TRACKED_DM_SENDERS {
+                if let Some(evict) = self.unknown_last.keys().next().cloned() {
+                    self.unknown_last.remove(&evict);
+                }
+            }
+        }
+        if let Some(&prev) = self.unknown_last.get(sender_did) {
+            if now.saturating_duration_since(prev) < self.unknown_cooldown {
+                return false;
+            }
+        }
+        self.unknown_last.insert(sender_did.to_string(), now);
+        true
+    }
+}
 
 /// Command parser and dispatcher for incoming direct messages.
 #[derive(Clone)]
@@ -31,6 +162,9 @@ pub struct BotCommandHandler {
     engine: Arc<SkybouncerEngine>,
     bot_did: String,
     public_url: String,
+    sender_limiter: Arc<Mutex<DmSenderLimiterState>>,
+    cmd_test_limiter: Arc<EvaluationRateLimiter>,
+    cmd_test_semaphore: Arc<Semaphore>,
 }
 
 impl BotCommandHandler {
@@ -39,19 +173,64 @@ impl BotCommandHandler {
     pub fn new(engine: Arc<SkybouncerEngine>, bot_did: impl Into<String>) -> Self {
         let public_url = crate::env::var_or(
             &["PUBLIC_URL", "SKYBOUNCER_PUBLIC_URL"],
-            "https://skybouncer.mike10010100.com",
-        );
+            "http://127.0.0.1:3000",
+        )
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
         Self {
             engine,
             bot_did: bot_did.into(),
             public_url,
+            sender_limiter: Arc::new(Mutex::new(DmSenderLimiterState::new(
+                DEFAULT_DM_RATE_LIMIT_PER_MIN,
+                DEFAULT_DM_RATE_WINDOW,
+                DEFAULT_UNKNOWN_CMD_COOLDOWN,
+            ))),
+            cmd_test_limiter: Arc::new(EvaluationRateLimiter::new(RateLimiterConfig {
+                max_evaluations: DEFAULT_DM_TEST_RATE_LIMIT_PER_MIN,
+                window_duration: DEFAULT_DM_RATE_WINDOW,
+            })),
+            cmd_test_semaphore: Arc::new(Semaphore::new(DEFAULT_DM_TEST_CONCURRENCY)),
         }
     }
 
     /// Sets the public base URL for onboarding authorization links.
     #[must_use]
     pub fn with_public_url(mut self, url: impl Into<String>) -> Self {
-        self.public_url = url.into().trim_end_matches('/').to_string();
+        self.public_url = url.into().trim().trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Configures the per-sender DM rate limit and unknown-command reply cooldown.
+    #[must_use]
+    pub fn with_dm_rate_limit(
+        mut self,
+        max_per_window: usize,
+        window: Duration,
+        unknown_cooldown: Duration,
+    ) -> Self {
+        self.sender_limiter = Arc::new(Mutex::new(DmSenderLimiterState::new(
+            max_per_window,
+            window,
+            unknown_cooldown,
+        )));
+        self
+    }
+
+    /// Configures the per-DID rate limit and concurrency bound for the DM `test` command.
+    #[must_use]
+    pub fn with_test_limits(
+        mut self,
+        max_per_window: usize,
+        window: Duration,
+        concurrency: usize,
+    ) -> Self {
+        self.cmd_test_limiter = Arc::new(EvaluationRateLimiter::new(RateLimiterConfig {
+            max_evaluations: max_per_window,
+            window_duration: window,
+        }));
+        self.cmd_test_semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
         self
     }
 
@@ -69,6 +248,9 @@ impl BotCommandHandler {
 
     /// Dispatches an incoming direct message and generates a response.
     ///
+    /// Returns an empty string when a reply should be suppressed (e.g., sender rate limit
+    /// saturation or unknown-command cooldown) to prevent bot-to-bot ping-pong loops.
+    ///
     /// # Errors
     /// Returns [`SkybouncerError`] if command execution fails.
     pub async fn handle_command(
@@ -76,24 +258,43 @@ impl BotCommandHandler {
         sender_did: &str,
         message_text: &str,
     ) -> Result<String, SkybouncerError> {
-        let trimmed = message_text.trim();
-        if trimmed.is_empty() {
-            return Ok("Type `help` to see available Skybouncer commands.".to_string());
+        if !self.bot_did.is_empty() && sender_did == self.bot_did {
+            return Ok(String::new());
         }
 
-        if trimmed.eq_ignore_ascii_case("help") || trimmed == "?" {
+        let now = Instant::now();
+        match self.sender_limiter.lock().check_rate(sender_did, now) {
+            DmRateDecision::Allowed => {}
+            DmRateDecision::NotifyOnce => {
+                return Ok(
+                    "⏳ Too many direct messages. Please wait a minute before sending more commands."
+                        .to_string(),
+                );
+            }
+            DmRateDecision::Suppress => {
+                return Ok(String::new());
+            }
+        }
+
+        let trimmed = message_text.trim();
+        let Some((w1, r1)) = take_next_token(trimmed) else {
+            return Ok("Type `help` to see available Skybouncer commands.".to_string());
+        };
+
+        if (w1.eq_ignore_ascii_case("help") || w1 == "?") && r1.is_empty() {
             return Ok(self.cmd_help());
         }
 
-        let is_onboard_cmd = trimmed.eq_ignore_ascii_case("start")
-            || trimmed.eq_ignore_ascii_case("onboard")
-            || trimmed.eq_ignore_ascii_case("activate")
-            || trimmed.eq_ignore_ascii_case("auth")
-            || trimmed.eq_ignore_ascii_case("login")
-            || trimmed.eq_ignore_ascii_case("join")
-            || trimmed.eq_ignore_ascii_case("hi")
-            || trimmed.eq_ignore_ascii_case("hello")
-            || trimmed.eq_ignore_ascii_case("hey");
+        let is_onboard_cmd = r1.is_empty()
+            && (w1.eq_ignore_ascii_case("start")
+                || w1.eq_ignore_ascii_case("onboard")
+                || w1.eq_ignore_ascii_case("activate")
+                || w1.eq_ignore_ascii_case("auth")
+                || w1.eq_ignore_ascii_case("login")
+                || w1.eq_ignore_ascii_case("join")
+                || w1.eq_ignore_ascii_case("hi")
+                || w1.eq_ignore_ascii_case("hello")
+                || w1.eq_ignore_ascii_case("hey"));
 
         if is_onboard_cmd {
             return Ok(self.cmd_onboarding(sender_did));
@@ -103,312 +304,319 @@ impl BotCommandHandler {
         // privileged command below is gated on a single authorization probe.
         let authorized = self.is_authorized_sender(sender_did);
 
-        if trimmed.eq_ignore_ascii_case("pause") {
+        let w2_pair = take_next_token(r1);
+        let w3_pair = w2_pair.and_then(|(_, rest)| take_next_token(rest));
+
+        if w1.eq_ignore_ascii_case("pause") && r1.is_empty() {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok(self.cmd_pause(sender_did));
         }
 
-        if trimmed.eq_ignore_ascii_case("resume") {
+        if w1.eq_ignore_ascii_case("resume") && r1.is_empty() {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok(self.cmd_resume(sender_did));
         }
 
-        if trimmed.eq_ignore_ascii_case("rules") {
+        if w1.eq_ignore_ascii_case("rules") && r1.is_empty() {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok(self.cmd_rules(sender_did));
         }
 
-        if trimmed.eq_ignore_ascii_case("set rules") {
+        if w1.eq_ignore_ascii_case("set") {
+            if let Some((w2, r2)) = w2_pair {
+                if w2.eq_ignore_ascii_case("rules") {
+                    if !authorized {
+                        return Ok(self.unauthorized_response());
+                    }
+                    return self.cmd_set_rules(sender_did, r2);
+                }
+                if w2.eq_ignore_ascii_case("duration") || w2.eq_ignore_ascii_case("timeout") {
+                    if !authorized {
+                        return Ok(self.unauthorized_response());
+                    }
+                    if r2.is_empty() {
+                        return Ok("Usage: `duration <permanent|24h|7d|30d>`".to_string());
+                    }
+                    return self.cmd_set_duration(sender_did, r2);
+                }
+            }
+        }
+
+        if w1.eq_ignore_ascii_case("sensitivity") {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
-            return self.cmd_set_rules(sender_did, "");
+            if r1.is_empty() {
+                return Ok("Usage: `sensitivity <low|medium|high>`".to_string());
+            }
+            return self.cmd_set_sensitivity(sender_did, r1);
         }
 
-        if let Some(prompt) = strip_prefix_ci(trimmed, "set rules ") {
+        if w1.eq_ignore_ascii_case("duration") || w1.eq_ignore_ascii_case("timeout") {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
-            return self.cmd_set_rules(sender_did, prompt);
-        }
-
-        if trimmed.eq_ignore_ascii_case("sensitivity") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
+            if r1.is_empty() {
+                return Ok("Usage: `duration <permanent|24h|7d|30d>`".to_string());
             }
-            return Ok("Usage: `sensitivity <low|medium|high>`".to_string());
+            return self.cmd_set_duration(sender_did, r1);
         }
 
-        if let Some(sens) = strip_prefix_ci(trimmed, "sensitivity ") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_set_sensitivity(sender_did, sens.trim());
-        }
-
-        if trimmed.eq_ignore_ascii_case("duration") || trimmed.eq_ignore_ascii_case("timeout") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return Ok("Usage: `duration <permanent|24h|7d|30d>`".to_string());
-        }
-
-        if let Some(dur) = strip_prefix_ci(trimmed, "duration ")
-            .or_else(|| strip_prefix_ci(trimmed, "timeout "))
-            .or_else(|| strip_prefix_ci(trimmed, "set duration "))
-            .or_else(|| strip_prefix_ci(trimmed, "set timeout "))
+        if (w1.eq_ignore_ascii_case("trust") || w1.eq_ignore_ascii_case("bypass"))
+            && w2_pair.is_some_and(|(w2, _)| w2.eq_ignore_ascii_case("followers"))
         {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
-            return self.cmd_set_duration(sender_did, dur.trim());
-        }
-
-        if trimmed.eq_ignore_ascii_case("trust followers")
-            || trimmed.eq_ignore_ascii_case("bypass followers")
-        {
-            if !authorized {
-                return Ok(self.unauthorized_response());
+            let r2 = w2_pair.map_or("", |(_, rest)| rest);
+            if r2.is_empty() {
+                return Ok(
+                    "Usage: `trust followers <on|off>` (toggle zero-cost bypass for accounts that follow you)"
+                        .to_string(),
+                );
             }
-            return Ok(
-                "Usage: `trust followers <on|off>` (toggle zero-cost bypass for accounts that follow you)"
-                    .to_string(),
-            );
+            return self.cmd_set_follower_bypass(sender_did, r2);
         }
 
-        if let Some(flag_str) = strip_prefix_ci(trimmed, "trust followers ")
-            .or_else(|| strip_prefix_ci(trimmed, "bypass followers "))
-        {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_set_follower_bypass(sender_did, flag_str.trim());
-        }
-
-        if trimmed.eq_ignore_ascii_case("recent") {
+        if w1.eq_ignore_ascii_case("recent") && r1.is_empty() {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return self.cmd_recent(sender_did);
         }
 
-        if trimmed.eq_ignore_ascii_case("allowlist") || trimmed.eq_ignore_ascii_case("allow list") {
+        if w1.eq_ignore_ascii_case("allowlist") {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
-            return self.cmd_allowlist(sender_did);
+            return self.cmd_allowlist(sender_did, r1);
         }
 
-        if trimmed.eq_ignore_ascii_case("allow") {
+        if w1.eq_ignore_ascii_case("allow") {
+            if let Some((w2, r2)) = w2_pair {
+                if w2.eq_ignore_ascii_case("list") {
+                    if !authorized {
+                        return Ok(self.unauthorized_response());
+                    }
+                    return self.cmd_allowlist(sender_did, r2);
+                }
+            }
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
-            return Ok(
-                "Usage: `allow <did|@handle>` (e.g. `allow @alice.bsky.social`)".to_string(),
-            );
+            if r1.is_empty() {
+                return Ok(
+                    "Usage: `allow <did|@handle>` (e.g. `allow @alice.bsky.social`)".to_string(),
+                );
+            }
+            return self.cmd_allow(sender_did, r1).await;
         }
 
-        if let Some(target) = strip_prefix_ci(trimmed, "allow ") {
+        if w1.eq_ignore_ascii_case("unallow") {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
-            return self.cmd_allow(sender_did, target.trim()).await;
+            if r1.is_empty() {
+                return Ok(
+                    "Usage: `unallow <did|@handle>` (e.g. `unallow @alice.bsky.social`)"
+                        .to_string(),
+                );
+            }
+            return self.cmd_unallow(sender_did, r1).await;
         }
 
-        if trimmed.eq_ignore_ascii_case("unallow") {
+        if w1.eq_ignore_ascii_case("pardon") {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
-            return Ok(
-                "Usage: `unallow <did|@handle>` (e.g. `unallow @alice.bsky.social`)".to_string(),
-            );
+            if r1.is_empty() {
+                return Ok(
+                    "Usage: `pardon <did|@handle>` or `pardon and allow <did|@handle>`".to_string(),
+                );
+            }
+            if let (Some((w2, _)), Some((w3, r3))) = (w2_pair, w3_pair) {
+                if w2.eq_ignore_ascii_case("and") && w3.eq_ignore_ascii_case("allow") {
+                    if r3.is_empty() {
+                        return Ok("Usage: `pardon and allow <did|@handle>`".to_string());
+                    }
+                    return self.cmd_pardon_and_allow(sender_did, r3).await;
+                }
+            }
+            return self.cmd_pardon(sender_did, r1).await;
         }
 
-        if let Some(target) = strip_prefix_ci(trimmed, "unallow ") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_unallow(sender_did, target.trim()).await;
-        }
-
-        if trimmed.eq_ignore_ascii_case("pardon") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return Ok(
-                "Usage: `pardon <did|@handle>` or `pardon and allow <did|@handle>`".to_string(),
-            );
-        }
-
-        if let Some(target) = strip_prefix_ci(trimmed, "pardon and allow ") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_pardon_and_allow(sender_did, target.trim()).await;
-        }
-
-        if let Some(target) = strip_prefix_ci(trimmed, "pardon ") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            if let Some(immunized_target) = strip_prefix_ci(target.trim(), "and allow ") {
-                return self
-                    .cmd_pardon_and_allow(sender_did, immunized_target.trim())
-                    .await;
-            }
-            return self.cmd_pardon(sender_did, target.trim()).await;
-        }
-
-        if trimmed.eq_ignore_ascii_case("bounce")
-            || trimmed.eq_ignore_ascii_case("rebounce")
-            || trimmed.eq_ignore_ascii_case("re-bounce")
-            || trimmed.eq_ignore_ascii_case("block")
+        if w1.eq_ignore_ascii_case("bounce")
+            || w1.eq_ignore_ascii_case("rebounce")
+            || w1.eq_ignore_ascii_case("re-bounce")
+            || w1.eq_ignore_ascii_case("block")
         {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
-            return Ok(
-                "Usage: `bounce <did|@handle>` (bounce or re-bounce an account onto your moderation list)"
-                    .to_string(),
-            );
+            if r1.is_empty() {
+                return Ok(
+                    "Usage: `bounce <did|@handle>` (bounce or re-bounce an account onto your moderation list)"
+                        .to_string(),
+                );
+            }
+            return self.cmd_bounce(sender_did, r1).await;
         }
 
-        if let Some(target) = strip_prefix_ci(trimmed, "re-bounce ")
-            .or_else(|| strip_prefix_ci(trimmed, "rebounce "))
-            .or_else(|| strip_prefix_ci(trimmed, "bounce "))
-            .or_else(|| strip_prefix_ci(trimmed, "block "))
+        if w1.eq_ignore_ascii_case("make")
+            && w2_pair.is_some_and(|(w2, _)| w2.eq_ignore_ascii_case("permanent"))
         {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
-            return self.cmd_bounce(sender_did, target.trim()).await;
+            let r2 = w2_pair.map_or("", |(_, rest)| rest);
+            if r2.is_empty() {
+                return Ok(
+                    "Usage: `perm <did|@handle>` (permanently block an account or upgrade a temporary block to permanent)"
+                        .to_string(),
+                );
+            }
+            return self.cmd_upgrade_perm(sender_did, r2).await;
         }
 
-        if trimmed.eq_ignore_ascii_case("perm")
-            || trimmed.eq_ignore_ascii_case("permanent")
-            || trimmed.eq_ignore_ascii_case("upgrade")
-            || trimmed.eq_ignore_ascii_case("make permanent")
-            || trimmed.eq_ignore_ascii_case("perm block")
+        if w1.eq_ignore_ascii_case("perm")
+            && w2_pair.is_some_and(|(w2, _)| w2.eq_ignore_ascii_case("block"))
         {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
-            return Ok(
-                "Usage: `perm <did|@handle>` (permanently block an account or upgrade a temporary block to permanent)"
-                    .to_string(),
-            );
+            let r2 = w2_pair.map_or("", |(_, rest)| rest);
+            if r2.is_empty() {
+                return Ok(
+                    "Usage: `perm <did|@handle>` (permanently block an account or upgrade a temporary block to permanent)"
+                        .to_string(),
+                );
+            }
+            return self.cmd_upgrade_perm(sender_did, r2).await;
         }
 
-        if let Some(target) = strip_prefix_ci(trimmed, "make permanent ")
-            .or_else(|| strip_prefix_ci(trimmed, "perm block "))
-            .or_else(|| strip_prefix_ci(trimmed, "permanent "))
-            .or_else(|| strip_prefix_ci(trimmed, "upgrade "))
-            .or_else(|| strip_prefix_ci(trimmed, "perm "))
+        if w1.eq_ignore_ascii_case("perm")
+            || w1.eq_ignore_ascii_case("permanent")
+            || w1.eq_ignore_ascii_case("upgrade")
         {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
-            return self.cmd_upgrade_perm(sender_did, target.trim()).await;
+            if r1.is_empty() {
+                return Ok(
+                    "Usage: `perm <did|@handle>` (permanently block an account or upgrade a temporary block to permanent)"
+                        .to_string(),
+                );
+            }
+            return self.cmd_upgrade_perm(sender_did, r1).await;
         }
 
-        if trimmed.eq_ignore_ascii_case("status") {
+        if w1.eq_ignore_ascii_case("status") && r1.is_empty() {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return Ok(self.cmd_status(sender_did));
         }
 
-        if trimmed.eq_ignore_ascii_case("storms")
-            || trimmed.eq_ignore_ascii_case("storm")
-            || trimmed.eq_ignore_ascii_case("storm status")
-        {
+        if w1.eq_ignore_ascii_case("storms") && r1.is_empty() {
             if !authorized {
                 return Ok(self.unauthorized_response());
             }
             return self.cmd_storms(sender_did);
         }
 
-        if trimmed.eq_ignore_ascii_case("storm on") || trimmed.eq_ignore_ascii_case("storm mode on")
+        if w1.eq_ignore_ascii_case("storm") {
+            if r1.is_empty() {
+                if !authorized {
+                    return Ok(self.unauthorized_response());
+                }
+                return self.cmd_storms(sender_did);
+            }
+            if let Some((w2, r2)) = w2_pair {
+                if w2.eq_ignore_ascii_case("status") && r2.is_empty() {
+                    if !authorized {
+                        return Ok(self.unauthorized_response());
+                    }
+                    return self.cmd_storms(sender_did);
+                }
+                if w2.eq_ignore_ascii_case("on") && r2.is_empty() {
+                    if !authorized {
+                        return Ok(self.unauthorized_response());
+                    }
+                    return self.cmd_storm_mode(sender_did, true);
+                }
+                if w2.eq_ignore_ascii_case("off") && r2.is_empty() {
+                    if !authorized {
+                        return Ok(self.unauthorized_response());
+                    }
+                    return self.cmd_storm_mode(sender_did, false);
+                }
+                if w2.eq_ignore_ascii_case("mode") {
+                    if let Some((w3, r3)) = w3_pair {
+                        if w3.eq_ignore_ascii_case("on") && r3.is_empty() {
+                            if !authorized {
+                                return Ok(self.unauthorized_response());
+                            }
+                            return self.cmd_storm_mode(sender_did, true);
+                        }
+                        if w3.eq_ignore_ascii_case("off") && r3.is_empty() {
+                            if !authorized {
+                                return Ok(self.unauthorized_response());
+                            }
+                            return self.cmd_storm_mode(sender_did, false);
+                        }
+                    }
+                }
+            }
+        }
+
+        if w1.eq_ignore_ascii_case("lock") {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_lock(sender_did, r1).await;
+        }
+
+        if w1.eq_ignore_ascii_case("unlock") {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_unlock(sender_did, r1).await;
+        }
+
+        if w1.eq_ignore_ascii_case("detach") {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            return self.cmd_detach(sender_did, r1).await;
+        }
+
+        if w1.eq_ignore_ascii_case("test") {
+            if !authorized {
+                return Ok(self.unauthorized_response());
+            }
+            if r1.is_empty() {
+                return Ok("Usage: `test <text>` (dry-run evaluation on sample text)".to_string());
+            }
+            return self.cmd_test(sender_did, r1).await;
+        }
+
+        if !self
+            .sender_limiter
+            .lock()
+            .allow_unknown_reply(sender_did, now)
         {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_storm_mode(sender_did, true);
+            return Ok(String::new());
         }
 
-        if trimmed.eq_ignore_ascii_case("storm off")
-            || trimmed.eq_ignore_ascii_case("storm mode off")
-        {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_storm_mode(sender_did, false);
-        }
-
-        if trimmed.eq_ignore_ascii_case("lock") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_lock(sender_did, "").await;
-        }
-
-        if let Some(args) = strip_prefix_ci(trimmed, "lock ") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_lock(sender_did, args.trim()).await;
-        }
-
-        if trimmed.eq_ignore_ascii_case("unlock") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_unlock(sender_did, "").await;
-        }
-
-        if let Some(target) = strip_prefix_ci(trimmed, "unlock ") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_unlock(sender_did, target.trim()).await;
-        }
-
-        if trimmed.eq_ignore_ascii_case("detach") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_detach(sender_did, "").await;
-        }
-
-        if let Some(args) = strip_prefix_ci(trimmed, "detach ") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_detach(sender_did, args.trim()).await;
-        }
-
-        if trimmed.eq_ignore_ascii_case("test") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return Ok("Usage: `test <text>` (dry-run evaluation on sample text)".to_string());
-        }
-
-        if let Some(sample) = strip_prefix_ci(trimmed, "test ") {
-            if !authorized {
-                return Ok(self.unauthorized_response());
-            }
-            return self.cmd_test(sender_did, sample.trim()).await;
-        }
-
+        let echoed = truncate_chars(trimmed, MAX_UNKNOWN_CMD_ECHO_CHARS);
         let unknown_msg =
-            format!("Unknown command: `{trimmed}`\n\nType `help` to see available commands.");
+            format!("Unknown command: `{echoed}`\n\nType `help` to see available commands.");
         if !self.engine.is_enrolled(sender_did) && !self.engine.is_protected(sender_did) {
             Ok(format!("{unknown_msg}\n\n(Tip: Your account is not yet protected. Visit {} to activate 1-click protection.)", self.auth_url()))
         } else {
@@ -506,15 +714,17 @@ impl BotCommandHandler {
         }
 
         let current = self.engine.rubric_for(sender_did);
-        let parsed = current.parse_updating(prompt)?;
+        let parsed = match current.parse_updating(prompt) {
+            Ok(r) => r,
+            Err(e) => return Ok(format!("❌ Invalid rubric: {e}")),
+        };
         if parsed.prompt.chars().count() > crate::classifier::MAX_RUBRIC_PROMPT_CHARS {
-            return Err(SkybouncerError::Config(format!(
-                "Rule rubric prompt exceeds maximum length of {} characters",
+            return Ok(format!(
+                "❌ Invalid rubric: prompt exceeds maximum length of {} characters.",
                 crate::classifier::MAX_RUBRIC_PROMPT_CHARS
-            )));
+            ));
         }
-        self.engine
-            .set_bypass_incoming_followers(sender_did, parsed.bypass_incoming_followers);
+
         if self.engine.is_enrolled(sender_did) {
             if let Err(e) = self
                 .engine
@@ -531,6 +741,9 @@ impl BotCommandHandler {
         } else {
             return Ok("❌ You can only update rules for your own enrolled account.".to_string());
         }
+
+        self.engine
+            .set_bypass_incoming_followers(sender_did, parsed.bypass_incoming_followers);
 
         // Asynchronously persist to sender's sovereign PDS repo
         let eng = self.engine.clone();
@@ -570,8 +783,6 @@ impl BotCommandHandler {
 
         let mut rubric = self.engine.rubric_for(sender_did);
         rubric.bypass_incoming_followers = bypass;
-        self.engine
-            .set_bypass_incoming_followers(sender_did, bypass);
 
         if self.engine.is_enrolled(sender_did) {
             if let Err(e) = self
@@ -591,6 +802,9 @@ impl BotCommandHandler {
                 "❌ You can only update follower bypass for your own enrolled account.".to_string(),
             );
         }
+
+        self.engine
+            .set_bypass_incoming_followers(sender_did, bypass);
 
         // Asynchronously persist to sender's sovereign PDS repo
         let eng = self.engine.clone();
@@ -1057,24 +1271,60 @@ impl BotCommandHandler {
         }
     }
 
-    fn cmd_allowlist(&self, sender_did: &str) -> Result<String, SkybouncerError> {
+    fn cmd_allowlist(&self, sender_did: &str, page_arg: &str) -> Result<String, SkybouncerError> {
         let entries = self.engine.list_allowlist(sender_did)?;
         if entries.is_empty() {
             return Ok("ℹ️ Your moderation allowlist is empty.\n\nUse `allow <did|@handle>` to exempt trusted accounts from moderation.".to_string());
         }
 
-        let mut out = format!(
-            "🛡️ Your Moderation Allowlist ({} account{}):\n\n",
-            entries.len(),
-            if entries.len() == 1 { "" } else { "s" }
-        );
-        for (idx, entry) in entries.iter().enumerate() {
-            let num = idx.saturating_add(1);
+        let total = entries.len();
+        let total_pages = total.div_ceil(ALLOWLIST_PAGE_SIZE);
+        let page = if page_arg.trim().is_empty() {
+            1usize
+        } else {
+            match page_arg.trim().parse::<usize>() {
+                Ok(p) if (1..=total_pages).contains(&p) => p,
+                _ => {
+                    return Ok(format!(
+                        "ℹ️ Invalid page `{}`. Your allowlist has {total_pages} page{} (use `allowlist 1`–`allowlist {total_pages}`).",
+                        page_arg.trim(),
+                        if total_pages == 1 { "" } else { "s" }
+                    ));
+                }
+            }
+        };
+
+        let start = page.saturating_sub(1).saturating_mul(ALLOWLIST_PAGE_SIZE);
+        let end = start.saturating_add(ALLOWLIST_PAGE_SIZE).min(total);
+
+        let mut out = if total_pages == 1 {
+            format!(
+                "🛡️ Your Moderation Allowlist ({total} account{}):\n\n",
+                if total == 1 { "" } else { "s" }
+            )
+        } else {
+            format!(
+                "🛡️ Your Moderation Allowlist ({total} account{}, Page {page}/{total_pages}):\n\n",
+                if total == 1 { "" } else { "s" }
+            )
+        };
+
+        for (offset, entry) in entries[start..end].iter().enumerate() {
+            let num = start.saturating_add(offset).saturating_add(1);
             let reason_str = entry.reason.as_deref().unwrap_or("No reason provided");
             let label = account_label_with_url(&entry.subject_did, entry.handle.as_deref());
+            let added_iso = crate::types::format_system_time_iso8601(
+                std::time::UNIX_EPOCH + std::time::Duration::from_micros(entry.created_at),
+            );
             out.push_str(&format!(
-                "{num}. {label}\n   Reason: {} | Added: {}\n",
-                reason_str, entry.created_at
+                "{num}. {label}\n   Reason: {reason_str} | Added: {added_iso}\n"
+            ));
+        }
+
+        if page < total_pages {
+            out.push_str(&format!(
+                "\nReply `allowlist {}` for the next page.",
+                page.saturating_add(1)
             ));
         }
 
@@ -1147,11 +1397,7 @@ impl BotCommandHandler {
             )
         } else {
             let rubric = self.engine.rubric_for(sender_did);
-            let my_bounces = self
-                .engine
-                .list_recent_bounces_for(Some(sender_did), 100)
-                .map(|b| b.len())
-                .unwrap_or(0);
+            let my_bounces = self.engine.count_bounced_for(sender_did).unwrap_or(0);
             let allowlist_count = self
                 .engine
                 .list_allowlist(sender_did)
@@ -1539,6 +1785,9 @@ impl BotCommandHandler {
                 let actor = segments[1];
                 let rkey = segments[3];
                 let did = if actor.starts_with("did:") {
+                    if skyauth::identity::validate_did_syntax(actor).is_err() {
+                        return Err(format!("❌ Invalid DID syntax in post URL: `{actor}`."));
+                    }
                     actor.to_string()
                 } else {
                     match self.engine.resolve_handle(actor).await {
@@ -1574,6 +1823,23 @@ impl BotCommandHandler {
     }
 
     async fn cmd_test(&self, sender_did: &str, text: &str) -> Result<String, SkybouncerError> {
+        if text.chars().count() > MAX_DM_TEST_TEXT_CHARS {
+            return Ok(format!(
+                "❌ Sample text exceeds maximum length of {MAX_DM_TEST_TEXT_CHARS} characters."
+            ));
+        }
+        if !self.cmd_test_limiter.check_and_record(sender_did) {
+            return Ok(
+                "⏳ Rate limit reached for `test`. Please wait a minute before running more dry-run evaluations."
+                    .to_string(),
+            );
+        }
+        let Ok(_permit) = self.cmd_test_semaphore.try_acquire() else {
+            return Ok(
+                "⏳ Dry-run evaluator is currently busy; please retry in a moment.".to_string(),
+            );
+        };
+
         let sender_rubric = self.engine.rubric_for(sender_did);
         let synthetic_interaction = Interaction::synthetic(
             "did:plc:test-author-sample",
@@ -1585,11 +1851,14 @@ impl BotCommandHandler {
         .with_post_cid("bafytest1234")
         .with_rubric(sender_rubric.clone());
 
-        // Evaluate using heuristic first, then model
-        let verdict = self
-            .engine
-            .heuristic_classifier()
-            .evaluate(&synthetic_interaction);
+        // Evaluate using heuristic first (only when enabled), then model
+        let verdict = if self.engine.config().enable_heuristic_prefilter {
+            self.engine
+                .heuristic_classifier()
+                .evaluate(&synthetic_interaction)
+        } else {
+            Verdict::permitted("Heuristic pre-filter disabled")
+        };
         let final_verdict = if verdict.is_violation() {
             verdict
         } else {
@@ -1672,6 +1941,9 @@ impl BotCommandHandler {
     ) -> Result<(String, Option<String>, String), String> {
         let clean = crate::util::normalize_handle(raw_target);
         if clean.starts_with("did:") {
+            if skyauth::identity::validate_did_syntax(clean).is_err() {
+                return Err(format!("❌ Invalid DID syntax: `{clean}`."));
+            }
             return Ok((clean.to_string(), None, String::new()));
         }
         match self.engine.resolve_handle(clean).await {
@@ -1727,13 +1999,42 @@ impl BotCommandHandler {
     }
 }
 
-/// Helper function performing case-insensitive prefix stripping on ASCII command prefixes.
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len()
-        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
-    {
-        s.get(prefix.len()..)
-    } else {
-        None
+/// Extracts the next Unicode-whitespace-delimited token and the remaining trimmed tail.
+fn take_next_token(s: &str) -> Option<(&str, &str)> {
+    let trimmed = s.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.find(char::is_whitespace) {
+        Some(idx) => Some((&trimmed[..idx], trimmed[idx..].trim_start())),
+        None => Some((trimmed, "")),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dm_sender_limiter_evicts_and_expires_sender_buckets() {
+        let mut limiter =
+            DmSenderLimiterState::new(1, Duration::from_secs(10), Duration::from_secs(10));
+        let t0 = Instant::now();
+
+        for idx in 0..=MAX_TRACKED_DM_SENDERS {
+            let did = format!("did:plc:sender{idx}");
+            assert_eq!(limiter.check_rate(&did, t0), DmRateDecision::Allowed);
+            assert!(limiter.allow_unknown_reply(&did, t0));
+        }
+
+        // Advance past window/cooldown so retention sweeps expired buckets cleanly.
+        let t1 = t0 + Duration::from_secs(11);
+        assert_eq!(
+            limiter.check_rate("did:plc:fresh", t1),
+            DmRateDecision::Allowed
+        );
+        assert!(limiter.allow_unknown_reply("did:plc:fresh", t1));
+        assert!(!limiter.allow_unknown_reply("did:plc:fresh", t1));
     }
 }

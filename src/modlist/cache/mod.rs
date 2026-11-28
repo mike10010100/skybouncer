@@ -338,6 +338,22 @@ pub struct EvaluationLogContext<'a> {
     pub outcome: &'a str,
 }
 
+/// Maximum characters persisted in `evaluation_log.post_text`.
+pub const MAX_EVALUATION_LOG_POST_TEXT_CHARS: usize = 2000;
+
+fn truncate_post_text_for_log(text: &str) -> String {
+    let mut chars = text.chars();
+    let prefix: String = chars
+        .by_ref()
+        .take(MAX_EVALUATION_LOG_POST_TEXT_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        prefix
+    } else {
+        text.to_string()
+    }
+}
+
 impl NewEvaluationLog {
     /// Builds an audit log for a heuristic (regex pre-filter) violation, bypassing the model tiers.
     #[must_use]
@@ -353,7 +369,7 @@ impl NewEvaluationLog {
             timestamp_us: current_time_us(),
             source: ctx.source.to_string(),
             post_uri: post_uri.to_string(),
-            post_text: interaction.text.clone(),
+            post_text: truncate_post_text_for_log(&interaction.text),
             author_did: interaction.author_did.clone(),
             author_handle,
             target_did: interaction.target_did.clone(),
@@ -402,7 +418,7 @@ impl NewEvaluationLog {
             timestamp_us: current_time_us(),
             source: ctx.source.to_string(),
             post_uri: post_uri.to_string(),
-            post_text: interaction.text.clone(),
+            post_text: truncate_post_text_for_log(&interaction.text),
             author_did: interaction.author_did.clone(),
             author_handle,
             target_did: interaction.target_did.clone(),

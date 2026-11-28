@@ -15,15 +15,28 @@ use crate::types::now_iso8601;
 /// Maximum size of a URL-fetched simulation image (2 MiB).
 pub const MAX_SIMULATION_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 
+/// Fetches a simulation image using an explicit [`skyauth::ssrf::SsrfFilter`], enforcing
+/// scheme/host/IP validation, DNS pinning, redirect bounds, and [`MAX_SIMULATION_IMAGE_BYTES`].
+///
+/// Production callers should use [`fetch_simulation_image_bytes`], which enforces
+/// `SsrfFilter::default()`.
+///
+/// # Errors
+/// Returns [`skyauth::SsrfError`] if URL validation, SSRF checks, HTTP fetch, or size limit fail.
+pub async fn fetch_simulation_image_bytes_with_filter(
+    url_str: &str,
+    filter: &skyauth::ssrf::SsrfFilter,
+) -> Result<Vec<u8>, skyauth::SsrfError> {
+    filter.safe_get(url_str, MAX_SIMULATION_IMAGE_BYTES).await
+}
+
 /// Fetches a simulation image through `skyauth`'s SSRF-hardened HTTP client, enforcing
 /// scheme/host/IP validation, DNS pinning, redirect bounds, and [`MAX_SIMULATION_IMAGE_BYTES`].
 ///
 /// # Errors
 /// Returns [`skyauth::SsrfError`] if URL validation, SSRF checks, HTTP fetch, or size limit fail.
 pub async fn fetch_simulation_image_bytes(url_str: &str) -> Result<Vec<u8>, skyauth::SsrfError> {
-    skyauth::ssrf::SsrfFilter::default()
-        .safe_get(url_str, MAX_SIMULATION_IMAGE_BYTES)
-        .await
+    fetch_simulation_image_bytes_with_filter(url_str, &skyauth::ssrf::SsrfFilter::default()).await
 }
 
 /// Per-tier evaluation detail for a [`SimulationResult`].
@@ -413,5 +426,40 @@ impl crate::engine::SkybouncerEngine {
                 created_at,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn test_fetch_simulation_image_bytes_enforces_default_ssrf_and_filter_override() {
+        let server = MockServer::start().await;
+        let valid_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(valid_png.as_slice()))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/img.png", server.uri());
+
+        // Production default blocks loopback/HTTP URLs.
+        let default_err = fetch_simulation_image_bytes(&url).await.unwrap_err();
+        assert!(matches!(
+            default_err,
+            skyauth::SsrfError::InsecureScheme(_) | skyauth::SsrfError::BlockedIp(_)
+        ));
+
+        // Explicit localhost test filter retrieves the exact response bytes.
+        let fetched =
+            fetch_simulation_image_bytes_with_filter(&url, &skyauth::ssrf::SsrfFilter::new(true))
+                .await
+                .unwrap();
+        assert_eq!(fetched, valid_png);
     }
 }

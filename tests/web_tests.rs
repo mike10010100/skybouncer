@@ -3778,32 +3778,35 @@ async fn test_api_update_rules_preserves_existing_settings_when_omitted() {
     assert!(!updated.bypass_incoming_followers);
 
     // 3. Verify operator CLI/API bearer token (SKYBOUNCER_API_TOKEN) authenticates against /api/status and /api/rules
-    std::env::set_var("SKYBOUNCER_API_TOKEN", "operator-secret-token-123");
-    let resp3 = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/rules")
-                .header("authorization", "Bearer operator-secret-token-123")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let s3 = resp3.status();
-    let resp_wrong = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/rules")
-                .header("authorization", "Bearer did:plc:spoof")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    std::env::remove_var("SKYBOUNCER_API_TOKEN");
+    let (s3, resp_wrong_status) = {
+        let _env_lock = WEB_ENV_LOCK.lock().await;
+        let _api_guard = EnvVarGuard::set("SKYBOUNCER_API_TOKEN", "operator-secret-token-123");
+        let resp3 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/rules")
+                    .header("authorization", "Bearer operator-secret-token-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let s3 = resp3.status();
+        let resp_wrong = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/rules")
+                    .header("authorization", "Bearer did:plc:spoof")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        (s3, resp_wrong.status())
+    };
     assert_eq!(s3, StatusCode::OK);
-    assert_eq!(resp_wrong.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp_wrong_status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -3835,7 +3838,8 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         })))
         .mount(&mock_appview)
         .await;
-    std::env::set_var("SKYBOUNCER_APPVIEW_ENDPOINT", mock_appview.uri());
+    let _env_lock = WEB_ENV_LOCK.lock().await;
+    let _appview_guard = EnvVarGuard::set("SKYBOUNCER_APPVIEW_ENDPOINT", &mock_appview.uri());
 
     // 1. Verify dashboard HTML includes the multi-step Atmosphere login UX views
     assert!(DASHBOARD_HTML.contains("login-view-saved"));
@@ -4148,7 +4152,7 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "text": "hello world",
-                        "image_base64": "aGVsbG8="
+                        "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
                     }))
                     .unwrap(),
                 ))
@@ -4190,7 +4194,6 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
         )
         .await
         .unwrap();
-    std::env::remove_var("SKYBOUNCER_APPVIEW_ENDPOINT");
     assert!(login_redirect_resp.status().is_redirection());
 }
 
@@ -4211,7 +4214,10 @@ async fn test_api_guest_simulate_presets_validation_and_zero_log_pollution() {
                     .method("POST")
                     .uri("/api/simulate/guest")
                     .header("content-type", "application/json")
-                    .header("x-forwarded-for", format!("198.51.100.{}", idx + 1))
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [198, 51, 100, (idx + 1) as u8],
+                        12345,
+                    ))))
                     .body(Body::from(
                         serde_json::to_vec(&json!({
                             "text": "I enjoyed reading your distributed systems writeup!",
@@ -4241,7 +4247,10 @@ async fn test_api_guest_simulate_presets_validation_and_zero_log_pollution() {
                 .method("POST")
                 .uri("/api/simulate/guest")
                 .header("content-type", "application/json")
-                .header("x-forwarded-for", "198.51.100.50")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [198, 51, 100, 50],
+                    12345,
+                ))))
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "text": "hello",
@@ -4263,7 +4272,10 @@ async fn test_api_guest_simulate_presets_validation_and_zero_log_pollution() {
                 .method("POST")
                 .uri("/api/simulate/guest")
                 .header("content-type", "application/json")
-                .header("x-forwarded-for", "198.51.100.51")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [198, 51, 100, 51],
+                    12345,
+                ))))
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "text": "   ",
@@ -4284,7 +4296,10 @@ async fn test_api_guest_simulate_presets_validation_and_zero_log_pollution() {
                 .method("POST")
                 .uri("/api/simulate/guest")
                 .header("content-type", "application/json")
-                .header("x-forwarded-for", "198.51.100.52")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [198, 51, 100, 52],
+                    12345,
+                ))))
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "text": "a".repeat(501),
@@ -4321,7 +4336,10 @@ async fn test_api_guest_simulate_ip_rate_limiting_and_headers() {
                     .method("POST")
                     .uri("/api/simulate/guest")
                     .header("content-type", "application/json")
-                    .header("x-forwarded-for", "203.0.113.42")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [203, 0, 113, 42],
+                        12345,
+                    ))))
                     .body(Body::from(
                         serde_json::to_vec(&json!({
                             "text": "Test sample reply",
@@ -4350,7 +4368,10 @@ async fn test_api_guest_simulate_ip_rate_limiting_and_headers() {
                 .method("POST")
                 .uri("/api/simulate/guest")
                 .header("content-type", "application/json")
-                .header("x-forwarded-for", "203.0.113.42")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [203, 0, 113, 42],
+                    12345,
+                ))))
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "text": "Seventh sample reply",
@@ -4379,7 +4400,10 @@ async fn test_api_guest_simulate_ip_rate_limiting_and_headers() {
                 .method("POST")
                 .uri("/api/simulate/guest")
                 .header("content-type", "application/json")
-                .header("x-forwarded-for", "203.0.113.99")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [203, 0, 113, 99],
+                    12345,
+                ))))
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "text": "Hello from another visitor",
@@ -5506,4 +5530,671 @@ async fn test_oauth_error_sanitization_and_api_guard_branches() {
         .await
         .unwrap();
     assert_eq!(toggle_blank_defaults_to_caller.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_trusted_proxy_header_spoof_rejection_and_cidr_honoring() {
+    let protected_did = "did:plc:proxytestaaaaaaaaaaaaaaa";
+    let (engine, _cache, _pds, _app) = setup_test_web_environment(protected_did).await;
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+
+    // 1. Default router (no TRUSTED_PROXY_HEADER / TRUSTED_PROXIES): spoofed headers ignored.
+    let unconfigured = create_web_router(Arc::clone(&engine), None, metadata.clone());
+    for idx in 0..6 {
+        let resp = unconfigured
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulate/guest")
+                    .header("content-type", "application/json")
+                    .header("cf-connecting-ip", format!("198.51.100.{idx}"))
+                    .header("x-forwarded-for", format!("203.0.113.{idx}"))
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [192, 0, 2, 10],
+                        44000,
+                    ))))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "text": "hello world", "preset": "balanced" }))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    // 7th request from same peer IP is rate-limited even with a new spoofed header.
+    let spoof_throttled = unconfigured
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate/guest")
+                .header("content-type", "application/json")
+                .header("cf-connecting-ip", "198.51.100.250")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [192, 0, 2, 10],
+                    44001,
+                ))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "text": "hello world", "preset": "balanced" }))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spoof_throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // 2. Trusted CIDR `172.21.0.0/16` + `cf-connecting-ip` honors header ONLY from 172.21.0.0/16.
+    let cf_cfg = WebServerConfig::default()
+        .with_trusted_proxy_header("cf-connecting-ip")
+        .with_trusted_proxies(skybouncer::web::parse_trusted_proxies("172.21.0.0/16"));
+    let cf_app = skybouncer::web::create_web_router_with_config(
+        Arc::clone(&engine),
+        None,
+        metadata.clone(),
+        &cf_cfg,
+    );
+    for idx in 0..7 {
+        let resp = cf_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulate/guest")
+                    .header("content-type", "application/json")
+                    .header("cf-connecting-ip", format!("203.0.113.{}", idx + 10))
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [172, 21, 0, 9],
+                        50000,
+                    ))))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "text": "hello world", "preset": "balanced" }))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "distinct cf-connecting-ip from trusted proxy CIDR must have separate quota"
+        );
+    }
+
+    // Untrusted peer 192.0.2.99 cannot bypass via cf-connecting-ip on the same router.
+    for _ in 0..6 {
+        let _ = cf_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulate/guest")
+                    .header("content-type", "application/json")
+                    .header("cf-connecting-ip", "203.0.113.200")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [192, 0, 2, 99],
+                        50001,
+                    ))))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "text": "hello", "preset": "balanced" }))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let untrusted_7th = cf_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate/guest")
+                .header("content-type", "application/json")
+                .header("cf-connecting-ip", "203.0.113.201")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [192, 0, 2, 99],
+                    50002,
+                ))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "text": "hello", "preset": "balanced" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(untrusted_7th.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // 3. `x-forwarded-for` picks rightmost untrusted hop when trusted proxies are configured.
+    let xff_cfg = WebServerConfig::default()
+        .with_trusted_proxy_header("x-forwarded-for")
+        .with_trusted_proxies(skybouncer::web::parse_trusted_proxies(
+            "127.0.0.1/32,10.0.0.0/8",
+        ));
+    let xff_app = skybouncer::web::create_web_router_with_config(engine, None, metadata, &xff_cfg);
+    for _ in 0..6 {
+        let r = xff_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulate/guest")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "198.51.100.1, 203.0.113.55, 10.0.0.8")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        51000,
+                    ))))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "text": "hello", "preset": "balanced" }))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    // Same rightmost untrusted hop (203.0.113.55) even with changed spoofed left entry -> throttled!
+    let xff_spoof_left = xff_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate/guest")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "198.51.100.99, 203.0.113.55, 10.0.0.9")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    51001,
+                ))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "text": "hello", "preset": "balanced" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(xff_spoof_left.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_api_simulate_limits_text_cap_log_truncation_and_image_validation() {
+    use async_trait::async_trait;
+    use skybouncer::classifier::Classifier;
+
+    let protected_did = "did:plc:simtestaaaaaaaaaaaaaaaaa";
+    let (engine, cache, _pds, app) = setup_test_web_environment(protected_did).await;
+    let tok = create_test_session(&engine, protected_did);
+
+    // 1. Text > 4000 chars -> 400
+    let over_text = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {tok}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "text": "x".repeat(4001) })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(over_text.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Text == 3500 chars -> 200 and evaluation_log.post_text is truncated to 2000 chars
+    let ok_3500 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {tok}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "text": "y".repeat(3500) })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_3500.status(), StatusCode::OK);
+    let logs = cache.list_evaluation_logs(None, None, 10, 0).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert!(
+        logs[0].post_text.chars().count() <= 2000,
+        "post_text must be capped at 2000 chars, got {}",
+        logs[0].post_text.chars().count()
+    );
+
+    // 3. Invalid image_base64 cases -> 400
+    for bad_b64 in [
+        "!!!not-base64!!!",
+        "aGVsbG8=",
+        "data:text/plain;base64,aGVsbG8=",
+        &"A".repeat(3_000_000),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulate")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {tok}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "text": "img test", "image_base64": bad_b64 }))
+                            .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // 4. Per-DID rate limiting & simulator concurrency semaphore saturation
+    struct SlowClassifier {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait]
+    impl Classifier for SlowClassifier {
+        async fn classify_with_rubric(
+            &self,
+            _interaction: &skybouncer::matcher::Interaction,
+            _rubric: Option<&RuleRubric>,
+        ) -> Result<Verdict, skybouncer::SkybouncerError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(Verdict::permitted("ok"))
+        }
+    }
+
+    let pds2 = MockPdsServer::start().await;
+    let cache2 = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let fg2 = Arc::new(FollowGraph::new());
+    let gate2 = Arc::new(NonFollowedGate::new(Arc::clone(&fg2)));
+    let rubric2 = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist2 = Arc::new(
+        ModListManager::from_shared_cache(Arc::clone(&cache2)).with_rubric(rubric2.clone()),
+    );
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let slow = Arc::new(SlowClassifier {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    });
+    let engine2 = Arc::new(
+        SkybouncerEngine::builder(SkybouncerConfig::new([protected_did], rubric2))
+            .with_follow_graph(fg2)
+            .with_gate(gate2)
+            .with_cache(cache2)
+            .with_modlist_manager(modlist2)
+            .with_pds_client(Arc::new(pds2.pds_client(protected_did)))
+            .with_classifier(slow)
+            .build()
+            .unwrap(),
+    );
+    let tok2 = create_test_session(&engine2, protected_did);
+    let limited_state =
+        skybouncer::web::ApiState::new(Arc::clone(&engine2)).with_simulate_limits(2, 1);
+    let sim_router = axum::Router::new()
+        .route(
+            "/api/simulate",
+            axum::routing::post(skybouncer::web::api::simulate_interaction),
+        )
+        .with_state(limited_state);
+
+    let r_clone = sim_router.clone();
+    let t_clone = tok2.clone();
+    let req1_task = tokio::spawn(async move {
+        r_clone
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulate")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {t_clone}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "text": "first slow" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    started.notified().await;
+
+    // Concurrent request hits semaphore saturation (429)
+    let busy_resp = sim_router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {tok2}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "text": "second concurrent" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(busy_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let busy_body = axum::body::to_bytes(busy_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&busy_body).contains("busy processing concurrent"));
+
+    release.notify_one();
+    assert_eq!(req1_task.await.unwrap().status(), StatusCode::OK);
+
+    // After req1 releases permit (rate limit already recorded req1 + busy req2 = 2), 3rd hits per-DID rate limit (429)
+    let rate_resp = sim_router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {tok2}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "text": "third rate" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rate_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_api_guest_simulate_global_vs_per_ip_rate_limit_messages() {
+    let (engine, _cache, _pds, _app) =
+        setup_test_web_environment("did:plc:guestmsgtestaaaaaaaaaa").await;
+
+    // Global cap reached (limit = 2 global, 10 per IP) -> distinct IPs trigger global message
+    let mut global_state = skybouncer::web::ApiState::new(Arc::clone(&engine));
+    global_state.guest_limiter = Arc::new(skybouncer::web::GuestSandboxLimiter::new(
+        10,
+        2,
+        Duration::from_secs(60),
+    ));
+    let global_app = axum::Router::new()
+        .route(
+            "/api/simulate/guest",
+            axum::routing::post(skybouncer::web::simulate_guest_interaction),
+        )
+        .with_state(global_state);
+
+    for octet in 1..=2u8 {
+        let ok = global_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/simulate/guest")
+                    .header("content-type", "application/json")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [198, 51, 100, octet],
+                        4000,
+                    ))))
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "text": "hi", "preset": "balanced" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+    }
+    let global_429 = global_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate/guest")
+                .header("content-type", "application/json")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                    [198, 51, 100, 99],
+                    4000,
+                ))))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "text": "hi", "preset": "balanced" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(global_429.status(), StatusCode::TOO_MANY_REQUESTS);
+    let global_body = axum::body::to_bytes(global_429.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let global_text = String::from_utf8_lossy(&global_body);
+    assert!(
+        global_text.contains("global capacity"),
+        "expected global capacity msg, got: {global_text}"
+    );
+}
+
+#[tokio::test]
+async fn test_auth_typeahead_preview_oauth_login_rate_limits_and_resolve_blank_did() {
+    let protected_did = "did:plc:ratelimitauthaaaaaaaaa";
+    let (engine, _cache, _pds, _app) = setup_test_web_environment(protected_did).await;
+    let tok = create_test_session(&engine, protected_did);
+
+    let mock_appview = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.searchActorsTypeahead"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "actors": [] })))
+        .mount(&mock_appview)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+        .mount(&mock_appview)
+        .await;
+
+    let _env_lock = WEB_ENV_LOCK.lock().await;
+    let _appview_guard = EnvVarGuard::set("SKYBOUNCER_APPVIEW_ENDPOINT", &mock_appview.uri());
+
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let app = create_web_router(Arc::clone(&engine), None, metadata);
+
+    // 1. Blank ?did=%20%20 on /api/resolve -> 400 Bad Request
+    let resolve_blank = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/resolve?did=%20%20")
+                .header("authorization", format!("Bearer {tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolve_blank.status(), StatusCode::BAD_REQUEST);
+
+    // 2. IP rate limit on /api/auth/typeahead (default 30/min per IP)
+    let ta_ip = std::net::SocketAddr::from(([203, 0, 113, 120], 1111));
+    for _ in 0..30 {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/typeahead?q=al")
+                    .extension(axum::extract::ConnectInfo(ta_ip))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    let ta_429 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/typeahead?q=al")
+                .extension(axum::extract::ConnectInfo(ta_ip))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ta_429.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(ta_429.headers().contains_key("retry-after"));
+
+    // 3. IP rate limit on /api/auth/preview (default 20/min per IP)
+    let prev_ip = std::net::SocketAddr::from(([203, 0, 113, 121], 2222));
+    for _ in 0..20 {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/preview?actor=alice.bsky.social")
+                    .extension(axum::extract::ConnectInfo(prev_ip))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    let prev_429 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?actor=alice.bsky.social")
+                .extension(axum::extract::ConnectInfo(prev_ip))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prev_429.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // 4. IP rate limit on /oauth/login (default 15/min per IP)
+    let oauth_ip = std::net::SocketAddr::from(([203, 0, 113, 122], 3333));
+    for _ in 0..15 {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth/login?handle=alice.bsky.social")
+                    .extension(axum::extract::ConnectInfo(oauth_ip))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+    let oauth_429 = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/login?handle=alice.bsky.social")
+                .extension(axum::extract::ConnectInfo(oauth_ip))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oauth_429.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_healthz_db_probe_body_limits_and_live_listener_connect_info() {
+    let protected_did = "did:plc:healthprobetestaaaaaaaaa";
+    let (engine, cache, _pds, app) = setup_test_web_environment(protected_did).await;
+    let tok = create_test_session(&engine, protected_did);
+
+    // 1. Router body limits: 64 KiB default rejects 80 KiB on /api/simulate/guest (413),
+    //    while /api/simulate allows > 64 KiB (8 MiB override).
+    let oversized_guest_json =
+        format!(r#"{{"text":"{}","preset":"balanced"}}"#, "a".repeat(80_000));
+    let guest_413 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate/guest")
+                .header("content-type", "application/json")
+                .body(Body::from(oversized_guest_json))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(guest_413.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let sim_over_64k_json = format!(r#"{{"text":"{}"}}"#, "a".repeat(80_000));
+    let sim_not_413 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/simulate")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {tok}"))
+                .body(Body::from(sim_over_64k_json))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sim_not_413.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Live listener ConnectInfo injection + /healthz 200 -> 503 after SQLite probe failure
+    let tmp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = tmp_listener.local_addr().unwrap().port();
+    drop(tmp_listener);
+
+    let cancel = CancellationToken::new();
+    let cfg = WebServerConfig::new("127.0.0.1", port);
+    let srv_engine = Arc::clone(&engine);
+    let srv_cancel = cancel.clone();
+    let srv_task = tokio::spawn(async move { run_web_server(cfg, srv_engine, srv_cancel).await });
+
+    let http = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let mut ready = false;
+    for _ in 0..40 {
+        if let Ok(r) = http.get(format!("{base}/healthz")).send().await {
+            assert_eq!(r.status(), StatusCode::OK);
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(ready, "live web server failed to bind in time");
+
+    // Verify ConnectInfo is wired on live listener via /api/simulate/guest headers
+    let live_guest = http
+        .post(format!("{base}/api/simulate/guest"))
+        .json(&json!({ "text": "Live test", "preset": "balanced" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(live_guest.status(), StatusCode::OK);
+
+    // Break DB liveness check -> /healthz must return 503 Service Unavailable
+    cache
+        .connection()
+        .lock()
+        .execute_batch("DROP TABLE mod_list_config;")
+        .unwrap();
+    let unhealthy = http.get(format!("{base}/healthz")).send().await.unwrap();
+    assert_eq!(unhealthy.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    cancel.cancel();
+    srv_task.await.unwrap().unwrap();
 }

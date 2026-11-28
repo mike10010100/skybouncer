@@ -102,6 +102,18 @@ impl DeduplicationCache {
         Arc::clone(&self.conn)
     }
 
+    /// Executes a lightweight SQLite liveness probe (`SELECT 1 FROM mod_list_config LIMIT 1`)
+    /// to verify database connectivity and schema readability.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if the SQLite probe fails.
+    pub fn health_check(&self) -> Result<(), SkybouncerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached("SELECT 1 FROM mod_list_config LIMIT 1;")?;
+        let _: Option<i64> = stmt.query_row([], |row| row.get(0)).optional()?;
+        Ok(())
+    }
+
     pub(super) fn apply_pragmas(
         conn: &Connection,
         busy_timeout_ms: u32,

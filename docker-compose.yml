@@ -15,8 +15,11 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     ports:
-      - "${PORT_BIND:-3031}:3000"
+      - "127.0.0.1:${PORT_BIND:-3031}:3000"
     env_file:
       - .env
     environment:
@@ -35,8 +38,8 @@ services:
       # Persistent storage for SQLite deduplication and evaluation TTL cache
       - skybouncer_data:/data:rw
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
-      interval: 5s
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/healthz"]
+      interval: 30s
       timeout: 5s
       retries: 3
       start_period: 15s
@@ -44,6 +47,7 @@ services:
       resources:
         limits:
           memory: ${MEM_LIMIT:-2048M}
+          pids: 256
         reservations:
           memory: 256M
     networks:
@@ -55,17 +59,29 @@ services:
   # directly into the isolated container network without exposing router ports.
   # ----------------------------------------------------------------------------
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared@sha256:55c7e3e8d89d5e8d20b75a82f3602cbf98e06db406e73e282073cfdc5a9a3af6
     container_name: skybouncer-cloudflared
     profiles:
       - tunnel
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
     command: tunnel --config /etc/cloudflared/config.yml run
     volumes:
       - ~/.cloudflared:/etc/cloudflared:ro
     depends_on:
       skybouncer:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 128
     networks:
       - skybouncer_net
 
@@ -74,13 +90,17 @@ services:
   # Activated via: docker compose --profile local-ai up -d
   # ----------------------------------------------------------------------------
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.35.1
     container_name: skybouncer-ollama
     profiles:
       - local-ai
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     ports:
-      - "${OLLAMA_PORT_BIND:-11434}:11434"
+      - "127.0.0.1:${OLLAMA_PORT_BIND:-11434}:11434"
     volumes:
       - ollama_models:/root/.ollama
     networks:
@@ -89,6 +109,7 @@ services:
       resources:
         limits:
           memory: ${OLLAMA_MEM_LIMIT:-16384M}
+          pids: 512
         reservations:
           memory: 4096M
 

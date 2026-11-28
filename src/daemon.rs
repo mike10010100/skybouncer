@@ -143,6 +143,61 @@ pub async fn provision_pds_resources(
     provisioned
 }
 
+/// Resolved DM bot credentials and polling interval loaded from environment variables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotEnvSettings {
+    /// Optional Bluesky bot handle (`BOT_HANDLE` / `BOT_IDENTIFIER`).
+    pub bot_handle: Option<String>,
+    /// Optional App Password (`BOT_APP_PASSWORD` / `BLUESKY_APP_PASSWORD`).
+    pub bot_password: Option<String>,
+    /// PDS endpoint (`PDS_ENDPOINT` / `SKYBOUNCER_PDS_URL`).
+    pub pds_endpoint: String,
+    /// Chat service endpoint (`CHAT_ENDPOINT`).
+    pub chat_endpoint: String,
+    /// Optional explicit chat token (`CHAT_ACCESS_TOKEN` only — never `PDS_ACCESS_TOKEN`).
+    pub chat_token: Option<String>,
+    /// Optional explicit bot DID (`BOT_DID` only — never inferred from `protected_dids`).
+    pub bot_did: Option<String>,
+    /// Polling interval (`CHAT_POLL_INTERVAL_SECS` / `SKYBOUNCER_CHAT_POLL_INTERVAL_SECS`).
+    pub poll_interval: Duration,
+}
+
+impl BotEnvSettings {
+    /// Loads DM bot environment settings without falling back to `PDS_ACCESS_TOKEN` or
+    /// arbitrary `protected_dids`.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let bot_handle = crate::env::var(&["BOT_HANDLE", "BOT_IDENTIFIER"]);
+        let bot_password = crate::env::var(&["BOT_APP_PASSWORD", "BLUESKY_APP_PASSWORD"])
+            .filter(|p| !p.contains("xxxx"));
+        let pds_endpoint = crate::env::var_or(
+            &["PDS_ENDPOINT", "SKYBOUNCER_PDS_URL"],
+            "https://bsky.social",
+        );
+        let chat_endpoint = crate::env::var_or(&["CHAT_ENDPOINT"], crate::DEFAULT_CHAT_ENDPOINT);
+        let chat_token = crate::env::var(&["CHAT_ACCESS_TOKEN"]).filter(|t| !t.contains("xxxx"));
+        let bot_did = crate::env::var(&["BOT_DID"])
+            .filter(|d| !d.contains("example") && !d.contains("skybouncerbotdid"));
+        let poll_secs = crate::env::parsed_or(
+            &[
+                "CHAT_POLL_INTERVAL_SECS",
+                "SKYBOUNCER_CHAT_POLL_INTERVAL_SECS",
+            ],
+            crate::DEFAULT_BOT_POLL_INTERVAL.as_secs(),
+        )
+        .max(1);
+        Self {
+            bot_handle,
+            bot_password,
+            pds_endpoint,
+            chat_endpoint,
+            chat_token,
+            bot_did,
+            poll_interval: Duration::from_secs(poll_secs),
+        }
+    }
+}
+
 /// Resolves an optional ATProto DM bot client from the provided credentials/token.
 ///
 /// Prefers App-Password login (handle + password); otherwise falls back to a bearer
@@ -349,7 +404,10 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
     });
 
     // Spawn Jetstream firehose streamer
-    let jetstream_url = crate::env::var_or(&["JETSTREAM_ENDPOINT"], DEFAULT_JETSTREAM_ENDPOINT);
+    let jetstream_url = crate::env::var_or(
+        &["JETSTREAM_ENDPOINT", "SKYBOUNCER_JETSTREAM_URL"],
+        DEFAULT_JETSTREAM_ENDPOINT,
+    );
     let read_timeout_secs = crate::env::parsed_or(
         &[
             "JETSTREAM_READ_TIMEOUT_SECS",
@@ -395,25 +453,15 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
     });
 
     // Optional ATProto DM Bot worker
-    let bot_handle = crate::env::var(&["BOT_HANDLE", "BOT_IDENTIFIER"]);
-    let bot_password = crate::env::var(&["BOT_APP_PASSWORD", "BLUESKY_APP_PASSWORD"])
-        .filter(|p| !p.contains("xxxx"));
-    let pds_endpoint = crate::env::var_or(&["PDS_ENDPOINT"], "https://bsky.social");
-
-    let chat_endpoint = crate::env::var_or(&["CHAT_ENDPOINT"], crate::DEFAULT_CHAT_ENDPOINT);
-    let chat_token =
-        crate::env::var(&["CHAT_ACCESS_TOKEN", "PDS_ACCESS_TOKEN"]).filter(|t| !t.contains("xxxx"));
-    let bot_did = crate::env::var(&["BOT_DID"])
-        .filter(|d| !d.contains("example") && !d.contains("skybouncerbotdid"))
-        .or_else(|| config.protected_dids.iter().next().cloned());
+    let bot_env = BotEnvSettings::from_env();
 
     let bot_client_and_did = resolve_bot_client(
-        bot_handle,
-        bot_password,
-        &pds_endpoint,
-        &chat_endpoint,
-        chat_token,
-        bot_did,
+        bot_env.bot_handle,
+        bot_env.bot_password,
+        &bot_env.pds_endpoint,
+        &bot_env.chat_endpoint,
+        bot_env.chat_token,
+        bot_env.bot_did,
     )
     .await;
 
@@ -423,14 +471,10 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
             .with_public_url(web_config.public_url);
         let poller_client = chat_client.clone();
         let cancel_bot = cancel.clone();
+        let poll_interval = bot_env.poll_interval;
         join_set.spawn(async move {
-            if let Err(e) = crate::run_bot_poller(
-                poller_client,
-                handler,
-                crate::DEFAULT_BOT_POLL_INTERVAL,
-                cancel_bot,
-            )
-            .await
+            if let Err(e) =
+                crate::run_bot_poller(poller_client, handler, poll_interval, cancel_bot).await
             {
                 error!(error = %e, "ATProto DM bot worker encountered error");
             }

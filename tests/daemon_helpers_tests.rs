@@ -371,3 +371,127 @@ async fn hydrate_cold_start_falls_back_to_follows_and_skips_empty() {
     assert_eq!(hydrated, 1, "only the fallback follow is hydrated");
     assert!(engine.is_following(protected, "did:plc:followed-via-fallback"));
 }
+
+static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvVarGuard {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EnvVarGuard {
+    fn new(keys: &[&'static str]) -> Self {
+        let saved = keys.iter().map(|&k| (k, std::env::var_os(k))).collect();
+        Self { saved }
+    }
+
+    fn set(&self, key: &str, val: &str) {
+        std::env::set_var(key, val);
+    }
+
+    fn remove(&self, key: &str) {
+        std::env::remove_var(key);
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        for (k, orig) in &self.saved {
+            match orig {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+#[test]
+fn bot_env_settings_ignores_pds_access_token_and_reads_chat_poll_interval() {
+    let _lock = ENV_TEST_LOCK.lock().unwrap();
+    let guard = EnvVarGuard::new(&[
+        "PDS_ACCESS_TOKEN",
+        "CHAT_ACCESS_TOKEN",
+        "BOT_DID",
+        "PROTECTED_DIDS",
+        "CHAT_POLL_INTERVAL_SECS",
+        "SKYBOUNCER_CHAT_POLL_INTERVAL_SECS",
+        "BOT_HANDLE",
+        "BOT_IDENTIFIER",
+        "BOT_APP_PASSWORD",
+        "BLUESKY_APP_PASSWORD",
+    ]);
+
+    guard.set("PDS_ACCESS_TOKEN", "should-not-become-chat-token");
+    guard.set("PROTECTED_DIDS", "did:plc:protectedaaaaaaaaaaaaaaa");
+    guard.remove("CHAT_ACCESS_TOKEN");
+    guard.remove("BOT_DID");
+    guard.remove("BOT_HANDLE");
+    guard.remove("BOT_IDENTIFIER");
+    guard.remove("BOT_APP_PASSWORD");
+    guard.remove("BLUESKY_APP_PASSWORD");
+    guard.set("CHAT_POLL_INTERVAL_SECS", "17");
+    guard.remove("SKYBOUNCER_CHAT_POLL_INTERVAL_SECS");
+
+    let s = skybouncer::daemon::BotEnvSettings::from_env();
+    assert_eq!(s.chat_token, None, "must never inherit PDS_ACCESS_TOKEN");
+    assert_eq!(s.bot_did, None, "must never inherit protected_dids");
+    assert_eq!(s.poll_interval, std::time::Duration::from_secs(17));
+
+    // SKYBOUNCER_CHAT_POLL_INTERVAL_SECS fallback + minimum 1s clamp
+    guard.remove("CHAT_POLL_INTERVAL_SECS");
+    guard.set("SKYBOUNCER_CHAT_POLL_INTERVAL_SECS", "9");
+    let s2 = skybouncer::daemon::BotEnvSettings::from_env();
+    assert_eq!(s2.poll_interval, std::time::Duration::from_secs(9));
+
+    guard.set("CHAT_POLL_INTERVAL_SECS", "0");
+    let s3 = skybouncer::daemon::BotEnvSettings::from_env();
+    assert_eq!(s3.poll_interval, std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn config_env_wiring_reads_newly_wired_variables() {
+    let _lock = ENV_TEST_LOCK.lock().unwrap();
+    let guard = EnvVarGuard::new(&[
+        "SENSITIVITY",
+        "SKYBOUNCER_SENSITIVITY",
+        "EVAL_CACHE_TTL_SECS",
+        "SKYBOUNCER_EVAL_CACHE_TTL_SECS",
+        "EVALUATION_CACHE_TTL_HOURS",
+        "SKYBOUNCER_EVALUATION_CACHE_TTL_HOURS",
+        "LIST_NAME",
+        "SKYBOUNCER_LIST_NAME",
+        "LIST_DESCRIPTION",
+        "SKYBOUNCER_LIST_DESCRIPTION",
+        "RATE_LIMIT_PER_HOUR",
+        "SKYBOUNCER_RATE_LIMIT_EVALS_PER_HOUR",
+    ]);
+
+    guard.set("SENSITIVITY", "high");
+    guard.remove("SKYBOUNCER_SENSITIVITY");
+    guard.remove("EVAL_CACHE_TTL_SECS");
+    guard.remove("SKYBOUNCER_EVAL_CACHE_TTL_SECS");
+    guard.set("EVALUATION_CACHE_TTL_HOURS", "48");
+    guard.set("LIST_NAME", "Custom Shield");
+    guard.set("LIST_DESCRIPTION", "Custom moderation list description");
+    guard.remove("SKYBOUNCER_RATE_LIMIT_EVALS_PER_HOUR");
+    guard.set("RATE_LIMIT_PER_HOUR", "250");
+
+    let cfg = SkybouncerConfig::from_env().expect("config from env");
+    assert_eq!(cfg.rubric.sensitivity, Sensitivity::High);
+    assert_eq!(
+        cfg.evaluation_ttl,
+        std::time::Duration::from_secs(48 * 3600)
+    );
+    assert_eq!(cfg.list_name, "Custom Shield");
+    assert_eq!(
+        cfg.list_description.as_deref(),
+        Some("Custom moderation list description")
+    );
+    assert_eq!(cfg.rate_limiter_config.max_evaluations, 250);
+
+    // SKYBOUNCER_EVAL_CACHE_TTL_SECS takes precedence over EVALUATION_CACHE_TTL_HOURS
+    guard.set("SKYBOUNCER_EVAL_CACHE_TTL_SECS", "120");
+    guard.set("SKYBOUNCER_RATE_LIMIT_EVALS_PER_HOUR", "99");
+    let cfg2 = SkybouncerConfig::from_env().expect("config2 from env");
+    assert_eq!(cfg2.evaluation_ttl, std::time::Duration::from_secs(120));
+    assert_eq!(cfg2.rate_limiter_config.max_evaluations, 99);
+}

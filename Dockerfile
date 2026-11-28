@@ -81,8 +81,8 @@ ENV HOST=0.0.0.0 \
 # Expose web dashboard and API port
 EXPOSE 3000
 
-# Container healthcheck: verify web dashboard and REST status endpoint
-HEALTHCHECK --interval=5s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:3000/healthz || exit 1
+# Container healthcheck: verify web dashboard and SQLite readiness probe
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS http://localhost:3000/healthz || exit 1
 
 ENTRYPOINT ["/usr/local/bin/skybouncer"]

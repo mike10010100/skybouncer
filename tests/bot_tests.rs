@@ -990,12 +990,11 @@ async fn test_command_handler_rules_and_set_rules() {
     let reply_err = handler
         .handle_command("did:plc:protected1", &oversized_cmd)
         .await
-        .unwrap_err();
+        .unwrap();
     assert!(
-        reply_err
-            .to_string()
-            .contains(&skybouncer::classifier::MAX_RUBRIC_PROMPT_CHARS.to_string()),
-        "expected max char limit error, got: {reply_err}"
+        reply_err.contains('❌')
+            && reply_err.contains(&skybouncer::classifier::MAX_RUBRIC_PROMPT_CHARS.to_string()),
+        "expected max char limit error reply, got: {reply_err}"
     );
 }
 
@@ -1118,7 +1117,7 @@ async fn test_command_handler_recent_and_pardon() {
     // Populate bounced user in cache
     cache
         .record_bounce(&BouncedUser {
-            subject_did: "did:plc:spammer1".to_string(),
+            subject_did: "did:plc:spammeraaaaaaaaaaaaaaaaa".to_string(),
             protected_did: "did:plc:protected1".to_string(),
             listitem_uri: "at://did:plc:protected1/app.bsky.graph.listitem/item1".to_string(),
             listitem_rkey: "item1".to_string(),
@@ -1126,7 +1125,7 @@ async fn test_command_handler_recent_and_pardon() {
             category: "spam".to_string(),
             confidence: 0.96,
             reason: "Detected crypto scam keyword".to_string(),
-            post_uri: "at://did:plc:spammer1/app.bsky.feed.post/post1".to_string(),
+            post_uri: "at://did:plc:spammeraaaaaaaaaaaaaaaaa/app.bsky.feed.post/post1".to_string(),
             post_text: "Scam post".to_string(),
             reply_to_uri: None,
             bounced_at: 1_700_000_000,
@@ -1140,7 +1139,7 @@ async fn test_command_handler_recent_and_pardon() {
         .await
         .expect("handle");
     assert!(reply_recent.contains("Recently Bounced Accounts from Your Replies (last 5):"));
-    assert!(reply_recent.contains("did:plc:spammer1"));
+    assert!(reply_recent.contains("did:plc:spammeraaaaaaaaaaaaaaaaa"));
     assert!(reply_recent.contains("96% confidence"));
     assert!(reply_recent.contains("Detected crypto scam keyword"));
 
@@ -1156,14 +1155,20 @@ async fn test_command_handler_recent_and_pardon() {
 
     // Pardon an account that is not present
     let reply_pardon_miss = handler
-        .handle_command("did:plc:protected1", "pardon did:plc:unknown")
+        .handle_command(
+            "did:plc:protected1",
+            "pardon did:plc:unknownaaaaaaaaaaaaaaaaa",
+        )
         .await
         .expect("handle");
     assert!(reply_pardon_miss.contains("was not found in your bounced list"));
 
     // Pardon the bounced account (PDS deleteRecord succeeds on mock)
     let reply_pardon = handler
-        .handle_command("did:plc:protected1", "pardon did:plc:spammer1")
+        .handle_command(
+            "did:plc:protected1",
+            "pardon did:plc:spammeraaaaaaaaaaaaaaaaa",
+        )
         .await
         .expect("handle");
     assert!(reply_pardon.contains("has been pardoned and removed from your moderation list"));
@@ -1171,7 +1176,7 @@ async fn test_command_handler_recent_and_pardon() {
 
     // Verify cache was cleared
     assert!(cache
-        .get_bounced_user("did:plc:spammer1")
+        .get_bounced_user("did:plc:spammeraaaaaaaaaaaaaaaaa")
         .unwrap()
         .is_none());
 }
@@ -1864,12 +1869,15 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
 
     // 2. Allow a friend
     let res = handler
-        .handle_command("did:plc:protected1", "allow did:plc:friend1")
+        .handle_command(
+            "did:plc:protected1",
+            "allow did:plc:friendaafriendaaaaaaaaaa",
+        )
         .await
         .expect("handle");
-    assert!(res.contains("Account did:plc:friend1"));
+    assert!(res.contains("Account did:plc:friendaafriendaaaaaaaaaa"));
     assert!(res.contains("has been added to your moderation allowlist"));
-    assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:friend1"));
+    assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:friendaafriendaaaaaaaaaa"));
 
     // 3. Allowlist now shows friend
     let res = handler
@@ -1877,22 +1885,28 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
         .await
         .expect("handle");
     assert!(res.contains("Your Moderation Allowlist (1 account):"));
-    assert!(res.contains("did:plc:friend1"));
+    assert!(res.contains("did:plc:friendaafriendaaaaaaaaaa"));
 
     // 4. Unallow friend
     let res = handler
-        .handle_command("did:plc:protected1", "unallow did:plc:friend1")
+        .handle_command(
+            "did:plc:protected1",
+            "unallow did:plc:friendaafriendaaaaaaaaaa",
+        )
         .await
         .expect("handle");
     assert!(
-        res.contains("Account did:plc:friend1")
+        res.contains("Account did:plc:friendaafriendaaaaaaaaaa")
             && res.contains("has been removed from your moderation allowlist")
     );
-    assert!(!engine.is_allowlisted("did:plc:protected1", "did:plc:friend1"));
+    assert!(!engine.is_allowlisted("did:plc:protected1", "did:plc:friendaafriendaaaaaaaaaa"));
 
     // 5. Unallow again -> not found
     let res = handler
-        .handle_command("did:plc:protected1", "unallow did:plc:friend1")
+        .handle_command(
+            "did:plc:protected1",
+            "unallow did:plc:friendaafriendaaaaaaaaaa",
+        )
         .await
         .expect("handle");
     assert!(res.contains("was not found on your moderation allowlist"));
@@ -1900,7 +1914,7 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
     // 6. Record a bounced violator in cache
     cache
         .record_bounce(&BouncedUser {
-            subject_did: "did:plc:violator_to_immunize".to_string(),
+            subject_did: "did:plc:violatorimmunizeaaaaaaaa".to_string(),
             protected_did: "did:plc:protected1".to_string(),
             listitem_uri: "at://did:plc:protected1/app.bsky.graph.listitem/item123".to_string(),
             listitem_rkey: "item123".to_string(),
@@ -1908,7 +1922,7 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
             category: "crypto_spam".to_string(),
             confidence: 0.99,
             reason: "airdrop spam".to_string(),
-            post_uri: "at://did:plc:violator_to_immunize/app.bsky.feed.post/123".to_string(),
+            post_uri: "at://did:plc:violatorimmunizeaaaaaaaa/app.bsky.feed.post/123".to_string(),
             post_text: "spam".to_string(),
             reply_to_uri: None,
             bounced_at: 1_700_000_000,
@@ -1916,14 +1930,14 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
         })
         .expect("record bounce");
     assert!(cache
-        .is_bounced_for("did:plc:protected1", "did:plc:violator_to_immunize")
+        .is_bounced_for("did:plc:protected1", "did:plc:violatorimmunizeaaaaaaaa")
         .expect("is_bounced"));
 
     // 7. Pardon and allow!
     let res = handler
         .handle_command(
             "did:plc:protected1",
-            "pardon and allow did:plc:violator_to_immunize",
+            "pardon and allow did:plc:violatorimmunizeaaaaaaaa",
         )
         .await
         .expect("handle");
@@ -1934,10 +1948,10 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
     assert_eq!(pds.deleted_records.lock().len(), 1);
     // Verify cleared from bounced cache
     assert!(!cache
-        .is_bounced_for("did:plc:protected1", "did:plc:violator_to_immunize")
+        .is_bounced_for("did:plc:protected1", "did:plc:violatorimmunizeaaaaaaaa")
         .expect("is_bounced"));
     // Verify added to allowlist in both memory and db
-    assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:violator_to_immunize"));
+    assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:violatorimmunizeaaaaaaaa"));
 }
 
 // =============================================================================
@@ -2068,7 +2082,7 @@ async fn test_command_allowlist_lifecycle_via_bot() {
 
     // Add (DID form), then view, then remove.
     let add = handler
-        .handle_command(protected, "allow did:plc:friend")
+        .handle_command(protected, "allow did:plc:friendaafriendaaaaaaaaaa")
         .await
         .unwrap();
     assert!(add.contains("added to your moderation allowlist"));
@@ -2077,17 +2091,17 @@ async fn test_command_allowlist_lifecycle_via_bot() {
         .handle_command(protected, "allow list")
         .await
         .unwrap();
-    assert!(view.contains("did:plc:friend"));
+    assert!(view.contains("did:plc:friendaafriendaaaaaaaaaa"));
 
     let remove = handler
-        .handle_command(protected, "unallow did:plc:friend")
+        .handle_command(protected, "unallow did:plc:friendaafriendaaaaaaaaaa")
         .await
         .unwrap();
     assert!(remove.contains("removed from your moderation allowlist"));
 
     // Removing again reports not found.
     let remove_again = handler
-        .handle_command(protected, "unallow did:plc:friend")
+        .handle_command(protected, "unallow did:plc:friendaafriendaaaaaaaaaa")
         .await
         .unwrap();
     assert!(remove_again.contains("was not found"));
@@ -2116,7 +2130,7 @@ async fn test_command_test_allowlist_status_variants() {
 
     // allowlist view with an entry (populated branch + pluralization).
     handler
-        .handle_command(protected, "allow did:plc:friend1")
+        .handle_command(protected, "allow did:plc:friendaafriendaaaaaaaaaa")
         .await
         .unwrap();
     let view = handler
@@ -2139,7 +2153,10 @@ async fn test_command_test_allowlist_status_variants() {
 
     // `pardon and allow <did>` alias resolves to the pardon+allowlist handler.
     let pa = handler
-        .handle_command(protected, "pardon and allow did:plc:someuser")
+        .handle_command(
+            protected,
+            "pardon and allow did:plc:someuseraaaaaaaaaaaaaaaa",
+        )
         .await
         .unwrap();
     assert!(!pa.is_empty());
@@ -2235,13 +2252,15 @@ async fn test_command_all_privileged_denied_for_stranger() {
         "trust followers off",
         "bypass followers on",
     ];
-    for cmd in commands {
-        let reply = handler.handle_command(stranger, cmd).await.expect("handle");
+    for (idx, cmd) in commands.iter().enumerate() {
+        let sender = format!("did:plc:stranger{idx}");
+        let reply = handler.handle_command(&sender, cmd).await.expect("handle");
         assert!(
             reply.contains("active bouncer session"),
             "command '{cmd}' must be denied for a stranger, got: {reply}"
         );
     }
+    let _ = stranger;
 }
 
 #[tokio::test]
@@ -2620,7 +2639,10 @@ async fn test_dm_upgrade_temp_bounce_to_permanent_and_proactive_alert_reminder()
 
     let (engine, cache, _pds) = setup_test_engine("did:plc:protected1").await;
     let enricher = Arc::new(skybouncer::enricher::MockContextEnricher::new());
-    enricher.set_handle("tempviolator.bsky.social", "did:plc:tempviolator");
+    enricher.set_handle(
+        "tempviolator.bsky.social",
+        "did:plc:tempviolatoraaaaaaaaaaaa",
+    );
 
     // Set duration to 24h cooldown so live bounces emit temporary bounce alerts
     let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
@@ -2636,11 +2658,14 @@ async fn test_dm_upgrade_temp_bounce_to_permanent_and_proactive_alert_reminder()
     // Subscribe to bounce notifications and trigger a temporary bounce
     let mut bounce_rx = engine.subscribe_bounces();
     cache
-        .set_handle_for_did("did:plc:tempviolator", "tempviolator.bsky.social")
+        .set_handle_for_did(
+            "did:plc:tempviolatoraaaaaaaaaaaa",
+            "tempviolator.bsky.social",
+        )
         .unwrap();
 
     let commit = make_reply_commit(
-        "did:plc:tempviolator",
+        "did:plc:tempviolatoraaaaaaaaaaaa",
         "did:plc:protected1",
         "rep_temp_1",
         "root_1",
@@ -2670,7 +2695,7 @@ async fn test_dm_upgrade_temp_bounce_to_permanent_and_proactive_alert_reminder()
 
     // Verify the bounce record in SQLite currently has an expiration timestamp
     let before = cache
-        .get_bounced_user_for("did:plc:protected1", "did:plc:tempviolator")
+        .get_bounced_user_for("did:plc:protected1", "did:plc:tempviolatoraaaaaaaaaaaa")
         .unwrap()
         .unwrap();
     assert!(before.expires_at.is_some());
@@ -2692,7 +2717,10 @@ async fn test_dm_upgrade_temp_bounce_to_permanent_and_proactive_alert_reminder()
 
     // Perm on an account not yet bounced creates a permanent block on the moderation list
     let direct_perm = handler
-        .handle_command("did:plc:protected1", "perm did:plc:nonexistent")
+        .handle_command(
+            "did:plc:protected1",
+            "perm did:plc:nonexistentaaaaaaaaaaaaa",
+        )
         .await
         .unwrap();
     assert!(
@@ -2700,7 +2728,7 @@ async fn test_dm_upgrade_temp_bounce_to_permanent_and_proactive_alert_reminder()
         "direct_perm={direct_perm}"
     );
     let direct_record = cache
-        .get_bounced_user_for("did:plc:protected1", "did:plc:nonexistent")
+        .get_bounced_user_for("did:plc:protected1", "did:plc:nonexistentaaaaaaaaaaaaa")
         .unwrap()
         .unwrap();
     assert!(direct_record.expires_at.is_none());
@@ -2719,18 +2747,21 @@ async fn test_dm_upgrade_temp_bounce_to_permanent_and_proactive_alert_reminder()
 
     // Verify expires_at is now None (permanent) and pruning does NOT remove it
     let after = cache
-        .get_bounced_user_for("did:plc:protected1", "did:plc:tempviolator")
+        .get_bounced_user_for("did:plc:protected1", "did:plc:tempviolatoraaaaaaaaaaaa")
         .unwrap()
         .unwrap();
     assert!(after.expires_at.is_none());
     assert_eq!(engine.prune_expired_bounces().await.unwrap(), 0);
     assert!(cache
-        .is_bounced_for("did:plc:protected1", "did:plc:tempviolator")
+        .is_bounced_for("did:plc:protected1", "did:plc:tempviolatoraaaaaaaaaaaa")
         .unwrap());
 
     // Upgrading again reports already permanent
     let already = handler
-        .handle_command("did:plc:protected1", "make permanent did:plc:tempviolator")
+        .handle_command(
+            "did:plc:protected1",
+            "make permanent did:plc:tempviolatoraaaaaaaaaaaa",
+        )
         .await
         .unwrap();
     assert!(already.contains("is already permanently blocked"));
@@ -2841,17 +2872,21 @@ async fn test_proactive_alert_and_recent_include_replying_to_link_only_for_repli
 async fn test_dm_pardon_then_bounce_or_perm_again_lifecycle_and_guards() {
     use skybouncer::classifier::BounceDuration;
 
-    let (engine, cache, pds) = setup_test_engine("did:plc:protected1").await;
-    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
+    let protected_did = "did:plc:protectedaaaaaaaaaaaaaaa";
+    let bot_did = "did:plc:botbotbotbotbotbotbotbot";
+    let troll_did = "did:plc:trolltrolltrolltrolltrol";
+
+    let (engine, cache, pds) = setup_test_engine(protected_did).await;
+    let handler = BotCommandHandler::new(Arc::clone(&engine), bot_did);
 
     // 0. Stranger is denied on bounce / rebounce / perm
     for cmd in [
         "bounce",
-        "bounce did:plc:troll",
-        "rebounce did:plc:troll",
-        "re-bounce did:plc:troll",
-        "block did:plc:troll",
-        "perm did:plc:troll",
+        &format!("bounce {troll_did}"),
+        &format!("rebounce {troll_did}"),
+        &format!("re-bounce {troll_did}"),
+        &format!("block {troll_did}"),
+        &format!("perm {troll_did}"),
     ] {
         let unauth = handler
             .handle_command("did:plc:stranger", cmd)
@@ -2865,10 +2900,7 @@ async fn test_dm_pardon_then_bounce_or_perm_again_lifecycle_and_guards() {
 
     // Bare usage prompts for bounce aliases
     for bare in ["bounce", "rebounce", "re-bounce", "block"] {
-        let usage = handler
-            .handle_command("did:plc:protected1", bare)
-            .await
-            .unwrap();
+        let usage = handler.handle_command(protected_did, bare).await.unwrap();
         assert!(
             usage.contains("Usage: `bounce <did|@handle>`"),
             "bare={bare}"
@@ -2876,16 +2908,19 @@ async fn test_dm_pardon_then_bounce_or_perm_again_lifecycle_and_guards() {
     }
 
     // Self-bounce and bot-bounce guards
-    for self_cmd in ["bounce did:plc:protected1", "perm did:plc:protected1"] {
+    for self_cmd in [
+        format!("bounce {protected_did}"),
+        format!("perm {protected_did}"),
+    ] {
         let msg = handler
-            .handle_command("did:plc:protected1", self_cmd)
+            .handle_command(protected_did, &self_cmd)
             .await
             .unwrap();
         assert!(msg.contains("cannot bounce or block your own account"));
     }
-    for bot_cmd in ["bounce did:plc:bot", "perm did:plc:bot"] {
+    for bot_cmd in [format!("bounce {bot_did}"), format!("perm {bot_did}")] {
         let msg = handler
-            .handle_command("did:plc:protected1", bot_cmd)
+            .handle_command(protected_did, &bot_cmd)
             .await
             .unwrap();
         assert!(msg.contains("cannot bounce the Skybouncer bot account"));
@@ -2894,22 +2929,22 @@ async fn test_dm_pardon_then_bounce_or_perm_again_lifecycle_and_guards() {
 
     // Configure 24h cooldown duration
     handler
-        .handle_command("did:plc:protected1", "duration 24h")
+        .handle_command(protected_did, "duration 24h")
         .await
         .unwrap();
     assert_eq!(
-        engine.rubric_for("did:plc:protected1").bounce_duration,
+        engine.rubric_for(protected_did).bounce_duration,
         BounceDuration::Cooldown24h
     );
 
     cache
-        .set_handle_for_did("did:plc:troll", "troll.bsky.social")
+        .set_handle_for_did(troll_did, "troll.bsky.social")
         .unwrap();
 
     // 1. Initial live reply bounce
     let commit = make_reply_commit(
-        "did:plc:troll",
-        "did:plc:protected1",
+        troll_did,
+        protected_did,
         "troll_reply_1",
         "protected_root_9",
         "Check out this free crypto scam airdrop!",
@@ -2930,21 +2965,19 @@ async fn test_dm_pardon_then_bounce_or_perm_again_lifecycle_and_guards() {
 
     // 2. Pardon via DM -> deletes listitem from PDS, suggests bounce/perm if user changes mind
     let pardon_reply = handler
-        .handle_command("did:plc:protected1", "pardon @troll.bsky.social")
+        .handle_command(protected_did, "pardon @troll.bsky.social")
         .await
         .unwrap();
     assert!(pardon_reply.contains("has been pardoned and removed from your moderation list"));
     assert!(pardon_reply.contains("bounce troll.bsky.social"));
     assert!(pardon_reply.contains("perm troll.bsky.social"));
-    assert!(!cache
-        .is_bounced_for("did:plc:protected1", "did:plc:troll")
-        .unwrap());
+    assert!(!cache.is_bounced_for(protected_did, troll_did).unwrap());
     assert_eq!(pds.deleted_records.lock().len(), 1);
 
     // 3. Re-bounce via DM (`bounce @troll.bsky.social`) -> creates new PDS listitem with 24h duration
     //    AND restores original reason, post_uri, and reply_to_uri from bounce_history!
     let rebounce_reply = handler
-        .handle_command("did:plc:protected1", "bounce @troll.bsky.social")
+        .handle_command(protected_did, "bounce @troll.bsky.social")
         .await
         .unwrap();
     assert!(
@@ -2955,17 +2988,17 @@ async fn test_dm_pardon_then_bounce_or_perm_again_lifecycle_and_guards() {
     assert!(rebounce_reply.contains("perm troll.bsky.social"));
 
     let rebounced = cache
-        .get_bounced_user_for("did:plc:protected1", "did:plc:troll")
+        .get_bounced_user_for(protected_did, troll_did)
         .unwrap()
         .expect("rebounced user in SQLite");
     assert!(rebounced.expires_at.is_some());
     assert_eq!(
         rebounced.post_uri,
-        "at://did:plc:troll/app.bsky.feed.post/troll_reply_1"
+        format!("at://{troll_did}/app.bsky.feed.post/troll_reply_1")
     );
     assert_eq!(
         rebounced.reply_to_uri.as_deref(),
-        Some("at://did:plc:protected1/app.bsky.feed.post/protected_root_9")
+        Some(format!("at://{protected_did}/app.bsky.feed.post/protected_root_9").as_str())
     );
 
     let listitem_count_after_rebounce = pds
@@ -2978,7 +3011,7 @@ async fn test_dm_pardon_then_bounce_or_perm_again_lifecycle_and_guards() {
 
     // Sending `bounce` again while already bounced is idempotent (0 extra PDS writes)
     let dup_bounce = handler
-        .handle_command("did:plc:protected1", "bounce @troll.bsky.social")
+        .handle_command(protected_did, "bounce @troll.bsky.social")
         .await
         .unwrap();
     assert!(dup_bounce.contains("already on your moderation list (temporary block)"));
@@ -2993,16 +3026,14 @@ async fn test_dm_pardon_then_bounce_or_perm_again_lifecycle_and_guards() {
     // 4. Pardon again, then `perm @troll.bsky.social` while rubric duration is still 24h ->
     //    creates a strictly PERMANENT block on PDS and restores bounce_history!
     handler
-        .handle_command("did:plc:protected1", "pardon @troll.bsky.social")
+        .handle_command(protected_did, "pardon @troll.bsky.social")
         .await
         .unwrap();
-    assert!(!cache
-        .is_bounced_for("did:plc:protected1", "did:plc:troll")
-        .unwrap());
+    assert!(!cache.is_bounced_for(protected_did, troll_did).unwrap());
     assert_eq!(pds.deleted_records.lock().len(), 2);
 
     let perm_after_pardon = handler
-        .handle_command("did:plc:protected1", "perm @troll.bsky.social")
+        .handle_command(protected_did, "perm @troll.bsky.social")
         .await
         .unwrap();
     assert!(
@@ -3010,52 +3041,50 @@ async fn test_dm_pardon_then_bounce_or_perm_again_lifecycle_and_guards() {
         "perm_after_pardon={perm_after_pardon}"
     );
     let perm_record = cache
-        .get_bounced_user_for("did:plc:protected1", "did:plc:troll")
+        .get_bounced_user_for(protected_did, troll_did)
         .unwrap()
         .expect("perm record in SQLite");
     assert!(perm_record.expires_at.is_none());
     assert_eq!(
         perm_record.reply_to_uri.as_deref(),
-        Some("at://did:plc:protected1/app.bsky.feed.post/protected_root_9")
+        Some(format!("at://{protected_did}/app.bsky.feed.post/protected_root_9").as_str())
     );
     assert_eq!(engine.prune_expired_bounces().await.unwrap(), 0);
 
     // 5. `pardon and allow` -> immunizes on allowlist; subsequent `bounce` or `perm` revokes allowlist immunity!
     let paa_reply = handler
-        .handle_command("did:plc:protected1", "pardon and allow @troll.bsky.social")
+        .handle_command(protected_did, "pardon and allow @troll.bsky.social")
         .await
         .unwrap();
     assert!(paa_reply.contains("has been pardoned and added to your allowlist"));
     assert!(paa_reply.contains("bounce troll.bsky.social"));
-    assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:troll"));
+    assert!(engine.is_allowlisted(protected_did, troll_did));
 
     let bounce_after_paa = handler
-        .handle_command("did:plc:protected1", "rebounce @troll.bsky.social")
+        .handle_command(protected_did, "rebounce @troll.bsky.social")
         .await
         .unwrap();
     assert!(bounce_after_paa.contains("re-added to your moderation list"));
     assert!(bounce_after_paa.contains("Allowlist immunity was also removed."));
-    assert!(!engine.is_allowlisted("did:plc:protected1", "did:plc:troll"));
-    assert!(cache
-        .is_bounced_for("did:plc:protected1", "did:plc:troll")
-        .unwrap());
+    assert!(!engine.is_allowlisted(protected_did, troll_did));
+    assert!(cache.is_bounced_for(protected_did, troll_did).unwrap());
 
     // And `pardon and allow` followed by `perm` also revokes allowlist immunity and permanently blocks
     handler
-        .handle_command("did:plc:protected1", "pardon and allow @troll.bsky.social")
+        .handle_command(protected_did, "pardon and allow @troll.bsky.social")
         .await
         .unwrap();
-    assert!(engine.is_allowlisted("did:plc:protected1", "did:plc:troll"));
+    assert!(engine.is_allowlisted(protected_did, troll_did));
 
     let perm_after_paa = handler
-        .handle_command("did:plc:protected1", "perm @troll.bsky.social")
+        .handle_command(protected_did, "perm @troll.bsky.social")
         .await
         .unwrap();
     assert!(perm_after_paa.contains("re-added and **permanently** blocked"));
     assert!(perm_after_paa.contains("Allowlist immunity was also removed."));
-    assert!(!engine.is_allowlisted("did:plc:protected1", "did:plc:troll"));
+    assert!(!engine.is_allowlisted(protected_did, troll_did));
     assert!(cache
-        .get_bounced_user_for("did:plc:protected1", "did:plc:troll")
+        .get_bounced_user_for(protected_did, troll_did)
         .unwrap()
         .unwrap()
         .expires_at
@@ -3294,5 +3323,786 @@ async fn test_regression_poller_executes_unread_dm_when_proactive_bot_alert_inte
     assert!(
         !engine.is_paused(),
         "already-read msg_old_pause_0 must NOT be re-executed"
+    );
+}
+
+#[tokio::test]
+async fn test_poller_invalid_set_rules_and_unexpected_handler_error_do_not_loop() {
+    use wiremock::matchers::query_param;
+
+    // 1. Invalid `set rules` returns Ok("❌ Invalid rubric: ...") and acknowledges read so poller does not loop.
+    let (engine, _cache, _pds) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvoRequests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "requests": [] })))
+        .mount(&server)
+        .await;
+    let read_acked1 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ra1_list = Arc::clone(&read_acked1);
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let unread = i64::from(!ra1_list.load(Ordering::SeqCst));
+            ResponseTemplate::new(200).set_body_json(json!({
+                "convos": [{
+                    "id": "convo_bad_rules",
+                    "rev": "1",
+                    "members": [],
+                    "muted": false,
+                    "unreadCount": unread,
+                    "lastMessage": {
+                        "id": "msg_bad_rules",
+                        "rev": "1",
+                        "text": format!("set rules {}", "x".repeat(skybouncer::classifier::MAX_RUBRIC_PROMPT_CHARS + 5)),
+                        "sender": {"did": "did:plc:protected1"},
+                        "sentAt": "2026-11-28T00:00:00Z"
+                    }
+                }]
+            }))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.getMessages"))
+        .and(query_param("convoId", "convo_bad_rules"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "messages": [{
+                "id": "msg_bad_rules",
+                "rev": "1",
+                "text": format!("set rules {}", "x".repeat(skybouncer::classifier::MAX_RUBRIC_PROMPT_CHARS + 5)),
+                "sender": {"did": "did:plc:protected1"},
+                "sentAt": "2026-11-28T00:00:00Z"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let sent_replies = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let sr_clone = Arc::clone(&sent_replies);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            sr_clone
+                .lock()
+                .push(body["message"]["text"].as_str().unwrap().to_string());
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_err_reply",
+                "rev": "2",
+                "sender": {"did": "did:plc:bot"},
+                "text": "ok",
+                "sentAt": "2026-11-28T00:00:01Z"
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let update_reads = Arc::new(AtomicUsize::new(0));
+    let ur_clone = Arc::clone(&update_reads);
+    let ra1_upd = Arc::clone(&read_acked1);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.updateRead"))
+        .respond_with(move |_req: &wiremock::Request| {
+            ra1_upd.store(true, Ordering::SeqCst);
+            ur_clone.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "convo": {"id": "convo_bad_rules", "rev": "2", "members": [], "muted": false, "unreadCount": 0}
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "tok").unwrap();
+    let cancel = CancellationToken::new();
+    let cancel_c = cancel.clone();
+    let task = tokio::spawn(async move {
+        run_bot_poller(client, handler, Duration::from_millis(20), cancel_c).await
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+
+    assert_eq!(sent_replies.lock().len(), 1);
+    assert!(sent_replies.lock()[0].contains("Invalid rubric"));
+    assert_eq!(update_reads.load(Ordering::SeqCst), 1);
+
+    // 2. Unexpected Err(e) from handle_command (DB error on `recent`) sends generic error DM once + marks read.
+    let (engine2, cache2, _pds2) = setup_test_engine("did:plc:protected1").await;
+    cache2
+        .connection()
+        .lock()
+        .execute_batch("DROP TABLE bounced_users;")
+        .unwrap();
+    let handler2 = BotCommandHandler::new(Arc::clone(&engine2), "did:plc:bot");
+
+    let server2 = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvoRequests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "requests": [] })))
+        .mount(&server2)
+        .await;
+    let read_acked2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ra2_list = Arc::clone(&read_acked2);
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let unread = i64::from(!ra2_list.load(Ordering::SeqCst));
+            ResponseTemplate::new(200).set_body_json(json!({
+                "convos": [{
+                    "id": "convo_db_err",
+                    "rev": "1",
+                    "members": [],
+                    "muted": false,
+                    "unreadCount": unread,
+                    "lastMessage": {
+                        "id": "msg_recent_err",
+                        "rev": "1",
+                        "text": "recent",
+                        "sender": {"did": "did:plc:protected1"},
+                        "sentAt": "2026-11-28T00:00:00Z"
+                    }
+                }]
+            }))
+        })
+        .mount(&server2)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.getMessages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "messages": [{
+                "id": "msg_recent_err",
+                "rev": "1",
+                "text": "recent",
+                "sender": {"did": "did:plc:protected1"},
+                "sentAt": "2026-11-28T00:00:00Z"
+            }]
+        })))
+        .mount(&server2)
+        .await;
+
+    let err_replies = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let er_clone = Arc::clone(&err_replies);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            er_clone
+                .lock()
+                .push(body["message"]["text"].as_str().unwrap().to_string());
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_err_2",
+                "rev": "2",
+                "sender": {"did": "did:plc:bot"},
+                "text": "err",
+                "sentAt": "2026-11-28T00:00:01Z"
+            }))
+        })
+        .expect(1)
+        .mount(&server2)
+        .await;
+    let ra2_upd = Arc::clone(&read_acked2);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.updateRead"))
+        .respond_with(move |_req: &wiremock::Request| {
+            ra2_upd.store(true, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "convo": {"id": "convo_db_err", "rev": "2", "members": [], "muted": false, "unreadCount": 0}
+            }))
+        })
+        .expect(1)
+        .mount(&server2)
+        .await;
+
+    let client2 = ChatClient::new(server2.uri(), "tok").unwrap();
+    let cancel2 = CancellationToken::new();
+    let cancel2_c = cancel2.clone();
+    let task2 = tokio::spawn(async move {
+        run_bot_poller(client2, handler2, Duration::from_millis(20), cancel2_c).await
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    cancel2.cancel();
+    task2.await.unwrap().unwrap();
+
+    assert_eq!(err_replies.lock().len(), 1);
+    assert!(err_replies.lock()[0].contains("an internal error occurred"));
+}
+
+#[tokio::test]
+async fn test_poller_get_messages_failure_never_marks_bot_fallback_read_and_none_last_message_fetches_history(
+) {
+    // 1. When lastMessage is from bot and unreadCount > 0, if getMessages fails (500),
+    //    poller must NOT call updateRead with the bot fallback message ID.
+    let (engine, _cache, _pds) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvoRequests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "requests": [] })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "convos": [{
+                "id": "convo_bot_last",
+                "rev": "2",
+                "members": [],
+                "muted": false,
+                "unreadCount": 1,
+                "lastMessage": {
+                    "id": "msg_from_bot",
+                    "rev": "2",
+                    "text": "Bot alert",
+                    "sender": {"did": "did:plc:bot"},
+                    "sentAt": "2026-11-28T00:00:02Z"
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.getMessages"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream err"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.updateRead"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "convo": {"id": "convo_bot_last", "rev": "2", "members": [], "muted": false, "unreadCount": 0}
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "tok").unwrap();
+    let cancel = CancellationToken::new();
+    let cancel_c = cancel.clone();
+    let task = tokio::spawn(async move {
+        run_bot_poller(client, handler, Duration::from_millis(20), cancel_c).await
+    });
+    tokio::time::sleep(Duration::from_millis(90)).await;
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+
+    // 2. When convo.lastMessage == None and unreadCount > 0, poller fetches getMessages history and executes it.
+    let (engine2, _cache2, _pds2) = setup_test_engine("did:plc:protected1").await;
+    let handler2 = BotCommandHandler::new(Arc::clone(&engine2), "did:plc:bot");
+
+    let server2 = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvoRequests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "requests": [] })))
+        .mount(&server2)
+        .await;
+    let none_read_acked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let nra_list = Arc::clone(&none_read_acked);
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let unread = i64::from(!nra_list.load(Ordering::SeqCst));
+            ResponseTemplate::new(200).set_body_json(json!({
+                "convos": [{
+                    "id": "convo_no_last",
+                    "rev": "1",
+                    "members": [],
+                    "muted": false,
+                    "unreadCount": unread
+                }]
+            }))
+        })
+        .mount(&server2)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.getMessages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "messages": [{
+                "id": "msg_hidden_pause",
+                "rev": "1",
+                "text": "pause",
+                "sender": {"did": "did:plc:protected1"},
+                "sentAt": "2026-11-28T00:00:00Z"
+            }]
+        })))
+        .mount(&server2)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_r",
+            "rev": "2",
+            "sender": {"did": "did:plc:bot"},
+            "text": "paused",
+            "sentAt": "2026-11-28T00:00:01Z"
+        })))
+        .expect(1)
+        .mount(&server2)
+        .await;
+    let nra_upd = Arc::clone(&none_read_acked);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.updateRead"))
+        .respond_with(move |_req: &wiremock::Request| {
+            nra_upd.store(true, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "convo": {"id": "convo_no_last", "rev": "2", "members": [], "muted": false, "unreadCount": 0}
+            }))
+        })
+        .expect(1)
+        .mount(&server2)
+        .await;
+
+    let client2 = ChatClient::new(server2.uri(), "tok").unwrap();
+    let cancel2 = CancellationToken::new();
+    let cancel2_c = cancel2.clone();
+    let task2 = tokio::spawn(async move {
+        run_bot_poller(client2, handler2, Duration::from_millis(20), cancel2_c).await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cancel2.cancel();
+    task2.await.unwrap().unwrap();
+    assert!(engine2.is_paused());
+}
+
+#[tokio::test]
+async fn test_poller_send_failure_retries_without_marking_read_and_paginates_and_accepts_request() {
+    use wiremock::matchers::query_param;
+
+    let (engine, _cache, _pds) = setup_test_engine("did:plc:protected1").await;
+    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:bot");
+
+    let server = MockServer::start().await;
+
+    // Paginated listConvoRequests (page 1 cursor -> page 2)
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvoRequests"))
+        .and(query_param("cursor", "rc2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "requests": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvoRequests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "cursor": "rc2",
+            "requests": []
+        })))
+        .mount(&server)
+        .await;
+
+    let req_read_acked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let rra_list = Arc::clone(&req_read_acked);
+    // Paginated listConvos: page 2 has a request-status convo with an unread `help` message
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .and(query_param("cursor", "c2"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let unread = i64::from(!rra_list.load(Ordering::SeqCst));
+            let status = if rra_list.load(Ordering::SeqCst) {
+                "accepted"
+            } else {
+                "request"
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "convos": [{
+                    "id": "convo_req_inline",
+                    "rev": "1",
+                    "status": status,
+                    "members": [],
+                    "muted": false,
+                    "unreadCount": unread,
+                    "lastMessage": {
+                        "id": "msg_help_req",
+                        "rev": "1",
+                        "text": "help",
+                        "sender": {"did": "did:plc:protected1"},
+                        "sentAt": "2026-11-28T00:00:00Z"
+                    }
+                }]
+            }))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.listConvos"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "cursor": "c2",
+            "convos": []
+        })))
+        .mount(&server)
+        .await;
+
+    // Paginated getMessages (page 1 -> cursor m2 -> page 2)
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.getMessages"))
+        .and(query_param("cursor", "m2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "messages": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/chat.bsky.convo.getMessages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "cursor": "m2",
+            "messages": [{
+                "id": "msg_help_req",
+                "rev": "1",
+                "text": "help",
+                "sender": {"did": "did:plc:protected1"},
+                "sentAt": "2026-11-28T00:00:00Z"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let accept_count = Arc::new(AtomicUsize::new(0));
+    let ac = Arc::clone(&accept_count);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.acceptConvo"))
+        .respond_with(move |_req: &wiremock::Request| {
+            ac.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({ "rev": "2" }))
+        })
+        .mount(&server)
+        .await;
+
+    // Fail the 1st sendMessage with 500, then succeed on subsequent attempts!
+    let send_attempts = Arc::new(AtomicUsize::new(0));
+    let sa = Arc::clone(&send_attempts);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = sa.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                ResponseTemplate::new(500).set_body_string("transient chat outage")
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "msg_reply_ok",
+                    "rev": "3",
+                    "sender": {"did": "did:plc:bot"},
+                    "text": "ok",
+                    "sentAt": "2026-11-28T00:00:02Z"
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let read_calls = Arc::new(AtomicUsize::new(0));
+    let rc = Arc::clone(&read_calls);
+    let rra_upd = Arc::clone(&req_read_acked);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/chat.bsky.convo.updateRead"))
+        .respond_with(move |_req: &wiremock::Request| {
+            rra_upd.store(true, Ordering::SeqCst);
+            rc.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "convo": {"id": "convo_req_inline", "rev": "3", "members": [], "muted": false, "unreadCount": 0}
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ChatClient::new(server.uri(), "tok").unwrap();
+    let cancel = CancellationToken::new();
+    let cancel_c = cancel.clone();
+    let task = tokio::spawn(async move {
+        run_bot_poller(client, handler, Duration::from_millis(25), cancel_c).await
+    });
+    tokio::time::sleep(Duration::from_millis(160)).await;
+    cancel.cancel();
+    task.await.unwrap().unwrap();
+
+    assert!(
+        send_attempts.load(Ordering::SeqCst) >= 2,
+        "must retry failed send"
+    );
+    assert_eq!(
+        read_calls.load(Ordering::SeqCst),
+        1,
+        "must only mark read after send succeeds"
+    );
+    assert!(
+        accept_count.load(Ordering::SeqCst) >= 1,
+        "must accept request convo"
+    );
+}
+
+#[tokio::test]
+async fn test_handler_bypass_ordering_did_validation_whitespace_status_count_and_allowlist_pagination(
+) {
+    let (engine, cache, _pds) = setup_test_engine("did:plc:protectedaaaaaaaaaaaaaaa").await;
+    let protected = "did:plc:protectedaaaaaaaaaaaaaaa";
+    let handler = BotCommandHandler::new(Arc::clone(&engine), "did:plc:botbotbotbotbotbotbotbot");
+
+    // 1. Auth failure and invalid rubric must NOT mutate bypass_incoming_followers gate (default is true)
+    assert!(engine.gate().bypass_incoming_followers(protected));
+    let unauth_bypass = handler
+        .handle_command("did:plc:strangeraaaaaaaaaaaaaaaa", "trust followers off")
+        .await
+        .unwrap();
+    assert!(unauth_bypass.contains("active bouncer session"));
+    assert!(engine.gate().bypass_incoming_followers(protected));
+
+    let unauth_rules = handler
+        .handle_command(
+            "did:plc:strangeraaaaaaaaaaaaaaaa",
+            "set rules Block scams\nbypass followers: off",
+        )
+        .await
+        .unwrap();
+    assert!(unauth_rules.contains("active bouncer session"));
+    assert!(engine.gate().bypass_incoming_followers(protected));
+
+    // Invalid rubric in `set rules` also must NOT mutate bypass gate
+    let bad_rules = handler
+        .handle_command(
+            protected,
+            &format!(
+                "set rules {}\nbypass followers: off",
+                "a".repeat(skybouncer::classifier::MAX_RUBRIC_PROMPT_CHARS + 10)
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(bad_rules.contains("Invalid rubric"));
+    assert!(engine.gate().bypass_incoming_followers(protected));
+
+    // 2. Strict DID syntax validation rejects malformed/short DIDs
+    for bad in ["allow did:invalid", "pardon did:plc:short", "perm did:web:"] {
+        let reply = handler.handle_command(protected, bad).await.unwrap();
+        assert!(
+            reply.contains("Invalid Bluesky DID") || reply.contains("Invalid DID"),
+            "cmd={bad}, reply={reply}"
+        );
+    }
+
+    // 3. Unicode whitespace normalization (`set\nrules`, `pardon\t@handle`, bare `pardon and allow`)
+    let newline_rules = handler
+        .handle_command(protected, "set\nrules\u{00A0}Block phishing scams")
+        .await
+        .unwrap();
+    assert!(
+        newline_rules.contains("Moderation rubric updated successfully"),
+        "newline_rules={newline_rules}"
+    );
+
+    let tab_pardon = handler
+        .handle_command(protected, "pardon\tdid:plc:missingmissingmissingaaa")
+        .await
+        .unwrap();
+    assert!(tab_pardon.contains("was not found in your bounced list"));
+
+    let bare_paa = handler
+        .handle_command(protected, "pardon and allow")
+        .await
+        .unwrap();
+    assert!(bare_paa.contains("Usage: `pardon and allow <did|@handle>`"));
+
+    // 4. `status` queries SQL COUNT(*) without 100-row truncation (>100 bounces)
+    for idx in 0..105usize {
+        cache
+            .record_bounce(&BouncedUser {
+                subject_did: format!("did:plc:spam{idx:020}"),
+                protected_did: protected.to_string(),
+                listitem_uri: format!("at://{protected}/app.bsky.graph.listitem/r{idx}"),
+                listitem_rkey: format!("r{idx}"),
+                listitem_cid: format!("cid{idx}"),
+                category: "spam".to_string(),
+                confidence: 0.95,
+                reason: "bulk".to_string(),
+                post_uri: format!("at://did:plc:spam{idx:020}/app.bsky.feed.post/p{idx}"),
+                post_text: "spam".to_string(),
+                reply_to_uri: None,
+                bounced_at: 1_700_000_000 + idx as u64,
+                expires_at: None,
+            })
+            .unwrap();
+    }
+    let status_reply = handler.handle_command(protected, "status").await.unwrap();
+    assert!(
+        status_reply.contains("Accounts Bounced from Your Posts: 105"),
+        "expected full count 105, got: {status_reply}"
+    );
+
+    // 5. `allowlist [page]` pagination & formatted ISO-8601 dates
+    for idx in 0..12usize {
+        cache
+            .add_to_allowlist(protected, &format!("did:plc:ally{idx:020}"), None)
+            .unwrap();
+    }
+    let page1 = handler
+        .handle_command(protected, "allowlist")
+        .await
+        .unwrap();
+    assert!(page1.contains("12 accounts"));
+    assert!(page1.contains("Page 1/2"), "page1={page1}");
+    assert!(page1.contains("allowlist 2"));
+    assert!(
+        page1.contains('T') && page1.contains('Z'),
+        "expected ISO-8601 timestamp in {page1}"
+    );
+
+    let page2 = handler
+        .handle_command(protected, "allowlist 2")
+        .await
+        .unwrap();
+    assert!(page2.contains("Page 2/2"), "page2={page2}");
+
+    let bad_page = handler
+        .handle_command(protected, "allowlist 99")
+        .await
+        .unwrap();
+    assert!(bad_page.contains("Invalid page"));
+
+    let bad_lock_did = handler
+        .handle_command(
+            protected,
+            "lock https://bsky.app/profile/did:plc:short/post/3abc",
+        )
+        .await
+        .unwrap();
+    assert!(bad_lock_did.contains("Invalid DID syntax in post URL"));
+}
+
+#[tokio::test]
+async fn test_handler_cmd_test_limits_prefilter_parity_and_dm_ping_pong_guards() {
+    use async_trait::async_trait;
+    use skybouncer::classifier::Classifier;
+
+    struct SlowMockClassifier {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Classifier for SlowMockClassifier {
+        async fn classify_with_rubric(
+            &self,
+            _interaction: &skybouncer::matcher::Interaction,
+            _rubric: Option<&RuleRubric>,
+        ) -> Result<Verdict, skybouncer::SkybouncerError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(Verdict::permitted("ok"))
+        }
+    }
+
+    // 1. `enable_heuristic_prefilter = false` is respected by `cmd_test` (even heuristic-triggering text runs classifier)
+    //    AND semaphore saturation + per-DID rate limit + text length cap all trigger cleanly.
+    let protected = "did:plc:protectedaaaaaaaaaaaaaaa";
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist_manager =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let pds = MockPdsServer::start().await;
+    let pds_client = Arc::new(pds.pds_client(protected));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let slow_classifier = Arc::new(SlowMockClassifier {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    });
+
+    let config = SkybouncerConfig::new([protected], rubric).with_enable_heuristic_prefilter(false);
+    let engine = Arc::new(
+        SkybouncerEngine::builder(config)
+            .with_follow_graph(follow_graph)
+            .with_gate(gate)
+            .with_cache(cache)
+            .with_modlist_manager(modlist_manager)
+            .with_pds_client(pds_client)
+            .with_classifier(slow_classifier)
+            .build()
+            .unwrap(),
+    );
+    let handler = Arc::new(
+        BotCommandHandler::new(Arc::clone(&engine), "did:plc:botbotbotbotbotbotbotbot")
+            .with_test_limits(2, Duration::from_secs(60), 1),
+    );
+
+    // Oversized text rejected immediately
+    let too_long = handler
+        .handle_command(protected, &format!("test {}", "z".repeat(2005)))
+        .await
+        .unwrap();
+    assert!(too_long.contains("exceeds maximum length"));
+
+    // Hold permit #1 with heuristic-looking text; because heuristic prefilter is disabled,
+    // it falls through to SlowMockClassifier and holds the semaphore!
+    let h1 = Arc::clone(&handler);
+    let task1 = tokio::spawn(async move {
+        h1.handle_command(protected, "test Claim free crypto airdrop giveaway now!")
+            .await
+            .unwrap()
+    });
+    started.notified().await;
+
+    // Concurrent `test` sees semaphore saturation
+    let busy = handler
+        .handle_command(protected, "test concurrent")
+        .await
+        .unwrap();
+    assert!(busy.contains("currently busy"), "busy={busy}");
+
+    release.notify_one();
+    let res1 = task1.await.unwrap();
+    assert!(
+        res1.contains("PERMITTED"),
+        "with heuristic prefilter disabled, mock permitted verdict must win: {res1}"
+    );
+
+    // 3rd `test` hits per-DID rate limit (max=2)
+    let rl_test = handler
+        .handle_command(protected, "test third")
+        .await
+        .unwrap();
+    assert!(rl_test.contains("Rate limit reached"), "rl_test={rl_test}");
+
+    // 2. Unknown command echo truncated to <= 60 chars, unknown cooldown suppresses repeat,
+    //    and overall DM sender rate limit sends NotifyOnce then Suppress.
+    let (engine2, _c2, _p2) = setup_test_engine(protected).await;
+    let dm_handler = BotCommandHandler::new(engine2, "did:plc:botbotbotbotbotbotbotbot")
+        .with_dm_rate_limit(3, Duration::from_secs(60), Duration::from_secs(60));
+
+    let long_unknown = format!("frobnicate_{}", "q".repeat(120));
+    let u1 = dm_handler
+        .handle_command(protected, &long_unknown)
+        .await
+        .unwrap();
+    assert!(u1.contains("Unknown command"));
+    assert!(
+        !u1.contains(&"q".repeat(70)),
+        "echo must be truncated to 60 chars: {u1}"
+    );
+
+    // Second unknown command within cooldown is suppressed ("")
+    let u2 = dm_handler
+        .handle_command(protected, "another_unknown")
+        .await
+        .unwrap();
+    assert!(
+        u2.is_empty(),
+        "unknown-command cooldown should suppress: {u2}"
+    );
+
+    // Known command #3 is allowed, #4 hits NotifyOnce, #5 is suppressed
+    let h3 = dm_handler.handle_command(protected, "help").await.unwrap();
+    assert!(h3.contains("Commands"));
+    let h4 = dm_handler.handle_command(protected, "help").await.unwrap();
+    assert!(h4.contains("Too many direct messages"));
+    let h5 = dm_handler.handle_command(protected, "help").await.unwrap();
+    assert!(
+        h5.is_empty(),
+        "5th DM should be suppressed after NotifyOnce"
     );
 }

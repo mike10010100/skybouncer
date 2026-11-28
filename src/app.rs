@@ -429,6 +429,12 @@ pub async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
                     "Failed to fetch offline simulation image '{img_url}': {e}"
                 ))
             })?;
+        if !crate::enricher::is_valid_image_magic_bytes(&bytes) {
+            return Err(SkybouncerError::Config(
+                "Fetched simulation image URL does not contain a valid image (expected JPEG, PNG, GIF, or WebP)"
+                    .to_string(),
+            ));
+        }
         (
             Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
             true,

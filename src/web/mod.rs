@@ -9,7 +9,7 @@ pub mod api;
 pub mod oauth;
 pub mod ui;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use axum::Router;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 pub use api::{
     auth_preview, auth_typeahead, get_prometheus_metrics, health_check, resolve_identity,
@@ -51,6 +51,63 @@ pub const DEFAULT_WEB_HOST: &str = "127.0.0.1";
 /// Default TCP port for the web dashboard (3000).
 pub const DEFAULT_WEB_PORT: u16 = 3000;
 
+/// Default HTTP request timeout applied across the Axum router (130 seconds, matching Nginx).
+const DEFAULT_WEB_REQUEST_TIMEOUT: Duration = Duration::from_secs(130);
+
+/// Default Hyper HTTP/1 header-read timeout mitigating Slowloris connection exhaustion.
+const DEFAULT_HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default maximum concurrent in-flight HTTP requests across the web router.
+const DEFAULT_WEB_CONCURRENCY_LIMIT: usize = 128;
+
+/// Default maximum request body size across routes without a dedicated override (64 KiB).
+const DEFAULT_WEB_BODY_LIMIT_BYTES: usize = 64 * 1024;
+
+/// Parses a `TRUSTED_PROXY_HEADER` configuration value, accepting only known client-IP
+/// proxy headers (`cf-connecting-ip`, `x-real-ip`, or `x-forwarded-for`).
+#[must_use]
+pub fn parse_trusted_proxy_header(raw: &str) -> Option<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    match normalized.as_str() {
+        "cf-connecting-ip" | "x-real-ip" | "x-forwarded-for" => Some(normalized),
+        other => {
+            warn!(
+                header = %other,
+                "Ignoring unsupported TRUSTED_PROXY_HEADER (expected cf-connecting-ip, x-real-ip, or x-forwarded-for)"
+            );
+            None
+        }
+    }
+}
+
+/// Parses a comma-separated `TRUSTED_PROXIES` list supporting both single IP addresses
+/// (e.g. `127.0.0.1`, `::1`) and CIDR blocks (e.g. `172.21.0.0/16`).
+#[must_use]
+pub fn parse_trusted_proxies(raw: &str) -> Vec<ipnet::IpNet> {
+    let mut out = Vec::new();
+    for entry in raw.split(',') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(net) = trimmed.parse::<ipnet::IpNet>() {
+            out.push(net);
+        } else if let Ok(ip) = trimmed.parse::<IpAddr>() {
+            let canon = match ip {
+                IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+                v4 => v4,
+            };
+            out.push(ipnet::IpNet::from(canon));
+        } else {
+            warn!(entry = %trimmed, "Ignoring invalid IP/CIDR entry in TRUSTED_PROXIES");
+        }
+    }
+    out
+}
+
 /// Configuration options for the embedded web dashboard server.
 #[derive(Debug, Clone)]
 pub struct WebServerConfig {
@@ -64,6 +121,10 @@ pub struct WebServerConfig {
     pub client_id: Option<String>,
     /// Optional custom OAuth redirect URI (defaults to `{public_url}/oauth/callback`).
     pub redirect_uri: Option<String>,
+    /// Optional trusted reverse-proxy client-IP header (`cf-connecting-ip`, `x-real-ip`, or `x-forwarded-for`).
+    pub trusted_proxy_header: Option<String>,
+    /// Trusted proxy IP/CIDR allowlist required before honoring `trusted_proxy_header`.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 impl Default for WebServerConfig {
@@ -74,6 +135,8 @@ impl Default for WebServerConfig {
             public_url: format!("http://{DEFAULT_WEB_HOST}:{DEFAULT_WEB_PORT}"),
             client_id: None,
             redirect_uri: None,
+            trusted_proxy_header: None,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -90,6 +153,8 @@ impl WebServerConfig {
             public_url,
             client_id: None,
             redirect_uri: None,
+            trusted_proxy_header: None,
+            trusted_proxies: Vec::new(),
         }
     }
 
@@ -109,6 +174,20 @@ impl WebServerConfig {
     ) -> Self {
         self.client_id = Some(client_id.into());
         self.redirect_uri = Some(redirect_uri.into());
+        self
+    }
+
+    /// Configures the trusted reverse-proxy client-IP header (e.g. `"cf-connecting-ip"`).
+    #[must_use]
+    pub fn with_trusted_proxy_header(mut self, header: impl Into<String>) -> Self {
+        self.trusted_proxy_header = parse_trusted_proxy_header(&header.into());
+        self
+    }
+
+    /// Configures the trusted reverse-proxy IP/CIDR allowlist.
+    #[must_use]
+    pub fn with_trusted_proxies(mut self, proxies: Vec<ipnet::IpNet>) -> Self {
+        self.trusted_proxies = proxies;
         self
     }
 
@@ -145,12 +224,22 @@ impl WebServerConfig {
         let redirect_uri =
             crate::env::var(&["OAUTH_REDIRECT_URI", "SKYBOUNCER_OAUTH_REDIRECT_URI"]);
 
+        let trusted_proxy_header =
+            crate::env::var(&["TRUSTED_PROXY_HEADER", "SKYBOUNCER_TRUSTED_PROXY_HEADER"])
+                .and_then(|v| parse_trusted_proxy_header(&v));
+
+        let trusted_proxies = crate::env::var(&["TRUSTED_PROXIES", "SKYBOUNCER_TRUSTED_PROXIES"])
+            .map(|v| parse_trusted_proxies(&v))
+            .unwrap_or_default();
+
         Self {
             host,
             port,
             public_url,
             client_id,
             redirect_uri,
+            trusted_proxy_header,
+            trusted_proxies,
         }
     }
 }
@@ -188,20 +277,40 @@ pub fn create_web_router_with_public_url(
     metadata: OAuthClientMetadata,
     public_url: impl Into<String>,
 ) -> Router {
-    let public_url = public_url.into().trim_end_matches('/').to_string();
+    let config = WebServerConfig::default().with_public_url(public_url);
+    create_web_router_with_config(engine, oauth_client, metadata, &config)
+}
+
+/// Constructs the full Axum router from an explicit [`WebServerConfig`] (including
+/// `public_url`, `trusted_proxy_header`, and `trusted_proxies`).
+pub fn create_web_router_with_config(
+    engine: Arc<SkybouncerEngine>,
+    oauth_client: Option<Arc<AtprotoOAuthClient>>,
+    metadata: OAuthClientMetadata,
+    config: &WebServerConfig,
+) -> Router {
+    let public_url = config.public_url.trim_end_matches('/').to_string();
     if let Some(ref c) = oauth_client {
         if engine.oauth_client().is_none() {
             engine.set_oauth_client(Arc::clone(c));
         }
     }
 
-    let api_state = ApiState::new(Arc::clone(&engine)).with_public_url(public_url.clone());
+    let api_state = ApiState::new(Arc::clone(&engine))
+        .with_public_url(public_url.clone())
+        .with_trusted_proxy(
+            config.trusted_proxy_header.clone(),
+            config.trusted_proxies.clone(),
+        );
 
     let oauth_state = OAuthState {
         oauth_client,
         metadata,
         engine: Some(Arc::clone(&engine)),
         public_url,
+        oauth_login_limiter: Arc::new(GuestSandboxLimiter::new(15, 150, Duration::from_secs(60))),
+        trusted_proxy_header: config.trusted_proxy_header.clone(),
+        trusted_proxies: config.trusted_proxies.clone(),
     };
 
     let api_router = Router::new()
@@ -266,7 +375,10 @@ pub fn create_web_router_with_public_url(
     Router::new()
         .route("/", get(ui::serve_dashboard))
         .route("/auth", get(oauth::auth_redirect))
-        .route("/healthz", get(api::health_check))
+        .route(
+            "/healthz",
+            get(api::health_check).with_state(api_state.clone()),
+        )
         .route(
             "/metrics",
             get(api::get_prometheus_metrics).with_state(api_state),
@@ -277,6 +389,16 @@ pub fn create_web_router_with_public_url(
         )
         .nest("/api", api_router)
         .nest("/oauth", oauth_router)
+        .layer(axum::extract::DefaultBodyLimit::max(
+            DEFAULT_WEB_BODY_LIMIT_BYTES,
+        ))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            DEFAULT_WEB_REQUEST_TIMEOUT,
+        ))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(
+            DEFAULT_WEB_CONCURRENCY_LIMIT,
+        ))
         .layer(cors)
         .layer(axum::middleware::from_fn_with_state(
             is_https,
@@ -460,7 +582,7 @@ pub async fn run_web_server(
         (client, meta)
     };
 
-    let app = create_web_router_with_public_url(engine, oauth_client, metadata, &config.public_url);
+    let app = create_web_router_with_config(engine, oauth_client, metadata, &config);
 
     let addr_str = format!("{}:{}", config.host, config.port);
     let addr: SocketAddr = addr_str.parse().map_err(|e| {
@@ -477,13 +599,60 @@ pub async fn run_web_server(
         SkybouncerError::Config(format!("Failed to bind TCP listener on {addr}: {e}"))
     })?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            cancel.cancelled().await;
-            info!("Web dashboard server received cancellation; shutting down");
-        })
-        .await
-        .map_err(|e| SkybouncerError::Config(format!("Web server failure: {e}")))?;
+    let mut http1 = hyper::server::conn::http1::Builder::new();
+    http1
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(DEFAULT_HTTP1_HEADER_READ_TIMEOUT);
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("Web dashboard server received cancellation; shutting down");
+                break;
+            }
+            accepted = listener.accept() => {
+                let (stream, peer_addr) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to accept incoming HTTP connection");
+                        continue;
+                    }
+                };
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let router = app.clone();
+                let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let router_inner = router.clone();
+                    async move {
+                        use tower::ServiceExt;
+                        let (mut parts, body) = req.into_parts();
+                        parts.extensions.insert(axum::extract::ConnectInfo(peer_addr));
+                        let axum_req = axum::http::Request::from_parts(parts, axum::body::Body::new(body));
+                        let resp = match router_inner.oneshot(axum_req).await {
+                            Ok(r) => r,
+                            Err(infallible) => match infallible {},
+                        };
+                        Ok::<_, std::convert::Infallible>(resp)
+                    }
+                });
+                let conn = http1.serve_connection(io, service);
+                let fut = graceful.watch(conn);
+                tokio::spawn(async move {
+                    if let Err(e) = fut.await {
+                        tracing::debug!(error = %e, peer = %peer_addr, "HTTP connection closed with error");
+                    }
+                });
+            }
+        }
+    }
+
+    tokio::select! {
+        _ = graceful.shutdown() => {}
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {
+            warn!("Timed out waiting for active HTTP connections to close during shutdown");
+        }
+    }
 
     Ok(())
 }
@@ -555,6 +724,56 @@ mod tests {
         assert_eq!(json_val["token_endpoint_auth_method"], "private_key_jwt");
         assert_eq!(json_val["token_endpoint_auth_signing_alg"], "ES256");
         assert_eq!(json_val["jwks"]["keys"][0]["kid"], expected_kid);
+    }
+
+    #[test]
+    fn parse_trusted_proxy_header_and_proxies_validate_inputs() {
+        assert_eq!(
+            parse_trusted_proxy_header("  CF-Connecting-IP "),
+            Some("cf-connecting-ip".to_string())
+        );
+        assert_eq!(
+            parse_trusted_proxy_header("X-Real-IP"),
+            Some("x-real-ip".to_string())
+        );
+        assert_eq!(
+            parse_trusted_proxy_header("x-forwarded-for"),
+            Some("x-forwarded-for".to_string())
+        );
+        assert_eq!(parse_trusted_proxy_header(""), None);
+        assert_eq!(parse_trusted_proxy_header("x-evil-custom-header"), None);
+
+        let parsed =
+            parse_trusted_proxies("127.0.0.1, ::1/128, 172.21.0.0/16, ::ffff:10.0.0.1, not-an-ip");
+        assert_eq!(parsed.len(), 4);
+        assert!(parsed[0].contains(&"127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(parsed[2].contains(&"172.21.5.4".parse::<IpAddr>().unwrap()));
+        assert!(parsed[3].contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn web_server_config_from_env_reads_trusted_proxy_settings() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_hdr = std::env::var_os("TRUSTED_PROXY_HEADER");
+        let saved_proxies = std::env::var_os("TRUSTED_PROXIES");
+        std::env::set_var("TRUSTED_PROXY_HEADER", "cf-connecting-ip");
+        std::env::set_var("TRUSTED_PROXIES", "172.21.0.0/16,127.0.0.1");
+
+        let cfg = WebServerConfig::from_env();
+        assert_eq!(
+            cfg.trusted_proxy_header.as_deref(),
+            Some("cf-connecting-ip")
+        );
+        assert_eq!(cfg.trusted_proxies.len(), 2);
+
+        match saved_hdr {
+            Some(v) => std::env::set_var("TRUSTED_PROXY_HEADER", v),
+            None => std::env::remove_var("TRUSTED_PROXY_HEADER"),
+        }
+        match saved_proxies {
+            Some(v) => std::env::set_var("TRUSTED_PROXIES", v),
+            None => std::env::remove_var("TRUSTED_PROXIES"),
+        }
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

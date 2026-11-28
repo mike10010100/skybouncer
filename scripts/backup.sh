@@ -17,18 +17,22 @@ set -euo pipefail
 
 # ------------------------------- Configuration --------------------------------
 # Overridable via environment variables (e.g. in cron).
-BACKUP_DIR="${SKYBOUNCER_BACKUP_DIR:-/home/mike10010100/backups/skybouncer}"
+BACKUP_DIR="${SKYBOUNCER_BACKUP_DIR:-${HOME}/backups/skybouncer}"
 RETAIN="${SKYBOUNCER_BACKUP_RETAIN:-5}"
 VOLUME_NAME="${SKYBOUNCER_VOLUME:-skybouncer_data}"
 DB_NAME="${SKYBOUNCER_DB_NAME:-skybouncer.db}"
 IMAGE="${SKYBOUNCER_IMAGE:-skybouncer:latest}"
 LOCK_FILE="${SKYBOUNCER_BACKUP_LOCK:-${BACKUP_DIR}/.backup.lock}"
 
-# Preserve ownership of created files to the invoking user (cron runs as them).
-HOST_UID="$(id -u)"
-HOST_GID="$(id -g)"
-STAMP="$(date +%F)"
+STAMP="$(date +%F-%H%M%S)"
 ARCHIVE_NAME="skybouncer-${STAMP}.db.gz"
+DEST_FILE="${BACKUP_DIR}/${ARCHIVE_NAME}"
+PART_FILE="${DEST_FILE}.part.$$"
+
+cleanup() {
+    rm -f "${PART_FILE:-}"
+}
+trap cleanup EXIT
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S%z')] $*"
@@ -50,7 +54,9 @@ if ! docker volume inspect "${VOLUME_NAME}" >/dev/null 2>&1; then
     fail "Docker volume '${VOLUME_NAME}' not found."
 fi
 
+umask 077
 mkdir -p "${BACKUP_DIR}"
+chmod 0700 "${BACKUP_DIR}"
 
 # ------------------------------- Locking --------------------------------------
 # Prevent overlapping runs (e.g. a slow run and the next cron tick).
@@ -62,24 +68,18 @@ fi
 # ------------------------------- Backup ---------------------------------------
 log "Starting Skybouncer backup (volume=${VOLUME_NAME}, db=${DB_NAME}, retain=${RETAIN})"
 
-# The script runs inside the container as root so it can read the appuser-owned
-# volume files and delete/prune older backups, then chowns outputs to the host
-# user so crontab-owned retention works. The trailing `; exit` ensures the
-# container reflects any failure in the embedded script.
+# Run inside the container as appuser (10001:10001) mounting ONLY the data volume so
+# WAL/SHM files never become root-owned, and stream verified gzipped bytes to stdout
+# into a host-owned 0600 archive.
 docker run --rm \
-    --user 0:0 \
+    --user 10001:10001 \
     -v "${VOLUME_NAME}:/data" \
-    -v "${BACKUP_DIR}:/backup" \
-    -e "BACKUP_ARCHIVE=${ARCHIVE_NAME}" \
-    -e "BACKUP_RETAIN=${RETAIN}" \
     -e "BACKUP_DB_NAME=${DB_NAME}" \
-    -e "BACKUP_HOST_UID=${HOST_UID}" \
-    -e "BACKUP_HOST_GID=${HOST_GID}" \
     --entrypoint sh "${IMAGE}" -c '
         set -eu
         SRC="/data/${BACKUP_DB_NAME}"
-        TMP="/backup/.${BACKUP_ARCHIVE%.gz}.tmp"
-        DEST="/backup/${BACKUP_ARCHIVE}"
+        TMP="/tmp/skybouncer-backup.$$.db"
+        trap '\''rm -f "${TMP}" "${TMP}-journal" "${TMP}-wal" "${TMP}-shm"'\'' EXIT
 
         if [ ! -f "${SRC}" ]; then
             echo "ERROR: database not found at ${SRC}" >&2
@@ -88,40 +88,34 @@ docker run --rm \
 
         # 1. Consistent online backup (safe while WAL-mode DB is in use).
         rm -f "${TMP}" "${TMP}-journal" "${TMP}-wal" "${TMP}-shm"
-        sqlite3 "${SRC}" ".backup ${TMP}"
+        sqlite3 -cmd ".timeout 5000" "${SRC}" ".backup ${TMP}"
 
-        # 2. Verify the backup is not corrupt before we trust it.
+        # 2. Verify the backup is not corrupt before streaming.
         INTEGRITY="$(sqlite3 "${TMP}" "PRAGMA integrity_check;")"
         if [ "${INTEGRITY}" != "ok" ]; then
             echo "ERROR: integrity_check failed on backup: ${INTEGRITY}" >&2
-            rm -f "${TMP}"
             exit 1
         fi
 
-        # 3. Compress atomically.
-        gzip -c "${TMP}" > "${DEST}.part"
-        mv "${DEST}.part" "${DEST}"
-        rm -f "${TMP}"
+        # 3. Stream compressed archive to stdout.
+        gzip -c "${TMP}"
+    ' > "${PART_FILE}"
 
-        # 4. Prune to the newest ${BACKUP_RETAIN} snapshots.
-        cd /backup
-        KEEP="${BACKUP_RETAIN}"
-        # Newest-first by filename (date-stamped), drop everything past the cap.
-        ls -1 skybouncer-*.db.gz 2>/dev/null | sort -r | tail -n +"$((KEEP + 1))" | while IFS= read -r old; do
-            echo "Pruning old backup: ${old}"
-            rm -f -- "${old}"
-        done
+mv "${PART_FILE}" "${DEST_FILE}"
+chmod 0600 "${DEST_FILE}"
 
-        # 5. Restore host ownership on remaining artifacts.
-        chown "${BACKUP_HOST_UID}:${BACKUP_HOST_GID}" "${DEST}" 2>/dev/null || true
-        chown "${BACKUP_HOST_UID}:${BACKUP_HOST_GID}" skybouncer-*.db.gz 2>/dev/null || true
-    '
+# Prune to the newest ${RETAIN} snapshots on host.
+while IFS= read -r old; do
+    [ -n "${old}" ] || continue
+    log "Pruning old backup: ${old}"
+    rm -f -- "${BACKUP_DIR}/${old}"
+done < <(find "${BACKUP_DIR}" -maxdepth 1 -type f -name 'skybouncer-*.db.gz' -printf '%f\n' | sort -r | tail -n +"$((RETAIN + 1))")
 
 # ------------------------------- Postflight -----------------------------------
-[ -f "${BACKUP_DIR}/${ARCHIVE_NAME}" ] || fail "Backup archive was not created: ${BACKUP_DIR}/${ARCHIVE_NAME}"
+[ -f "${DEST_FILE}" ] || fail "Backup archive was not created: ${DEST_FILE}"
 
-SIZE="$(du -h "${BACKUP_DIR}/${ARCHIVE_NAME}" | cut -f1)"
-log "Backup complete: ${BACKUP_DIR}/${ARCHIVE_NAME} (${SIZE})"
+SIZE="$(du -h "${DEST_FILE}" | cut -f1)"
+log "Backup complete: ${DEST_FILE} (${SIZE})"
 
 REMAINING="$(find "${BACKUP_DIR}" -maxdepth 1 -type f -name 'skybouncer-*.db.gz' | wc -l | tr -d ' ')"
 log "Retained ${REMAINING} snapshot(s) in ${BACKUP_DIR}"

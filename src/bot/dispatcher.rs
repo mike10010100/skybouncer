@@ -4,7 +4,9 @@
 //! resolves or establishes direct chat conversations with protected target users, and sends
 //! structured, actionable moderation alerts with one-click pardon instructions.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -18,6 +20,77 @@ use crate::engine::{BounceNotification, ReauthNotification};
 use crate::error::SkybouncerError;
 use crate::tenant::TenantRegistry;
 use skybase::chat::ChatClient;
+
+const MAX_CONVO_CACHE_ENTRIES: usize = 4096;
+const REAUTH_BACKOFF_BASE_SECS: u64 = 120;
+const REAUTH_BACKOFF_MAX_SECS: u64 = 86_400;
+
+/// In-memory `did -> convo_id` cache eliminating redundant `getConvoForMembers` RPCs.
+#[derive(Debug, Default)]
+pub(crate) struct ConvoIdCache {
+    entries: HashMap<String, String>,
+}
+
+impl ConvoIdCache {
+    pub(crate) async fn resolve(
+        &mut self,
+        client: &ChatClient,
+        did: &str,
+    ) -> Result<String, skybase::SkybaseError> {
+        if let Some(convo_id) = self.entries.get(did) {
+            return Ok(convo_id.clone());
+        }
+        let convo_id = client.find_or_create_convo_for_did(did).await?;
+        if self.entries.len() >= MAX_CONVO_CACHE_ENTRIES {
+            self.entries.clear();
+        }
+        self.entries.insert(did.to_string(), convo_id.clone());
+        Ok(convo_id)
+    }
+
+    pub(crate) fn invalidate(&mut self, did: &str) {
+        self.entries.remove(did);
+    }
+}
+
+/// Exponential backoff tracker for tenants whose DMs are closed or failing delivery.
+#[derive(Debug, Default)]
+pub(crate) struct DeliveryBackoff {
+    failures: HashMap<String, (u32, Instant)>,
+}
+
+impl DeliveryBackoff {
+    pub(crate) fn should_skip(&self, did: &str, now: Instant) -> bool {
+        self.failures
+            .get(did)
+            .is_some_and(|(_, next_at)| now < *next_at)
+    }
+
+    pub(crate) fn record_failure(&mut self, did: &str, now: Instant) -> Duration {
+        let count = self
+            .failures
+            .get(did)
+            .map_or(1, |(prev, _)| prev.saturating_add(1));
+        let shift = count.saturating_sub(1).min(10);
+        let secs = REAUTH_BACKOFF_BASE_SECS
+            .saturating_mul(1u64 << shift)
+            .min(REAUTH_BACKOFF_MAX_SECS);
+        let delay = Duration::from_secs(secs);
+        let next_at = now.checked_add(delay).unwrap_or(now);
+        if self.failures.len() >= MAX_CONVO_CACHE_ENTRIES && !self.failures.contains_key(did) {
+            self.failures.retain(|_, (_, until)| now < *until);
+            if self.failures.len() >= MAX_CONVO_CACHE_ENTRIES {
+                self.failures.clear();
+            }
+        }
+        self.failures.insert(did.to_string(), (count, next_at));
+        delay
+    }
+
+    pub(crate) fn record_success(&mut self, did: &str) {
+        self.failures.remove(did);
+    }
+}
 
 /// Formats a proactive ATProto direct message alert for a bounced violator.
 #[must_use]
@@ -273,9 +346,9 @@ pub fn format_reauth_alert_with_count(
     notify_count: u32,
 ) -> String {
     let account = account_label(&notification.target_did, notification.handle.as_deref());
-    let base = public_url.trim_end_matches('/');
+    let base = public_url.trim().trim_end_matches('/');
     let auth_url = if base.is_empty() {
-        "https://skybouncer.mike10010100.com/?auth=login".to_string()
+        "your Skybouncer web dashboard (/?auth=login)".to_string()
     } else {
         format!("{base}/?auth=login")
     };
@@ -315,8 +388,15 @@ async fn deliver_reauth_dm(
     tenant_registry: &TenantRegistry,
     notification: &ReauthNotification,
     public_url: &str,
+    convo_cache: &mut ConvoIdCache,
+    backoff: &mut DeliveryBackoff,
 ) -> bool {
     let target_did = &notification.target_did;
+    let now = Instant::now();
+    if backoff.should_skip(target_did, now) {
+        debug!(target = %target_did, "Skipping re-authentication DM due to closed-DM exponential backoff");
+        return false;
+    }
     if !tenant_registry
         .is_reauth_notification_pending(target_did)
         .unwrap_or(false)
@@ -332,9 +412,10 @@ async fn deliver_reauth_dm(
         "Dispatching proactive OAuth re-authentication alert DM"
     );
 
-    match client.find_or_create_convo_for_did(target_did).await {
-        Ok(convo_id) => match client.send_message(&convo_id, &alert_text).await {
-            Ok(_) => {
+    match convo_cache.resolve(client, target_did).await {
+        Ok(convo_id) => match send_dm_chunked(client, &convo_id, &alert_text).await {
+            Ok(()) => {
+                backoff.record_success(target_did);
                 if let Err(e) = tenant_registry.mark_reauth_notified(target_did) {
                     warn!(
                         error = %e,
@@ -350,19 +431,24 @@ async fn deliver_reauth_dm(
                 true
             }
             Err(e) => {
+                convo_cache.invalidate(target_did);
+                let delay = backoff.record_failure(target_did, Instant::now());
                 warn!(
                     error = %e,
                     target = %target_did,
-                    "Failed to send proactive DM re-authentication alert"
+                    backoff_secs = delay.as_secs(),
+                    "Failed to send proactive DM re-authentication alert; backing off"
                 );
                 false
             }
         },
         Err(e) => {
+            let delay = backoff.record_failure(target_did, Instant::now());
             warn!(
                 error = %e,
                 target = %target_did,
-                "Could not locate chat conversation to deliver proactive DM re-authentication alert"
+                backoff_secs = delay.as_secs(),
+                "Could not locate chat conversation to deliver proactive DM re-authentication alert; backing off"
             );
             false
         }
@@ -388,6 +474,9 @@ pub async fn run_reauth_alert_dispatcher(
 ) -> Result<(), SkybouncerError> {
     info!("Starting proactive ATProto DM re-authentication alert dispatcher worker");
 
+    let mut convo_cache = ConvoIdCache::default();
+    let mut backoff = DeliveryBackoff::default();
+
     if let Ok(pending) = tenant_registry.list_pending_reauth_notifications() {
         for (did, handle) in pending {
             if cancel.is_cancelled() {
@@ -397,7 +486,15 @@ pub async fn run_reauth_alert_dispatcher(
                 target_did: did,
                 handle,
             };
-            deliver_reauth_dm(&client, &tenant_registry, &notification, &public_url).await;
+            deliver_reauth_dm(
+                &client,
+                &tenant_registry,
+                &notification,
+                &public_url,
+                &mut convo_cache,
+                &mut backoff,
+            )
+            .await;
         }
     }
 
@@ -416,7 +513,15 @@ pub async fn run_reauth_alert_dispatcher(
             received = reauth_rx.recv() => {
                 match received {
                     Ok(notification) => {
-                        deliver_reauth_dm(&client, &tenant_registry, &notification, &public_url).await;
+                        deliver_reauth_dm(
+                            &client,
+                            &tenant_registry,
+                            &notification,
+                            &public_url,
+                            &mut convo_cache,
+                            &mut backoff,
+                        )
+                        .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
                         warn!(missed = missed, "Re-authentication alert dispatcher lagged behind event stream");
@@ -429,7 +534,15 @@ pub async fn run_reauth_alert_dispatcher(
                                     target_did: did,
                                     handle,
                                 };
-                                deliver_reauth_dm(&client, &tenant_registry, &notif, &public_url).await;
+                                deliver_reauth_dm(
+                                    &client,
+                                    &tenant_registry,
+                                    &notif,
+                                    &public_url,
+                                    &mut convo_cache,
+                                    &mut backoff,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -449,7 +562,15 @@ pub async fn run_reauth_alert_dispatcher(
                             target_did: did,
                             handle,
                         };
-                        deliver_reauth_dm(&client, &tenant_registry, &notif, &public_url).await;
+                        deliver_reauth_dm(
+                            &client,
+                            &tenant_registry,
+                            &notif,
+                            &public_url,
+                            &mut convo_cache,
+                            &mut backoff,
+                        )
+                        .await;
                     }
                 }
             }
@@ -469,6 +590,7 @@ pub async fn run_bounce_alert_dispatcher(
     cancel: CancellationToken,
 ) -> Result<(), SkybouncerError> {
     info!("Starting proactive ATProto DM bounce alert dispatcher worker");
+    let mut convo_cache = ConvoIdCache::default();
 
     while !cancel.is_cancelled() {
         tokio::select! {
@@ -485,9 +607,10 @@ pub async fn run_bounce_alert_dispatcher(
 
                         debug!(target = %target_did, violator = %notification.violator_did, "Dispatching proactive bounce alert DM");
 
-                        match client.find_or_create_convo_for_did(&target_did).await {
+                        match convo_cache.resolve(&client, &target_did).await {
                             Ok(convo_id) => {
                                 if let Err(e) = send_dm_chunked(&client, &convo_id, &alert_text).await {
+                                    convo_cache.invalidate(&target_did);
                                     warn!(error = %e, target = %target_did, "Failed to send proactive DM bounce alert");
                                 } else {
                                     info!(target = %target_did, violator = %notification.violator_did, "Proactive DM bounce alert delivered successfully");
@@ -523,6 +646,7 @@ pub async fn run_storm_alert_dispatcher(
     cancel: CancellationToken,
 ) -> Result<(), SkybouncerError> {
     info!("Starting proactive ATProto DM dogpile storm alert dispatcher worker");
+    let mut convo_cache = ConvoIdCache::default();
 
     while !cancel.is_cancelled() {
         tokio::select! {
@@ -539,9 +663,10 @@ pub async fn run_storm_alert_dispatcher(
 
                         debug!(target = %target_did, focal = %notification.storm.focal_post_uri, "Dispatching proactive DM dogpile storm alert");
 
-                        match client.find_or_create_convo_for_did(&target_did).await {
+                        match convo_cache.resolve(&client, &target_did).await {
                             Ok(convo_id) => {
                                 if let Err(e) = send_dm_chunked(&client, &convo_id, &alert_text).await {
+                                    convo_cache.invalidate(&target_did);
                                     warn!(error = %e, target = %target_did, "Failed to send proactive DM storm alert");
                                 } else {
                                     info!(target = %target_did, focal = %notification.storm.focal_post_uri, "Proactive DM storm alert delivered successfully");
@@ -577,6 +702,7 @@ pub async fn run_storm_digest_dispatcher(
     cancel: CancellationToken,
 ) -> Result<(), SkybouncerError> {
     info!("Starting proactive ATProto DM Storm Mode digest dispatcher worker");
+    let mut convo_cache = ConvoIdCache::default();
 
     while !cancel.is_cancelled() {
         tokio::select! {
@@ -593,9 +719,10 @@ pub async fn run_storm_digest_dispatcher(
 
                         debug!(target = %target_did, count = digest.bounced_count, "Dispatching proactive DM Storm Mode digest");
 
-                        match client.find_or_create_convo_for_did(&target_did).await {
+                        match convo_cache.resolve(&client, &target_did).await {
                             Ok(convo_id) => {
                                 if let Err(e) = send_dm_chunked(&client, &convo_id, &digest_text).await {
+                                    convo_cache.invalidate(&target_did);
                                     warn!(error = %e, target = %target_did, "Failed to send Storm Mode digest DM");
                                 } else {
                                     info!(target = %target_did, count = digest.bounced_count, "Storm Mode digest DM delivered successfully");
@@ -641,7 +768,8 @@ mod tests {
         assert!(text.contains("https://skybouncer.mike10010100.com/?auth=login"));
 
         let fallback_text = format_reauth_alert(&notif, "");
-        assert!(fallback_text.contains("https://skybouncer.mike10010100.com/?auth=login"));
+        assert!(!fallback_text.contains("mike10010100"));
+        assert!(fallback_text.contains("/?auth=login"));
 
         let reminder_1 =
             format_reauth_alert_with_count(&notif, "https://skybouncer.mike10010100.com/", 1);
@@ -1023,5 +1151,190 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         c_a2.cancel();
         h_a2.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_convo_id_cache_hits_and_invalidates() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/chat.bsky.convo.getConvoForMembers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "convo": {
+                    "id": "convo-cached-1",
+                    "rev": "1",
+                    "members": [{"did": "did:plc:alice"}],
+                    "muted": false,
+                    "unreadCount": 0
+                }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = ChatClient::new(server.uri(), "tok").unwrap();
+        let mut cache = ConvoIdCache::default();
+
+        // Miss -> RPC #1
+        assert_eq!(
+            cache.resolve(&client, "did:plc:alice").await.unwrap(),
+            "convo-cached-1"
+        );
+        // Hit -> no RPC
+        assert_eq!(
+            cache.resolve(&client, "did:plc:alice").await.unwrap(),
+            "convo-cached-1"
+        );
+        // Invalidate -> miss -> RPC #2
+        cache.invalidate("did:plc:alice");
+        assert_eq!(
+            cache.resolve(&client, "did:plc:alice").await.unwrap(),
+            "convo-cached-1"
+        );
+    }
+
+    #[test]
+    fn test_delivery_backoff_exponential_schedule_and_recovery() {
+        let mut backoff = DeliveryBackoff::default();
+        let t0 = Instant::now();
+        assert!(!backoff.should_skip("did:plc:alice", t0));
+
+        let d1 = backoff.record_failure("did:plc:alice", t0);
+        assert_eq!(d1, Duration::from_secs(120));
+        assert!(backoff.should_skip("did:plc:alice", t0 + Duration::from_secs(60)));
+        assert!(!backoff.should_skip("did:plc:alice", t0 + Duration::from_secs(120)));
+
+        let d2 = backoff.record_failure("did:plc:alice", t0);
+        assert_eq!(d2, Duration::from_secs(240));
+        let d3 = backoff.record_failure("did:plc:alice", t0);
+        assert_eq!(d3, Duration::from_secs(480));
+
+        backoff.record_success("did:plc:alice");
+        assert!(!backoff.should_skip("did:plc:alice", t0 + Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn test_deliver_reauth_dm_uses_backoff_and_chunked_delivery() {
+        use crate::tenant::{Tenant, TenantRegistry};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/chat.bsky.convo.getConvoForMembers"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Recipient DMs closed"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let registry = TenantRegistry::open_in_memory().unwrap();
+        registry
+            .register_or_update(&Tenant::new("did:plc:closeddms").with_handle("closed.bsky.social"))
+            .unwrap();
+        registry.mark_reauth_required("did:plc:closeddms").unwrap();
+
+        let client = ChatClient::new(server.uri(), "tok").unwrap();
+        let notif = ReauthNotification {
+            target_did: "did:plc:closeddms".to_string(),
+            handle: Some("closed.bsky.social".to_string()),
+        };
+        let mut convo_cache = ConvoIdCache::default();
+        let mut backoff = DeliveryBackoff::default();
+
+        // First attempt fails -> triggers backoff.
+        assert!(
+            !deliver_reauth_dm(
+                &client,
+                &registry,
+                &notif,
+                "https://bouncer.example",
+                &mut convo_cache,
+                &mut backoff,
+            )
+            .await
+        );
+        // Immediate second sweep skips without hitting the mock server again (expect(1)).
+        assert!(
+            !deliver_reauth_dm(
+                &client,
+                &registry,
+                &notif,
+                "https://bouncer.example",
+                &mut convo_cache,
+                &mut backoff,
+            )
+            .await
+        );
+
+        // Now test convo lookup succeeds, sendMessage fails (500 -> invalidates convo_cache & backs off),
+        // then sendMessage succeeds -> marks reauth notified & resets backoff.
+        let ok_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/chat.bsky.convo.getConvoForMembers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "convo": {
+                    "id": "convo-reauth-1",
+                    "rev": "1",
+                    "members": [{"did": "did:plc:reauthok"}],
+                    "muted": false,
+                    "unreadCount": 0
+                }
+            })))
+            .expect(2)
+            .mount(&ok_server)
+            .await;
+
+        let send_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sc = std::sync::Arc::clone(&send_calls);
+        Mock::given(method("POST"))
+            .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+            .respond_with(move |_req: &wiremock::Request| {
+                if sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(500).set_body_string("send err")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "id": "m-reauth-1",
+                        "rev": "2",
+                        "sender": {"did": "did:plc:bot"},
+                        "text": "ok",
+                        "sentAt": "2026-11-28T00:00:00Z"
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&ok_server)
+            .await;
+
+        registry
+            .register_or_update(&Tenant::new("did:plc:reauthok").with_handle("ok.bsky.social"))
+            .unwrap();
+        registry.mark_reauth_required("did:plc:reauthok").unwrap();
+        let ok_client = ChatClient::new(ok_server.uri(), "tok").unwrap();
+        let notif_ok = ReauthNotification {
+            target_did: "did:plc:reauthok".to_string(),
+            handle: Some("ok.bsky.social".to_string()),
+        };
+        let mut backoff2 = DeliveryBackoff::default();
+        assert!(
+            !deliver_reauth_dm(
+                &ok_client,
+                &registry,
+                &notif_ok,
+                "https://bouncer.example",
+                &mut convo_cache,
+                &mut backoff2,
+            )
+            .await
+        );
+        // Clear backoff2 manually to simulate elapsed backoff and verify convo_cache was invalidated -> RPC #2 & success!
+        backoff2.record_success("did:plc:reauthok");
+        assert!(
+            deliver_reauth_dm(
+                &ok_client,
+                &registry,
+                &notif_ok,
+                "https://bouncer.example",
+                &mut convo_cache,
+                &mut backoff2,
+            )
+            .await
+        );
     }
 }

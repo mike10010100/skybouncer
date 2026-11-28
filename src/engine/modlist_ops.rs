@@ -41,6 +41,15 @@ impl SkybouncerEngine {
         self.cache.list_recent_bounces_for(protected_did, limit)
     }
 
+    /// Counts total bounced violators recorded for `protected_did` via SQL `COUNT(*)`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if SQLite query fails.
+    pub fn count_bounced_for(&self, protected_did: &str) -> Result<usize, SkybouncerError> {
+        self.cache.count_bounced_for(protected_did)
+    }
+
     /// Pardons an account by deleting its listitems from the PDS and purging the cache.
     ///
     /// # Errors

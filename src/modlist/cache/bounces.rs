@@ -668,6 +668,20 @@ impl DeduplicationCache {
         Ok(usize::try_from(count.max(0)).unwrap_or(0))
     }
 
+    /// Counts the total number of bounced users recorded for `protected_did`.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the query fails.
+    pub fn count_bounced_for(&self, protected_did: &str) -> Result<usize, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare_cached("SELECT COUNT(*) FROM bounced_users WHERE protected_did = ?1;")?;
+        let count: i64 = stmt.query_row(params![protected_did], |row| row.get(0))?;
+        Ok(usize::try_from(count.max(0)).unwrap_or(0))
+    }
+
     /// Prunes archived `bounce_history` rows strictly older than `older_than_us`.
     ///
     /// # Errors

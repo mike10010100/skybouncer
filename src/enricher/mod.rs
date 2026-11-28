@@ -21,8 +21,10 @@ pub use timing::{
     parse_iso8601_utc_secs,
 };
 
+#[cfg(any(feature = "web", test))]
+pub(crate) use appview::is_valid_image_magic_bytes;
 #[cfg(test)]
-pub(crate) use appview::{is_valid_cdn_cid, is_valid_cdn_did, is_valid_image_magic_bytes};
+pub(crate) use appview::{is_valid_cdn_cid, is_valid_cdn_did};
 
 /// Default public Bluesky AppView endpoint for read-only XRPC resolution.
 pub const DEFAULT_APPVIEW_ENDPOINT: &str = "https://public.api.bsky.app";
