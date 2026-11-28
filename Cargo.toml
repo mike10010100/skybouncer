@@ -39,7 +39,7 @@ skyauth = "0.3.14"
 
 # HTTP Web Framework & Networking
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "query", "tokio", "macros", "http1"] }
-tower-http = { version = "0.6", optional = true, default-features = false, features = ["cors", "trace", "timeout", "limit", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.7", optional = true, default-features = false, features = ["cors", "trace", "timeout", "limit", "compression-gzip", "compression-br"] }
 tower = { version = "0.5", optional = true, default-features = false, features = ["limit", "util"] }
 hyper = { version = "1", optional = true, default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1", optional = true, default-features = false, features = ["tokio", "server", "server-graceful", "http1", "service"] }
