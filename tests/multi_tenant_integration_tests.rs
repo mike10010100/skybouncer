@@ -52,14 +52,17 @@ async fn setup_multi_tenant_engine() -> (
     let config = SkybouncerConfig::new(HashSet::<String>::new(), default_rubric)
         .with_enable_heuristic_prefilter(true);
 
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        follow_graph,
-        gate,
-        classifier,
-        modlist_manager,
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(
+            config,
+            follow_graph,
+            gate,
+            classifier,
+            modlist_manager,
+            pds_client,
+        )
+        .expect("multi-tenant test engine should initialize"),
+    );
 
     (engine, cache, pds)
 }
@@ -288,12 +291,39 @@ async fn test_web_auth_redirect_endpoint() {
 
 #[tokio::test]
 async fn test_temporary_ttl_timeout_pruning_in_engine() {
-    let (engine, cache, _pds) = setup_multi_tenant_engine().await;
+    let (engine, cache, pds) = setup_multi_tenant_engine().await;
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let oauth_client = Arc::new(
+        skyauth::client::AtprotoOAuthClient::builder()
+            .client_metadata(metadata)
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+    engine.set_oauth_client(oauth_client);
     let now_us = 1_720_000_000_000_000;
 
-    // Enroll a tenant
+    // Enroll a tenant with an OAuthSession pointing at the mock PDS
     let tenant_did = "did:plc:alice_tenant";
-    let tenant = Tenant::new(tenant_did).with_handle("alice.bsky.social");
+    let session = skyauth::session::OAuthSession::new(
+        tenant_did,
+        "at-test-access-token",
+        Some("rt-test-refresh-token".to_string()),
+        "DPoP",
+        Some("atproto".to_string()),
+        Some(3600),
+        skyauth::dpop::DPoPKey::generate(),
+        Some(pds.uri()),
+        Some(pds.uri()),
+        Some(format!("{}/oauth/token", pds.uri())),
+    )
+    .expect("session");
+    let tenant = Tenant::new(tenant_did)
+        .with_handle("alice.bsky.social")
+        .with_session(session);
     engine.enroll_tenant(tenant).expect("enroll");
 
     // Populate an expired temporary bounce
@@ -326,4 +356,251 @@ async fn test_temporary_ttl_timeout_pruning_in_engine() {
         .is_bounced_for(tenant_did, "did:plc:timed_out_spammer")
         .unwrap());
     assert_eq!(cache.count_bounced().expect("count"), 0);
+}
+
+#[tokio::test]
+async fn test_is_single_tenant_matrix_and_401_expired_token_refresh_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // 1. admin_did + 1 enrolled tenant => is_single_tenant() == false!
+    let pds1 = MockPdsServer::start().await;
+    let rubric = RuleRubric::new("Default", Sensitivity::Medium);
+    let mut cfg1 =
+        SkybouncerConfig::new(["did:plc:admin"], rubric.clone()).with_admin_did("did:plc:admin");
+    cfg1.protected_dids.insert("did:plc:tenant1".to_string());
+    let eng_admin_plus_1 = SkybouncerEngine::builder(cfg1)
+        .with_classifier(Arc::new(skybouncer::classifier::MockClassifier::new(
+            Verdict::permitted("ok"),
+        )))
+        .with_pds_client(Arc::new(pds1.pds_client("did:plc:admin")))
+        .build()
+        .unwrap();
+    eng_admin_plus_1
+        .enroll_tenant(Tenant::new("did:plc:tenant1"))
+        .unwrap();
+    assert!(!eng_admin_plus_1.is_single_tenant());
+
+    // 2. 1 static protected DID + 1 different enrolled tenant => is_single_tenant() == false!
+    let mut static_set = HashSet::new();
+    static_set.insert("did:plc:static_owner".to_string());
+    let eng_diff = SkybouncerEngine::builder(SkybouncerConfig::new(static_set, rubric.clone()))
+        .with_classifier(Arc::new(skybouncer::classifier::MockClassifier::new(
+            Verdict::permitted("ok"),
+        )))
+        .with_pds_client(Arc::new(pds1.pds_client("did:plc:static_owner")))
+        .build()
+        .unwrap();
+    eng_diff
+        .enroll_tenant(Tenant::new("did:plc:different_tenant"))
+        .unwrap();
+    assert!(!eng_diff.is_single_tenant());
+
+    // 3. Matching 1 static + 1 enrolled same DID => is_single_tenant() == true!
+    let mut same_set = HashSet::new();
+    same_set.insert("did:plc:solo".to_string());
+    let eng_solo = SkybouncerEngine::builder(SkybouncerConfig::new(same_set, rubric.clone()))
+        .with_classifier(Arc::new(skybouncer::classifier::MockClassifier::new(
+            Verdict::permitted("ok"),
+        )))
+        .with_pds_client(Arc::new(pds1.pds_client("did:plc:solo")))
+        .build()
+        .unwrap();
+    eng_solo.enroll_tenant(Tenant::new("did:plc:solo")).unwrap();
+    assert!(eng_solo.is_single_tenant());
+
+    // 3b. admin_did != sole_protected OR admin_did != sole_tenant => is_single_tenant() == false!
+    let eng_mismatch_admin = SkybouncerEngine::builder(
+        SkybouncerConfig::new(["did:plc:other_user"], rubric.clone())
+            .with_admin_did("did:plc:admin"),
+    )
+    .with_classifier(Arc::new(skybouncer::classifier::MockClassifier::new(
+        Verdict::permitted("ok"),
+    )))
+    .with_pds_client(Arc::new(pds1.pds_client("did:plc:admin")))
+    .build()
+    .unwrap();
+    assert!(!eng_mismatch_admin.is_single_tenant());
+
+    let eng_admin_with_other_tenant = SkybouncerEngine::builder(
+        SkybouncerConfig::new(HashSet::<String>::new(), rubric.clone())
+            .with_admin_did("did:plc:admin"),
+    )
+    .with_classifier(Arc::new(skybouncer::classifier::MockClassifier::new(
+        Verdict::permitted("ok"),
+    )))
+    .with_pds_client(Arc::new(pds1.pds_client("did:plc:admin")))
+    .build()
+    .unwrap();
+    eng_admin_with_other_tenant
+        .enroll_tenant(Tenant::new("did:plc:other_tenant"))
+        .unwrap();
+    assert!(!eng_admin_with_other_tenant.is_single_tenant());
+
+    // 4. 401 ExpiredToken single refresh + retry succeeds end-to-end via publish_sovereign_config!
+    let server = MockServer::start().await;
+    let alice = "did:plc:alice_401_retry";
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let oauth_client = Arc::new(
+        skyauth::client::AtprotoOAuthClient::builder()
+            .client_metadata(metadata)
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_calls_ref = Arc::clone(&refresh_calls);
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(move |_: &wiremock::Request| {
+            let n = refresh_calls_ref.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .insert_header("dpop-nonce", "nonce-refreshed")
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "access_token": format!("at-refreshed-{n}"),
+                    "token_type": "DPoP",
+                    "expires_in": 3600,
+                    "refresh_token": "rt-refreshed",
+                    "scope": "atproto",
+                    "sub": alice
+                }))
+        })
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "RecordNotFound",
+            "message": "Could not locate record"
+        })))
+        .mount(&server)
+        .await;
+
+    let put_calls = Arc::new(AtomicUsize::new(0));
+    let put_calls_ref = Arc::clone(&put_calls);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.repo.putRecord"))
+        .respond_with(move |_: &wiremock::Request| {
+            let n = put_calls_ref.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                    "error": "ExpiredToken",
+                    "message": "Token has expired"
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "uri": format!("at://{alice}/social.skybouncer.config/self"),
+                    "cid": "bafyafterrefresh"
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let engine = SkybouncerEngine::builder(SkybouncerConfig::new([alice], rubric))
+        .with_classifier(Arc::new(skybouncer::classifier::MockClassifier::new(
+            Verdict::permitted("ok"),
+        )))
+        .with_oauth_client(oauth_client)
+        .with_pds_client(Arc::new(
+            skybase::repo::PdsRepoClient::from_credentials(server.uri(), alice, "unused")
+                .unwrap()
+                .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true)),
+        ))
+        .build()
+        .unwrap();
+
+    let session = skyauth::session::OAuthSession::new(
+        alice,
+        "at-expired-initial",
+        Some("rt-initial".to_string()),
+        "DPoP",
+        Some("atproto".to_string()),
+        Some(3600),
+        skyauth::dpop::DPoPKey::generate(),
+        Some(server.uri()),
+        Some(server.uri()),
+        Some(format!("{}/oauth/token", server.uri())),
+    )
+    .unwrap();
+    engine
+        .enroll_tenant(Tenant::new(alice).with_session(session))
+        .unwrap();
+
+    let published = engine
+        .publish_sovereign_config(alice)
+        .await
+        .expect("401 ExpiredToken must trigger single refresh and retry cleanly");
+    assert!(published.contains("social.skybouncer.config/self"));
+    assert!(refresh_calls.load(Ordering::SeqCst) >= 1);
+    assert_eq!(put_calls.load(Ordering::SeqCst), 2);
+
+    // 5. Persistent 401 when refresh returns invalid_grant marks reauth_required and surfaces error.
+    let srv_fail = MockServer::start().await;
+    let bob = "did:plc:bob_401_reauth";
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "Refresh token expired"
+        })))
+        .mount(&srv_fail)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "InvalidToken",
+            "message": "Token revoked"
+        })))
+        .mount(&srv_fail)
+        .await;
+
+    let oc2 = Arc::new(
+        skyauth::client::AtprotoOAuthClient::builder()
+            .client_metadata(OAuthClientMetadata::new(
+                "http://127.0.0.1:3000/oauth/client-metadata.json",
+                "http://127.0.0.1:3000/oauth/callback",
+            ))
+            .allow_insecure_localhost(true)
+            .build()
+            .unwrap(),
+    );
+    let eng_fail = SkybouncerEngine::builder(SkybouncerConfig::new([bob], RuleRubric::default()))
+        .with_classifier(Arc::new(skybouncer::classifier::MockClassifier::new(
+            Verdict::permitted("ok"),
+        )))
+        .with_oauth_client(oc2)
+        .with_pds_client(Arc::new(
+            skybase::repo::PdsRepoClient::from_credentials(srv_fail.uri(), bob, "unused")
+                .unwrap()
+                .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true)),
+        ))
+        .build()
+        .unwrap();
+    let bob_session = skyauth::session::OAuthSession::new(
+        bob,
+        "at-revoked",
+        Some("rt-revoked".to_string()),
+        "DPoP",
+        Some("atproto".to_string()),
+        Some(3600),
+        skyauth::dpop::DPoPKey::generate(),
+        Some(srv_fail.uri()),
+        Some(srv_fail.uri()),
+        Some(format!("{}/oauth/token", srv_fail.uri())),
+    )
+    .unwrap();
+    eng_fail
+        .enroll_tenant(Tenant::new(bob).with_session(bob_session))
+        .unwrap();
+    assert!(eng_fail.publish_sovereign_config(bob).await.is_err());
+    assert!(eng_fail.tenant_registry().is_reauth_required(bob).unwrap());
+    assert!(eng_fail.is_tenant_paused(bob));
 }

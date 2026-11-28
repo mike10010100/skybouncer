@@ -50,10 +50,12 @@ impl SkybouncerEngine {
         protected_did: &str,
         subject_did: &str,
     ) -> Result<bool, SkybouncerError> {
-        let pds_client = self.resolve_pds_client_for(protected_did).await?;
-        self.modlist_manager
-            .pardon_user(&pds_client, protected_did, subject_did)
-            .await
+        self.with_pds_client_401_retry(protected_did, |pds_client| async move {
+            self.modlist_manager
+                .pardon_user(&pds_client, protected_did, subject_did)
+                .await
+        })
+        .await
     }
 
     /// Upgrades a temporary bounce for `(protected_did, subject_did)` to permanent
@@ -103,10 +105,12 @@ impl SkybouncerEngine {
         }
 
         let duration = self.rubric_for(protected_did).bounce_duration;
-        let pds_client = self.resolve_pds_client_for(protected_did).await?;
         let outcome = self
-            .modlist_manager
-            .manual_bounce_or_perm(&pds_client, protected_did, subject_did, duration, false)
+            .with_pds_client_401_retry(protected_did, |pds_client| async move {
+                self.modlist_manager
+                    .manual_bounce_or_perm(&pds_client, protected_did, subject_did, duration, false)
+                    .await
+            })
             .await
             .inspect_err(|_e| {
                 self.stats
@@ -157,16 +161,18 @@ impl SkybouncerEngine {
             None => {}
         }
 
-        let pds_client = self.resolve_pds_client_for(protected_did).await?;
         let outcome = self
-            .modlist_manager
-            .manual_bounce_or_perm(
-                &pds_client,
-                protected_did,
-                subject_did,
-                crate::classifier::BounceDuration::Permanent,
-                true,
-            )
+            .with_pds_client_401_retry(protected_did, |pds_client| async move {
+                self.modlist_manager
+                    .manual_bounce_or_perm(
+                        &pds_client,
+                        protected_did,
+                        subject_did,
+                        crate::classifier::BounceDuration::Permanent,
+                        true,
+                    )
+                    .await
+            })
             .await
             .inspect_err(|_e| {
                 self.stats
@@ -256,10 +262,12 @@ impl SkybouncerEngine {
     /// # Errors
     /// Returns [`SkybouncerError`] if list provisioning fails.
     pub async fn ensure_mod_list(&self, protected_did: &str) -> Result<String, SkybouncerError> {
-        let pds_client = self.resolve_pds_client_for(protected_did).await?;
-        self.modlist_manager
-            .ensure_mod_list(&pds_client, protected_did)
-            .await
+        self.with_pds_client_401_retry(protected_did, |pds_client| async move {
+            self.modlist_manager
+                .ensure_mod_list(&pds_client, protected_did)
+                .await
+        })
+        .await
     }
 
     /// Ensures that an `app.bsky.graph.listblock` record exists on the sovereign PDS to auto-block list members.
@@ -271,9 +279,11 @@ impl SkybouncerEngine {
         protected_did: &str,
         list_uri: &str,
     ) -> Result<(), SkybouncerError> {
-        let pds_client = self.resolve_pds_client_for(protected_did).await?;
-        self.modlist_manager
-            .ensure_list_blocked(&pds_client, protected_did, list_uri)
-            .await
+        self.with_pds_client_401_retry(protected_did, |pds_client| async move {
+            self.modlist_manager
+                .ensure_list_blocked(&pds_client, protected_did, list_uri)
+                .await
+        })
+        .await
     }
 }

@@ -28,7 +28,13 @@ fn map_shield_error(err: SkybouncerError) -> (StatusCode, String) {
     match err {
         SkybouncerError::Config(msg) => (StatusCode::BAD_REQUEST, msg),
         SkybouncerError::Auth(msg) => (StatusCode::UNAUTHORIZED, msg),
-        other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        other => {
+            tracing::error!(error = %other, "Shield action failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Shield action failed".to_string(),
+            )
+        }
     }
 }
 
@@ -78,7 +84,13 @@ pub async fn get_storms(
     let storms = state
         .engine
         .list_storms_for(filter_did, active_only, limit)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to list storms");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load dogpile storms".to_string(),
+            )
+        })?;
 
     let storm_mode_did = filter_did.unwrap_or(&caller_did);
     let storm_mode_active = state.engine.is_storm_mode_active(storm_mode_did);
@@ -149,7 +161,13 @@ pub async fn dismiss_storm(
         .dismiss_storm(owner_filter, payload.storm_id)
         .map_err(|e| match e {
             SkybouncerError::Config(msg) => (StatusCode::FORBIDDEN, msg),
-            other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            other => {
+                tracing::error!(error = %other, storm_id = payload.storm_id, "Failed to dismiss storm");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to dismiss storm".to_string(),
+                )
+            }
         })?;
 
     Ok(Json(DismissStormResponse {

@@ -452,12 +452,10 @@ async fn test_adversarial_per_tenant_sensitivity_threshold_enforcement() {
 ///
 /// Demonstrates that when a tenant has Sensitivity::High (threshold 0.60) in a deployment where the
 /// fleet default rubric has Sensitivity::Medium (threshold 0.75), a violation with confidence 0.70
-/// (which is actionable under the tenant's rubric) passes `act_on_verdict`'s tenant rubric check,
-/// but is rejected by `ModListManager::bounce` (which checks its internal global rubric).
-/// `act_on_verdict` then misinterprets the `Ok(None)` return value as a double-checked lock collision
-/// and falsely returns `InteractionOutcome::AlreadyBounced` even though the author was never bounced!
+/// Regression test: per-tenant sensitivity is honored by `ModListManager::bounce`
+/// rather than being shadowed by the engine's fleet default rubric.
 #[tokio::test]
-async fn test_empirical_proof_modlist_manager_shadows_tenant_sensitivity_threshold() {
+async fn test_empirical_proof_modlist_manager_honors_tenant_sensitivity_threshold() {
     let high_did = "did:plc:tenant_high_sens_leak";
     let author_did = "did:plc:first_time_violator";
 
@@ -489,22 +487,21 @@ async fn test_empirical_proof_modlist_manager_shadows_tenant_sensitivity_thresho
     let item = make_interaction(high_did, author_did, "post_1", "spam text");
     let outcome = engine.process_interaction(item).await.unwrap();
 
-    // EMPIRICALLY CONFIRMED ARCHITECTURAL DEFECT:
-    // Expected behavior: Bounced (since 0.70 >= High 0.60 threshold).
-    // Actual defect behavior: AlreadyBounced (swallowed by ModListManager's check against fleet default).
-    assert_eq!(
-        outcome,
-        InteractionOutcome::AlreadyBounced {
-            author_did: author_did.to_string(),
-            target_did: high_did.to_string(),
-        },
-        "Defect empirically verified: ModListManager global rubric shadows tenant rubric!"
-    );
-
-    // Furthermore, the violator was NEVER actually recorded in the cache!
+    // Fixed behavior: Bounced (since 0.70 >= High 0.60 threshold).
     assert!(
-        !engine.cache().is_bounced_for(high_did, author_did).unwrap(),
-        "Violator was never bounced in cache despite outcome claiming AlreadyBounced!"
+        matches!(
+            outcome,
+            InteractionOutcome::Bounced {
+                ref author_did,
+                ref target_did,
+                ..
+            } if author_did == "did:plc:first_time_violator" && target_did == high_did
+        ),
+        "Tenant High sensitivity must honor 0.70 confidence; got {outcome:?}"
+    );
+    assert!(
+        engine.cache().is_bounced_for(high_did, author_did).unwrap(),
+        "Violator must be recorded in cache for tenant"
     );
 }
 

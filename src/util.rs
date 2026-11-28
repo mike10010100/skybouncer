@@ -59,6 +59,33 @@ pub fn apply_common_pragmas(
     Ok(())
 }
 
+/// Validates that a tenant/protected DID argument is non-empty after trimming whitespace,
+/// failing closed with [`crate::error::SkybouncerError::Config`] otherwise.
+pub(crate) fn require_non_empty_did<'a>(
+    did: &'a str,
+    label: &str,
+) -> Result<&'a str, crate::error::SkybouncerError> {
+    let clean = did.trim();
+    if clean.is_empty() {
+        return Err(crate::error::SkybouncerError::Config(format!(
+            "{label} cannot be empty"
+        )));
+    }
+    Ok(clean)
+}
+
+/// Returns `true` if a PDS error string indicates a missing record (`RecordNotFound` /
+/// `CouldNotFindRecord` / `"Could not locate record"` / `"Could not find record"`).
+///
+/// Intentionally does NOT match raw `"404"` substrings, avoiding misclassifying proxy/gateway
+/// 404 HTML responses as missing records.
+pub(crate) fn is_pds_record_not_found(msg: &str) -> bool {
+    msg.contains("CouldNotFindRecord")
+        || msg.contains("RecordNotFound")
+        || msg.contains("Could not locate record")
+        || msg.contains("Could not find record")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 mod tests {
@@ -139,5 +166,63 @@ mod tests {
             .pragma_query_value(None, "synchronous", |r| r.get(0))
             .expect("synchronous");
         assert_eq!(sync_mode, 1);
+    }
+
+    #[test]
+    fn require_non_empty_did_trims_valid_and_rejects_blank() {
+        assert_eq!(
+            require_non_empty_did("did:plc:alice", "tenant_did").unwrap(),
+            "did:plc:alice"
+        );
+        assert_eq!(
+            require_non_empty_did("  did:plc:alice\t\n ", "tenant_did").unwrap(),
+            "did:plc:alice"
+        );
+
+        let err_empty = require_non_empty_did("", "tenant_did").unwrap_err();
+        assert!(
+            matches!(err_empty, crate::error::SkybouncerError::Config(ref msg) if msg == "tenant_did cannot be empty"),
+            "unexpected error for empty DID: {err_empty:?}"
+        );
+
+        let err_ws = require_non_empty_did("   \t\n ", "protected_did").unwrap_err();
+        assert!(
+            matches!(err_ws, crate::error::SkybouncerError::Config(ref msg) if msg == "protected_did cannot be empty"),
+            "unexpected error for whitespace DID: {err_ws:?}"
+        );
+    }
+
+    #[test]
+    fn is_pds_record_not_found_matches_each_known_pds_error_independently() {
+        assert!(is_pds_record_not_found("CouldNotFindRecord"));
+        assert!(is_pds_record_not_found(
+            r#"XRPC error 400: {"error":"CouldNotFindRecord","message":"missing"}"#
+        ));
+
+        assert!(is_pds_record_not_found("RecordNotFound"));
+        assert!(is_pds_record_not_found(
+            r#"XRPC error 400: {"error":"RecordNotFound","message":"missing"}"#
+        ));
+
+        assert!(is_pds_record_not_found("Could not locate record"));
+        assert!(is_pds_record_not_found(
+            "PDS error: Could not locate record at://did:plc:alice/app.bsky.graph.list/3k"
+        ));
+
+        assert!(is_pds_record_not_found("Could not find record"));
+        assert!(is_pds_record_not_found(
+            "PDS error: Could not find record for rkey 3k"
+        ));
+    }
+
+    #[test]
+    fn is_pds_record_not_found_rejects_unrelated_and_raw_404_errors() {
+        assert!(!is_pds_record_not_found(""));
+        assert!(!is_pds_record_not_found("HTTP 404 Not Found"));
+        assert!(!is_pds_record_not_found(
+            "<html><body>404 Not Found</body></html>"
+        ));
+        assert!(!is_pds_record_not_found("InternalServerError"));
+        assert!(!is_pds_record_not_found("InvalidSwap"));
     }
 }

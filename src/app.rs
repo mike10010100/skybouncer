@@ -325,7 +325,7 @@ pub async fn run_cli_pardon(args: &[String]) -> Result<(), SkybouncerError> {
         eprintln!("❌ Pardon failed (HTTP {status}): {body}");
         if status == reqwest::StatusCode::UNAUTHORIZED {
             eprintln!(
-                "💡 Tip: Pass '--token <TOKEN>' or set SKYBOUNCER_API_TOKEN (or PDS_ACCESS_TOKEN) in your environment/.env to authenticate CLI requests."
+                "💡 Tip: Pass '--token <TOKEN>' or set SKYBOUNCER_API_TOKEN in your environment/.env to authenticate CLI requests."
             );
         }
         Err(SkybouncerError::Config(format!(

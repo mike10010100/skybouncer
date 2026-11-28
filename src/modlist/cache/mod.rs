@@ -933,11 +933,15 @@ mod tests {
             .get_bounced_user_for("did:plc:other", "did:plc:spammer")
             .unwrap()
             .is_none());
-        // Whitespace/empty protected DID falls back to the unscoped query.
-        assert!(cache
-            .get_bounced_user_for("   ", "did:plc:spammer")
-            .unwrap()
-            .is_some());
+        // Whitespace/empty protected DID fails closed with Config error.
+        assert!(matches!(
+            cache.get_bounced_user_for("   ", "did:plc:spammer"),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.get_bounced_user_for("", "did:plc:spammer"),
+            Err(SkybouncerError::Config(_))
+        ));
     }
 
     #[test]
@@ -1261,12 +1265,14 @@ mod tests {
                 .unwrap(),
             None
         );
-        assert_eq!(
-            cache
-                .make_bounce_permanent_for("", "did:plc:missing")
-                .unwrap(),
-            None
-        );
+        assert!(matches!(
+            cache.make_bounce_permanent_for("", "did:plc:missing"),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.make_bounce_permanent_for("   ", "did:plc:missing"),
+            Err(SkybouncerError::Config(_))
+        ));
 
         // Record a temporary bounce for Alice
         let mut entry = bounce_fixture("did:plc:alice", "did:plc:spammer");
@@ -1306,21 +1312,116 @@ mod tests {
             Some(false)
         );
 
-        // Unscoped upgrade on Bob's remaining temporary bounce
+        // Empty/whitespace protected_did fails closed across all *_for cache methods.
         let mut entry_charlie = bounce_fixture("did:plc:charlie", "did:plc:temp_only");
         entry_charlie.expires_at = Some(1_700_000_123);
         cache.record_bounce(&entry_charlie).unwrap();
+        assert!(matches!(
+            cache.make_bounce_permanent_for("", "did:plc:temp_only"),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.is_bounced_for(" ", "did:plc:temp_only"),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.get_all_bounced_rkeys_for(" ", "did:plc:temp_only"),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.list_recent_bounces_for(Some(" "), 10),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.remove_bounce_for("", "did:plc:temp_only"),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.remove_all_bounces_for("", "did:plc:temp_only"),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.get_bounce_history_for(" ", "did:plc:temp_only"),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.list_storms(Some(""), true, 10),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.list_evaluation_logs(Some(" "), None, 10, 0),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.count_evaluation_logs(Some(""), None),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.add_to_allowlist(" ", "did:plc:temp_only", None),
+            Err(SkybouncerError::Config(_))
+        ));
+        assert!(matches!(
+            cache.get_mod_list(" "),
+            Err(SkybouncerError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn test_handle_cache_verified_flag_and_cross_did_cleanup() {
+        let cache = DeduplicationCache::open_in_memory().unwrap();
+
+        // Unverified handle must NEVER resolve via get_did_for_handle.
+        cache
+            .set_unverified_handle_for_did("did:plc:unverified", "Claimed.Bsky.Social")
+            .unwrap();
         assert_eq!(
-            cache
-                .make_bounce_permanent_for("", "did:plc:temp_only")
-                .unwrap(),
-            Some(true)
+            cache.get_did_for_handle("claimed.bsky.social").unwrap(),
+            None
         );
         assert_eq!(
             cache
-                .make_bounce_permanent_for("", "did:plc:temp_only")
-                .unwrap(),
-            Some(false)
+                .get_handle_for_did("did:plc:unverified")
+                .unwrap()
+                .as_deref(),
+            Some("claimed.bsky.social")
+        );
+
+        // Verified handle sets handle_verified=1, normalizes lowercase, and resolves cleanly.
+        cache
+            .set_handle_for_did("did:plc:alice", "Alice.Bsky.Social")
+            .unwrap();
+        assert_eq!(
+            cache
+                .get_did_for_handle("ALICE.BSKY.SOCIAL")
+                .unwrap()
+                .as_deref(),
+            Some("did:plc:alice")
+        );
+
+        // Reassigning the same handle to a new DID clears the stale DID mapping.
+        cache
+            .set_handle_for_did("did:plc:alice2", "alice.bsky.social")
+            .unwrap();
+        assert_eq!(
+            cache
+                .get_did_for_handle("alice.bsky.social")
+                .unwrap()
+                .as_deref(),
+            Some("did:plc:alice2")
+        );
+        assert_eq!(cache.get_handle_for_did("did:plc:alice").unwrap(), None);
+
+        // "handle.invalid" is ignored cleanly.
+        cache
+            .set_handle_for_did("did:plc:alice2", "handle.invalid")
+            .unwrap();
+        assert_eq!(cache.get_did_for_handle("handle.invalid").unwrap(), None);
+        assert_eq!(
+            cache
+                .get_handle_for_did("did:plc:alice2")
+                .unwrap()
+                .as_deref(),
+            Some("alice.bsky.social")
         );
     }
 }

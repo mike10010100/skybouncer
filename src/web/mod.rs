@@ -155,24 +155,53 @@ impl WebServerConfig {
     }
 }
 
+fn derive_public_url_from_metadata(metadata: &OAuthClientMetadata) -> String {
+    for candidate in [&metadata.redirect_uri, &metadata.client_id] {
+        if let Ok(parsed) = url::Url::parse(candidate) {
+            if let Some(host) = parsed.host_str() {
+                let scheme = parsed.scheme();
+                return match parsed.port() {
+                    Some(port) => format!("{scheme}://{host}:{port}"),
+                    None => format!("{scheme}://{host}"),
+                };
+            }
+        }
+    }
+    format!("http://{DEFAULT_WEB_HOST}:{DEFAULT_WEB_PORT}")
+}
+
 /// Constructs the full Axum router for the dashboard, REST API, and OAuth endpoints.
 pub fn create_web_router(
     engine: Arc<SkybouncerEngine>,
     oauth_client: Option<Arc<AtprotoOAuthClient>>,
     metadata: OAuthClientMetadata,
 ) -> Router {
+    let public_url = derive_public_url_from_metadata(&metadata);
+    create_web_router_with_public_url(engine, oauth_client, metadata, public_url)
+}
+
+/// Constructs the full Axum router with an explicit `public_url` for HTTPS cookie flags,
+/// HSTS, and same-site CSRF origin matching.
+pub fn create_web_router_with_public_url(
+    engine: Arc<SkybouncerEngine>,
+    oauth_client: Option<Arc<AtprotoOAuthClient>>,
+    metadata: OAuthClientMetadata,
+    public_url: impl Into<String>,
+) -> Router {
+    let public_url = public_url.into().trim_end_matches('/').to_string();
     if let Some(ref c) = oauth_client {
         if engine.oauth_client().is_none() {
             engine.set_oauth_client(Arc::clone(c));
         }
     }
 
-    let api_state = ApiState::new(Arc::clone(&engine));
+    let api_state = ApiState::new(Arc::clone(&engine)).with_public_url(public_url.clone());
 
     let oauth_state = OAuthState {
         oauth_client,
         metadata,
         engine: Some(Arc::clone(&engine)),
+        public_url,
     };
 
     let api_router = Router::new()
@@ -216,6 +245,10 @@ pub fn create_web_router(
         .route("/auth/typeahead", get(api::auth_typeahead))
         .route("/auth/preview", get(api::auth_preview))
         .route("/resolve", get(api::resolve_identity))
+        .layer(axum::middleware::from_fn_with_state(
+            api_state.clone(),
+            same_site_csrf_middleware,
+        ))
         .with_state(api_state.clone());
 
     let oauth_router = Router::new()
@@ -227,6 +260,8 @@ pub fn create_web_router(
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::ACCEPT]);
+
+    let is_https = api_state.is_https();
 
     Router::new()
         .route("/", get(ui::serve_dashboard))
@@ -243,14 +278,71 @@ pub fn create_web_router(
         .nest("/api", api_router)
         .nest("/oauth", oauth_router)
         .layer(cors)
-        .layer(axum::middleware::from_fn(security_headers_middleware))
+        .layer(axum::middleware::from_fn_with_state(
+            is_https,
+            security_headers_middleware,
+        ))
         .layer(TraceLayer::new_for_http())
 }
 
-async fn security_headers_middleware(
+async fn same_site_csrf_middleware(
+    axum::extract::State(state): axum::extract::State<ApiState>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let method = req.method();
+    if *method == Method::GET || *method == Method::HEAD {
+        return next.run(req).await;
+    }
+
+    let headers = req.headers();
+    let has_bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.trim().starts_with("Bearer "));
+
+    let has_session_cookie = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|raw| {
+            raw.split(';')
+                .any(|part| part.trim().starts_with("skybouncer_session="))
+        });
+
+    if !has_bearer && has_session_cookie {
+        let same_origin_fetch_site = headers
+            .get("sec-fetch-site")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("same-origin"));
+
+        let same_origin_header = headers
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .and_then(api::parse_url_origin)
+            .zip(state.public_origin())
+            .is_some_and(|(req_origin, expected)| req_origin == expected);
+
+        if !same_origin_fetch_site && !same_origin_header {
+            return (
+                StatusCode::FORBIDDEN,
+                "CSRF validation failed: cross-origin cookie request rejected",
+            )
+                .into_response();
+        }
+    }
+
+    next.run(req).await
+}
+
+async fn security_headers_middleware(
+    axum::extract::State(is_https): axum::extract::State<bool>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let is_api_path = req.uri().path().starts_with("/api/");
     let mut resp = next.run(req).await;
     let headers = resp.headers_mut();
     headers.insert(
@@ -271,6 +363,18 @@ async fn security_headers_middleware(
             "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none';",
         ),
     );
+    if is_api_path {
+        headers.insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    if is_https {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            axum::http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
     resp
 }
 
@@ -356,7 +460,7 @@ pub async fn run_web_server(
         (client, meta)
     };
 
-    let app = create_web_router(engine, oauth_client, metadata);
+    let app = create_web_router_with_public_url(engine, oauth_client, metadata, &config.public_url);
 
     let addr_str = format!("{}:{}", config.host, config.port);
     let addr: SocketAddr = addr_str.parse().map_err(|e| {

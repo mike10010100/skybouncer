@@ -21,12 +21,14 @@ impl DeduplicationCache {
     /// Checks whether a subject DID is recorded as bounced for a specific protected user.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the query fails.
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the query fails.
     pub fn is_bounced_for(
         &self,
         protected_did: &str,
         subject_did: &str,
     ) -> Result<bool, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT 1 FROM bounced_users
@@ -49,50 +51,38 @@ impl DeduplicationCache {
         &self,
         subject_did: &str,
     ) -> Result<Option<BouncedUser>, SkybouncerError> {
-        self.get_bounced_user_scoped(None, subject_did)
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {BOUNCED_USER_COLUMNS}
+             FROM bounced_users
+             WHERE subject_did = ?1
+             LIMIT 1;"
+        ))?;
+        Ok(stmt
+            .query_row(params![subject_did], map_bounced_user)
+            .optional()?)
     }
 
     /// Retrieves detailed record of a bounced violator for a specific protected user.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the SQLite query fails.
     pub fn get_bounced_user_for(
         &self,
         protected_did: &str,
         subject_did: &str,
     ) -> Result<Option<BouncedUser>, SkybouncerError> {
-        self.get_bounced_user_scoped(Some(protected_did), subject_did)
-    }
-
-    /// Retrieves a bounce record optionally scoped to a specific protected user.
-    pub(super) fn get_bounced_user_scoped(
-        &self,
-        protected_did: Option<&str>,
-        subject_did: &str,
-    ) -> Result<Option<BouncedUser>, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
         let conn = self.conn.lock();
-        let res = match protected_did.filter(|s| !s.trim().is_empty()) {
-            Some(target) => {
-                let mut stmt = conn.prepare_cached(&format!(
-                    "SELECT {BOUNCED_USER_COLUMNS}
-                     FROM bounced_users
-                     WHERE subject_did = ?1 AND protected_did = ?2;"
-                ))?;
-                stmt.query_row(params![subject_did, target], map_bounced_user)
-                    .optional()?
-            }
-            None => {
-                let mut stmt = conn.prepare_cached(&format!(
-                    "SELECT {BOUNCED_USER_COLUMNS}
-                     FROM bounced_users
-                     WHERE subject_did = ?1
-                     LIMIT 1;"
-                ))?;
-                stmt.query_row(params![subject_did], map_bounced_user)
-                    .optional()?
-            }
-        };
-        Ok(res)
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {BOUNCED_USER_COLUMNS}
+             FROM bounced_users
+             WHERE subject_did = ?1 AND protected_did = ?2;"
+        ))?;
+        Ok(stmt
+            .query_row(params![subject_did, protected_did], map_bounced_user)
+            .optional()?)
     }
 
     /// Records a bounced violator and their corresponding PDS listitem record into the cache.
@@ -214,69 +204,43 @@ impl DeduplicationCache {
     /// Retrieves all known listitem `rkey` values associated with the given subject DID for a protected user.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the SQLite query fails.
     pub fn get_all_bounced_rkeys_for(
         &self,
         protected_did: &str,
         subject_did: &str,
     ) -> Result<Vec<String>, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
         let conn = self.conn.lock();
         let mut rkeys = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        if protected_did.is_empty() {
-            let mut stmt = conn.prepare_cached(
-                "SELECT listitem_rkey FROM bounced_user_rkeys
-                 WHERE subject_did = ?1
-                 ORDER BY created_at ASC;",
+        let mut stmt = conn.prepare_cached(
+            "SELECT listitem_rkey FROM bounced_user_rkeys
+             WHERE subject_did = ?1 AND protected_did = ?2
+             ORDER BY created_at ASC;",
+        )?;
+
+        let rows = stmt.query_map(params![subject_did, protected_did], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for r in rows {
+            let rk = r?;
+            if seen.insert(rk.clone()) {
+                rkeys.push(rk);
+            }
+        }
+
+        if rkeys.is_empty() {
+            let mut fallback_stmt = conn.prepare_cached(
+                "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1 AND protected_did = ?2;",
             )?;
-
-            let rows = stmt.query_map(params![subject_did], |row| row.get::<_, String>(0))?;
-            for r in rows {
-                let rk = r?;
-                if seen.insert(rk.clone()) {
-                    rkeys.push(rk);
-                }
-            }
-
-            if rkeys.is_empty() {
-                let mut fallback_stmt = conn.prepare_cached(
-                    "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1;",
-                )?;
-                let fallback_rkey: Option<String> = fallback_stmt
-                    .query_row(params![subject_did], |row| row.get(0))
-                    .optional()?;
-                if let Some(rk) = fallback_rkey {
-                    rkeys.push(rk);
-                }
-            }
-        } else {
-            let mut stmt = conn.prepare_cached(
-                "SELECT listitem_rkey FROM bounced_user_rkeys
-                 WHERE subject_did = ?1 AND protected_did = ?2
-                 ORDER BY created_at ASC;",
-            )?;
-
-            let rows = stmt.query_map(params![subject_did, protected_did], |row| {
-                row.get::<_, String>(0)
-            })?;
-            for r in rows {
-                let rk = r?;
-                if seen.insert(rk.clone()) {
-                    rkeys.push(rk);
-                }
-            }
-
-            if rkeys.is_empty() {
-                let mut fallback_stmt = conn.prepare_cached(
-                    "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1 AND protected_did = ?2;",
-                )?;
-                let fallback_rkey: Option<String> = fallback_stmt
-                    .query_row(params![subject_did, protected_did], |row| row.get(0))
-                    .optional()?;
-                if let Some(rk) = fallback_rkey {
-                    rkeys.push(rk);
-                }
+            let fallback_rkey: Option<String> = fallback_stmt
+                .query_row(params![subject_did, protected_did], |row| row.get(0))
+                .optional()?;
+            if let Some(rk) = fallback_rkey {
+                rkeys.push(rk);
             }
         }
 
@@ -288,7 +252,37 @@ impl DeduplicationCache {
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
     pub fn get_all_bounced_rkeys(&self, subject_did: &str) -> Result<Vec<String>, SkybouncerError> {
-        self.get_all_bounced_rkeys_for("", subject_did)
+        let conn = self.conn.lock();
+        let mut rkeys = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        let mut stmt = conn.prepare_cached(
+            "SELECT listitem_rkey FROM bounced_user_rkeys
+             WHERE subject_did = ?1
+             ORDER BY created_at ASC;",
+        )?;
+
+        let rows = stmt.query_map(params![subject_did], |row| row.get::<_, String>(0))?;
+        for r in rows {
+            let rk = r?;
+            if seen.insert(rk.clone()) {
+                rkeys.push(rk);
+            }
+        }
+
+        if rkeys.is_empty() {
+            let mut fallback_stmt = conn.prepare_cached(
+                "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1;",
+            )?;
+            let fallback_rkey: Option<String> = fallback_stmt
+                .query_row(params![subject_did], |row| row.get(0))
+                .optional()?;
+            if let Some(rk) = fallback_rkey {
+                rkeys.push(rk);
+            }
+        }
+
+        Ok(rkeys)
     }
 
     /// Retrieves all known listitem `rkey` values associated with the given subject DID.
@@ -312,21 +306,26 @@ impl DeduplicationCache {
     /// Lists recently bounced users filtered by an optional protected user DID,
     /// ordered by most recent bounce timestamp descending.
     ///
-    /// Strictly isolates tenant moderation data: when `protected_did` is provided,
-    /// only bounces for that exact tenant are returned.
+    /// Strictly isolates tenant moderation data: when `protected_did` is `Some`,
+    /// it must be non-empty and only bounces for that exact tenant are returned.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    /// Returns [`SkybouncerError::Config`] if `Some` contains an empty/whitespace DID,
+    /// or [`SkybouncerError::Database`] if the SQLite query fails.
     pub fn list_recent_bounces_for(
         &self,
         protected_did: Option<&str>,
         limit: usize,
     ) -> Result<Vec<BouncedUser>, SkybouncerError> {
+        let scoped_target = match protected_did {
+            Some(raw) => Some(crate::util::require_non_empty_did(raw, "protected_did")?),
+            None => None,
+        };
         let limit_i64 = i64::try_from(limit).unwrap_or(50);
         let conn = self.conn.lock();
         let mut list = Vec::new();
 
-        if let Some(target) = protected_did.filter(|s| !s.trim().is_empty()) {
+        if let Some(target) = scoped_target {
             let mut stmt = conn.prepare_cached(&format!(
                 "SELECT {BOUNCED_USER_COLUMNS}
                  FROM bounced_users
@@ -381,17 +380,73 @@ impl DeduplicationCache {
         Ok(list)
     }
 
+    /// Removes a single `listitem_rkey` from `bounced_user_rkeys` for `(protected_did, subject_did)`.
+    ///
+    /// Used for incremental SQLite cleanup as individual PDS `deleteRecord` calls succeed during
+    /// multi-rkey pardons so partially completed pardons never stall on already-deleted records.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the SQLite update fails.
+    pub fn remove_bounced_rkey_for(
+        &self,
+        protected_did: &str,
+        subject_did: &str,
+        rkey: &str,
+    ) -> Result<bool, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(|e| {
+            SkybouncerError::Database(format!(
+                "Failed to start transaction for remove_bounced_rkey_for: {e}"
+            ))
+        })?;
+        let deleted = tx.execute(
+            "DELETE FROM bounced_user_rkeys
+             WHERE protected_did = ?1 AND subject_did = ?2 AND listitem_rkey = ?3;",
+            params![protected_did, subject_did, rkey],
+        )?;
+        if deleted > 0 {
+            let next_rkey: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT listitem_rkey, listitem_uri, listitem_cid
+                     FROM bounced_user_rkeys
+                     WHERE protected_did = ?1 AND subject_did = ?2
+                     ORDER BY created_at DESC LIMIT 1;",
+                    params![protected_did, subject_did],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if let Some((rk, uri, cid)) = next_rkey {
+                tx.execute(
+                    "UPDATE bounced_users
+                     SET listitem_rkey = ?1, listitem_uri = ?2, listitem_cid = ?3
+                     WHERE protected_did = ?4 AND subject_did = ?5 AND listitem_rkey = ?6;",
+                    params![rk, uri, cid, protected_did, subject_did, rkey],
+                )?;
+            }
+        }
+        tx.commit().map_err(|e| {
+            SkybouncerError::Database(format!(
+                "Failed to commit remove_bounced_rkey_for transaction: {e}"
+            ))
+        })?;
+        Ok(deleted > 0)
+    }
+
     /// Removes a bounced user from the cache for a specific protected user, returning the listitem `rkey`.
     ///
     /// Cleans up both `bounced_users` and all associated entries in `bounced_user_rkeys`.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the query or deletion fails.
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the query or deletion fails.
     pub fn remove_bounce_for(
         &self,
         protected_did: &str,
         subject_did: &str,
     ) -> Result<Option<String>, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(|e| {
             SkybouncerError::Database(format!(
@@ -400,21 +455,12 @@ impl DeduplicationCache {
         })?;
 
         let rkey: Option<String> = {
-            if protected_did.is_empty() {
-                let mut select_stmt = tx.prepare_cached(
-                    "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1 LIMIT 1;",
-                )?;
-                select_stmt
-                    .query_row(params![subject_did], |row| row.get(0))
-                    .optional()?
-            } else {
-                let mut select_stmt = tx.prepare_cached(
-                    "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1 AND protected_did = ?2 LIMIT 1;",
-                )?;
-                select_stmt
-                    .query_row(params![subject_did, protected_did], |row| row.get(0))
-                    .optional()?
-            }
+            let mut select_stmt = tx.prepare_cached(
+                "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1 AND protected_did = ?2 LIMIT 1;",
+            )?;
+            select_stmt
+                .query_row(params![subject_did, protected_did], |row| row.get(0))
+                .optional()?
         };
 
         if rkey.is_some() {
@@ -435,18 +481,44 @@ impl DeduplicationCache {
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if the query or deletion fails.
     pub fn remove_bounce(&self, subject_did: &str) -> Result<Option<String>, SkybouncerError> {
-        self.remove_bounce_for("", subject_did)
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(|e| {
+            SkybouncerError::Database(format!(
+                "Failed to start transaction for remove_bounce: {e}"
+            ))
+        })?;
+
+        let rkey: Option<String> = {
+            let mut select_stmt = tx.prepare_cached(
+                "SELECT listitem_rkey FROM bounced_users WHERE subject_did = ?1 LIMIT 1;",
+            )?;
+            select_stmt
+                .query_row(params![subject_did], |row| row.get(0))
+                .optional()?
+        };
+
+        if rkey.is_some() {
+            delete_bounce_rows(&tx, "", subject_did)?;
+        }
+
+        tx.commit().map_err(|e| {
+            SkybouncerError::Database(format!("Failed to commit remove_bounce transaction: {e}"))
+        })?;
+
+        Ok(rkey)
     }
 
     /// Removes a bounced user from the cache for a specific protected user, returning all known listitem `rkey` values.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the query or deletion fails.
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the query or deletion fails.
     pub fn remove_all_bounces_for(
         &self,
         protected_did: &str,
         subject_did: &str,
     ) -> Result<Vec<String>, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
         let rkeys = self.get_all_bounced_rkeys_for(protected_did, subject_did)?;
         if !rkeys.is_empty() {
             let mut conn = self.conn.lock();
@@ -476,12 +548,14 @@ impl DeduplicationCache {
     /// - `Ok(None)` if no bounce record exists for `(protected_did, subject_did)`.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the SQLite query or update fails.
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the SQLite query or update fails.
     pub fn make_bounce_permanent_for(
         &self,
         protected_did: &str,
         subject_did: &str,
     ) -> Result<Option<bool>, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
         let mut conn = self.conn.lock();
         let tx = conn.transaction().map_err(|e| {
             SkybouncerError::Database(format!(
@@ -489,13 +563,7 @@ impl DeduplicationCache {
             ))
         })?;
 
-        let existing_expires: Option<Option<i64>> = if protected_did.is_empty() {
-            let mut stmt = tx.prepare_cached(
-                "SELECT expires_at FROM bounced_users WHERE subject_did = ?1 LIMIT 1;",
-            )?;
-            stmt.query_row(params![subject_did], |row| row.get(0))
-                .optional()?
-        } else {
+        let existing_expires: Option<Option<i64>> = {
             let mut stmt = tx.prepare_cached(
                 "SELECT expires_at FROM bounced_users
                  WHERE subject_did = ?1 AND protected_did = ?2 LIMIT 1;",
@@ -510,18 +578,11 @@ impl DeduplicationCache {
 
         let was_temp = expires_opt.is_some();
         if was_temp {
-            if protected_did.is_empty() {
-                let mut upd = tx.prepare_cached(
-                    "UPDATE bounced_users SET expires_at = NULL WHERE subject_did = ?1;",
-                )?;
-                upd.execute(params![subject_did])?;
-            } else {
-                let mut upd = tx.prepare_cached(
-                    "UPDATE bounced_users SET expires_at = NULL
-                     WHERE subject_did = ?1 AND protected_did = ?2;",
-                )?;
-                upd.execute(params![subject_did, protected_did])?;
-            }
+            let mut upd = tx.prepare_cached(
+                "UPDATE bounced_users SET expires_at = NULL
+                 WHERE subject_did = ?1 AND protected_did = ?2;",
+            )?;
+            upd.execute(params![subject_did, protected_did])?;
         }
 
         tx.commit().map_err(|e| {
@@ -538,56 +599,61 @@ impl DeduplicationCache {
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if the query or deletion fails.
     pub fn remove_all_bounces(&self, subject_did: &str) -> Result<Vec<String>, SkybouncerError> {
-        self.remove_all_bounces_for("", subject_did)
+        let rkeys = self.get_all_bounced_rkeys(subject_did)?;
+        if !rkeys.is_empty() {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction().map_err(|e| {
+                SkybouncerError::Database(format!(
+                    "Failed to start transaction for remove_all_bounces: {e}"
+                ))
+            })?;
+
+            delete_bounce_rows(&tx, "", subject_did)?;
+
+            tx.commit().map_err(|e| {
+                SkybouncerError::Database(format!(
+                    "Failed to commit remove_all_bounces transaction: {e}"
+                ))
+            })?;
+        }
+        Ok(rkeys)
     }
 
     /// Retrieves archived bounce metadata for `(protected_did, subject_did)`, if any prior bounce
     /// was recorded for this pair (including bounces that were subsequently pardoned or expired).
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the SQLite query fails.
     pub fn get_bounce_history_for(
         &self,
         protected_did: &str,
         subject_did: &str,
     ) -> Result<Option<ArchivedBounce>, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
         let conn = self.conn.lock();
-        let map_archived = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ArchivedBounce> {
-            Ok(ArchivedBounce {
-                protected_did: row.get(0)?,
-                subject_did: row.get(1)?,
-                category: row.get(2)?,
-                confidence: row.get(3)?,
-                reason: row.get(4)?,
-                post_uri: row.get(5)?,
-                post_text: row.get(6)?,
-                reply_to_uri: row.get(7)?,
-                archived_at: i64_to_us(row.get(8)?),
+        let mut stmt = conn.prepare_cached(
+            "SELECT protected_did, subject_did, category, confidence, reason,
+                    post_uri, post_text, reply_to_uri, archived_at
+             FROM bounce_history
+             WHERE subject_did = ?1 AND protected_did = ?2
+             LIMIT 1;",
+        )?;
+        let res = stmt
+            .query_row(params![subject_did, protected_did], |row| {
+                Ok(ArchivedBounce {
+                    protected_did: row.get(0)?,
+                    subject_did: row.get(1)?,
+                    category: row.get(2)?,
+                    confidence: row.get(3)?,
+                    reason: row.get(4)?,
+                    post_uri: row.get(5)?,
+                    post_text: row.get(6)?,
+                    reply_to_uri: row.get(7)?,
+                    archived_at: i64_to_us(row.get(8)?),
+                })
             })
-        };
-
-        let res = if protected_did.trim().is_empty() {
-            let mut stmt = conn.prepare_cached(
-                "SELECT protected_did, subject_did, category, confidence, reason,
-                        post_uri, post_text, reply_to_uri, archived_at
-                 FROM bounce_history
-                 WHERE subject_did = ?1
-                 ORDER BY archived_at DESC
-                 LIMIT 1;",
-            )?;
-            stmt.query_row(params![subject_did], map_archived)
-                .optional()?
-        } else {
-            let mut stmt = conn.prepare_cached(
-                "SELECT protected_did, subject_did, category, confidence, reason,
-                        post_uri, post_text, reply_to_uri, archived_at
-                 FROM bounce_history
-                 WHERE subject_did = ?1 AND protected_did = ?2
-                 LIMIT 1;",
-            )?;
-            stmt.query_row(params![subject_did, protected_did], map_archived)
-                .optional()?
-        };
+            .optional()?;
         Ok(res)
     }
 

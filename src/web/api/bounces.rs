@@ -1,5 +1,22 @@
 use super::*;
 
+fn resolve_bounce_target_did(
+    engine: &SkybouncerEngine,
+    caller_did: &str,
+    requested_did: Option<&str>,
+    denied_msg: &str,
+) -> Result<String, (StatusCode, String)> {
+    let is_admin = engine.is_admin(caller_did);
+    if let Some(requested) = requested_did.map(str::trim).filter(|s| !s.is_empty()) {
+        if requested != caller_did && !is_admin {
+            return Err((StatusCode::FORBIDDEN, denied_msg.to_string()));
+        }
+        Ok(requested.to_string())
+    } else {
+        Ok(caller_did.to_string())
+    }
+}
+
 /// Handler for `GET /api/bounces`: returns recent bounced violators.
 ///
 /// Authentication is strictly required. Non-admin users are restricted to viewing
@@ -18,11 +35,16 @@ pub async fn get_bounces(
 
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let is_admin = state.engine.is_admin(&caller_did);
+    let requested_user = query
+        .user_did
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let filter_did = if is_admin {
-        query.user_did.as_deref().filter(|s| !s.trim().is_empty())
+        requested_user
     } else {
-        if let Some(requested_did) = query.user_did.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Some(requested_did) = requested_user {
             if requested_did != caller_did {
                 return Err((
                     StatusCode::FORBIDDEN,
@@ -36,7 +58,13 @@ pub async fn get_bounces(
     let bounces = state
         .engine
         .list_recent_bounces_for(filter_did, limit)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to list recent bounces");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load recent bounces".to_string(),
+            )
+        })?;
 
     let enriched = bounces
         .into_iter()
@@ -86,20 +114,12 @@ pub async fn pardon_user(
         ));
     }
 
-    let is_admin = state.engine.is_admin(&caller_did);
-    let protected_did = if let Some(ref pd) = payload.protected_did {
-        let requested = pd.trim();
-        if requested != caller_did && !is_admin {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Access denied: you may only pardon users from your own moderation list."
-                    .to_string(),
-            ));
-        }
-        requested.to_string()
-    } else {
-        caller_did.clone()
-    };
+    let protected_did = resolve_bounce_target_did(
+        &state.engine,
+        &caller_did,
+        payload.protected_did.as_deref(),
+        "Access denied: you may only pardon users from your own moderation list.",
+    )?;
 
     if payload.allowlist {
         match state
@@ -122,10 +142,13 @@ pub async fn pardon_user(
                     "Account {subject_did} was pardoned and immunized on the allowlist."
                 ),
             })),
-            Err(e) => Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to pardon and allowlist: {e}"),
-            )),
+            Err(e) => {
+                tracing::error!(error = %e, protected_did = %protected_did, subject_did = %subject_did, "Failed to pardon and allowlist");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to pardon and allowlist account".to_string(),
+                ))
+            }
         }
     } else {
         match state.engine.pardon_user(&protected_did, &subject_did).await {
@@ -143,10 +166,13 @@ pub async fn pardon_user(
                 subject_did: subject_did.clone(),
                 message: format!("Account {subject_did} was not found in the bounced cache."),
             })),
-            Err(e) => Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to pardon: {e}"),
-            )),
+            Err(e) => {
+                tracing::error!(error = %e, protected_did = %protected_did, subject_did = %subject_did, "Failed to pardon account");
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to pardon account".to_string(),
+                ))
+            }
         }
     }
 }
@@ -175,20 +201,12 @@ pub async fn upgrade_bounce(
         ));
     }
 
-    let is_admin = state.engine.is_admin(&caller_did);
-    let protected_did = if let Some(ref pd) = payload.protected_did {
-        let requested = pd.trim();
-        if requested != caller_did && !is_admin {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Access denied: you may only upgrade bounces on your own moderation list."
-                    .to_string(),
-            ));
-        }
-        requested.to_string()
-    } else {
-        caller_did.clone()
-    };
+    let protected_did = resolve_bounce_target_did(
+        &state.engine,
+        &caller_did,
+        payload.protected_did.as_deref(),
+        "Access denied: you may only upgrade bounces on your own moderation list.",
+    )?;
 
     match state
         .engine
@@ -213,10 +231,13 @@ pub async fn upgrade_bounce(
             subject_did: subject_did.clone(),
             message: format!("Account {subject_did} was not found in the bounced cache."),
         })),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to upgrade bounce: {e}"),
-        )),
+        Err(e) => {
+            tracing::error!(error = %e, protected_did = %protected_did, subject_did = %subject_did, "Failed to upgrade bounce");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to upgrade bounce".to_string(),
+            ))
+        }
     }
 }
 
@@ -233,21 +254,14 @@ pub async fn get_allowlist(
         )
     })?;
 
-    let is_admin = state.engine.is_admin(&caller_did);
-    let target_did = if let Some(ref ud) = query.user_did {
-        let requested = ud.trim();
-        if requested != caller_did && !is_admin {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Access denied: you may only view your own allowlist.".to_string(),
-            ));
-        }
-        requested
-    } else {
-        &caller_did
-    };
+    let target_did = resolve_bounce_target_did(
+        &state.engine,
+        &caller_did,
+        query.user_did.as_deref(),
+        "Access denied: you may only view your own allowlist.",
+    )?;
 
-    match state.engine.list_allowlist(target_did) {
+    match state.engine.list_allowlist(&target_did) {
         Ok(mut entries) => {
             for entry in &mut entries {
                 if entry.handle.is_none() {
@@ -256,10 +270,13 @@ pub async fn get_allowlist(
             }
             Ok(Json(entries))
         }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to list allowlist: {e}"),
-        )),
+        Err(e) => {
+            tracing::error!(error = %e, target_did = %target_did, "Failed to list allowlist");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load allowlist".to_string(),
+            ))
+        }
     }
 }
 
@@ -276,19 +293,12 @@ pub async fn add_to_allowlist(
         )
     })?;
 
-    let is_admin = state.engine.is_admin(&caller_did);
-    let protected_did = if let Some(ref pd) = payload.protected_did {
-        let requested = pd.trim();
-        if requested != caller_did && !is_admin {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Access denied: you may only update your own allowlist.".to_string(),
-            ));
-        }
-        requested.to_string()
-    } else {
-        caller_did.clone()
-    };
+    let protected_did = resolve_bounce_target_did(
+        &state.engine,
+        &caller_did,
+        payload.protected_did.as_deref(),
+        "Access denied: you may only update your own allowlist.",
+    )?;
 
     let raw_subject = payload.subject.trim();
     if raw_subject.is_empty() {
@@ -327,10 +337,13 @@ pub async fn add_to_allowlist(
             handle: resolved_handle,
             message: format!("Account {subject_did} was added to the allowlist."),
         })),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to add to allowlist: {e}"),
-        )),
+        Err(e) => {
+            tracing::error!(error = %e, protected_did = %protected_did, subject_did = %subject_did, "Failed to add to allowlist");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to add account to allowlist".to_string(),
+            ))
+        }
     }
 }
 
@@ -348,19 +361,12 @@ pub async fn remove_from_allowlist(
         )
     })?;
 
-    let is_admin = state.engine.is_admin(&caller_did);
-    let protected_did = if let Some(ref ud) = query.user_did {
-        let requested = ud.trim();
-        if requested != caller_did && !is_admin {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Access denied: you may only update your own allowlist.".to_string(),
-            ));
-        }
-        requested
-    } else {
-        &caller_did
-    };
+    let protected_did = resolve_bounce_target_did(
+        &state.engine,
+        &caller_did,
+        query.user_did.as_deref(),
+        "Access denied: you may only update your own allowlist.",
+    )?;
 
     let clean_did = subject_did.trim();
     if clean_did.is_empty() {
@@ -370,7 +376,10 @@ pub async fn remove_from_allowlist(
         ));
     }
 
-    match state.engine.remove_from_allowlist(protected_did, clean_did) {
+    match state
+        .engine
+        .remove_from_allowlist(&protected_did, clean_did)
+    {
         Ok(removed) => Ok(Json(RemoveAllowlistResponse {
             removed,
             subject_did: clean_did.to_string(),
@@ -380,9 +389,12 @@ pub async fn remove_from_allowlist(
                 format!("Account {clean_did} was not found on the allowlist.")
             },
         })),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to remove from allowlist: {e}"),
-        )),
+        Err(e) => {
+            tracing::error!(error = %e, protected_did = %protected_did, clean_did = %clean_did, "Failed to remove from allowlist");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to remove account from allowlist".to_string(),
+            ))
+        }
     }
 }

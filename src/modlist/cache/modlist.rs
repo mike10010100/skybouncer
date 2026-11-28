@@ -6,6 +6,7 @@ impl DeduplicationCache {
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if the query fails.
     pub fn get_mod_list(&self, user_did: &str) -> Result<Option<ModListConfig>, SkybouncerError> {
+        let user_did = crate::util::require_non_empty_did(user_did, "user_did")?;
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT user_did, list_uri, list_cid, created_at
@@ -32,8 +33,10 @@ impl DeduplicationCache {
     /// Persists or updates the moderation list configuration for a protected user DID.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the insert fails.
+    /// Returns [`SkybouncerError::Config`] if `config.user_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the insert fails.
     pub fn set_mod_list(&self, config: &ModListConfig) -> Result<(), SkybouncerError> {
+        let user_did = crate::util::require_non_empty_did(&config.user_did, "user_did")?;
         let created_at_i64 = us_to_i64(config.created_at);
 
         let conn = self.conn.lock();
@@ -47,7 +50,7 @@ impl DeduplicationCache {
         )?;
 
         stmt.execute(params![
-            config.user_did,
+            user_did,
             config.list_uri,
             config.list_cid,
             created_at_i64,
@@ -59,8 +62,10 @@ impl DeduplicationCache {
     /// Checks whether an automatic `app.bsky.graph.listblock` subscription is cached for the user.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the SQLite query fails.
+    /// Returns [`SkybouncerError::Config`] if `user_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the SQLite query fails.
     pub fn is_list_blocked(&self, user_did: &str) -> Result<bool, SkybouncerError> {
+        let user_did = crate::util::require_non_empty_did(user_did, "user_did")?;
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare_cached("SELECT 1 FROM listblock_cache WHERE user_did = ?1 LIMIT 1;")
@@ -82,8 +87,10 @@ impl DeduplicationCache {
     /// Records an active `app.bsky.graph.listblock` subscription for the user.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the SQLite execution fails.
+    /// Returns [`SkybouncerError::Config`] if `user_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the SQLite execution fails.
     pub fn set_list_blocked(&self, user_did: &str, list_uri: &str) -> Result<(), SkybouncerError> {
+        let user_did = crate::util::require_non_empty_did(user_did, "user_did")?;
         let now_us = us_to_i64(current_time_us());
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(

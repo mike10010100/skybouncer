@@ -360,9 +360,10 @@ pub async fn simulate_interaction(
     }
 
     let result = state.engine.run_simulation(inputs).await.map_err(|e| {
+        tracing::error!(error = %e, "Simulation classification failed");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Classification failed: {e}"),
+            "Classification failed".to_string(),
         )
     })?;
 
@@ -443,11 +444,8 @@ pub async fn simulate_guest_interaction(
     let result = match state.engine.run_simulation(inputs).await {
         Ok(r) => r,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Classification failed: {e}"),
-            )
-                .into_response();
+            tracing::error!(error = %e, "Guest simulation classification failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Classification failed").into_response();
         }
     };
 

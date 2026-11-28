@@ -96,7 +96,10 @@ async fn test_adversarial_pds_repeated_500_create_record() {
         .await
         .unwrap();
 
-    assert!(res.is_some());
+    assert!(matches!(
+        res,
+        skybouncer::modlist::BounceOutcome::Bounced(_)
+    ));
     assert!(manager.is_bounced("did:plc:resilient_spammer").unwrap());
     assert_eq!(manager.cache().count_bounced().unwrap(), 1);
 }
@@ -120,7 +123,8 @@ async fn test_adversarial_pds_malformed_json_create_record() {
 
     let client =
         skybase::repo::PdsRepoClient::from_credentials(server.uri(), "did:plc:alice", "mock_token")
-            .unwrap();
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
     let manager = ModListManager::open_in_memory().unwrap();
 
     // Cache a fake list config so ensure_mod_list doesn't call PDS
@@ -171,7 +175,8 @@ async fn test_adversarial_pds_socket_drop_on_create_record() {
         "did:plc:alice",
         "mock_token",
     )
-    .unwrap();
+    .unwrap()
+    .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
     let manager = ModListManager::open_in_memory().unwrap();
 
     // Pre-populate list config in cache so ensure_mod_list doesn't fail before createRecord
@@ -277,7 +282,8 @@ async fn test_adversarial_pds_socket_drop_on_delete_record() {
         "did:plc:alice",
         "mock_token",
     )
-    .unwrap();
+    .unwrap()
+    .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
     let manager = ModListManager::open_in_memory().unwrap();
 
     // Seed cache with a bounced user
@@ -336,7 +342,8 @@ async fn test_adversarial_pds_list_records_500_fails_without_duplicate_provision
 
     let client =
         skybase::repo::PdsRepoClient::from_credentials(server.uri(), "did:plc:alice", "mock_token")
-            .unwrap();
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
     let manager = ModListManager::open_in_memory().unwrap();
 
     let res = manager.ensure_mod_list(&client, "did:plc:alice").await;
@@ -376,7 +383,8 @@ async fn test_adversarial_pds_list_records_malformed_json() {
 
     let client =
         skybase::repo::PdsRepoClient::from_credentials(server.uri(), "did:plc:alice", "mock_token")
-            .unwrap();
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
     let manager = ModListManager::open_in_memory().unwrap();
 
     // Malformed JSON is not swallowed to avoid provisioning duplicates
@@ -460,11 +468,9 @@ async fn test_rapid_oscillating_bounce_pardon_bounce_lifecycle() {
             .await
             .unwrap();
 
-        assert!(
-            bounce_res.is_some(),
-            "Cycle {cycle}: bounce should create listitem"
-        );
-        let listitem_uri = bounce_res.unwrap();
+        let skybouncer::modlist::BounceOutcome::Bounced(listitem_uri) = bounce_res else {
+            panic!("Cycle {cycle}: expected Bounced, got {bounce_res:?}");
+        };
         assert!(listitem_uri.contains("app.bsky.graph.listitem"));
 
         // Verify cache state
@@ -491,8 +497,8 @@ async fn test_rapid_oscillating_bounce_pardon_bounce_lifecycle() {
             .await
             .unwrap();
         assert!(
-            dupe_res.is_none(),
-            "Cycle {cycle}: duplicate bounce should return None"
+            matches!(dupe_res, skybouncer::modlist::BounceOutcome::AlreadyBounced),
+            "Cycle {cycle}: duplicate bounce should return AlreadyBounced"
         );
 
         // 2. Pardon user
@@ -594,7 +600,13 @@ async fn test_concurrent_bounce_race_same_violator() {
         results.push(res);
     }
 
-    let successes: Vec<_> = results.into_iter().flatten().collect();
+    let successes: Vec<_> = results
+        .into_iter()
+        .filter_map(|r| match r {
+            skybouncer::modlist::BounceOutcome::Bounced(uri) => Some(uri),
+            _ => None,
+        })
+        .collect();
 
     // Check how many listitem creations were received by PDS
     let created_listitems: Vec<_> = pds

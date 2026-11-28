@@ -172,7 +172,9 @@ impl GateMockPds {
     }
 
     fn client(&self, did: &str) -> PdsRepoClient {
-        PdsRepoClient::from_credentials(self.server.uri(), did, "mock_token").unwrap()
+        PdsRepoClient::from_credentials(self.server.uri(), did, "mock_token")
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true))
     }
 }
 
@@ -883,7 +885,9 @@ async fn test_engine_threadgate_and_postgate_live_and_dry_run() {
         .respond_with(ResponseTemplate::new(500).set_body_string("pds err"))
         .mount(&bad_pds_srv)
         .await;
-    let err_pds_client = PdsRepoClient::from_credentials(bad_pds_srv.uri(), alice, "tok").unwrap();
+    let err_pds_client = PdsRepoClient::from_credentials(bad_pds_srv.uri(), alice, "tok")
+        .unwrap()
+        .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
     let cache_err = Arc::new(DeduplicationCache::open_in_memory().unwrap());
     let mut protected_set = HashSet::new();
     protected_set.insert(alice.to_string());
@@ -1585,6 +1589,7 @@ async fn test_web_api_storms_endpoints_auth_prometheus_and_cli() {
         .oneshot(
             Request::builder()
                 .uri("/api/metrics")
+                .header(header::AUTHORIZATION, format!("Bearer {alice_tok}"))
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -131,9 +131,9 @@ pub use matcher::{
 pub use modlist::{
     extract_rubric_from_list_description, fetch_sovereign_config,
     format_list_description_with_rubric, publish_sovereign_config, AllowlistEntry, ArchivedBounce,
-    BounceRequest, BouncedUser, DeduplicationCache, ManualBounceOutcome, ModListConfig,
-    ModListManager, SovereignConfigRecord, DEFAULT_MOD_LIST_DESCRIPTION, DEFAULT_MOD_LIST_NAME,
-    SOVEREIGN_CONFIG_COLLECTION, SOVEREIGN_CONFIG_RKEY,
+    BounceOutcome, BounceRequest, BouncedUser, DeduplicationCache, ManualBounceOutcome,
+    ModListConfig, ModListManager, SovereignConfigRecord, DEFAULT_MOD_LIST_DESCRIPTION,
+    DEFAULT_MOD_LIST_NAME, SOVEREIGN_CONFIG_COLLECTION, SOVEREIGN_CONFIG_RKEY,
 };
 pub use types::{
     format_system_time_iso8601, now_iso8601, ByteSlice, Embed, Facet, FacetFeature, FollowRecord,

@@ -27,7 +27,8 @@ impl TenantRegistry {
             let conn = self.conn.lock();
             let mut stmt = conn.prepare_cached(
                 "SELECT did FROM tenants WHERE (LOWER(handle) = LOWER(?1) OR LOWER(handle) = LOWER(?2))
-                 AND handle_updated_at IS NOT NULL AND handle_updated_at >= ?3 LIMIT 1;",
+                 AND handle_updated_at IS NOT NULL AND handle_updated_at >= ?3
+                 ORDER BY handle_updated_at DESC LIMIT 1;",
             )?;
             stmt.query_row(params![clean, format!("@{clean}"), cutoff_i64], |row| {
                 row.get(0)
@@ -77,15 +78,25 @@ impl TenantRegistry {
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if update query fails.
     pub fn update_handle(&self, did: &str, handle: &str) -> Result<bool, SkybouncerError> {
+        let clean = crate::util::normalize_handle(handle).to_ascii_lowercase();
+        if clean.is_empty() || clean == "handle.invalid" {
+            return Ok(false);
+        }
         let now_us = current_time_us();
         let now_i64 = us_to_i64(now_us);
 
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare_cached(
-            "UPDATE tenants SET handle = ?1, handle_updated_at = ?2, updated_at = ?2 WHERE did = ?3;",
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE tenants SET handle = NULL, handle_updated_at = ?1, updated_at = ?1
+             WHERE (LOWER(handle) = LOWER(?2) OR LOWER(handle) = LOWER(?3)) AND did != ?4;",
+            params![now_i64, clean, format!("@{clean}"), did],
         )?;
-
-        let count = stmt.execute(params![handle, now_i64, did])?;
+        let count = tx.execute(
+            "UPDATE tenants SET handle = ?1, handle_updated_at = ?2, updated_at = ?2 WHERE did = ?3;",
+            params![clean, now_i64, did],
+        )?;
+        tx.commit()?;
         Ok(count > 0)
     }
 }

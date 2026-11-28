@@ -11,6 +11,8 @@ impl DeduplicationCache {
         subject_did: &str,
         reason: Option<&str>,
     ) -> Result<(), SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
+        let subject_did = crate::util::require_non_empty_did(subject_did, "subject_did")?;
         let conn = self.conn.lock();
         let now_us = current_time_us();
         let now_i64 = us_to_i64(now_us);
@@ -30,12 +32,15 @@ impl DeduplicationCache {
     /// Removes an account from the protected user's moderation allowlist.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if SQLite delete fails.
+    /// Returns [`SkybouncerError::Config`] if `protected_did` or `subject_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if SQLite delete fails.
     pub fn remove_from_allowlist(
         &self,
         protected_did: &str,
         subject_did: &str,
     ) -> Result<bool, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
+        let subject_did = crate::util::require_non_empty_did(subject_did, "subject_did")?;
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "DELETE FROM allowlist WHERE protected_did = ?1 AND subject_did = ?2;",
@@ -47,12 +52,14 @@ impl DeduplicationCache {
     /// Checks whether an account is currently on the protected user's moderation allowlist in SQLite.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if SQLite query fails.
     pub fn is_allowlisted(
         &self,
         protected_did: &str,
         subject_did: &str,
     ) -> Result<bool, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT 1 FROM allowlist WHERE protected_did = ?1 AND subject_did = ?2 LIMIT 1;",
@@ -67,11 +74,13 @@ impl DeduplicationCache {
     /// Lists all accounts on the protected user's moderation allowlist.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if SQLite query fails.
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if SQLite query fails.
     pub fn list_allowlist(
         &self,
         protected_did: &str,
     ) -> Result<Vec<AllowlistEntry>, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT a.protected_did, a.subject_did, a.reason, a.created_at, h.handle

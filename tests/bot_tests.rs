@@ -37,6 +37,28 @@ async fn setup_test_engine(
     Arc<DeduplicationCache>,
     MockPdsServer,
 ) {
+    setup_test_engine_opt_admin(protected_did, None).await
+}
+
+async fn setup_test_engine_with_admin(
+    protected_did: &str,
+    admin_did: &str,
+) -> (
+    Arc<SkybouncerEngine>,
+    Arc<DeduplicationCache>,
+    MockPdsServer,
+) {
+    setup_test_engine_opt_admin(protected_did, Some(admin_did)).await
+}
+
+async fn setup_test_engine_opt_admin(
+    protected_did: &str,
+    admin_did: Option<&str>,
+) -> (
+    Arc<SkybouncerEngine>,
+    Arc<DeduplicationCache>,
+    MockPdsServer,
+) {
     let pds = MockPdsServer::start().await;
     let cache = Arc::new(DeduplicationCache::open_in_memory().expect("in-memory cache"));
     let follow_graph = Arc::new(FollowGraph::new());
@@ -52,18 +74,23 @@ async fn setup_test_engine(
 
     let mut protected_dids = HashSet::new();
     protected_dids.insert(protected_did.to_string());
-    let config = SkybouncerConfig::new(protected_dids, rubric)
-        .with_enable_heuristic_prefilter(true)
-        .with_admin_did("did:plc:admin");
+    let mut config =
+        SkybouncerConfig::new(protected_dids, rubric).with_enable_heuristic_prefilter(true);
+    if let Some(admin) = admin_did {
+        config = config.with_admin_did(admin);
+    }
 
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        follow_graph,
-        gate,
-        classifier,
-        modlist_manager,
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(
+            config,
+            follow_graph,
+            gate,
+            classifier,
+            modlist_manager,
+            pds_client,
+        )
+        .expect("bot test engine"),
+    );
 
     (engine, cache, pds)
 }
@@ -1135,7 +1162,7 @@ async fn test_command_handler_recent_and_pardon() {
 
 #[tokio::test]
 async fn test_command_handler_status_and_test() {
-    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let (engine, _, _) = setup_test_engine_with_admin("did:plc:protected1", "did:plc:admin").await;
     let handler = BotCommandHandler::new(engine, "did:plc:bot");
 
     // Tenant Status output (scoped privacy)
@@ -1904,7 +1931,7 @@ async fn test_bot_handler_allowlist_and_pardon_immunization() {
 
 #[tokio::test]
 async fn test_command_branch_matrix_admin_and_stranger() {
-    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let (engine, _, _) = setup_test_engine_with_admin("did:plc:protected1", "did:plc:admin").await;
     // Enroll an extra tenant so is_single_tenant becomes false.
     engine
         .enroll_tenant(skybouncer::tenant::Tenant::new("did:plc:enrolled"))
@@ -2052,7 +2079,7 @@ async fn test_command_allowlist_lifecycle_via_bot() {
 
 #[tokio::test]
 async fn test_command_test_allowlist_status_variants() {
-    let (engine, _, _) = setup_test_engine("did:plc:protected1").await;
+    let (engine, _, _) = setup_test_engine_with_admin("did:plc:protected1", "did:plc:admin").await;
     let handler = BotCommandHandler::new(engine, "did:plc:bot");
     let protected = "did:plc:protected1";
     let admin = "did:plc:admin";
@@ -2270,14 +2297,10 @@ async fn test_command_status_dry_run_variants() {
     let config = SkybouncerConfig::new(dids, rubric)
         .with_admin_did("did:plc:admin")
         .with_dry_run(true);
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        follow_graph,
-        gate,
-        classifier,
-        modlist,
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(config, follow_graph, gate, classifier, modlist, pds_client)
+            .expect("bot test engine"),
+    );
     let handler = BotCommandHandler::new(engine, "did:plc:bot");
 
     // Admin status in dry-run -> "Yes (shadow)".
@@ -2558,14 +2581,10 @@ async fn test_dm_test_command_respects_threshold_and_reports_classifier_errors()
     let mut dids = HashSet::new();
     dids.insert("did:plc:protected1".to_string());
     let config = SkybouncerConfig::new(dids, rubric);
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        follow_graph,
-        gate,
-        classifier,
-        modlist,
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(config, follow_graph, gate, classifier, modlist, pds_client)
+            .expect("bot test engine"),
+    );
     let handler = BotCommandHandler::new(engine, "did:plc:bot");
 
     let below_reply = handler

@@ -306,8 +306,9 @@ async fn test_extreme_thundering_herd_same_candidate_bounce() {
             .expect("Task should join cleanly")
             .expect("bounce_user should not error");
         match result {
-            Some(_) => successful_bounces += 1,
-            None => short_circuited_drops += 1,
+            skybouncer::modlist::BounceOutcome::Bounced(_) => successful_bounces += 1,
+            skybouncer::modlist::BounceOutcome::AlreadyBounced
+            | skybouncer::modlist::BounceOutcome::BelowThreshold => short_circuited_drops += 1,
         }
     }
 

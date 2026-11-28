@@ -380,6 +380,7 @@ impl MockPdsServer {
     pub fn pds_client(&self, did: &str) -> PdsRepoClient {
         PdsRepoClient::from_credentials(self.uri(), did, "mock_token")
             .expect("mock PdsRepoClient creation should succeed")
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true))
     }
 
     /// Injects a one-time DPoP nonce challenge (HTTP 401 use_dpop_nonce) on createRecord.

@@ -545,7 +545,9 @@ mod tests {
     #[tokio::test]
     async fn dry_run_gates_make_zero_pds_requests() {
         let pds = MockServer::start().await;
-        let client = PdsRepoClient::from_credentials(pds.uri(), "did:plc:alice", "tok").unwrap();
+        let client = PdsRepoClient::from_credentials(pds.uri(), "did:plc:alice", "tok")
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
 
         let tg_uri = apply_threadgate(
             &client,
@@ -584,7 +586,9 @@ mod tests {
     #[tokio::test]
     async fn live_threadgate_and_postgate_merge_preserves_existing_and_caps_at_50() {
         let pds = MockServer::start().await;
-        let client = PdsRepoClient::from_credentials(pds.uri(), "did:plc:alice", "tok").unwrap();
+        let client = PdsRepoClient::from_credentials(pds.uri(), "did:plc:alice", "tok")
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
 
         Mock::given(method("POST"))
             .and(path("/xrpc/com.atproto.repo.putRecord"))
@@ -702,8 +706,9 @@ mod tests {
             .mount(&err_pds)
             .await;
 
-        let err_client =
-            PdsRepoClient::from_credentials(err_pds.uri(), "did:plc:alice", "tok").unwrap();
+        let err_client = PdsRepoClient::from_credentials(err_pds.uri(), "did:plc:alice", "tok")
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
         let (fresh_uri, fresh_cnt) = apply_postgate_detach(
             &err_client,
             "did:plc:alice",
@@ -741,8 +746,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
             .mount(&fail_pds)
             .await;
-        let fail_client =
-            PdsRepoClient::from_credentials(fail_pds.uri(), "did:plc:alice", "tok").unwrap();
+        let fail_client = PdsRepoClient::from_credentials(fail_pds.uri(), "did:plc:alice", "tok")
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
         assert!(
             apply_postgate_detach(&fail_client, "did:plc:alice", "3x", &[], true, false)
                 .await

@@ -175,6 +175,7 @@ impl DeduplicationCache {
         &self,
         target_did: &str,
     ) -> Result<Option<StormEvent>, SkybouncerError> {
+        let target_did = crate::util::require_non_empty_did(target_did, "target_did")?;
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT {STORM_COLUMNS} FROM dogpile_events
@@ -189,12 +190,14 @@ impl DeduplicationCache {
     /// Retrieves an active storm for a specific `(target_did, focal_post_uri)` pair.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the query fails.
+    /// Returns [`SkybouncerError::Config`] if `target_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the query fails.
     pub fn get_active_storm_by_focal_uri(
         &self,
         target_did: &str,
         focal_post_uri: &str,
     ) -> Result<Option<StormEvent>, SkybouncerError> {
+        let target_did = crate::util::require_non_empty_did(target_did, "target_did")?;
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT {STORM_COLUMNS} FROM dogpile_events
@@ -210,17 +213,22 @@ impl DeduplicationCache {
     /// ordered by most recent activity descending.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the query fails.
+    /// Returns [`SkybouncerError::Config`] if `target_did` is `Some("")`/`Some("   ")`,
+    /// or [`SkybouncerError::Database`] if the query fails.
     pub fn list_storms(
         &self,
         target_did: Option<&str>,
         active_only: bool,
         limit: usize,
     ) -> Result<Vec<StormEvent>, SkybouncerError> {
+        let scoped_target = match target_did {
+            Some(raw) => Some(crate::util::require_non_empty_did(raw, "target_did")?),
+            None => None,
+        };
         let capped_limit = i64::try_from(limit.clamp(1, 200)).unwrap_or(50);
         let conn = self.conn.lock();
 
-        let sql = match (target_did.filter(|d| !d.trim().is_empty()), active_only) {
+        let sql = match (scoped_target, active_only) {
             (Some(_), true) => format!(
                 "SELECT {STORM_COLUMNS} FROM dogpile_events
                  WHERE target_did = ?1 AND status = 'active'
@@ -244,7 +252,7 @@ impl DeduplicationCache {
 
         let mut stmt = conn.prepare_cached(&sql)?;
         let mut out = Vec::new();
-        if let Some(did) = target_did.filter(|d| !d.trim().is_empty()) {
+        if let Some(did) = scoped_target {
             let rows = stmt.query_map(params![did, capped_limit], map_storm_event)?;
             for r in rows {
                 out.push(r?);
@@ -262,13 +270,15 @@ impl DeduplicationCache {
     /// (and `focal_post_uri` if supplied, else the latest active storm for `target_did`).
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the SQLite update fails.
+    /// Returns [`SkybouncerError::Config`] if `target_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the SQLite update fails.
     pub fn increment_storm_bounces(
         &self,
         target_did: &str,
         focal_post_uri: Option<&str>,
         delta: u64,
     ) -> Result<(), SkybouncerError> {
+        let target_did = crate::util::require_non_empty_did(target_did, "target_did")?;
         let delta_i64 = i64::try_from(delta).unwrap_or(1);
         let conn = self.conn.lock();
         if let Some(focal) = focal_post_uri.filter(|s| !s.trim().is_empty()) {
@@ -298,13 +308,15 @@ impl DeduplicationCache {
     /// Marks `threadgate_applied` for storms targeting `(target_did, focal_post_uri)`.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the SQLite update fails.
+    /// Returns [`SkybouncerError::Config`] if `target_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the SQLite update fails.
     pub fn mark_storm_threadgate_applied(
         &self,
         target_did: &str,
         focal_post_uri: &str,
         applied: bool,
     ) -> Result<(), SkybouncerError> {
+        let target_did = crate::util::require_non_empty_did(target_did, "target_did")?;
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "UPDATE dogpile_events
@@ -318,13 +330,15 @@ impl DeduplicationCache {
     /// Increments `postgate_detaches_applied` for storms targeting `(target_did, focal_post_uri)`.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the SQLite update fails.
+    /// Returns [`SkybouncerError::Config`] if `target_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if the SQLite update fails.
     pub fn increment_storm_postgate_detaches(
         &self,
         target_did: &str,
         focal_post_uri: &str,
         count: u64,
     ) -> Result<(), SkybouncerError> {
+        let target_did = crate::util::require_non_empty_did(target_did, "target_did")?;
         let count_i64 = i64::try_from(count).unwrap_or(1);
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
@@ -341,7 +355,8 @@ impl DeduplicationCache {
     /// Returns `true` if a matching row was updated.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if the SQLite update fails.
+    /// Returns [`SkybouncerError::Config`] if `target_did` is `Some("")`/`Some("   ")`,
+    /// or [`SkybouncerError::Database`] if the SQLite update fails.
     pub fn update_storm_status(
         &self,
         target_did: Option<&str>,
@@ -349,8 +364,12 @@ impl DeduplicationCache {
         status: StormStatus,
         resolved_at_us: Option<u64>,
     ) -> Result<bool, SkybouncerError> {
+        let scoped_target = match target_did {
+            Some(raw) => Some(crate::util::require_non_empty_did(raw, "target_did")?),
+            None => None,
+        };
         let conn = self.conn.lock();
-        let updated = match target_did.filter(|d| !d.trim().is_empty()) {
+        let updated = match scoped_target {
             Some(did) => {
                 let mut stmt = conn.prepare_cached(
                     "UPDATE dogpile_events

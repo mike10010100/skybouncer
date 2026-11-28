@@ -1,5 +1,20 @@
 use super::*;
 
+pub(crate) fn constant_time_token_eq(expected: &str, provided: &str) -> bool {
+    let expected_digest = skyauth::crypto::sha256_digest(expected.as_bytes());
+    let provided_digest = skyauth::crypto::sha256_digest(provided.as_bytes());
+    skyauth::crypto::constant_time_eq(&expected_digest, &provided_digest)
+}
+
+pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
 /// Extracts the verified authenticated caller DID strictly from a valid session token in Cookie or Authorization header.
 ///
 /// Unsigned `x-skybouncer-did` headers and unverified cookie DIDs are strictly rejected.
@@ -8,21 +23,11 @@ pub fn extract_authenticated_caller(
     engine: &SkybouncerEngine,
 ) -> Option<String> {
     // 1. Check Authorization: Bearer <session_token_or_api_token>
-    if let Some(auth_header) = headers.get(header::AUTHORIZATION) {
-        if let Ok(s) = auth_header.to_str() {
-            let trimmed = s.trim();
-            if let Some(token) = trimmed.strip_prefix("Bearer ") {
-                let token = token.trim();
-                if !token.is_empty() {
-                    if let Ok(Some(did)) = engine.tenant_registry().validate_web_session(token) {
-                        return Some(did);
-                    }
-                    if let Some(did) = validate_configured_api_token(token, engine) {
-                        return Some(did);
-                    }
-                }
-            }
+    if let Some(token) = extract_bearer_token(headers) {
+        if let Ok(Some(did)) = engine.tenant_registry().validate_web_session(token) {
+            return Some(did);
         }
+        return validate_configured_api_token(token, engine);
     }
 
     // 2. Check Cookie: skybouncer_session=<session_token>
@@ -47,29 +52,35 @@ pub fn extract_authenticated_caller(
 }
 
 /// Validates an operator CLI/API bearer token against configured environment secrets
-/// (`SKYBOUNCER_API_TOKEN`, `SKYBOUNCER_TOKEN`, or `PDS_ACCESS_TOKEN`), resolving to the
-/// configured administrator DID or primary protected DID.
+/// (`SKYBOUNCER_API_TOKEN` or `SKYBOUNCER_TOKEN`), resolving to the configured administrator
+/// DID or sole protected DID in single-tenant mode.
 fn validate_configured_api_token(token: &str, engine: &SkybouncerEngine) -> Option<String> {
     if token.starts_with("did:") {
         return None;
     }
-    let configured = crate::env::var(&[
-        "SKYBOUNCER_API_TOKEN",
-        "SKYBOUNCER_TOKEN",
-        "PDS_ACCESS_TOKEN",
-    ])
-    .filter(|val| {
-        !matches!(
-            val.as_str(),
-            "your_access_jwt_here" | "placeholder" | "changeme" | "test_token"
-        )
-    })?;
-    if configured.len() >= 8 && configured == token {
-        if let Some(admin) = engine.config().admin_did {
-            return Some(admin);
+    let configured =
+        crate::env::var(&["SKYBOUNCER_API_TOKEN", "SKYBOUNCER_TOKEN"]).filter(|val| {
+            !matches!(
+                val.as_str(),
+                "your_access_jwt_here" | "placeholder" | "changeme" | "test_token"
+            )
+        })?;
+    if configured.len() >= 8 && constant_time_token_eq(&configured, token) {
+        if let Some(admin) = engine
+            .config()
+            .admin_did
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            return Some(admin.to_string());
         }
-        let protected = engine.protected_dids();
-        return protected.into_iter().min();
+        if engine.is_single_tenant() {
+            let protected = engine.protected_dids();
+            if protected.len() == 1 {
+                return protected.into_iter().next();
+            }
+        }
     }
     None
 }
@@ -201,11 +212,13 @@ pub async fn update_rules(
                 tracing::error!(did = %target_did, error = %e, "Failed to persist updated rubric");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to persist rubric: {e}"),
+                    "Failed to persist rubric".to_string(),
                 )
             })?;
-    } else if state.engine.is_protected(&target_did) {
-        // Only non-enrolled protected accounts update the default engine rubric
+    } else if state.engine.is_admin(&target_did)
+        || (state.engine.is_single_tenant() && state.engine.is_protected(&target_did))
+    {
+        // Only admin or single-tenant protected accounts update the default engine rubric
         state.engine.set_rubric(rubric.clone());
     }
 

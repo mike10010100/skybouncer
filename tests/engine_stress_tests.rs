@@ -146,14 +146,17 @@ impl StressFixture {
         let config =
             SkybouncerConfig::new(protected_dids, rubric).with_channel_capacity(channel_capacity);
 
-        let engine = Arc::new(SkybouncerEngine::new(
-            config,
-            Arc::clone(&follow_graph),
-            gate,
-            classifier,
-            modlist_manager,
-            pds_client,
-        ));
+        let engine = Arc::new(
+            SkybouncerEngine::new(
+                config,
+                Arc::clone(&follow_graph),
+                gate,
+                classifier,
+                modlist_manager,
+                pds_client,
+            )
+            .expect("stress test engine"),
+        );
 
         Self {
             pds,
@@ -219,14 +222,17 @@ async fn make_fast_engine(
         .with_evaluation_queue_capacity(4096)
         .with_rate_limiter_config(RateLimiterConfig::unlimited());
 
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        follow_graph,
-        gate,
-        classifier,
-        modlist_manager,
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(
+            config,
+            follow_graph,
+            gate,
+            classifier,
+            modlist_manager,
+            pds_client,
+        )
+        .expect("stress test engine"),
+    );
 
     (engine, cache, pds)
 }
@@ -522,14 +528,48 @@ async fn test_stress_multi_protected_targets_high_concurrency() {
 
     let config = SkybouncerConfig::new(protected_dids, rubric).with_channel_capacity(200);
 
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        follow_graph,
-        gate,
-        classifier,
-        modlist_manager,
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(
+            config,
+            follow_graph,
+            gate,
+            classifier,
+            modlist_manager,
+            pds_client,
+        )
+        .expect("stress test engine"),
+    );
+    let oauth_metadata = skyauth::client::OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let oauth_client = Arc::new(
+        skyauth::client::AtprotoOAuthClient::builder()
+            .client_metadata(oauth_metadata)
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+    engine.set_oauth_client(oauth_client);
+    for i in 0..4 {
+        let did = format!("did:plc:target_{i}");
+        let session = skyauth::session::OAuthSession::new(
+            &did,
+            "mock_token",
+            Some("rt-mock".to_string()),
+            "DPoP",
+            Some("atproto".to_string()),
+            Some(3600),
+            skyauth::dpop::DPoPKey::generate(),
+            Some(pds.uri()),
+            Some(pds.uri()),
+            Some(format!("{}/oauth/token", pds.uri())),
+        )
+        .expect("session");
+        engine
+            .enroll_tenant(skybouncer::tenant::Tenant::new(&did).with_session(session))
+            .expect("enroll tenant");
+    }
 
     // Launch 40 concurrent tasks attacking across the 4 protected targets
     let mut handles = Vec::new();

@@ -7,21 +7,36 @@
 //! - Dynamic enrollment and activation toggles for ATProto users.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use skyauth::client::AtprotoOAuthClient;
 use skyauth::session::OAuthSession;
 use skybase::repo::PdsRepoClient;
+use zeroize::Zeroizing;
 
 use crate::classifier::RuleRubric;
 use crate::crypto::SessionCipher;
 use crate::error::SkybouncerError;
 use crate::time::{current_time_us, i64_to_us, us_to_i64};
+
+/// Prefix applied to SHA-256 hashed web session tokens stored in SQLite.
+pub const WEB_SESSION_HASH_PREFIX: &str = "sha256:";
+
+/// Outcome of a Compare-And-Swap (`WHERE did = ? AND session_json = ?`) OAuth session update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CasUpdateOutcome {
+    /// The stored ciphertext matched `expected_raw_session_json` and was atomically replaced.
+    Updated,
+    /// The row still exists, but its ciphertext was concurrently modified by another operation.
+    Conflict,
+    /// No tenant row exists for the given DID.
+    NotFound,
+}
 
 /// Default time-to-live for handle resolution caching (1 hour).
 pub const DEFAULT_HANDLE_TTL: Duration = Duration::from_secs(3600);
@@ -102,6 +117,7 @@ pub struct TenantRegistry {
     conn: Arc<Mutex<Connection>>,
     /// In-memory cache of authenticated [`PdsRepoClient`] instances indexed by tenant DID.
     pub pds_clients: Arc<RwLock<HashMap<String, Arc<PdsRepoClient>>>>,
+    client_epochs: Arc<RwLock<HashMap<String, u64>>>,
     oauth_client: Arc<RwLock<Option<Arc<AtprotoOAuthClient>>>>,
     cipher: SessionCipher,
     refresh_locks: Arc<crate::modlist::manager::StripedAsyncLocks>,
@@ -202,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_registry_fallback_constructs_usable_registry() {
-        let registry = TenantRegistry::fallback();
+        let registry = TenantRegistry::fallback().unwrap();
         assert_eq!(registry.count().unwrap(), 0);
         registry
             .register_or_update(&Tenant::new("did:plc:fb"))
@@ -535,9 +551,26 @@ mod tests {
 
         // update_session on an existing tenant returns true and evicts any cached client.
         assert!(registry.update_session("did:plc:upd", &session).unwrap());
-        // update_session on an unknown tenant returns false.
-        assert!(!registry
+        // update_session rejects a mismatched subject DID.
+        assert!(registry
             .update_session("did:plc:missing", &session)
+            .is_err());
+        // update_session on an unknown tenant with matching subject returns false.
+        let missing_session = OAuthSession::new(
+            "did:plc:missing",
+            "at-missing",
+            Some("rt-missing".to_string()),
+            "DPoP",
+            None,
+            None,
+            DPoPKey::generate(),
+            Some("https://pds.example".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!registry
+            .update_session("did:plc:missing", &missing_session)
             .unwrap());
 
         // Empty DID for a web session is a config error.
@@ -696,22 +729,24 @@ mod tests {
             .unwrap();
         }
 
-        // 1. Transparent backward compatibility: get() loads and parses plain JSON seamlessly
+        // 1. Runtime get() strictly rejects unmigrated plaintext (no silent downgrade)
+        assert!(matches!(
+            registry.get("did:plc:legacy-user"),
+            Err(SkybouncerError::Auth(_))
+        ));
+
+        // 2. Startup migrate_encrypted_secrets transparently re-seals legacy plaintext with tenant AAD
+        registry.migrate_encrypted_secrets(None).unwrap();
+
         let fetched = registry
             .get("did:plc:legacy-user")
             .unwrap()
             .expect("legacy tenant exists");
-        let loaded_session = fetched.session.expect("legacy session parsed");
+        let loaded_session = fetched.session.expect("legacy session migrated");
         assert_eq!(loaded_session.access_token(), "legacy_plain_access_token");
 
-        // 2. On update_session (e.g. token refresh or update), session is encrypted
-        let updated = registry
-            .update_session("did:plc:legacy-user", &loaded_session)
-            .unwrap();
-        assert!(updated);
-
-        // 3. Raw SQLite inspection now verifies encryption
-        let raw_json_after_update: String = {
+        // 3. Raw SQLite inspection now verifies strict encryption at rest
+        let raw_json_after_migration: String = {
             let conn = registry.conn.lock();
             conn.query_row(
                 "SELECT session_json FROM tenants WHERE did = 'did:plc:legacy-user';",
@@ -721,8 +756,8 @@ mod tests {
             .unwrap()
         };
 
-        assert!(raw_json_after_update.starts_with(ENCRYPTION_V1_PREFIX));
-        assert!(!raw_json_after_update.contains("legacy_plain_access_token"));
+        assert!(raw_json_after_migration.starts_with(ENCRYPTION_V1_PREFIX));
+        assert!(!raw_json_after_migration.contains("legacy_plain_access_token"));
     }
 
     #[test]
@@ -1130,9 +1165,653 @@ mod tests {
 
     #[test]
     fn test_fallback_and_cipher_accessor() {
-        let reg = TenantRegistry::fallback();
+        let reg = TenantRegistry::fallback().unwrap();
         assert_eq!(reg.count().unwrap(), 0);
         let enc = reg.cipher().encrypt(b"check").unwrap();
         assert_eq!(reg.cipher().decrypt_or_passthrough(&enc).unwrap(), "check");
+    }
+
+    #[test]
+    fn test_web_session_pass_the_hash_rejected() {
+        let registry = test_registry();
+        let token = registry
+            .create_web_session("did:plc:alice", Duration::from_secs(3600))
+            .unwrap();
+        let stored_hash = {
+            let d = skyauth::crypto::sha256_digest(token.as_bytes());
+            let mut h = String::with_capacity(WEB_SESSION_HASH_PREFIX.len() + 64);
+            h.push_str(WEB_SESSION_HASH_PREFIX);
+            for b in d {
+                use std::fmt::Write;
+                let _ = write!(&mut h, "{b:02x}");
+            }
+            h
+        };
+        assert!(stored_hash.starts_with(WEB_SESSION_HASH_PREFIX));
+
+        // Presenting the stored `sha256:<hex>` digest or raw `<hex>` must NOT validate.
+        assert_eq!(registry.validate_web_session(&stored_hash).unwrap(), None);
+        let raw_hex = stored_hash.strip_prefix(WEB_SESSION_HASH_PREFIX).unwrap();
+        assert_eq!(registry.validate_web_session(raw_hex).unwrap(), None);
+        assert!(!registry.delete_web_session(&stored_hash).unwrap());
+
+        // Real token still validates cleanly.
+        assert_eq!(
+            registry.validate_web_session(&token).unwrap().as_deref(),
+            Some("did:plc:alice")
+        );
+    }
+
+    #[test]
+    fn test_web_session_zero_logout_migration_from_64hex_and_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy_web_sessions.db");
+        let now = current_time_us();
+        let future = now + 3_600_000_000;
+
+        let raw_hex_tok = "tok-prehashed-v033";
+        let legacy_64hex = {
+            let d = skyauth::crypto::sha256_digest(raw_hex_tok.as_bytes());
+            let mut h = String::with_capacity(64);
+            for b in d {
+                use std::fmt::Write;
+                let _ = write!(&mut h, "{b:02x}");
+            }
+            h
+        };
+        let legacy_plaintext_tok = "legacy-plaintext-session-token";
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE web_sessions (
+                    token TEXT PRIMARY KEY,
+                    did TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO web_sessions (token, did, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                params![legacy_64hex, "did:plc:hexuser", us_to_i64(now), us_to_i64(future)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO web_sessions (token, did, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                params![legacy_plaintext_tok, "did:plc:plainuser", us_to_i64(now), us_to_i64(future)],
+            )
+            .unwrap();
+            // Expired legacy row should be purged on migration.
+            conn.execute(
+                "INSERT INTO web_sessions (token, did, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                params!["expired-legacy-tok", "did:plc:exp", us_to_i64(now), us_to_i64(now - 10)],
+            )
+            .unwrap();
+        }
+
+        let _env_guard = crate::crypto::test_env_lock().lock().unwrap();
+        std::env::remove_var("SKYBOUNCER_SESSION_ENCRYPTION_KEY");
+        let registry = TenantRegistry::open(&db_path).unwrap();
+
+        // Zero-logout: both pre-existing tokens STILL validate.
+        assert_eq!(
+            registry
+                .validate_web_session(raw_hex_tok)
+                .unwrap()
+                .as_deref(),
+            Some("did:plc:hexuser")
+        );
+        assert_eq!(
+            registry
+                .validate_web_session(legacy_plaintext_tok)
+                .unwrap()
+                .as_deref(),
+            Some("did:plc:plainuser")
+        );
+        assert_eq!(
+            registry.validate_web_session("expired-legacy-tok").unwrap(),
+            None
+        );
+
+        // Pass-the-hash on migrated rows is rejected.
+        let stored_tokens: Vec<String> = {
+            let conn = registry.conn.lock();
+            let mut stmt = conn.prepare("SELECT token FROM web_sessions").unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(stored_tokens.len(), 2);
+        for tok in stored_tokens {
+            assert!(tok.starts_with(WEB_SESSION_HASH_PREFIX), "tok={tok}");
+            assert_eq!(registry.validate_web_session(&tok).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn test_zero_logout_secret_migration_and_db_file_permissions() {
+        let _env_guard = crate::crypto::test_env_lock().lock().unwrap();
+        std::env::remove_var("SKYBOUNCER_SESSION_ENCRYPTION_KEY");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("migrate_secrets.db");
+        let legacy_cipher = SessionCipher::legacy_host_fallback();
+        let did = "did:plc:legacy_migrated";
+        let dpop = DPoPKey::generate();
+        let session = OAuthSession::new(
+            did,
+            "at-legacy-tok",
+            Some("rt-legacy-tok".to_string()),
+            "DPoP",
+            Some("atproto".to_string()),
+            Some(3600),
+            dpop,
+            Some("https://pds.example".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        let raw_session_json = serde_json::to_string(&session).unwrap();
+        let legacy_session_enc = legacy_cipher.encrypt(raw_session_json.as_bytes()).unwrap();
+        let legacy_client_dpop = DPoPKey::generate();
+        let legacy_oauth_key_enc = legacy_cipher
+            .encrypt(legacy_client_dpop.to_bytes_b64().as_bytes())
+            .unwrap();
+
+        {
+            let reg = TenantRegistry::from_connection(Arc::new(Mutex::new(
+                Connection::open(&db_path).unwrap(),
+            )))
+            .unwrap();
+            let now = us_to_i64(current_time_us());
+            let conn = reg.conn.lock();
+            conn.execute(
+                "INSERT INTO tenants (did, session_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![did, legacy_session_enc, now, now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO oauth_client_keys (key_id, encrypted_key, created_at) VALUES ('primary', ?1, ?2)",
+                params![legacy_oauth_key_enc, now],
+            )
+            .unwrap();
+        }
+
+        // Reopen with TenantRegistry::open -> generates .skybouncer.key + migrates legacy rows atomically.
+        let migrated_reg = TenantRegistry::open(&db_path).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let db_mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(db_mode, 0o600);
+            let key_mode = std::fs::metadata(dir.path().join(crate::crypto::KEY_FILE_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(key_mode, 0o600);
+        }
+
+        // Tenant session decrypts seamlessly under the new cipher + strict AAD.
+        let tenant = migrated_reg.get(did).unwrap().expect("migrated tenant");
+        assert_eq!(
+            tenant.session.as_ref().unwrap().access_token,
+            "at-legacy-tok"
+        );
+
+        // Stored DB ciphertext was actually re-sealed under the new key with AAD (not legacy cipher).
+        let (stored_sess, stored_key): (String, String) = {
+            let conn = migrated_reg.conn.lock();
+            let s: String = conn
+                .query_row(
+                    "SELECT session_json FROM tenants WHERE did = ?1",
+                    params![did],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let k: String = conn
+                .query_row(
+                    "SELECT encrypted_key FROM oauth_client_keys WHERE key_id = 'primary'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (s, k)
+        };
+        assert!(legacy_cipher
+            .decrypt_strict_with_aad(&stored_sess, did.as_bytes())
+            .is_err());
+        assert!(migrated_reg
+            .cipher()
+            .decrypt_strict_with_aad(&stored_sess, did.as_bytes())
+            .is_ok());
+        assert!(migrated_reg
+            .cipher()
+            .decrypt_strict_with_aad(&stored_key, b"oauth_client_key:primary")
+            .is_ok());
+    }
+
+    #[test]
+    fn test_tenant_session_sub_mismatch_rejected_on_write_and_read() {
+        let registry = test_registry();
+        let wrong_session = OAuthSession::new(
+            "did:plc:attacker",
+            "at-1",
+            None,
+            "DPoP",
+            None,
+            None,
+            DPoPKey::generate(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Write checks reject mismatched sub.
+        assert!(registry
+            .register_or_update(&Tenant::new("did:plc:victim").with_session(wrong_session.clone()))
+            .is_err());
+        assert!(registry
+            .upsert_oauth_session("did:plc:victim", None, &wrong_session)
+            .is_err());
+
+        // Read check rejects tampered DB row whose decrypted session.sub != row.did.
+        let tampered_enc = registry
+            .cipher()
+            .encrypt_with_aad(
+                serde_json::to_string(&wrong_session).unwrap().as_bytes(),
+                b"did:plc:victim",
+            )
+            .unwrap();
+        let now = us_to_i64(current_time_us());
+        {
+            let conn = registry.conn.lock();
+            conn.execute(
+                "INSERT INTO tenants (did, session_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params!["did:plc:victim", tampered_enc, now, now],
+            )
+            .unwrap();
+        }
+        assert!(registry.get("did:plc:victim").is_err());
+    }
+
+    #[test]
+    fn test_load_or_create_oauth_client_key_concurrent_cold_start_race() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cold_start_race.db");
+        let _env_guard = crate::crypto::test_env_lock().lock().unwrap();
+        std::env::remove_var("SKYBOUNCER_SESSION_ENCRYPTION_KEY");
+
+        let reg = Arc::new(TenantRegistry::open(&db_path).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(6));
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let r = Arc::clone(&reg);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                r.load_or_create_oauth_client_key()
+                    .map(|k| serde_json::to_string(&k).unwrap())
+            }));
+        }
+
+        let keys: Vec<String> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().expect("cold-start key"))
+            .collect();
+        for k in &keys[1..] {
+            assert_eq!(k, &keys[0], "all racing threads must observe identical JWK");
+        }
+    }
+
+    #[test]
+    fn test_remove_tenant_purges_web_sessions_and_evicts_pds_client() {
+        let registry = test_registry();
+        let did = "did:plc:remove_me";
+        let session = OAuthSession::new(
+            did,
+            "at-rem",
+            None,
+            "DPoP",
+            None,
+            None,
+            DPoPKey::generate(),
+            Some("https://pds.example".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        registry
+            .register_or_update(&Tenant::new(did).with_session(session))
+            .unwrap();
+        let web_tok = registry
+            .create_web_session(did, Duration::from_secs(3600))
+            .unwrap();
+        let other_tok = registry
+            .create_web_session("did:plc:other", Duration::from_secs(3600))
+            .unwrap();
+
+        let pds_client =
+            Arc::new(PdsRepoClient::from_credentials("https://pds.example", did, "tok").unwrap());
+        {
+            let mut map = registry.pds_clients.write();
+            map.insert(did.to_string(), pds_client);
+        }
+
+        assert!(registry.remove(did).unwrap());
+        assert!(registry.get(did).unwrap().is_none());
+        assert_eq!(registry.validate_web_session(&web_tok).unwrap(), None);
+        assert_eq!(
+            registry
+                .validate_web_session(&other_tok)
+                .unwrap()
+                .as_deref(),
+            Some("did:plc:other")
+        );
+        assert!(!registry.pds_clients.read().contains_key(did));
+    }
+
+    #[test]
+    fn test_upsert_oauth_session_preserves_concurrent_rubric_and_pause_edits() {
+        let registry = test_registry();
+        let did = "did:plc:upsert_preserve";
+        let rubric = RuleRubric::new(
+            "Custom sovereign prompt",
+            crate::classifier::Sensitivity::High,
+        );
+        let tenant = Tenant::new(did)
+            .with_handle("old.bsky.social")
+            .with_rubric(rubric.clone())
+            .with_active(false);
+        registry.register_or_update(&tenant).unwrap();
+
+        let fresh_session = OAuthSession::new(
+            did,
+            "at-fresh-upsert",
+            Some("rt-fresh-upsert".to_string()),
+            "DPoP",
+            Some("atproto".to_string()),
+            Some(3600),
+            DPoPKey::generate(),
+            Some("https://pds.example".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        registry
+            .upsert_oauth_session(did, Some("new.bsky.social"), &fresh_session)
+            .unwrap();
+
+        let updated = registry.get(did).unwrap().unwrap();
+        assert_eq!(updated.handle.as_deref(), Some("new.bsky.social"));
+        assert!(
+            !updated.is_active,
+            "inactive/paused state must be preserved on OAuth upsert"
+        );
+        assert_eq!(
+            updated.rubric.as_ref().map(|r| r.prompt.as_str()),
+            Some("Custom sovereign prompt")
+        );
+        assert_eq!(
+            updated.session.as_ref().unwrap().access_token,
+            "at-fresh-upsert"
+        );
+    }
+
+    #[test]
+    fn test_update_session_cas_conflict_detection_and_missing_row() {
+        let registry = test_registry();
+        let did = "did:plc:cas_user";
+        let s1 = OAuthSession::new(
+            did,
+            "at-1",
+            Some("rt-1".to_string()),
+            "DPoP",
+            None,
+            Some(3600),
+            DPoPKey::generate(),
+            Some("https://pds.example".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        registry
+            .register_or_update(&Tenant::new(did).with_session(s1))
+            .unwrap();
+
+        let original_raw: String = {
+            let conn = registry.conn.lock();
+            conn.query_row(
+                "SELECT session_json FROM tenants WHERE did = ?1",
+                params![did],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // Simulate concurrent fresh login replacing s1 with s2.
+        let s2 = OAuthSession::new(
+            did,
+            "at-2-fresh-login",
+            Some("rt-2".to_string()),
+            "DPoP",
+            None,
+            Some(3600),
+            DPoPKey::generate(),
+            Some("https://pds.example".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        registry.upsert_oauth_session(did, None, &s2).unwrap();
+
+        // Stale refresh CAS using old expected ciphertext must detect Conflict and NOT overwrite s2.
+        let s_stale_refresh = OAuthSession::new(
+            did,
+            "at-stale",
+            None,
+            "DPoP",
+            None,
+            Some(3600),
+            DPoPKey::generate(),
+            Some("https://pds.example".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        let outcome = registry
+            .update_session_cas(did, &s_stale_refresh, &original_raw)
+            .unwrap();
+        assert_eq!(outcome, CasUpdateOutcome::Conflict);
+        assert_eq!(
+            registry
+                .get(did)
+                .unwrap()
+                .unwrap()
+                .session
+                .unwrap()
+                .access_token,
+            "at-2-fresh-login"
+        );
+
+        // Missing row returns NotFound.
+        let missing_s = OAuthSession::new(
+            "did:plc:missing_cas",
+            "at-m",
+            None,
+            "DPoP",
+            None,
+            None,
+            DPoPKey::generate(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            registry
+                .update_session_cas("did:plc:missing_cas", &missing_s, "raw")
+                .unwrap(),
+            CasUpdateOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn test_migrate_encrypted_secrets_skips_corrupt_mismatched_and_non_strict_rows() {
+        let _env_guard = crate::crypto::test_env_lock().lock().unwrap();
+        std::env::remove_var("SKYBOUNCER_SESSION_ENCRYPTION_KEY");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("corrupt_migration.db");
+        let now = us_to_i64(current_time_us());
+
+        let wrong_sub_session = OAuthSession::new(
+            "did:plc:wrong_sub",
+            "at-wrong",
+            None,
+            "DPoP",
+            None,
+            None,
+            DPoPKey::generate(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let wrong_sub_plain = serde_json::to_string(&wrong_sub_session).unwrap();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let reg = TenantRegistry::from_connection(Arc::new(Mutex::new(conn))).unwrap();
+            let c = reg.conn.lock();
+            // 1. Undecryptable tenant session_json
+            c.execute(
+                "INSERT INTO tenants (did, session_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params!["did:plc:bad_cipher", "enc:v1:bm90LXZhbGlkLWJhc2U2NA==", now, now],
+            )
+            .unwrap();
+            // 2. Non-JSON plaintext tenant session_json
+            c.execute(
+                "INSERT INTO tenants (did, session_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params!["did:plc:bad_json", "{not-json", now, now],
+            )
+            .unwrap();
+            // 3. Plaintext JSON whose sub != row.did
+            c.execute(
+                "INSERT INTO tenants (did, session_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params!["did:plc:victim_mig", wrong_sub_plain, now, now],
+            )
+            .unwrap();
+            // 4. Undecryptable oauth_client_keys row
+            c.execute(
+                "INSERT INTO oauth_client_keys (key_id, encrypted_key, created_at) VALUES ('bad1', ?1, ?2)",
+                params!["enc:v1:invalid==", now],
+            )
+            .unwrap();
+            // 5. Invalid DPoPKey payload in oauth_client_keys row
+            c.execute(
+                "INSERT INTO oauth_client_keys (key_id, encrypted_key, created_at) VALUES ('bad2', ?1, ?2)",
+                params!["not-a-dpop-key", now],
+            )
+            .unwrap();
+        }
+
+        // Reopen triggers migration: corrupt rows are safely skipped without aborting startup.
+        let reopened = TenantRegistry::open(&db_path).unwrap();
+        assert!(reopened.get("did:plc:bad_cipher").is_err());
+        assert!(reopened.get("did:plc:victim_mig").is_err());
+    }
+
+    #[test]
+    fn test_load_or_create_oauth_client_key_env_override_valid_and_invalid() {
+        let _env_guard = crate::crypto::test_env_lock().lock().unwrap();
+        let reg = test_registry();
+        let generated = DPoPKey::generate();
+        let b64 = generated.to_bytes_b64();
+
+        std::env::set_var("OAUTH_CLIENT_PRIVATE_KEY", &b64);
+        let loaded = reg.load_or_create_oauth_client_key().unwrap();
+        assert_eq!(loaded.to_bytes_b64(), b64);
+
+        std::env::set_var(
+            "OAUTH_CLIENT_PRIVATE_KEY",
+            "-----BEGIN PRIVATE KEY-----\ninvalid",
+        );
+        assert!(reg.load_or_create_oauth_client_key().is_err());
+
+        std::env::set_var("OAUTH_CLIENT_PRIVATE_KEY", "not-base64-key");
+        assert!(reg.load_or_create_oauth_client_key().is_err());
+
+        std::env::remove_var("OAUTH_CLIENT_PRIVATE_KEY");
+    }
+
+    #[test]
+    fn test_mark_reauth_required_cas_epoch_guard_and_transient_db_detection() {
+        assert!(TenantRegistry::is_transient_db_error(
+            &SkybouncerError::Database("database is locked".to_string())
+        ));
+        assert!(TenantRegistry::is_transient_db_error(
+            &SkybouncerError::Database("SQLITE_BUSY".to_string())
+        ));
+        assert!(!TenantRegistry::is_transient_db_error(
+            &SkybouncerError::Auth("token expired".to_string())
+        ));
+
+        let registry = test_registry();
+        let did = "did:plc:reauth_cas_user";
+        let s1 = OAuthSession::new(
+            did,
+            "at-1",
+            Some("rt-1".to_string()),
+            "DPoP",
+            None,
+            Some(3600),
+            DPoPKey::generate(),
+            Some("https://pds.example".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        registry
+            .register_or_update(&Tenant::new(did).with_session(s1))
+            .unwrap();
+
+        let raw1: String = {
+            let conn = registry.conn.lock();
+            conn.query_row(
+                "SELECT session_json FROM tenants WHERE did = ?1",
+                params![did],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // CAS mismatch returns false and does NOT mark reauth_required.
+        assert!(!registry.mark_reauth_required_cas(did, "stale-raw").unwrap());
+        assert!(!registry.is_reauth_required(did).unwrap());
+
+        // Matching CAS marks reauth_required = true and evicts client.
+        assert!(registry.mark_reauth_required_cas(did, &raw1).unwrap());
+        assert!(registry.is_reauth_required(did).unwrap());
+
+        // Missing DID returns false.
+        assert!(!registry
+            .mark_reauth_required_cas("did:plc:no_such", &raw1)
+            .unwrap());
+
+        // Epoch mismatch prevents stale pds_client insertion.
+        let pds_client =
+            Arc::new(PdsRepoClient::from_credentials("https://pds.example", did, "tok").unwrap());
+        let old_epoch = registry.client_epochs.read().get(did).copied().unwrap_or(0);
+        registry.bump_epoch_and_evict(did);
+        registry.insert_pds_client_if_epoch_matches(did, old_epoch, &pds_client);
+        assert!(!registry.pds_clients.read().contains_key(did));
+        let cur_epoch = registry.client_epochs.read().get(did).copied().unwrap_or(0);
+        registry.insert_pds_client_if_epoch_matches(did, cur_epoch, &pds_client);
+        assert!(registry.pds_clients.read().contains_key(did));
     }
 }

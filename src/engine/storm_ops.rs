@@ -403,20 +403,26 @@ impl SkybouncerEngine {
         let (canonical_post_uri, _) = self
             .resolve_owned_post_uri(protected_did, post_uri_or_rkey)
             .await?;
-        let pds_client = self.resolve_pds_client_for(protected_did).await?;
-        let tg_uri = apply_threadgate(
-            &pds_client,
-            protected_did,
-            &canonical_post_uri,
-            policy,
-            self.config.dry_run,
-        )
-        .await
-        .inspect_err(|_| {
-            self.stats
-                .errors_encountered
-                .fetch_add(1, Ordering::Relaxed);
-        })?;
+        let tg_uri = self
+            .with_pds_client_401_retry(protected_did, |pds_client| {
+                let post_uri_ref = canonical_post_uri.as_str();
+                async move {
+                    apply_threadgate(
+                        &pds_client,
+                        protected_did,
+                        post_uri_ref,
+                        policy,
+                        self.config.dry_run,
+                    )
+                    .await
+                }
+            })
+            .await
+            .inspect_err(|_| {
+                self.stats
+                    .errors_encountered
+                    .fetch_add(1, Ordering::Relaxed);
+            })?;
         self.stats
             .threadgates_applied
             .fetch_add(1, Ordering::Relaxed);
@@ -440,13 +446,18 @@ impl SkybouncerEngine {
         let (canonical_post_uri, _) = self
             .resolve_owned_post_uri(protected_did, post_uri_or_rkey)
             .await?;
-        let pds_client = self.resolve_pds_client_for(protected_did).await?;
-        remove_threadgate(
-            &pds_client,
-            protected_did,
-            &canonical_post_uri,
-            self.config.dry_run,
-        )
+        self.with_pds_client_401_retry(protected_did, |pds_client| {
+            let post_uri_ref = canonical_post_uri.as_str();
+            async move {
+                remove_threadgate(
+                    &pds_client,
+                    protected_did,
+                    post_uri_ref,
+                    self.config.dry_run,
+                )
+                .await
+            }
+        })
         .await
         .inspect_err(|_| {
             self.stats
@@ -509,21 +520,28 @@ impl SkybouncerEngine {
             ));
         }
 
-        let pds_client = self.resolve_pds_client_for(protected_did).await?;
-        let (pg_uri, total_detached) = apply_postgate_detach(
-            &pds_client,
-            protected_did,
-            &canonical_post_uri,
-            &effective_qts,
-            disable_all_quotes,
-            self.config.dry_run,
-        )
-        .await
-        .inspect_err(|_| {
-            self.stats
-                .errors_encountered
-                .fetch_add(1, Ordering::Relaxed);
-        })?;
+        let (pg_uri, total_detached) = self
+            .with_pds_client_401_retry(protected_did, |pds_client| {
+                let post_uri_ref = canonical_post_uri.as_str();
+                let qts_ref = &effective_qts;
+                async move {
+                    apply_postgate_detach(
+                        &pds_client,
+                        protected_did,
+                        post_uri_ref,
+                        qts_ref,
+                        disable_all_quotes,
+                        self.config.dry_run,
+                    )
+                    .await
+                }
+            })
+            .await
+            .inspect_err(|_| {
+                self.stats
+                    .errors_encountered
+                    .fetch_add(1, Ordering::Relaxed);
+            })?;
 
         let applied_delta =
             u64::try_from(effective_qts.len().max(usize::from(disable_all_quotes))).unwrap_or(1);

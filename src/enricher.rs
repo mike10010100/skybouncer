@@ -2068,30 +2068,34 @@ impl AppViewContextEnricher {
         results
     }
 
-    /// Resolves an ATProto DID to a handle via profile lookup or PLC directory fallback.
+    /// Resolves an ATProto DID to a handle via profile lookup or bidirectionally verified PLC directory fallback.
     pub async fn resolve_did(&self, did: &str) -> Option<String> {
         let clean = did.trim();
         if !clean.starts_with("did:") {
             return None;
         }
 
-        // 1. Try AppView actor profile
+        // 1. Try AppView actor profile (AppView validates handle ownership, marking invalid as "handle.invalid")
         if let Some(profile) = self.fetch_author_profile(clean).await {
             if let Some(h) = profile.handle {
-                let trimmed = crate::util::normalize_handle(&h).to_string();
-                if !trimmed.is_empty() {
+                let trimmed = crate::util::normalize_handle(&h).to_ascii_lowercase();
+                if !trimmed.is_empty() && trimmed != "handle.invalid" {
                     return Some(trimmed);
                 }
             }
         }
 
-        // 2. Fallback to DID document resolution via skyauth::identity::IdentityResolver
+        // 2. Fallback to DID document resolution via skyauth::identity::IdentityResolver,
+        //    requiring bidirectional handle -> DID verification before trusting `alsoKnownAs`.
         let resolver =
             skyauth::identity::IdentityResolver::new(skyauth::ssrf::SsrfFilter::default());
         if let Ok(doc) = resolver.resolve_did(clean).await {
             if let Some(handle) = doc.extract_primary_handle() {
-                let trimmed = crate::util::normalize_handle(&handle).to_string();
-                if !trimmed.is_empty() {
+                let trimmed = crate::util::normalize_handle(&handle).to_ascii_lowercase();
+                if !trimmed.is_empty()
+                    && trimmed != "handle.invalid"
+                    && self.resolve_handle(&trimmed).await.as_deref() == Some(clean)
+                {
                     return Some(trimmed);
                 }
             }

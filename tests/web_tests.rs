@@ -74,14 +74,17 @@ async fn setup_test_web_environment(
         .with_enable_heuristic_prefilter(true)
         .with_admin_did(protected_did);
 
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        follow_graph,
-        gate,
-        classifier,
-        modlist_manager,
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(
+            config,
+            follow_graph,
+            gate,
+            classifier,
+            modlist_manager,
+            pds_client,
+        )
+        .expect("web test engine"),
+    );
 
     let metadata = OAuthClientMetadata::new(
         "http://127.0.0.1:3000/oauth/client-metadata.json",
@@ -315,6 +318,7 @@ async fn test_api_get_and_update_rules() {
         .method("POST")
         .uri("/api/rules")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&update_payload).unwrap()))
         .unwrap();
@@ -348,6 +352,7 @@ async fn test_api_get_and_update_rules() {
         .method("POST")
         .uri("/api/rules")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&invalid_payload).unwrap()))
         .unwrap();
@@ -380,6 +385,7 @@ async fn test_api_rules_bypass_incoming_followers_toggle_roundtrip() {
         .method("POST")
         .uri("/api/rules")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&disable_payload).unwrap()))
         .unwrap();
@@ -411,6 +417,7 @@ async fn test_api_rules_bypass_incoming_followers_toggle_roundtrip() {
         .method("POST")
         .uri("/api/rules")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&enable_payload).unwrap()))
         .unwrap();
@@ -434,6 +441,7 @@ async fn test_api_update_rules_bounce_duration_variants() {
         .method("POST")
         .uri("/api/rules")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload_24h).unwrap()))
         .unwrap();
@@ -467,6 +475,7 @@ async fn test_api_update_rules_bounce_duration_variants() {
         .method("POST")
         .uri("/api/rules")
         .header("cookie", format!("skybouncer_session={bob_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&json!({
@@ -492,6 +501,7 @@ async fn test_api_update_rules_bounce_duration_variants() {
         .method("POST")
         .uri("/api/rules")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload_7d).unwrap()))
         .unwrap();
@@ -511,6 +521,7 @@ async fn test_api_update_rules_bounce_duration_variants() {
         .method("POST")
         .uri("/api/rules")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload_30d).unwrap()))
         .unwrap();
@@ -530,6 +541,7 @@ async fn test_api_update_rules_bounce_duration_variants() {
         .method("POST")
         .uri("/api/rules")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload_perm).unwrap()))
         .unwrap();
@@ -617,6 +629,7 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
         .method("POST")
         .uri("/api/pardon")
         .header("cookie", format!("skybouncer_session={mallory_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&json!({
@@ -651,6 +664,7 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
         .method("POST")
         .uri("/api/pardon")
         .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&pardon_payload).unwrap()))
         .unwrap();
@@ -672,6 +686,7 @@ async fn test_api_bounces_feed_and_pardon_lifecycle() {
         .method("POST")
         .uri("/api/pardon")
         .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&pardon_payload).unwrap()))
         .unwrap();
@@ -740,6 +755,7 @@ async fn test_api_upgrade_bounce_to_permanent_lifecycle() {
         .method("POST")
         .uri("/api/bounces/upgrade")
         .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&json!({ "subject_did": "   " })).unwrap(),
@@ -753,6 +769,7 @@ async fn test_api_upgrade_bounce_to_permanent_lifecycle() {
         .method("POST")
         .uri("/api/bounces/upgrade")
         .header("cookie", format!("skybouncer_session={mallory_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&json!({
@@ -770,6 +787,7 @@ async fn test_api_upgrade_bounce_to_permanent_lifecycle() {
         .method("POST")
         .uri("/api/bounces/upgrade")
         .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&json!({ "subject_did": "did:plc:missing" })).unwrap(),
@@ -789,6 +807,7 @@ async fn test_api_upgrade_bounce_to_permanent_lifecycle() {
         .method("POST")
         .uri("/api/bounces/upgrade")
         .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&json!({ "subject_did": violator_did })).unwrap(),
@@ -815,6 +834,7 @@ async fn test_api_upgrade_bounce_to_permanent_lifecycle() {
         .method("POST")
         .uri("/api/bounces/upgrade")
         .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&json!({
@@ -872,6 +892,7 @@ async fn test_api_simulate_heuristic_match() {
         .method("POST")
         .uri("/api/simulate")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
@@ -909,14 +930,17 @@ async fn test_api_simulate_heuristic_disabled_by_default() {
     let config = SkybouncerConfig::new(protected_dids, rubric);
     assert!(!config.enable_heuristic_prefilter);
 
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        follow_graph,
-        gate,
-        classifier,
-        modlist_manager,
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(
+            config,
+            follow_graph,
+            gate,
+            classifier,
+            modlist_manager,
+            pds_client,
+        )
+        .expect("web test engine"),
+    );
 
     let metadata = OAuthClientMetadata::new(
         "http://127.0.0.1:3000/oauth/client-metadata.json",
@@ -935,6 +959,7 @@ async fn test_api_simulate_heuristic_disabled_by_default() {
         .method("POST")
         .uri("/api/simulate")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
@@ -965,6 +990,7 @@ async fn test_api_simulate_benign_text() {
         .method("POST")
         .uri("/api/simulate")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
@@ -991,6 +1017,7 @@ async fn test_api_simulate_validation_error() {
         .method("POST")
         .uri("/api/simulate")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
@@ -1030,14 +1057,17 @@ async fn test_api_simulate_tiered_inspection_escalation() {
     protected_dids.insert("did:plc:alice".to_string());
     let config = SkybouncerConfig::new(protected_dids, rubric);
 
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        follow_graph,
-        gate,
-        tiered,
-        modlist_manager,
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(
+            config,
+            follow_graph,
+            gate,
+            tiered,
+            modlist_manager,
+            pds_client,
+        )
+        .expect("web tiered test engine"),
+    );
     let metadata = OAuthClientMetadata::new(
         "http://127.0.0.1:3000/oauth/client-metadata.json",
         "http://127.0.0.1:3000/oauth/callback",
@@ -1054,6 +1084,7 @@ async fn test_api_simulate_tiered_inspection_escalation() {
         .method("POST")
         .uri("/api/simulate")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&payload).unwrap()))
         .unwrap();
@@ -1363,6 +1394,7 @@ async fn test_api_session_and_admin_endpoints() {
         .method("POST")
         .uri("/api/simulate")
         .header("cookie", format!("skybouncer_session={admin_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&sim_payload).unwrap()))
         .unwrap();
@@ -1419,6 +1451,7 @@ async fn test_api_session_and_admin_endpoints() {
         .method("POST")
         .uri("/api/tenant/toggle")
         .header("cookie", format!("skybouncer_session={admin_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
@@ -1456,6 +1489,7 @@ async fn test_api_session_and_admin_endpoints() {
         .method("POST")
         .uri("/api/auth/logout")
         .header("cookie", format!("skybouncer_session={tenant_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(logout_req).await.unwrap();
@@ -1554,6 +1588,7 @@ async fn test_api_tenant_isolated_rules_and_dynamic_handle_resolution() {
         .method("POST")
         .uri("/api/rules")
         .header("cookie", format!("skybouncer_session={dynamic_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&custom_payload).unwrap()))
         .unwrap();
@@ -1666,6 +1701,7 @@ async fn test_simulate_ssrf_prevention() {
             .method("POST")
             .uri("/api/simulate")
             .header("cookie", format!("skybouncer_session={admin_token}"))
+            .header("origin", "http://127.0.0.1:3000")
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&payload).unwrap()))
             .unwrap();
@@ -1719,6 +1755,7 @@ async fn test_web_allowlist_endpoints_and_pardon_immunization() {
         .method("POST")
         .uri("/api/allowlist")
         .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&add_payload).unwrap()))
         .unwrap();
@@ -1755,6 +1792,7 @@ async fn test_web_allowlist_endpoints_and_pardon_immunization() {
             "/api/allowlist/did:plc:friend1?user_did={protected_did}"
         ))
         .header("cookie", format!("skybouncer_session={mallory_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .body(Body::empty())
         .unwrap();
     let cross_del_resp = app.clone().oneshot(cross_del_req).await.unwrap();
@@ -1765,6 +1803,7 @@ async fn test_web_allowlist_endpoints_and_pardon_immunization() {
         .method("DELETE")
         .uri("/api/allowlist/did:plc:friend1")
         .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .body(Body::empty())
         .unwrap();
     let del_resp = app.clone().oneshot(del_req).await.unwrap();
@@ -1806,6 +1845,7 @@ async fn test_web_allowlist_endpoints_and_pardon_immunization() {
         .method("POST")
         .uri("/api/pardon")
         .header("cookie", format!("skybouncer_session={owner_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&pardon_payload).unwrap()))
         .unwrap();
@@ -1994,6 +2034,7 @@ async fn test_tenant_scoped_evaluations_api() {
 #[tokio::test]
 async fn test_prometheus_metrics_endpoint() {
     let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let admin_token = create_test_session(&engine, "did:plc:alice");
 
     // Simulate some engine stats activity
     engine
@@ -2013,6 +2054,7 @@ async fn test_prometheus_metrics_endpoint() {
     let req = Request::builder()
         .uri("/metrics")
         .method("GET")
+        .header("cookie", format!("skybouncer_session={admin_token}"))
         .body(Body::empty())
         .unwrap();
 
@@ -2051,6 +2093,7 @@ async fn test_prometheus_metrics_endpoint() {
     let req_api = Request::builder()
         .uri("/api/metrics")
         .method("GET")
+        .header("cookie", format!("skybouncer_session={admin_token}"))
         .body(Body::empty())
         .unwrap();
 
@@ -2219,6 +2262,7 @@ async fn test_api_all_rubric_presets_submission_matrix() {
                 .method("POST")
                 .uri("/api/rules")
                 .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&payload).unwrap()))
                 .unwrap();
@@ -2293,6 +2337,7 @@ async fn test_api_allowlist_full_lifecycle_matrix() {
         .method("POST")
         .uri("/api/allowlist")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&json!({
@@ -2310,6 +2355,7 @@ async fn test_api_allowlist_full_lifecycle_matrix() {
         .method("POST")
         .uri("/api/allowlist")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&json!({
@@ -2340,6 +2386,7 @@ async fn test_api_allowlist_full_lifecycle_matrix() {
         .method("DELETE")
         .uri("/api/allowlist/did:plc:charlie")
         .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -2615,6 +2662,7 @@ async fn test_api_bounces_and_allowlist_handle_enrichment() {
         .uri("/api/allowlist")
         .method("POST")
         .header("Cookie", format!("skybouncer_session={owner_token}"))
+        .header("origin", "http://127.0.0.1:3000")
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&json!({
@@ -2752,6 +2800,7 @@ async fn test_api_pardon_validation_and_allowlist_branch() {
                 .method("POST")
                 .uri("/api/pardon")
                 .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2777,6 +2826,7 @@ async fn test_api_pardon_validation_and_allowlist_branch() {
                 .method("POST")
                 .uri("/api/pardon")
                 .header("cookie", format!("skybouncer_session={bob_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2800,6 +2850,7 @@ async fn test_api_pardon_validation_and_allowlist_branch() {
                 .method("POST")
                 .uri("/api/pardon")
                 .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2858,6 +2909,7 @@ async fn test_api_allowlist_handler_branches() {
                 .method("POST")
                 .uri("/api/allowlist")
                 .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2881,6 +2933,7 @@ async fn test_api_allowlist_handler_branches() {
                 .method("POST")
                 .uri("/api/allowlist")
                 .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -2916,6 +2969,7 @@ async fn test_api_allowlist_handler_branches() {
                 .method("DELETE")
                 .uri("/api/allowlist/did:plc:friend")
                 .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2992,6 +3046,7 @@ async fn test_api_me_and_toggle_branches() {
                 .method("POST")
                 .uri("/api/tenant/toggle")
                 .header("cookie", format!("skybouncer_session={admin_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({"did": null, "is_active": false})).unwrap(),
@@ -3010,6 +3065,7 @@ async fn test_api_me_and_toggle_branches() {
                 .method("POST")
                 .uri("/api/tenant/toggle")
                 .header("cookie", format!("skybouncer_session={bob_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({"did": "did:plc:alice", "is_active": true}))
@@ -3165,6 +3221,7 @@ async fn test_api_allowlist_target_did_and_not_found_branches() {
                 .method("POST")
                 .uri("/api/allowlist")
                 .header("cookie", format!("skybouncer_session={admin_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -3188,6 +3245,7 @@ async fn test_api_allowlist_target_did_and_not_found_branches() {
                 .method("DELETE")
                 .uri("/api/allowlist/did:plc:friend2")
                 .header("cookie", format!("skybouncer_session={bob_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3202,6 +3260,7 @@ async fn test_api_allowlist_target_did_and_not_found_branches() {
                 .method("DELETE")
                 .uri("/api/allowlist/did:plc:friend2")
                 .header("cookie", format!("skybouncer_session={bob_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3332,6 +3391,14 @@ async fn test_oauth_callback_success_seeds_session_cookie() {
 
     let app = create_web_router(std::sync::Arc::clone(&engine), Some(client), metadata);
 
+    let state_cookie = {
+        let digest = skyauth::crypto::sha256_digest(b"state-success");
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+
     let cb = app
         .oneshot(
             Request::builder()
@@ -3341,6 +3408,7 @@ async fn test_oauth_callback_success_seeds_session_cookie() {
                         .replace("http://", "http%3A%2F%2F")
                         .replace(':', "%3A")
                 ))
+                .header("cookie", format!("skybouncer_oauth_state={state_cookie}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3352,18 +3420,27 @@ async fn test_oauth_callback_success_seeds_session_cookie() {
         .get(axum::http::header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    let cookie = cb
+    let set_cookies: Vec<&str> = cb
         .headers()
-        .get(axum::http::header::SET_COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
     assert!(
         loc.contains("auth=success"),
         "expected success redirect, got {loc}"
     );
     assert!(
-        cookie.contains("skybouncer_session="),
-        "expected session cookie, got {cookie}"
+        set_cookies
+            .iter()
+            .any(|c| c.contains("skybouncer_oauth_state=;") && c.contains("Max-Age=0")),
+        "expected cleared oauth state cookie, got {set_cookies:?}"
+    );
+    assert!(
+        set_cookies
+            .iter()
+            .any(|c| c.contains("skybouncer_session=")),
+        "expected session cookie, got {set_cookies:?}"
     );
     tokio::time::sleep(Duration::from_millis(25)).await;
 }
@@ -3422,6 +3499,7 @@ async fn test_api_allowlist_add_by_handle_resolves_and_removes_by_handle() {
                 .method("POST")
                 .uri("/api/allowlist")
                 .header("cookie", format!("skybouncer_session={token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -3445,6 +3523,7 @@ async fn test_api_allowlist_add_by_handle_resolves_and_removes_by_handle() {
                 .method("DELETE")
                 .uri("/api/allowlist/@friend.bsky.social")
                 .header("cookie", format!("skybouncer_session={token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -3606,6 +3685,7 @@ async fn test_api_admin_bounces_and_pardon_with_explicit_protected_did() {
                 .method("POST")
                 .uri("/api/pardon")
                 .header("cookie", format!("skybouncer_session={admin_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -3634,6 +3714,7 @@ async fn test_api_update_rules_preserves_existing_settings_when_omitted() {
                 .method("POST")
                 .uri("/api/rules")
                 .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -3658,6 +3739,7 @@ async fn test_api_update_rules_preserves_existing_settings_when_omitted() {
                 .method("POST")
                 .uri("/api/rules")
                 .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -4046,6 +4128,7 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
                 .uri("/api/simulate")
                 .header("content-type", "application/json")
                 .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "text": "hello world",
@@ -4067,6 +4150,7 @@ async fn test_auth_preview_and_typeahead_endpoints_and_login_modal_ux() {
                 .uri("/api/simulate")
                 .header("content-type", "application/json")
                 .header("cookie", format!("skybouncer_session={alice_token}"))
+                .header("origin", "http://127.0.0.1:3000")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "text": "hello world",
@@ -4310,6 +4394,7 @@ async fn test_api_simulate_draft_rubric_override_without_mutating_saved_rules() 
                 .uri("/api/simulate")
                 .header("content-type", "application/json")
                 .header("cookie", &cookie)
+                .header("origin", "http://127.0.0.1:3000")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
                         "text": "Testing unsaved draft sensitivity",
@@ -4335,6 +4420,7 @@ async fn test_api_simulate_draft_rubric_override_without_mutating_saved_rules() 
             Request::builder()
                 .uri("/api/rules")
                 .header("cookie", &cookie)
+                .header("origin", "http://127.0.0.1:3000")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4369,4 +4455,1039 @@ fn test_ui_onboarding_workspace_tabs_and_admin_gating_contract() {
         fleet_pos > drawer_pos && fleet_pos < main_end_pos,
         "admin-fleet-card must be tucked inside the collapsed operator-drawer"
     );
+}
+
+// =============================================================================
+// PR 1 (v0.3.4) Dedicated Security & Multi-Tenant Regression Tests
+// =============================================================================
+
+static WEB_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, prev }
+    }
+
+    fn unset(key: &'static str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(ref prev) = self.prev {
+            std::env::set_var(self.key, prev);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_auth_preview_does_not_write_did_handles() {
+    let (engine, cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    assert_eq!(
+        engine
+            .cache()
+            .get_did_for_handle("alice.bsky.social")
+            .unwrap(),
+        None
+    );
+
+    // Unauthenticated preview call must NOT populate did_handles even if handle cannot be verified.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/preview?handle=evil-spoof.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Without PLC/network resolution it returns 502; crucially did_handles stays untouched.
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!body.contains("sqlite") && !body.contains("unwrap"));
+    assert_eq!(
+        cache.get_did_for_handle("evil-spoof.example").unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn test_oauth_login_csrf_state_cookie_and_rollback() {
+    use skyauth::client::{AtprotoOAuthClient, OAuthClientMetadata, StoredStateEntry};
+    use skyauth::dpop::DPoPKey;
+    use skyauth::store::OAuthStateStore;
+
+    let (engine, _cache, _pds, _app) = setup_test_web_environment("did:plc:alice").await;
+    let prior_tok = create_test_session(&engine, "did:plc:alice");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("dpop-nonce", "nonce-1")
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "access_token": "at-issued",
+                    "token_type": "DPoP",
+                    "expires_in": 3600,
+                    "refresh_token": "rt-issued",
+                    "scope": "atproto",
+                    "sub": "did:plc:newuser_csrf"
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let issuer = server.uri();
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let state_store = Arc::new(OAuthStateStore::new(Duration::from_secs(300)));
+    let client = Arc::new(
+        AtprotoOAuthClient::builder()
+            .client_metadata(metadata.clone())
+            .state_store(Arc::clone(&state_store))
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+
+    let entry = StoredStateEntry {
+        state: "valid-state-123".to_string(),
+        client_id: "http://127.0.0.1:3000/oauth/client-metadata.json".to_string(),
+        code_verifier: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~ab"
+            .to_string(),
+        dpop_key: DPoPKey::generate(),
+        issuer: issuer.clone(),
+        did: Some("did:plc:newuser_csrf".to_string()),
+        handle: Some("newuser.bsky.social".to_string()),
+        redirect_uri: "http://127.0.0.1:3000/oauth/callback".to_string(),
+        pds_endpoint: issuer.clone(),
+        token_endpoint: format!("{issuer}/oauth/token"),
+        scopes: "atproto".to_string(),
+        created_at: std::time::SystemTime::now(),
+        expires_in_secs: 300,
+    };
+    state_store
+        .insert_state_sync(
+            "valid-state-123".to_string(),
+            entry,
+            Duration::from_secs(300),
+        )
+        .unwrap();
+
+    let app = create_web_router(Arc::clone(&engine), Some(client), metadata);
+
+    // 1. Mismatched skybouncer_oauth_state cookie is rejected, cookie cleared, and prior session revoked.
+    let mismatch_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/oauth/callback?code=c&state=valid-state-123&iss={}",
+                    issuer
+                        .replace("http://", "http%3A%2F%2F")
+                        .replace(':', "%3A")
+                ))
+                .header(
+                    "cookie",
+                    format!("skybouncer_oauth_state=wronghash; skybouncer_session={prior_tok}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(mismatch_resp.status().is_redirection());
+    let loc = mismatch_resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(loc, "/?auth=error&reason=invalid_state");
+    let set_cookies: Vec<&str> = mismatch_resp
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert!(set_cookies
+        .iter()
+        .any(|c| c.contains("skybouncer_oauth_state=;") && c.contains("Max-Age=0")));
+    assert_eq!(
+        engine
+            .tenant_registry()
+            .validate_web_session(&prior_tok)
+            .unwrap()
+            .as_deref(),
+        Some("did:plc:alice"),
+        "CSRF-rejected callback must not revoke victim's prior session"
+    );
+
+    // 2. Matching cookie succeeds, revokes prior session, and issues new session cookie.
+    let prior2 = create_test_session(&engine, "did:plc:alice");
+    let state_hash = {
+        let d = skyauth::crypto::sha256_digest(b"valid-state-123");
+        d.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let ok_resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/oauth/callback?code=auth-code&state=valid-state-123&iss={}",
+                    issuer
+                        .replace("http://", "http%3A%2F%2F")
+                        .replace(':', "%3A")
+                ))
+                .header(
+                    "cookie",
+                    format!("skybouncer_oauth_state={state_hash}; skybouncer_session={prior2}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(ok_resp.status().is_redirection());
+    assert_eq!(
+        ok_resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "/?auth=success"
+    );
+    assert_eq!(
+        engine
+            .tenant_registry()
+            .validate_web_session(&prior2)
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn test_csrf_middleware_and_bearer_fallback_protection() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let tok = create_test_session(&engine, "did:plc:alice");
+    let body_bytes = serde_json::to_vec(&json!({
+        "prompt": "Strict filter",
+        "sensitivity": "high"
+    }))
+    .unwrap();
+
+    // 1. Cross-origin Origin header rejected with 403.
+    let cross_origin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rules")
+                .header("content-type", "application/json")
+                .header("cookie", format!("skybouncer_session={tok}"))
+                .header("origin", "https://evil.example")
+                .body(Body::from(body_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        cross_origin
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+
+    // 2. Cross-site Sec-Fetch-Site rejected with 403.
+    let cross_site = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rules")
+                .header("content-type", "application/json")
+                .header("cookie", format!("skybouncer_session={tok}"))
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::from(body_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_site.status(), StatusCode::FORBIDDEN);
+
+    // 3. Missing Origin and Sec-Fetch-Site on cookie POST rejected with 403.
+    let no_origin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rules")
+                .header("content-type", "application/json")
+                .header("cookie", format!("skybouncer_session={tok}"))
+                .body(Body::from(body_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_origin.status(), StatusCode::FORBIDDEN);
+
+    // 4. Invalid Bearer + valid cookie must NOT fall back to cookie -> 401.
+    let bad_bearer = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rules")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer invalid-token")
+                .header("cookie", format!("skybouncer_session={tok}"))
+                .header("origin", "http://127.0.0.1:3000")
+                .body(Body::from(body_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_bearer.status(), StatusCode::UNAUTHORIZED);
+
+    // 5. Valid Bearer without Origin bypasses CSRF middleware and succeeds.
+    let bearer_ok = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rules")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {tok}"))
+                .body(Body::from(body_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bearer_ok.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_api_token_no_pds_fallback_and_multi_tenant_admin_fail_closed() {
+    let _lock = WEB_ENV_LOCK.lock().await;
+    let _g_api = EnvVarGuard::set("SKYBOUNCER_API_TOKEN", "secret-api-tok-123");
+    let _g_pds = EnvVarGuard::set("PDS_ACCESS_TOKEN", "legacy-pds-secret-must-not-work");
+
+    let (_engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+
+    // 1. PDS_ACCESS_TOKEN does NOT authenticate API routes.
+    let pds_fallback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/bounces")
+                .header("authorization", "Bearer legacy-pds-secret-must-not-work")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pds_fallback.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. SKYBOUNCER_API_TOKEN succeeds when admin_did is configured.
+    let api_ok = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/bounces")
+                .header("authorization", "Bearer secret-api-tok-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(api_ok.status(), StatusCode::OK);
+
+    // 3. When admin_did is UNSET and multi-tenant, SKYBOUNCER_API_TOKEN fails closed (401).
+    let pds2 = MockPdsServer::start().await;
+    let cache2 = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let fg2 = Arc::new(FollowGraph::new());
+    let gate2 = Arc::new(NonFollowedGate::new(Arc::clone(&fg2)));
+    let rubric2 = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist2 = Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache2)));
+    let mut protected2 = HashSet::new();
+    protected2.insert("did:plc:u1".to_string());
+    protected2.insert("did:plc:u2".to_string());
+    let cfg2 = SkybouncerConfig::new(protected2, rubric2);
+    let eng2 = Arc::new(
+        SkybouncerEngine::new(
+            cfg2,
+            fg2,
+            gate2,
+            Arc::new(skybouncer::classifier::MockClassifier::new(
+                Verdict::permitted("ok"),
+            )),
+            modlist2,
+            Arc::new(pds2.pds_client("did:plc:u1")),
+        )
+        .unwrap(),
+    );
+    let md2 = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let app2 = create_web_router(eng2, None, md2);
+
+    let fail_closed = app2
+        .oneshot(
+            Request::builder()
+                .uri("/api/bounces")
+                .header("authorization", "Bearer secret-api-tok-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fail_closed.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_metrics_auth_and_public_opt_in() {
+    let _lock = WEB_ENV_LOCK.lock().await;
+    let _g_pub = EnvVarGuard::unset("SKYBOUNCER_METRICS_PUBLIC");
+    let _g_tok = EnvVarGuard::set("SKYBOUNCER_METRICS_TOKEN", "prom-scrape-secret");
+
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let non_admin_tok = create_test_session(&engine, "did:plc:bob");
+    let admin_tok = create_test_session(&engine, "did:plc:alice");
+
+    // 1. Unauthenticated /metrics -> 401.
+    let unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. Non-admin session -> 403.
+    let non_admin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/metrics")
+                .header("cookie", format!("skybouncer_session={non_admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(non_admin.status(), StatusCode::FORBIDDEN);
+
+    // 3. Dedicated SKYBOUNCER_METRICS_TOKEN -> 200.
+    let scrape_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header("authorization", "Bearer prom-scrape-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(scrape_ok.status(), StatusCode::OK);
+
+    // 4. Admin session -> 200.
+    let admin_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header("cookie", format!("skybouncer_session={admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_ok.status(), StatusCode::OK);
+
+    // 5. Explicit SKYBOUNCER_METRICS_PUBLIC=true allows unauthenticated scrape.
+    let _g_pub_on = EnvVarGuard::set("SKYBOUNCER_METRICS_PUBLIC", "true");
+    let pub_ok = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pub_ok.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_logout_https_hsts_toggle_and_non_admin_rules_isolation() {
+    let (engine, _cache, _pds, _app) = setup_test_web_environment("did:plc:alice").await;
+    engine
+        .enroll_tenant(skybouncer::tenant::Tenant::new("did:plc:tenant_b"))
+        .unwrap();
+    engine.add_protected_did("did:plc:tenant_b");
+
+    let metadata = OAuthClientMetadata::new(
+        "https://bouncer.example.com/oauth/client-metadata.json",
+        "https://bouncer.example.com/oauth/callback",
+    );
+    let app = skybouncer::web::create_web_router_with_public_url(
+        Arc::clone(&engine),
+        None,
+        metadata,
+        "https://bouncer.example.com",
+    );
+
+    let admin_tok = create_test_session(&engine, "did:plc:alice");
+    let tenant_tok = create_test_session(&engine, "did:plc:tenant_b");
+
+    // 1. HTTPS router sets Strict-Transport-Security & Cache-Control: no-store on /api/*.
+    let st = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/status")
+                .header("authorization", format!("Bearer {admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(st.status(), StatusCode::OK);
+    assert!(st
+        .headers()
+        .contains_key(axum::http::header::STRICT_TRANSPORT_SECURITY));
+    assert_eq!(
+        st.headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+
+    // 2. Non-admin update_rules must NOT mutate engine global rubric.
+    let global_before = engine.rubric().prompt.clone();
+    let upd = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/rules")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {tenant_tok}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "prompt": "Tenant B private rules only",
+                        "sensitivity": "high"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upd.status(), StatusCode::OK);
+    assert_eq!(engine.rubric().prompt, global_before);
+    assert_eq!(
+        engine
+            .tenant_registry()
+            .get("did:plc:tenant_b")
+            .unwrap()
+            .unwrap()
+            .rubric
+            .unwrap()
+            .prompt,
+        "Tenant B private rules only"
+    );
+
+    // 3. POST /api/tenant/toggle returns 404 for unknown DID and syncs protected_dids for known DID.
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/toggle")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {admin_tok}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "did": "did:plc:does_not_exist",
+                        "paused": true
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let pause_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/toggle")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {admin_tok}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "did": "  did:plc:tenant_b ",
+                        "is_active": false
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pause_ok.status(), StatusCode::OK);
+    assert!(!engine.is_protected("did:plc:tenant_b"));
+
+    let resume_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/toggle")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {admin_tok}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "did": "did:plc:tenant_b",
+                        "is_active": true
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resume_ok.status(), StatusCode::OK);
+    assert!(engine.is_protected("did:plc:tenant_b"));
+
+    // 3b. Admin evaluations 401/403/200 branches
+    let admin_eval_unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/evaluations")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_eval_unauth.status(), StatusCode::UNAUTHORIZED);
+
+    let admin_eval_non_admin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/evaluations")
+                .header("authorization", format!("Bearer {tenant_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_eval_non_admin.status(), StatusCode::FORBIDDEN);
+
+    let admin_eval_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/evaluations?target_did=did:plc:tenant_b")
+                .header("authorization", format!("Bearer {admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin_eval_ok.status(), StatusCode::OK);
+
+    // 4. Logout via Bearer revokes web session AND emits `; Secure` on HTTPS public_url.
+    let logout_tok = create_test_session(&engine, "did:plc:tenant_b");
+    let logout_resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/logout")
+                .header("authorization", format!("Bearer {logout_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout_resp.status(), StatusCode::OK);
+    assert_eq!(
+        engine
+            .tenant_registry()
+            .validate_web_session(&logout_tok)
+            .unwrap(),
+        None
+    );
+    let set_cookie = logout_resp
+        .headers()
+        .get(axum::http::header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(set_cookie.contains("; Secure"), "set_cookie={set_cookie}");
+}
+
+#[tokio::test]
+async fn test_api_bounces_blank_did_trimming_and_cache_fail_closed() {
+    let (engine, _cache, _pds, app) = setup_test_web_environment("did:plc:alice").await;
+    let admin_tok = create_test_session(&engine, "did:plc:alice");
+
+    // 1. Blank user_did is trimmed to None cleanly rather than hitting cache with whitespace.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/bounces?user_did=%20%20")
+                .header("authorization", format!("Bearer {admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. Direct cache/engine call with whitespace protected_did fails closed.
+    assert!(matches!(
+        engine.list_recent_bounces_for(Some("   "), 10),
+        Err(skybouncer::error::SkybouncerError::Config(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_oauth_error_sanitization_and_api_guard_branches() {
+    use skyauth::client::{AtprotoOAuthClient, OAuthClientMetadata, StoredStateEntry};
+    use skyauth::dpop::DPoPKey;
+    use skyauth::store::OAuthStateStore;
+
+    let (engine, _cache, _pds, _app) = setup_test_web_environment("did:plc:alice").await;
+    let admin_tok = create_test_session(&engine, "did:plc:alice");
+    let non_admin_tok = create_test_session(&engine, "did:plc:bob");
+
+    // 1. OAuth server returns 500 -> callback sanitizes error without leaking upstream details.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal_secret_db_crash"))
+        .mount(&server)
+        .await;
+
+    let metadata = OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
+    );
+    let state_store = Arc::new(OAuthStateStore::new(Duration::from_secs(300)));
+    let client = Arc::new(
+        AtprotoOAuthClient::builder()
+            .client_metadata(metadata.clone())
+            .state_store(Arc::clone(&state_store))
+            .allow_insecure_localhost(true)
+            .build()
+            .unwrap(),
+    );
+    let issuer = server.uri();
+    let entry = StoredStateEntry {
+        state: "state-500".to_string(),
+        client_id: metadata.client_id.clone(),
+        code_verifier: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~ab"
+            .to_string(),
+        dpop_key: DPoPKey::generate(),
+        issuer: issuer.clone(),
+        did: Some("did:plc:failuser".to_string()),
+        handle: Some("fail.bsky.social".to_string()),
+        redirect_uri: metadata.redirect_uri.clone(),
+        pds_endpoint: issuer.clone(),
+        token_endpoint: format!("{issuer}/oauth/token"),
+        scopes: "atproto".to_string(),
+        created_at: std::time::SystemTime::now(),
+        expires_in_secs: 300,
+    };
+    state_store
+        .insert_state_sync("state-500".to_string(), entry, Duration::from_secs(300))
+        .unwrap();
+
+    let app = create_web_router(Arc::clone(&engine), Some(client), metadata);
+    let state_hash = {
+        let d = skyauth::crypto::sha256_digest(b"state-500");
+        d.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let cb_500 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/oauth/callback?code=c&state=state-500&iss={}",
+                    issuer
+                        .replace("http://", "http%3A%2F%2F")
+                        .replace(':', "%3A")
+                ))
+                .header("cookie", format!("skybouncer_oauth_state={state_hash}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(cb_500.status().is_redirection());
+    let loc500 = cb_500
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(loc500, "/?auth=error&reason=oauth_failed");
+
+    // 2. OAuth callback with upstream error=access_denied -> sanitized invalid_callback.
+    let cb_denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?error=access_denied&error_description=internal_details")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cb_denied
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "/?auth=error&reason=invalid_callback"
+    );
+
+    // 3. OAuth login when discovery fails -> 502 Bad Gateway with sanitized error.
+    let login_fail = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/login?handle=nonexistent.invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_fail.status(), StatusCode::BAD_GATEWAY);
+
+    // 4. Toggle static admin DID (current_tenant.is_none(), is_active: None) flips pause/resume.
+    let toggle_admin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/toggle")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {admin_tok}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "did": "did:plc:alice" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_admin.status(), StatusCode::OK);
+
+    // 5. Validation & authorization guards on /api/pardon, /api/bounces/upgrade, /api/bounces.
+    let blank_pardon = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/pardon")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {admin_tok}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "subject_did": "   " })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blank_pardon.status(), StatusCode::BAD_REQUEST);
+
+    let blank_upgrade = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/bounces/upgrade")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {admin_tok}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "subject_did": "" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blank_upgrade.status(), StatusCode::BAD_REQUEST);
+
+    let cross_tenant_bounces = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/bounces?user_did=did:plc:alice")
+                .header("authorization", format!("Bearer {non_admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant_bounces.status(), StatusCode::FORBIDDEN);
+
+    let cross_tenant_eval = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/evaluations?target_did=did:plc:alice")
+                .header("authorization", format!("Bearer {non_admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant_eval.status(), StatusCode::FORBIDDEN);
+
+    // 6. /api/admin/tenants (401, 403, 200 with cached mod_list_uri) and /api/me (unauth + enrolled).
+    let tenants_unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/tenants")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tenants_unauth.status(), StatusCode::UNAUTHORIZED);
+
+    let tenants_forbid = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/tenants")
+                .header("authorization", format!("Bearer {non_admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tenants_forbid.status(), StatusCode::FORBIDDEN);
+
+    engine
+        .enroll_tenant(skybouncer::tenant::Tenant::new("did:plc:listed_t").with_active(false))
+        .unwrap();
+    engine
+        .cache()
+        .set_mod_list(&skybouncer::modlist::ModListConfig {
+            user_did: "did:plc:listed_t".to_string(),
+            list_uri: "at://did:plc:listed_t/app.bsky.graph.list/rkey1".to_string(),
+            list_cid: "bafylist1".to_string(),
+            created_at: 1,
+        })
+        .unwrap();
+    let tenants_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/tenants")
+                .header("authorization", format!("Bearer {admin_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tenants_ok.status(), StatusCode::OK);
+
+    let listed_tok = create_test_session(&engine, "did:plc:listed_t");
+    let me_listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .header("authorization", format!("Bearer {listed_tok}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(me_listed.status(), StatusCode::OK);
+
+    let me_unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(me_unauth.status(), StatusCode::OK);
+
+    let toggle_forbid = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/toggle")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {non_admin_tok}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "did": "did:plc:alice" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_forbid.status(), StatusCode::FORBIDDEN);
+
+    let toggle_blank_defaults_to_caller = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tenant/toggle")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {admin_tok}"))
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "did": "  " })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(toggle_blank_defaults_to_caller.status(), StatusCode::OK);
 }

@@ -21,6 +21,33 @@ impl SkybouncerEngine {
         Ok(())
     }
 
+    /// Atomically enrolls or updates an OAuth-authenticated tenant from `/oauth/callback`
+    /// without overwriting concurrent rubric or pause edits, and syncs runtime `protected_dids`
+    /// and `gate` state from the persisted DB row.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if session validation, encryption, or persistence fails.
+    pub fn enroll_oauth_tenant(
+        &self,
+        did: &str,
+        handle: Option<&str>,
+        session: &skyauth::session::OAuthSession,
+    ) -> Result<(), SkybouncerError> {
+        let (is_active, rubric) = self
+            .tenant_registry
+            .upsert_oauth_session(did, handle, session)?;
+        if let Some(ref r) = rubric {
+            self.gate
+                .set_bypass_incoming_followers(did, r.bypass_incoming_followers);
+        }
+        if is_active {
+            self.add_protected_did(did.to_string());
+        } else {
+            self.remove_protected_did(did);
+        }
+        Ok(())
+    }
+
     /// Checks whether a DID is an enrolled tenant in the registry.
     #[must_use]
     pub fn is_enrolled(&self, did: &str) -> bool {
@@ -45,15 +72,49 @@ impl SkybouncerEngine {
         false
     }
 
-    /// Returns true if running in single-tenant mode (at most one protected DID besides admin, and no multi-tenant enrollments).
+    /// Returns `true` only when at most one protected DID and at most one enrolled tenant exist,
+    /// they refer to the same DID (if both exist), and any configured `admin_did` matches that sole DID.
+    ///
+    /// Fails closed (`false`) if the tenant registry cannot be queried.
     #[must_use]
     pub fn is_single_tenant(&self) -> bool {
-        if self.tenant_registry.count().unwrap_or(0) > 1 {
+        let protected: Vec<String> = self.protected_dids.read().iter().cloned().collect();
+        if protected.len() > 1 {
             return false;
         }
-        let guard = self.protected_dids.read();
-        let non_admin_count = guard.iter().filter(|d| !self.is_admin(d)).count();
-        non_admin_count <= 1
+        let Ok(tenants) = self.tenant_registry.list_all() else {
+            return false;
+        };
+        if tenants.len() > 1 {
+            return false;
+        }
+
+        let sole_protected = protected.first().map(String::as_str);
+        let sole_tenant = tenants.first().map(|t| t.did.as_str());
+        if let (Some(p), Some(t)) = (sole_protected, sole_tenant) {
+            if p != t {
+                return false;
+            }
+        }
+        if let Some(admin) = self
+            .config
+            .admin_did
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            if let Some(p) = sole_protected {
+                if !admin.eq_ignore_ascii_case(p) {
+                    return false;
+                }
+            }
+            if let Some(t) = sole_tenant {
+                if !admin.eq_ignore_ascii_case(t) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Checks whether a tenant is paused (or the entire engine is paused),
@@ -103,12 +164,11 @@ impl SkybouncerEngine {
         match self.tenant_registry.get_pds_client(did, oc.as_ref()).await {
             Ok(Some(client)) => Ok(client),
             Ok(None) => {
-                let has_enrolled_tenants = self.tenant_registry.count().unwrap_or(0) > 0;
-                if self.pds_client.did() == did
-                    || self.is_admin(did)
-                    || (!has_enrolled_tenants && self.is_protected(did))
-                    || (self.is_single_tenant() && self.is_protected(did))
-                {
+                let allow_fallback = self.pds_client.did() == did
+                    || (self.is_admin(did)
+                        && (self.pds_client.did() == did || self.config.dry_run))
+                    || (self.config.dry_run && self.is_single_tenant() && self.is_protected(did));
+                if allow_fallback {
                     Ok(Arc::clone(&self.pds_client))
                 } else {
                     Err(SkybouncerError::Config(format!(
@@ -117,23 +177,7 @@ impl SkybouncerEngine {
                 }
             }
             Err(e) => {
-                if !was_reauth_required
-                    && self
-                        .tenant_registry
-                        .is_reauth_notification_pending(did)
-                        .unwrap_or(false)
-                {
-                    let handle = self
-                        .tenant_registry
-                        .get(did)
-                        .ok()
-                        .flatten()
-                        .and_then(|t| t.handle);
-                    let _ = self.reauth_notifier.send(ReauthNotification {
-                        target_did: did.to_string(),
-                        handle,
-                    });
-                }
+                self.notify_reauth_if_pending(did, was_reauth_required);
                 tracing::error!(
                     did = %did,
                     error = %e,
@@ -141,6 +185,82 @@ impl SkybouncerEngine {
                 );
                 Err(e)
             }
+        }
+    }
+
+    fn notify_reauth_if_pending(&self, did: &str, was_reauth_required: bool) {
+        if !was_reauth_required
+            && self
+                .tenant_registry
+                .is_reauth_notification_pending(did)
+                .unwrap_or(false)
+        {
+            let handle = self
+                .tenant_registry
+                .get(did)
+                .ok()
+                .flatten()
+                .and_then(|t| t.handle);
+            let _ = self.reauth_notifier.send(ReauthNotification {
+                target_did: did.to_string(),
+                handle,
+            });
+        }
+    }
+
+    pub(crate) fn is_pds_auth_401_or_expired(err: &SkybouncerError) -> bool {
+        match err {
+            SkybouncerError::Auth(msg) => {
+                let lower = msg.to_ascii_lowercase();
+                lower.contains("expired") || lower.contains("invalidtoken")
+            }
+            SkybouncerError::Repo(msg) => {
+                msg.contains("status 401")
+                    || msg.contains("401 Unauthorized")
+                    || msg.contains("ExpiredToken")
+                    || msg.contains("InvalidToken")
+            }
+            _ => false,
+        }
+    }
+
+    /// Executes an async PDS operation for `did`, performing a single-flight OAuth token refresh
+    /// and one retry if the PDS rejects the access token with HTTP 401 (`ExpiredToken`/`InvalidToken`).
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if client resolution, token refresh, or the PDS operation fails.
+    pub async fn with_pds_client_401_retry<T, F, Fut>(
+        &self,
+        did: &str,
+        op: F,
+    ) -> Result<T, SkybouncerError>
+    where
+        F: Fn(Arc<PdsRepoClient>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, SkybouncerError>>,
+    {
+        let client = self.resolve_pds_client_for(did).await?;
+        match op(Arc::clone(&client)).await {
+            Ok(val) => Ok(val),
+            Err(err) if Self::is_pds_auth_401_or_expired(&err) => {
+                let was_reauth_required = self
+                    .tenant_registry
+                    .is_reauth_required(did)
+                    .unwrap_or(false);
+                let oc = self.oauth_client.read().clone();
+                match self
+                    .tenant_registry
+                    .force_refresh_pds_client(did, &client, oc.as_ref())
+                    .await
+                {
+                    Ok(Some(refreshed)) => op(refreshed).await,
+                    Ok(None) => Err(err),
+                    Err(refresh_err) => {
+                        self.notify_reauth_if_pending(did, was_reauth_required);
+                        Err(refresh_err)
+                    }
+                }
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -214,15 +334,19 @@ impl SkybouncerEngine {
         &self,
         protected_did: &str,
     ) -> Result<Option<RuleRubric>, SkybouncerError> {
-        let pds_client = self.resolve_pds_client_for(protected_did).await?;
-        let mut pds_rubric =
-            crate::modlist::fetch_sovereign_config(&pds_client, protected_did).await?;
-        if let Some(ref mut rubric) = pds_rubric {
+        let fetched = self
+            .with_pds_client_401_retry(protected_did, |pds_client| async move {
+                crate::modlist::fetch_sovereign_config_with_cid(&pds_client, protected_did).await
+            })
+            .await?;
+
+        let mut pds_rubric = None;
+        if let Some((mut rubric, cid)) = fetched {
             let upgraded_legacy = rubric.upgrade_legacy_prompt();
             self.gate
                 .set_bypass_incoming_followers(protected_did, rubric.bypass_incoming_followers);
             if self.is_enrolled(protected_did) {
-                let _ = self.tenant_registry.update_rubric(protected_did, rubric);
+                let _ = self.tenant_registry.update_rubric(protected_did, &rubric);
             }
             if self.is_admin(protected_did)
                 || (self.is_single_tenant() && self.is_protected(protected_did))
@@ -230,9 +354,35 @@ impl SkybouncerEngine {
                 self.set_rubric(rubric.clone());
             }
             if upgraded_legacy {
-                match crate::modlist::publish_sovereign_config(&pds_client, protected_did, rubric)
-                    .await
-                {
+                let _publish_guard = self
+                    .sovereign_publish_locks
+                    .shard_for(protected_did)
+                    .lock()
+                    .await;
+                let mod_list_uri = self
+                    .cache
+                    .get_mod_list(protected_did)
+                    .ok()
+                    .flatten()
+                    .map(|c| c.list_uri);
+                let writeback_res = self
+                    .with_pds_client_401_retry(protected_did, |pds_client| {
+                        let rubric_ref = &rubric;
+                        let list_uri_ref = mod_list_uri.as_deref();
+                        let cid_ref = cid.as_deref();
+                        async move {
+                            crate::modlist::publish_sovereign_config_with_options(
+                                &pds_client,
+                                protected_did,
+                                rubric_ref,
+                                list_uri_ref,
+                                cid_ref,
+                            )
+                            .await
+                        }
+                    })
+                    .await;
+                match writeback_res {
                     Ok(uri) => {
                         info!(
                             did = %protected_did,
@@ -254,11 +404,13 @@ impl SkybouncerEngine {
                 rubric = %rubric.prompt,
                 "Synchronized sovereign rules from PDS repo"
             );
+            pds_rubric = Some(rubric);
         }
         Ok(pds_rubric)
     }
 
-    /// Publishes current active rules to the user's sovereign ATProto repository.
+    /// Publishes current active rules to the user's sovereign ATProto repository,
+    /// serialized per tenant and protected by `swapRecord` CAS.
     ///
     /// # Errors
     /// Returns [`SkybouncerError`] if PDS mutation fails.
@@ -266,9 +418,33 @@ impl SkybouncerEngine {
         &self,
         protected_did: &str,
     ) -> Result<String, SkybouncerError> {
+        let _publish_guard = self
+            .sovereign_publish_locks
+            .shard_for(protected_did)
+            .lock()
+            .await;
         let rubric = self.rubric_for(protected_did);
-        let pds_client = self.resolve_pds_client_for(protected_did).await?;
-        crate::modlist::publish_sovereign_config(&pds_client, protected_did, &rubric).await
+        let mod_list_uri = self
+            .cache
+            .get_mod_list(protected_did)
+            .ok()
+            .flatten()
+            .map(|c| c.list_uri);
+        self.with_pds_client_401_retry(protected_did, |pds_client| {
+            let rubric_ref = &rubric;
+            let list_uri_ref = mod_list_uri.as_deref();
+            async move {
+                crate::modlist::publish_sovereign_config_with_options(
+                    &pds_client,
+                    protected_did,
+                    rubric_ref,
+                    list_uri_ref,
+                    None,
+                )
+                .await
+            }
+        })
+        .await
     }
 
     /// Handles a commit event on `social.skybouncer.config` for a protected user.

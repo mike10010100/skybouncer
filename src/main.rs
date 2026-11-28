@@ -33,11 +33,15 @@ async fn dispatch(args: &[String]) -> Result<(), SkybouncerError> {
     skybouncer::app::dispatch(args, CancellationToken::new()).await
 }
 
-#[tokio::main]
-async fn main() -> Result<(), SkybouncerError> {
-    // 1. Load .env file from current working directory if present
+fn main() -> Result<(), SkybouncerError> {
+    // 1. Load .env file synchronously before starting multi-threaded runtime workers
+    //    so std::env::set_var cannot race with concurrent environment reads.
     load_dotenv_file(Path::new(".env"));
 
     let args: Vec<String> = std::env::args().collect();
-    dispatch(&args).await
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| SkybouncerError::Config(format!("Failed to build Tokio runtime: {e}")))?;
+    runtime.block_on(dispatch(&args))
 }
