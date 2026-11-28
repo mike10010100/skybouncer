@@ -435,7 +435,10 @@ impl SkybouncerConfig {
             &["MODERATION_RUBRIC", "SKYBOUNCER_RULES"],
             crate::classifier::DEFAULT_RUBRIC_PROMPT,
         );
-        let rubric = RuleRubric::parse(&rubric_prompt)?;
+        let mut rubric = RuleRubric::parse(&rubric_prompt)?;
+        if let Some(sens_raw) = crate::env::var(&["SENSITIVITY", "SKYBOUNCER_SENSITIVITY"]) {
+            rubric.sensitivity = sens_raw.parse::<Sensitivity>()?;
+        }
 
         let pds_endpoint = crate::env::var(&["PDS_ENDPOINT", "SKYBOUNCER_PDS_URL"]);
 
@@ -595,13 +598,36 @@ impl SkybouncerConfig {
             DEFAULT_MAX_CLASSIFIER_500_RETRIES,
         );
 
+        let evaluation_ttl = if let Some(secs) =
+            crate::env::var(&["EVAL_CACHE_TTL_SECS", "SKYBOUNCER_EVAL_CACHE_TTL_SECS"])
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            Duration::from_secs(secs)
+        } else if let Some(hours) = crate::env::var(&[
+            "EVALUATION_CACHE_TTL_HOURS",
+            "SKYBOUNCER_EVALUATION_CACHE_TTL_HOURS",
+        ])
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            Duration::from_secs(hours.saturating_mul(3600))
+        } else {
+            DEFAULT_EVALUATION_CACHE_TTL
+        };
+
+        let list_name = crate::env::var_or(
+            &["LIST_NAME", "SKYBOUNCER_LIST_NAME"],
+            DEFAULT_MOD_LIST_NAME,
+        );
+        let list_description =
+            crate::env::var(&["LIST_DESCRIPTION", "SKYBOUNCER_LIST_DESCRIPTION"]);
+
         Ok(Self {
             protected_dids,
             rubric,
             pds_endpoint,
             pds_access_token,
             cache_path,
-            evaluation_ttl: DEFAULT_EVALUATION_CACHE_TTL,
+            evaluation_ttl,
             channel_capacity: DEFAULT_ENGINE_CHANNEL_CAPACITY,
             evaluation_queue_capacity,
             evaluation_concurrency,
@@ -609,8 +635,8 @@ impl SkybouncerConfig {
             fallback_jev_config,
             multimodal_jev_config,
             certainty_config,
-            list_name: DEFAULT_MOD_LIST_NAME.to_string(),
-            list_description: None,
+            list_name,
+            list_description,
             rate_limiter_config,
             enable_heuristic_prefilter,
             dry_run,

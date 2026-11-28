@@ -58,6 +58,12 @@ pub struct OAuthState {
     pub engine: Option<Arc<SkybouncerEngine>>,
     /// Publicly configured base URL for HTTPS cookie flags.
     pub public_url: String,
+    /// IP-based sliding-window rate limiter for `GET /oauth/login`.
+    pub oauth_login_limiter: Arc<crate::web::api::GuestSandboxLimiter>,
+    /// Optional trusted reverse-proxy client-IP header.
+    pub trusted_proxy_header: Option<String>,
+    /// Trusted proxy IP/CIDR allowlist required before honoring `trusted_proxy_header`.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 impl OAuthState {
@@ -96,8 +102,30 @@ pub async fn get_client_metadata(
 /// SHA-256 state cookie to defeat OAuth Login CSRF attacks.
 pub async fn oauth_login(
     State(state): State<OAuthState>,
+    crate::web::api::OptionalConnectInfo(peer_addr): crate::web::api::OptionalConnectInfo,
+    headers: HeaderMap,
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, (StatusCode, String)> {
+    let ip_key = crate::web::api::extract_client_ip_key(
+        &headers,
+        peer_addr,
+        state.trusted_proxy_header.as_deref(),
+        &state.trusted_proxies,
+    );
+    if let crate::web::api::GuestRateLimitDecision::RateLimited {
+        retry_after_secs, ..
+    } = state.oauth_login_limiter.check_and_record(&ip_key)
+    {
+        let mut resp = (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("Too many login attempts; please retry in {retry_after_secs}s."),
+        )
+            .into_response();
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(retry_after_secs));
+        return Ok(resp);
+    }
+
     let raw_handle = query
         .handle
         .as_deref()
@@ -344,6 +372,13 @@ mod tests {
             ),
             engine: None,
             public_url: "http://127.0.0.1:3000".to_string(),
+            oauth_login_limiter: Arc::new(crate::web::api::GuestSandboxLimiter::new(
+                15,
+                150,
+                Duration::from_secs(60),
+            )),
+            trusted_proxy_header: None,
+            trusted_proxies: Vec::new(),
         }
     }
 
@@ -366,13 +401,20 @@ mod tests {
     #[tokio::test]
     async fn oauth_login_requires_handle() {
         let state = state_without_client();
-        let err = oauth_login(State(state.clone()), Query(LoginQuery { handle: None }))
-            .await
-            .expect_err("missing handle");
+        let err = oauth_login(
+            State(state.clone()),
+            crate::web::api::OptionalConnectInfo(None),
+            HeaderMap::new(),
+            Query(LoginQuery { handle: None }),
+        )
+        .await
+        .expect_err("missing handle");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
 
         let err = oauth_login(
             State(state.clone()),
+            crate::web::api::OptionalConnectInfo(None),
+            HeaderMap::new(),
             Query(LoginQuery {
                 handle: Some("   ".to_string()),
             }),
@@ -387,6 +429,8 @@ mod tests {
         let state = state_without_client();
         let err = oauth_login(
             State(state),
+            crate::web::api::OptionalConnectInfo(None),
+            HeaderMap::new(),
             Query(LoginQuery {
                 handle: Some("alice.bsky.social".to_string()),
             }),

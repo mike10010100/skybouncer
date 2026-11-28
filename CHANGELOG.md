@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-11-28
+
+### Added
+
+- **Web Trusted Reverse-Proxy, Per-Endpoint Rate Limits & Timeouts (`src/web/{mod,oauth}.rs`, `src/web/api/{mod,simulate,resolve,telemetry}.rs`, `src/modlist/cache/core.rs`)**:
+  - Added `TRUSTED_PROXY_HEADER` (`cf-connecting-ip`, `x-real-ip`, `x-forwarded-for`) and `TRUSTED_PROXIES` IP/CIDR allowlist (`ipnet`), honoring proxy headers only when `ConnectInfo<SocketAddr>` is inside configured trusted CIDRs and walking `x-forwarded-for` to the rightmost untrusted hop.
+  - Added `OptionalConnectInfo` and wired Hyper HTTP/1 10s `header_read_timeout` + `GracefulShutdown` + `ConnectInfo(peer_addr)` in `run_web_server`, alongside router `TimeoutLayer` (130s), `ConcurrencyLimitLayer` (128), 64 KiB default body limit, and 8 MiB override on `/api/simulate`.
+  - Added per-DID rate limiting (`20/min`) and concurrency semaphore (`2`) on `POST /api/simulate`, IP rate limits on `/api/auth/typeahead`, `/api/auth/preview`, and `/oauth/login`, distinct global vs per-IP 429 messages on `/api/simulate/guest`, memoized custom `AppViewClient`, and lightweight SQLite `SELECT 1` liveness probing in `/healthz` (`200`/`503`).
+- **DM Bot Reliability, Grapheme Chunking & Closed-DM Backoff (`src/bot/{poller,handler,dispatcher,render}.rs`, `src/modlist/cache/bounces.rs`)**:
+  - Added grapheme-cluster chunking/truncation via `unicode-segmentation` (`MAX_DM_CHUNKS = 10` cap + 100ms burst pacing) and routed `deliver_reauth_dm` through `send_dm_chunked`.
+  - Added `ConvoIdCache` (`did -> convo_id`) and exponential `DeliveryBackoff` for closed/failing re-auth DMs.
+  - Added bounded FIFO LRU `ProcessedMessageCache`, cursor pagination across `list_convo_requests`/`list_convos`/`get_messages`, `status == "request"` auto-acceptance, SQL `COUNT(*)` (`count_bounced_for`) in `cmd_status`, paginated `allowlist [page]` with ISO-8601 dates, `cmd_test` rate/concurrency limits + `enable_heuristic_prefilter` parity, and per-sender DM rate limits + unknown-command cooldowns to defeat bot ping-pong loops.
+- **Environment Variable Reconciliation (`src/daemon.rs`, `src/engine/mod.rs`, `src/limiter.rs`, `.env.example`, `deploy/systemd/skybouncer.env.example`)**:
+  - Extracted `BotEnvSettings::from_env()` and wired `CHAT_POLL_INTERVAL_SECS` / `SKYBOUNCER_CHAT_POLL_INTERVAL_SECS`, `SKYBOUNCER_JETSTREAM_URL`, `SENSITIVITY` / `SKYBOUNCER_SENSITIVITY`, `SKYBOUNCER_EVAL_CACHE_TTL_SECS` / `EVALUATION_CACHE_TTL_HOURS`, `LIST_NAME` / `LIST_DESCRIPTION`, `RATE_LIMIT_PER_HOUR`, `TRUSTED_PROXY_HEADER`, and `TRUSTED_PROXIES`.
+
+### Changed
+
+- **DM Bot Security, Ordering & Poison-Pill Resilience (`src/bot/{poller,handler,dispatcher}.rs`, `src/daemon.rs`)**:
+  - Removed `PDS_ACCESS_TOKEN` and random `protected_dids` fallbacks for DM bot credentials and removed hardcoded `https://skybouncer.mike10010100.com` URL fallbacks.
+  - Ordered `set_bypass_incoming_followers` strictly *after* authorization and SQLite persistence, enforced `skyauth::identity::validate_did_syntax` on `did:` targets, normalized Unicode whitespace command splitting, and prevented `get_messages` failures / `user_taken == 0` / failed `send_dm_chunked` from marking bot or unread messages read.
+  - Prevented poller poison-pill loops by returning `Ok("❌ Invalid rubric: ...")` on invalid `set rules` and sending a generic error reply + read ack on unexpected handler failures.
+- **Simulator Payload Bounds & Ops Hardening (`src/web/api/simulate.rs`, `src/modlist/cache/mod.rs`, `scripts/{backup,deploy}.sh`, `docker-compose.yml`, `deploy/systemd/{skybouncer.service,install.sh}`)**:
+  - Enforced 4,000-char `SimulateRequest::text` cap, 2,000-char `evaluation_log.post_text` cap, 2 MiB + magic-byte validation on both `image_base64` and `image_url`, and empty/whitespace `?did=` `400` validation on `/api/resolve`.
+  - Hardened `scripts/backup.sh` with `--user 10001:10001`, `.timeout 5000`, `PRAGMA integrity_check;`, stdout `gzip -c` streaming under `umask 077`, `0700`/`0600` permissions, and `shellcheck` cleanliness; moved `latest` tag in `scripts/deploy.sh` after healthcheck passes.
+  - Bound Docker ports to `127.0.0.1`, added `read_only: true` + `/tmp` `tmpfs` + `pids_limit: 256` + `30s` `/healthz` check, hardened systemd unit sandboxing + `install.sh` key generation and eMudhra/Comodo CA distrust parity check.
+
 ## [0.3.6] - 2026-11-28
 
 ### Changed

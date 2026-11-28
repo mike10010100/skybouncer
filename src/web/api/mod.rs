@@ -7,13 +7,35 @@
 //! - One-click account pardon and unban (`POST /api/pardon`).
 //! - Interactive dry-run evaluation simulator (`POST /api/simulate`).
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+
+/// Extracts `ConnectInfo<SocketAddr>` when present on request extensions, or `None`
+/// in unit tests invoking the router via `ServiceExt::oneshot`.
+#[derive(Debug, Clone, Copy)]
+pub struct OptionalConnectInfo(pub Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for OptionalConnectInfo
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let addr = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .map(|c| c.0);
+        Ok(Self(addr))
+    }
+}
 
 use crate::classifier::{BounceDuration, RuleRubric, Sensitivity};
 use crate::engine::{EngineStatsSnapshot, SkybouncerEngine};
@@ -28,22 +50,53 @@ pub struct ApiState {
     pub engine: Arc<SkybouncerEngine>,
     /// Bounded sliding-window rate limiter for the anonymous live sandbox (`POST /api/simulate/guest`).
     pub guest_limiter: Arc<GuestSandboxLimiter>,
+    /// Per-DID rate limiter for authenticated simulator evaluations (`POST /api/simulate`).
+    pub simulate_limiter: Arc<crate::limiter::EvaluationRateLimiter>,
+    /// Dedicated concurrency semaphore bounding simultaneous simulator LLM evaluations.
+    pub simulate_semaphore: Arc<tokio::sync::Semaphore>,
+    /// IP-based sliding-window rate limiter for `GET /api/auth/typeahead`.
+    pub auth_typeahead_limiter: Arc<GuestSandboxLimiter>,
+    /// IP-based sliding-window rate limiter for `GET /api/auth/preview`.
+    pub auth_preview_limiter: Arc<GuestSandboxLimiter>,
     /// Publicly configured base URL for origin/CSRF validation and HTTPS cookie flags.
     pub public_url: String,
+    /// Optional trusted reverse-proxy client-IP header (`cf-connecting-ip`, `x-real-ip`, or `x-forwarded-for`).
+    pub trusted_proxy_header: Option<String>,
+    /// Trusted proxy IP/CIDR allowlist required before honoring `trusted_proxy_header`.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 impl ApiState {
-    /// Creates a new [`ApiState`] wrapping `engine` and a fresh guest sandbox rate limiter.
+    /// Creates a new [`ApiState`] wrapping `engine` and default rate limiters.
     #[must_use]
     pub fn new(engine: Arc<SkybouncerEngine>) -> Self {
         Self {
             engine,
             guest_limiter: Arc::new(GuestSandboxLimiter::default()),
+            simulate_limiter: Arc::new(crate::limiter::EvaluationRateLimiter::new(
+                crate::limiter::RateLimiterConfig {
+                    max_evaluations: 20,
+                    window_duration: std::time::Duration::from_secs(60),
+                },
+            )),
+            simulate_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            auth_typeahead_limiter: Arc::new(GuestSandboxLimiter::new(
+                30,
+                300,
+                std::time::Duration::from_secs(60),
+            )),
+            auth_preview_limiter: Arc::new(GuestSandboxLimiter::new(
+                20,
+                200,
+                std::time::Duration::from_secs(60),
+            )),
             public_url: format!(
                 "http://{}:{}",
                 crate::web::DEFAULT_WEB_HOST,
                 crate::web::DEFAULT_WEB_PORT
             ),
+            trusted_proxy_header: None,
+            trusted_proxies: Vec::new(),
         }
     }
 
@@ -51,6 +104,31 @@ impl ApiState {
     #[must_use]
     pub fn with_public_url(mut self, public_url: impl Into<String>) -> Self {
         self.public_url = public_url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Configures the trusted reverse-proxy header and CIDR allowlist for client IP extraction.
+    #[must_use]
+    pub fn with_trusted_proxy(
+        mut self,
+        header: Option<String>,
+        proxies: Vec<ipnet::IpNet>,
+    ) -> Self {
+        self.trusted_proxy_header = header;
+        self.trusted_proxies = proxies;
+        self
+    }
+
+    /// Configures per-DID rate limits and concurrency semaphore for `POST /api/simulate`.
+    #[must_use]
+    pub fn with_simulate_limits(mut self, rate_per_min: usize, concurrency: usize) -> Self {
+        self.simulate_limiter = Arc::new(crate::limiter::EvaluationRateLimiter::new(
+            crate::limiter::RateLimiterConfig {
+                max_evaluations: rate_per_min.max(1),
+                window_duration: std::time::Duration::from_secs(60),
+            },
+        ));
+        self.simulate_semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
         self
     }
 

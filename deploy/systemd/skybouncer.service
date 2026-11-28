@@ -14,8 +14,8 @@ Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
 
-# Environment configuration
-EnvironmentFile=-/etc/skybouncer/skybouncer.env
+# Environment configuration (strictly required)
+EnvironmentFile=/etc/skybouncer/skybouncer.env
 Environment=SKYBOUNCER_DATABASE_PATH=/var/lib/skybouncer/skybouncer.db
 Environment=HOST=127.0.0.1
 Environment=PORT=3000
@@ -24,18 +24,29 @@ Environment=PORT=3000
 LimitNOFILE=65536
 
 # Security & Sandbox Hardening
+UMask=0077
 NoNewPrivileges=true
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
 MemoryDenyWriteExecute=true
 LockPersonality=true
+MemoryMax=2G
+TasksMax=256
 ReadWritePaths=/var/lib/skybouncer
 
 [Install]

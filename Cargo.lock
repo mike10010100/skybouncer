@@ -1908,12 +1908,15 @@ dependencies = [
 
 [[package]]
 name = "skybouncer"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
  "futures-util",
+ "hyper",
+ "hyper-util",
+ "ipnet",
  "parking_lot",
  "proptest",
  "regex",
@@ -1934,6 +1937,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "url",
  "webpki-roots",
  "wiremock",
@@ -2205,8 +2209,10 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -2220,7 +2226,9 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "pin-project-lite",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
@@ -2328,6 +2336,12 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "universal-hash"

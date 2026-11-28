@@ -45,11 +45,6 @@ echo "======================================================================"
 export IMAGE_TAG
 ${COMPOSE_CMD} build skybouncer
 
-# Maintain 'latest' tag pointing to the new versioned build
-if docker image inspect "skybouncer:${IMAGE_TAG}" >/dev/null 2>&1; then
-    docker tag "skybouncer:${IMAGE_TAG}" "skybouncer:latest" || true
-fi
-
 # Launch the stack
 ${COMPOSE_CMD} up -d skybouncer
 
@@ -84,6 +79,11 @@ if [[ "${HEALTH_STATUS}" != "healthy" ]]; then
         echo "Check logs: docker logs ${CONTAINER_NAME}" >&2
         exit 1
     fi
+fi
+
+# Advance 'latest' tag only after the new container passes its healthcheck
+if docker image inspect "skybouncer:${IMAGE_TAG}" >/dev/null 2>&1; then
+    docker tag "skybouncer:${IMAGE_TAG}" "skybouncer:latest" || true
 fi
 
 echo "----------------------------------------------------------------------"

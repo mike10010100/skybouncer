@@ -1069,7 +1069,7 @@ async fn test_bot_storm_commands_and_authorization() {
     assert!(bot
         .handle_command(
             alice,
-            "lock https://bsky.app/profile/did:plc:bob/post/3other"
+            "lock https://bsky.app/profile/did:plc:bobbbbbbbbbbbbbbbbbbbbbb/post/3other"
         )
         .await
         .unwrap()
@@ -1077,7 +1077,7 @@ async fn test_bot_storm_commands_and_authorization() {
     assert!(bot
         .handle_command(
             alice,
-            "unlock https://bsky.app/profile/did:plc:bob/post/3other"
+            "unlock https://bsky.app/profile/did:plc:bobbbbbbbbbbbbbbbbbbbbbb/post/3other"
         )
         .await
         .unwrap()

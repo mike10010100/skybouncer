@@ -61,14 +61,29 @@ pub async fn get_status(State(state): State<ApiState>, headers: HeaderMap) -> Js
 }
 
 /// Handler for `GET /healthz` and `GET /api/health`: service liveness and readiness probe.
-pub async fn health_check() -> (StatusCode, Json<HealthResponse>) {
-    (
-        StatusCode::OK,
-        Json(HealthResponse {
-            status: "healthy".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-        }),
-    )
+///
+/// Runs a lightweight SQLite probe and returns `503 Service Unavailable` if the embedded
+/// database cannot be queried.
+pub async fn health_check(State(state): State<ApiState>) -> (StatusCode, Json<HealthResponse>) {
+    match state.engine.cache().health_check() {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(HealthResponse {
+                status: "healthy".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            }),
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "Health check SQLite probe failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(HealthResponse {
+                    status: "unhealthy".to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                }),
+            )
+        }
+    }
 }
 
 fn is_metrics_authorized(

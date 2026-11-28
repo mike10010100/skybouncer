@@ -7,12 +7,20 @@
 //! display-label formatting used by both the command handler and the bounce-alert
 //! dispatcher.
 
+use unicode_segmentation::UnicodeSegmentation;
+
 /// Public Bluesky web origin used for profile and post deep links.
 pub const BSKY_WEB_ORIGIN: &str = "https://bsky.app";
 
-/// Maximum Unicode scalar characters per outbound ATProto Chat DM chunk (stays safely within
+/// Maximum grapheme clusters per outbound ATProto Chat DM chunk (stays safely within
 /// `chat.bsky.convo.defs#messageInput`'s 1,000-grapheme lexicon ceiling).
 pub(crate) const MAX_DM_CHARS: usize = 980;
+
+/// Maximum number of chunks sent for a single outbound DM reply to prevent flood bursts.
+pub(crate) const MAX_DM_CHUNKS: usize = 10;
+
+/// Inter-chunk pacing delay to avoid Chat XRPC burst rate limiting.
+const DM_CHUNK_PACING_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Sanitizes an ATProto handle or DID for safe inclusion in a URL path segment.
 ///
@@ -90,75 +98,80 @@ pub fn bsky_post_or_web_url(uri_or_url: &str) -> Option<String> {
     })
 }
 
-/// Truncates `text` to at most `max_chars` Unicode scalar values, appending `…` when truncated.
+/// Truncates `text` to at most `max_graphemes` Unicode extended grapheme clusters,
+/// appending `…` when truncated so ZWJ emoji sequences are never sheared.
 #[must_use]
-pub(crate) fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
+pub(crate) fn truncate_chars(text: &str, max_graphemes: usize) -> String {
+    if max_graphemes == 0 {
         return String::new();
     }
-    let count = text.chars().count();
-    if count <= max_chars {
+    let mut graphemes = text.graphemes(true);
+    let prefix: Vec<&str> = graphemes.by_ref().take(max_graphemes).collect();
+    if graphemes.next().is_none() {
         return text.to_string();
     }
-    let keep = max_chars.saturating_sub(1);
-    let mut out: String = text.chars().take(keep).collect();
+    let keep = max_graphemes.saturating_sub(1);
+    let mut out = String::new();
+    for g in prefix.into_iter().take(keep) {
+        out.push_str(g);
+    }
     out.push('…');
     out
 }
 
-/// Splits an outbound DM body on newline boundaries into chunks of at most `max_chars`
-/// Unicode scalar values so URLs and link facets are never split mid-line and each
-/// message obeys `chat.bsky.convo.defs#messageInput` (`maxGraphemes: 1000`).
+/// Splits an outbound DM body on newline boundaries into chunks of at most `max_graphemes`
+/// Unicode extended grapheme clusters so URLs, link facets, and ZWJ emojis are never split
+/// mid-cluster and each message obeys `chat.bsky.convo.defs#messageInput` (`maxGraphemes: 1000`).
 #[must_use]
-pub(crate) fn split_dm_chunks(text: &str, max_chars: usize) -> Vec<String> {
-    let cap = max_chars.max(64);
-    if text.chars().count() <= cap {
+pub(crate) fn split_dm_chunks(text: &str, max_graphemes: usize) -> Vec<String> {
+    let cap = max_graphemes.max(64);
+    if text.graphemes(true).count() <= cap {
         return vec![text.to_string()];
     }
 
     let mut chunks = Vec::new();
     let mut current = String::new();
-    let mut current_chars = 0usize;
+    let mut current_graphemes = 0usize;
 
     for line in text.split('\n') {
-        let line_chars = line.chars().count();
+        let line_graphemes = line.graphemes(true).count();
         let needed = if current.is_empty() {
-            line_chars
+            line_graphemes
         } else {
-            line_chars.saturating_add(1)
+            line_graphemes.saturating_add(1)
         };
 
-        if !current.is_empty() && current_chars.saturating_add(needed) > cap {
+        if !current.is_empty() && current_graphemes.saturating_add(needed) > cap {
             chunks.push(std::mem::take(&mut current));
-            current_chars = 0;
+            current_graphemes = 0;
         }
 
-        if line_chars > cap {
+        if line_graphemes > cap {
             if !current.is_empty() {
                 chunks.push(std::mem::take(&mut current));
-                current_chars = 0;
+                current_graphemes = 0;
             }
             let mut buf = String::new();
             let mut buf_len = 0usize;
-            for ch in line.chars() {
+            for g in line.graphemes(true) {
                 if buf_len >= cap {
                     chunks.push(std::mem::take(&mut buf));
                     buf_len = 0;
                 }
-                buf.push(ch);
+                buf.push_str(g);
                 buf_len += 1;
             }
             if !buf.is_empty() {
                 current = buf;
-                current_chars = buf_len;
+                current_graphemes = buf_len;
             }
         } else {
             if !current.is_empty() {
                 current.push('\n');
-                current_chars += 1;
+                current_graphemes += 1;
             }
             current.push_str(line);
-            current_chars += line_chars;
+            current_graphemes += line_graphemes;
         }
     }
 
@@ -170,20 +183,35 @@ pub(crate) fn split_dm_chunks(text: &str, max_chars: usize) -> Vec<String> {
 }
 
 /// Sends a DM via [`skybase::chat::ChatClient::send_message`], automatically splitting into
-/// line-aligned chunks only if `text` exceeds [`MAX_DM_CHARS`].
+/// grapheme-bounded, line-aligned chunks when `text` exceeds [`MAX_DM_CHARS`], pacing multi-chunk
+/// bursts, and capping total outbound chunks at [`MAX_DM_CHUNKS`].
 pub(crate) async fn send_dm_chunked(
     client: &skybase::chat::ChatClient,
     convo_id: &str,
     text: &str,
 ) -> Result<(), skybase::error::SkybaseError> {
-    if text.chars().count() <= MAX_DM_CHARS {
+    if text.graphemes(true).count() <= MAX_DM_CHARS {
         let _ = client.send_message(convo_id, text).await?;
         return Ok(());
     }
-    for chunk in split_dm_chunks(text, MAX_DM_CHARS) {
-        if !chunk.trim().is_empty() {
-            let _ = client.send_message(convo_id, &chunk).await?;
+    let mut chunks: Vec<String> = split_dm_chunks(text, MAX_DM_CHARS)
+        .into_iter()
+        .filter(|c| !c.trim().is_empty())
+        .collect();
+    if chunks.len() > MAX_DM_CHUNKS {
+        chunks.truncate(MAX_DM_CHUNKS);
+        if let Some(last) = chunks.last_mut() {
+            const TRUNC_NOTE: &str = "\n… (output truncated; narrow query or use pagination)";
+            let note_len = TRUNC_NOTE.graphemes(true).count();
+            let trimmed_last = truncate_chars(last, MAX_DM_CHARS.saturating_sub(note_len));
+            *last = format!("{trimmed_last}{TRUNC_NOTE}");
         }
+    }
+    for (idx, chunk) in chunks.iter().enumerate() {
+        if idx > 0 {
+            tokio::time::sleep(DM_CHUNK_PACING_DELAY).await;
+        }
+        let _ = client.send_message(convo_id, chunk).await?;
     }
     Ok(())
 }
@@ -318,5 +346,71 @@ mod tests {
             assert!(!chunk.ends_with("https://bsky.app/profile/did:"));
         }
         assert_eq!(chunks.join("\n"), long_text);
+    }
+
+    #[test]
+    fn grapheme_cluster_splitting_and_truncation_preserve_zwj_emoji() {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let zwj = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        assert_eq!(zwj.graphemes(true).count(), 1);
+        let sample = format!("a{zwj}{zwj}b");
+        let truncated = truncate_chars(&sample, 3);
+        // Budget 3 -> 2 graphemes + '…' => "a" + full ZWJ emoji + "…"
+        assert_eq!(truncated, format!("a{zwj}…"));
+        assert!(truncated.contains(zwj));
+
+        let long_zwj_line = zwj.repeat(65);
+        let chunks = split_dm_chunks(&long_zwj_line, 64);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], zwj.repeat(64));
+        assert_eq!(chunks[1], zwj);
+    }
+
+    #[tokio::test]
+    async fn send_dm_chunked_caps_at_max_dm_chunks() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let sent_texts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sent_texts_clone = Arc::clone(&sent_texts);
+
+        Mock::given(method("POST"))
+            .and(path("/xrpc/chat.bsky.convo.sendMessage"))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let text = body["message"]["text"].as_str().unwrap().to_string();
+                let idx = {
+                    let mut guard = sent_texts_clone.lock().unwrap();
+                    guard.push(text);
+                    guard.len()
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": format!("msg-{idx}"),
+                    "rev": format!("rev-{idx}"),
+                    "sender": {"did": "did:plc:bot"},
+                    "text": "ok",
+                    "sentAt": "2026-11-28T00:00:00Z"
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let client = skybase::chat::ChatClient::new(server.uri(), "tok").unwrap();
+        let line = "z".repeat(MAX_DM_CHARS.saturating_sub(10));
+        let oversized = vec![line; MAX_DM_CHUNKS + 4].join("\n");
+
+        send_dm_chunked(&client, "convo-1", &oversized)
+            .await
+            .unwrap();
+
+        let captured = sent_texts.lock().unwrap();
+        assert_eq!(captured.len(), MAX_DM_CHUNKS);
+        assert!(
+            captured.last().unwrap().contains("output truncated"),
+            "final chunk should indicate truncation"
+        );
     }
 }

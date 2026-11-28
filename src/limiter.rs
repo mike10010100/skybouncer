@@ -43,7 +43,10 @@ impl RateLimiterConfig {
     #[must_use]
     pub fn from_env() -> Self {
         let max_evaluations = crate::env::parsed_or(
-            &["SKYBOUNCER_RATE_LIMIT_EVALS_PER_HOUR"],
+            &[
+                "SKYBOUNCER_RATE_LIMIT_EVALS_PER_HOUR",
+                "RATE_LIMIT_PER_HOUR",
+            ],
             DEFAULT_MAX_EVALUATIONS_PER_WINDOW,
         );
 
