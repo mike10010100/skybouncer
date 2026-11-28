@@ -304,17 +304,26 @@ async fn test_appview_resolve_handle_and_did() {
 
 #[tokio::test]
 async fn test_appview_fetch_image_base64_and_batch() {
+    let png_bytes = b"\x89PNG\r\n\x1a\nPNGDATA".to_vec();
+    let expected_b64 = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(&png_bytes)
+    };
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/img/feed_thumbnail/plain/did:plc:bob/bafyimg@jpeg"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PNGDATA".to_vec()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(png_bytes),
+        )
         .mount(&mock_server)
         .await;
 
     let enricher = AppViewContextEnricher::with_endpoints(mock_server.uri(), mock_server.uri());
 
     let b64 = enricher.fetch_image_base64("did:plc:bob", "bafyimg").await;
-    assert_eq!(b64.as_deref(), Some("UE5HREFUQQ==")); // base64("PNGDATA")
+    assert_eq!(b64.as_deref(), Some(expected_b64.as_str()));
 
     // Invalid (empty after sanitizing) DID/CID short-circuits to None.
     assert!(enricher.fetch_image_base64("", "bafyimg").await.is_none());
@@ -880,12 +889,21 @@ async fn test_quoted_ancestor_target_author_roles_is_empty_and_image_enrich() {
     )));
 
     // `AppViewContextEnricher::enrich` exercises image fetching when `interaction.has_images()`.
+    let jpeg_bytes = b"\xFF\xD8\xFF\xE0IMG".to_vec();
+    let expected_img_b64 = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes)
+    };
     let mock_server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(format!(
             "/img/feed_thumbnail/plain/{author_did}/bafkreiimg@jpeg"
         )))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"IMG".to_vec()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/jpeg")
+                .set_body_bytes(jpeg_bytes),
+        )
         .mount(&mock_server)
         .await;
 
@@ -901,7 +919,7 @@ async fn test_quoted_ancestor_target_author_roles_is_empty_and_image_enrich() {
     img_interaction.image_cids = vec!["bafkreiimg".to_string()];
 
     let enriched = enricher.enrich(&img_interaction).await;
-    assert_eq!(enriched.images_base64, vec!["SU1H".to_string()]);
+    assert_eq!(enriched.images_base64, vec![expected_img_b64]);
 }
 
 #[tokio::test]
@@ -1960,4 +1978,375 @@ fn parse_iso8601_utc_secs_handles_valid_and_invalid_inputs() {
     assert_eq!(parse_iso8601_utc_secs("2026-11-21T12:00:00+02:00"), None);
     assert_eq!(parse_iso8601_utc_secs("2026-11-21T12:00:00.Z"), None);
     assert_eq!(parse_iso8601_utc_secs("not-a-timestamp"), None);
+}
+
+#[tokio::test]
+async fn test_pr3_get_post_thread_omits_duplicate_get_posts_and_passes_depth_parent_height() {
+    let server = MockServer::start().await;
+    let target_did = "did:plc:focaltarget";
+    let author_did = "did:plc:focalauthor";
+    let parent_uri = "at://did:plc:focaltarget/app.bsky.feed.post/p1";
+
+    // Reply/quote focal post extraction MUST NOT issue a duplicate getPosts RPC.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPosts"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": author_did,
+            "handle": "author.bsky.social"
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPostThread"))
+        .and(query_param("uri", parent_uri))
+        .and(query_param("depth", "0"))
+        .and(query_param("parentHeight", "12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "thread": {
+                "$type": "app.bsky.feed.defs#threadViewPost",
+                "post": {
+                    "uri": parent_uri,
+                    "cid": "bafyfocalcid999",
+                    "author": { "did": target_did },
+                    "record": { "$type": "app.bsky.feed.post", "text": "Focal parent text" }
+                },
+                "parent": {
+                    "$type": "app.bsky.feed.defs#threadViewPost",
+                    "post": {
+                        "uri": "at://did:plc:root/app.bsky.feed.post/r0",
+                        "cid": "bafyrootcid0",
+                        "author": { "did": "did:plc:root" },
+                        "record": { "$type": "app.bsky.feed.post", "text": "Root post" }
+                    },
+                    "parent": null
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let enricher = AppViewContextEnricher::with_endpoint(server.uri()).with_thread_context(true);
+    let reply = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::DirectReply,
+        "at://did:plc:focalauthor/app.bsky.feed.post/reply1",
+        "bafyreply1",
+        "Replying to focal",
+    )
+    .with_parent_uri(parent_uri);
+
+    let ctx = enricher.enrich(&reply).await;
+    let parent = ctx.parent_post.expect("parent_post extracted from focal");
+    assert_eq!(parent.author_did, target_did);
+    assert_eq!(parent.text, "Focal parent text");
+    assert_eq!(parent.cid.as_deref(), Some("bafyfocalcid999"));
+    assert_eq!(ctx.thread_ancestors.len(), 2);
+}
+
+#[tokio::test]
+async fn test_pr3_cdn_image_validation_concurrency_and_budget() {
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+    let author_did = "did:plc:imgauthor";
+    let target_did = "did:plc:imgtarget";
+
+    // Path traversal / invalid CIDs MUST be rejected with zero HTTP calls.
+    Mock::given(method("GET"))
+        .and(path("/img/feed_thumbnail/plain/did:plc:../bafybad@jpeg"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let bad_did_inter = Interaction::new(
+        "did:plc:..",
+        target_did,
+        InteractionType::Mention,
+        "at://did:plc:imgauthor/app.bsky.feed.post/bad1",
+        "bafybad1",
+        "bad did",
+    );
+    let mut bad_cid_inter = bad_did_inter.clone();
+    bad_cid_inter.author_did = author_did.to_string();
+    bad_cid_inter.image_cids = vec!["../secret".to_string(), "cid%2f".to_string()];
+
+    let enricher = AppViewContextEnricher::with_endpoints(server.uri(), server.uri());
+    assert!(enricher
+        .enrich(&bad_did_inter)
+        .await
+        .images_base64
+        .is_empty());
+    assert!(enricher
+        .enrich(&bad_cid_inter)
+        .await
+        .images_base64
+        .is_empty());
+
+    // Valid PNG magic bytes accepted, text/html rejected even if HTTP 200.
+    let mut png_payload = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png_payload.extend_from_slice(&[0u8; 32]);
+    let mut jpeg_payload = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    jpeg_payload.extend_from_slice(&[1u8; 32]);
+
+    for (idx, cid) in ["bafkpng1", "bafkjpg2", "bafkjpg3", "bafkjpg4"]
+        .iter()
+        .enumerate()
+    {
+        let body = if idx == 0 {
+            png_payload.clone()
+        } else {
+            jpeg_payload.clone()
+        };
+        let ct = if idx == 0 { "image/png" } else { "image/jpeg" };
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/img/feed_thumbnail/plain/{author_did}/{cid}@jpeg"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(60))
+                    .insert_header("content-type", ct)
+                    .set_body_bytes(body),
+            )
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/img/feed_thumbnail/plain/{author_did}/bafkhtml@jpeg"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_bytes(b"<html>error</html>".to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let mut multi_inter = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::Mention,
+        "at://did:plc:imgauthor/app.bsky.feed.post/multi",
+        "bafymulti",
+        "concurrent images",
+    );
+    multi_inter.image_cids = vec![
+        "bafkpng1".to_string(),
+        "bafkjpg2".to_string(),
+        "bafkjpg3".to_string(),
+        "bafkjpg4".to_string(),
+        "bafkhtml".to_string(),
+    ];
+
+    let start = std::time::Instant::now();
+    let enriched = enricher.enrich(&multi_inter).await;
+    let elapsed = start.elapsed();
+    assert_eq!(
+        enriched.images_base64.len(),
+        4,
+        "text/html must be rejected"
+    );
+    assert!(
+        elapsed < Duration::from_millis(210),
+        "4 images with 60ms delay should fetch concurrently in <210ms, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_pr3_author_feed_excludes_self_replies_from_template_count() {
+    use skybouncer::enricher::decode_tid_timestamp_us;
+
+    let server = MockServer::start().await;
+    let target_did = "did:plc:t_self";
+    let author_did = "did:plc:a_self";
+    let parent_uri = "at://did:plc:t_self/app.bsky.feed.post/3n2tfn2blds22";
+    let parent_us = decode_tid_timestamp_us("3n2tfn2blds22").unwrap();
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .and(query_param("actor", author_did))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": author_did,
+            "handle": "selfauthor.bsky.social",
+            "followersCount": 10
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("actor", author_did))
+        .and(query_param("filter", "posts_no_replies"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "feed": [] })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getAuthorFeed"))
+        .and(query_param("actor", author_did))
+        .and(query_param("filter", "posts_with_replies"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "feed": [
+                {
+                    "post": {
+                        "uri": "at://did:plc:a_self/app.bsky.feed.post/sr1",
+                        "author": { "did": author_did },
+                        "indexedAt": "2026-11-21T15:18:00Z",
+                        "record": {
+                            "text": "Following up on my own thread!",
+                            "reply": {
+                                "parent": { "uri": format!("at://{author_did}/app.bsky.feed.post/root1") },
+                                "root": { "uri": format!("at://{author_did}/app.bsky.feed.post/root1") }
+                            }
+                        }
+                    }
+                },
+                {
+                    "post": {
+                        "uri": "at://did:plc:a_self/app.bsky.feed.post/sr2",
+                        "author": { "did": author_did },
+                        "indexedAt": "2026-11-21T15:18:05Z",
+                        "record": {
+                            "text": "Following up on my own thread!",
+                            "reply": {
+                                "parent": { "uri": format!("at://{author_did}/app.bsky.feed.post/sr1") },
+                                "root": { "uri": format!("at://{author_did}/app.bsky.feed.post/root1") }
+                            }
+                        }
+                    }
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let enricher = AppViewContextEnricher::with_endpoint(server.uri());
+    let mut inter = Interaction::new(
+        author_did,
+        target_did,
+        InteractionType::DirectReply,
+        "at://did:plc:a_self/app.bsky.feed.post/3n2tfn35xpx2b",
+        "bafynew",
+        "Normal reply text",
+    )
+    .with_parent_uri(parent_uri);
+    inter.created_at_us = parent_us + 180_000_000;
+
+    let ctx = enricher.enrich(&inter).await;
+    // Both self-replies had identical text, so excluding self-replies before template counting
+    // keeps `repeated_reply_template_count` < 2 (zero suspicious bot signals).
+    assert!(
+        ctx.author_signals
+            .as_ref()
+            .is_none_or(|s| s.repeated_reply_template_count <= 1 && !s.has_suspicious_bot_signals()),
+        "self-replies must be excluded before counting repeated_reply_template_count: {:?}",
+        ctx.author_signals
+    );
+}
+
+#[tokio::test]
+async fn test_pr3_cdn_budget_cap_gif_webp_and_engagement_helpers() {
+    let server = MockServer::start().await;
+    let author_did = "did:plc:budget_author";
+
+    // 5 images of 1.5 MiB each (total 7.5 MiB > 6 MiB aggregate cap): 1st GIF, 2nd WebP, 3-5 JPEG.
+    let mut gif_1_5m = b"GIF89a".to_vec();
+    gif_1_5m.resize(1_500_000, b'G');
+    let mut webp_1_5m = b"RIFF\x00\x00\x00\x00WEBP".to_vec();
+    webp_1_5m.resize(1_500_000, b'W');
+    let mut jpeg_1_5m = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    jpeg_1_5m.resize(1_500_000, b'J');
+
+    for (cid, ct, body) in [
+        ("bafkgif0", "image/gif", gif_1_5m),
+        ("bafkwebp1", "image/webp", webp_1_5m),
+        ("bafkjpg2", "image/jpeg", jpeg_1_5m.clone()),
+        ("bafkjpg3", "image/jpeg", jpeg_1_5m.clone()),
+        ("bafkjpg4", "image/jpeg", jpeg_1_5m),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/img/feed_thumbnail/plain/{author_did}/{cid}@jpeg"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", ct)
+                    .set_body_bytes(body),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.actor.getProfile"))
+        .and(query_param("actor", author_did))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "did": author_did,
+            "handle": "budget.bsky.social",
+            "followersCount": 420
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/xrpc/app.bsky.feed.getPosts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "posts": [{
+                "uri": format!("at://{author_did}/app.bsky.feed.post/p1"),
+                "cid": "bafyp1",
+                "author": { "did": author_did },
+                "record": { "$type": "app.bsky.feed.post", "text": "Focal" },
+                "likeCount": 10,
+                "repostCount": 2,
+                "replyCount": 5,
+                "quoteCount": 1
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let enricher = AppViewContextEnricher::with_endpoints(server.uri(), server.uri());
+    let mut inter = Interaction::new(
+        author_did,
+        "did:plc:target_budget",
+        InteractionType::Mention,
+        "at://did:plc:budget_author/app.bsky.feed.post/img5",
+        "bafyimg5",
+        "5 large images",
+    );
+    inter.image_cids = vec![
+        "bafkgif0".to_string(),
+        "bafkwebp1".to_string(),
+        "bafkjpg2".to_string(),
+        "bafkjpg3".to_string(),
+        "bafkjpg4".to_string(),
+    ];
+
+    let ctx = enricher.enrich(&inter).await;
+    assert!(
+        ctx.images_base64.len() <= 4,
+        "6 MiB budget cap must halt before decoding all 7.5 MiB (got {})",
+        ctx.images_base64.len()
+    );
+    assert!(!ctx.images_base64.is_empty());
+
+    assert_eq!(
+        enricher.fetch_actor_followers_count(author_did).await,
+        Some(420)
+    );
+    let snaps = enricher
+        .fetch_post_engagements(&[format!("at://{author_did}/app.bsky.feed.post/p1")])
+        .await;
+    assert_eq!(snaps.len(), 1);
+    assert_eq!(snaps[0].like_count, 10);
 }

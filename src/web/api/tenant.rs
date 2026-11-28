@@ -27,7 +27,7 @@ pub async fn get_current_user(
             None
         };
 
-        if let Ok(Some(tenant)) = state.engine.tenant_registry().get(&did) {
+        if let Ok(Some(tenant)) = state.engine.tenant_registry().get_meta(&did) {
             let rubric = tenant.rubric.unwrap_or_else(|| state.engine.rubric());
             let handle = tenant.handle.or(resolved_handle);
             return Json(UserSessionResponse {
@@ -104,13 +104,17 @@ pub async fn get_admin_tenants(
         ));
     }
 
-    let all_tenants = state.engine.tenant_registry().list_all().map_err(|e| {
-        tracing::error!(error = %e, "Failed to list tenants");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to load tenant fleet".to_string(),
-        )
-    })?;
+    let all_tenants = state
+        .engine
+        .tenant_registry()
+        .list_summaries()
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to list tenants");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load tenant fleet".to_string(),
+            )
+        })?;
 
     let mut active_count = 0;
     let mut paused_count = 0;
@@ -139,7 +143,7 @@ pub async fn get_admin_tenants(
             did: t.did,
             handle,
             is_active: t.is_active,
-            has_session: t.session.is_some(),
+            has_session: t.has_session,
             mod_list_uri,
             created_at: t.created_at,
             updated_at: t.updated_at,
@@ -311,10 +315,10 @@ pub async fn toggle_tenant(
         ));
     }
 
-    let current_tenant = state
+    let current_status = state
         .engine
         .tenant_registry()
-        .get(&target_did)
+        .get_status(&target_did)
         .map_err(|e| {
             tracing::error!(did = %target_did, error = %e, "Failed to read tenant state");
             (
@@ -327,7 +331,7 @@ pub async fn toggle_tenant(
         || state.engine.is_protected(&target_did)
         || state.engine.config().protected_dids.contains(&target_did);
 
-    if current_tenant.is_none() && !is_configured_or_protected {
+    if current_status.is_none() && !is_configured_or_protected {
         return Err((
             StatusCode::NOT_FOUND,
             format!("Tenant {target_did} not found"),
@@ -336,13 +340,13 @@ pub async fn toggle_tenant(
 
     let new_active = match payload.is_active {
         Some(explicit) => explicit,
-        None => match current_tenant {
-            Some(ref t) => !t.is_active,
+        None => match current_status {
+            Some(st) => !st.is_active,
             None => state.engine.is_paused(),
         },
     };
 
-    if current_tenant.is_some() {
+    if current_status.is_some() {
         state
             .engine
             .tenant_registry()
@@ -362,7 +366,7 @@ pub async fn toggle_tenant(
         }
     }
 
-    if current_tenant.is_none()
+    if current_status.is_none()
         && (state.engine.is_admin(&target_did) || state.engine.is_single_tenant())
         && is_configured_or_protected
     {

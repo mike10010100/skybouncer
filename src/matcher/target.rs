@@ -10,6 +10,76 @@ use crate::types::{FacetFeature, PostRecord};
 /// ATProto post collection NSID.
 const POST_COLLECTION: &str = "app.bsky.feed.post";
 
+/// Zero-allocation `&serde_json::Value` check across all 4 interaction target vectors before
+/// cloning or deserializing a full [`PostRecord`].
+fn uri_targets_protected(uri: &str, protected_dids: &HashSet<String>) -> bool {
+    extract_did_for_collection(uri, POST_COLLECTION).is_some_and(|did| protected_dids.contains(did))
+}
+
+fn record_targets_protected_did(
+    record_val: &serde_json::Value,
+    protected_dids: &HashSet<String>,
+) -> bool {
+    if let Some(reply) = record_val.get("reply") {
+        if reply
+            .get("parent")
+            .and_then(|p| p.get("uri"))
+            .and_then(|u| u.as_str())
+            .is_some_and(|uri| uri_targets_protected(uri, protected_dids))
+        {
+            return true;
+        }
+        if reply
+            .get("root")
+            .and_then(|r| r.get("uri"))
+            .and_then(|u| u.as_str())
+            .is_some_and(|uri| uri_targets_protected(uri, protected_dids))
+        {
+            return true;
+        }
+    }
+
+    if let Some(facets) = record_val.get("facets").and_then(|f| f.as_array()) {
+        for facet in facets {
+            if let Some(features) = facet.get("features").and_then(|f| f.as_array()) {
+                for feat in features {
+                    if feat.get("$type").and_then(|t| t.as_str())
+                        == Some("app.bsky.richtext.facet#mention")
+                        && feat
+                            .get("did")
+                            .and_then(|d| d.as_str())
+                            .is_some_and(|did| protected_dids.contains(did))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(embed) = record_val.get("embed") {
+        if let Some(embed_type) = embed.get("$type").and_then(|t| t.as_str()) {
+            let quote_uri = match embed_type {
+                "app.bsky.embed.record" => embed
+                    .get("record")
+                    .and_then(|r| r.get("uri"))
+                    .and_then(|u| u.as_str()),
+                "app.bsky.embed.recordWithMedia" => embed
+                    .get("record")
+                    .and_then(|r| r.get("record"))
+                    .and_then(|r| r.get("uri"))
+                    .and_then(|u| u.as_str()),
+                _ => None,
+            };
+            if quote_uri.is_some_and(|uri| uri_targets_protected(uri, protected_dids)) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Target matching engine detecting incoming interactions directed at protected users.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TargetMatcher;
@@ -63,10 +133,12 @@ impl TargetMatcher {
             return Vec::new();
         };
 
-        // Fast-path bypass: if record has neither reply, facets, nor embed, it cannot target any user.
-        if record_val.get("reply").is_none()
+        // Fast-path bypass: if record has neither reply, facets, nor embed targeting a protected
+        // DID, skip cloning and deserializing `PostRecord` altogether.
+        if (record_val.get("reply").is_none()
             && record_val.get("facets").is_none()
-            && record_val.get("embed").is_none()
+            && record_val.get("embed").is_none())
+            || !record_targets_protected_did(record_val, protected_dids)
         {
             return Vec::new();
         }

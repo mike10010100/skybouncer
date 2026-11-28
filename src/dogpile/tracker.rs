@@ -1,9 +1,9 @@
-//! In-memory rolling-window surge tracker, Storm Mode state, and digest buffer.
+//! In-memory sharded rolling-window surge tracker, Storm Mode state, and digest buffer.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::dogpile::math::{
     canonical_focal_post_uri, compute_burst_acceleration, compute_structural_score,
@@ -18,10 +18,14 @@ const MAX_RECENT_QUOTES: usize = 25;
 const MAX_DIGEST_SAMPLES: usize = 5;
 const MAX_EVAL_OUTCOMES: usize = 512;
 const MAX_POSTGATE_STATES: usize = 4096;
+const MAX_ALERT_COOLDOWNS: usize = 4096;
+const MAX_BUCKET_EVENTS: usize = 2048;
+const MAX_DEFENSIVE_EVENTS: usize = 1024;
 const POSTGATE_STATE_TTL_US: u64 = 24 * 3600 * 1_000_000;
 
 #[derive(Debug, Clone)]
 struct TrackedEvent {
+    post_uri: String,
     timestamp_us: u64,
     author_did: String,
     is_oon: bool,
@@ -49,9 +53,31 @@ impl DefensiveWindow {
         }
     }
 
+    fn push_block(&mut self, now_us: u64, cutoff_us: u64) {
+        self.prune(cutoff_us);
+        if self.recent_blocks.len() >= MAX_DEFENSIVE_EVENTS {
+            self.recent_blocks.pop_front();
+        }
+        self.recent_blocks.push_back(now_us);
+    }
+
+    fn push_detaches(&mut self, now_us: u64, cutoff_us: u64, delta: usize) {
+        self.prune(cutoff_us);
+        for _ in 0..delta {
+            if self.recent_detaches.len() >= MAX_DEFENSIVE_EVENTS {
+                self.recent_detaches.pop_front();
+            }
+            self.recent_detaches.push_back(now_us);
+        }
+    }
+
     fn counts(&mut self, cutoff_us: u64) -> (usize, usize) {
         self.prune(cutoff_us);
         (self.recent_blocks.len(), self.recent_detaches.len())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.recent_blocks.is_empty() && self.recent_detaches.is_empty()
     }
 }
 
@@ -59,10 +85,18 @@ impl DefensiveWindow {
 struct FocalPostBucket {
     events: VecDeque<TrackedEvent>,
     seen_post_uris: HashSet<String>,
+    short_cursor: usize,
+    short_count: usize,
+    short_author_counts: HashMap<String, usize>,
+    short_oon_author_counts: HashMap<String, usize>,
+    reply_count_short: usize,
+    quote_count_short: usize,
+    mention_count_short: usize,
     oon_samples: VecDeque<(u64, SampleReply)>,
     oon_sample_seen_count: usize,
     recent_quote_uris: VecDeque<String>,
     eval_outcomes: VecDeque<(u64, bool)>,
+    eval_violation_count: usize,
     last_eval_us: Option<u64>,
     last_activity_us: u64,
     active_storm_id: Option<i64>,
@@ -76,20 +110,161 @@ struct FocalPostBucket {
 }
 
 impl FocalPostBucket {
-    fn prune(&mut self, medium_cutoff_us: u64) {
+    fn increment_short_metrics(&mut self, ev: &TrackedEvent) {
+        self.short_count = self.short_count.saturating_add(1);
+        *self
+            .short_author_counts
+            .entry(ev.author_did.clone())
+            .or_insert(0) += 1;
+        if ev.is_oon {
+            *self
+                .short_oon_author_counts
+                .entry(ev.author_did.clone())
+                .or_insert(0) += 1;
+        }
+        match ev.interaction_type {
+            InteractionType::DirectReply | InteractionType::ThreadReply => {
+                self.reply_count_short = self.reply_count_short.saturating_add(1);
+            }
+            InteractionType::Quote => {
+                self.quote_count_short = self.quote_count_short.saturating_add(1);
+            }
+            InteractionType::Mention => {
+                self.mention_count_short = self.mention_count_short.saturating_add(1);
+            }
+        }
+        if ev.is_quote_of_focal && ev.interaction_type != InteractionType::Quote {
+            self.quote_count_short = self.quote_count_short.saturating_add(1);
+        }
+    }
+
+    fn decrement_short_metrics(&mut self, ev: &TrackedEvent) {
+        self.short_count = self.short_count.saturating_sub(1);
+        if let Some(cnt) = self.short_author_counts.get_mut(&ev.author_did) {
+            if *cnt <= 1 {
+                self.short_author_counts.remove(&ev.author_did);
+            } else {
+                *cnt -= 1;
+            }
+        }
+        if ev.is_oon {
+            if let Some(cnt) = self.short_oon_author_counts.get_mut(&ev.author_did) {
+                if *cnt <= 1 {
+                    self.short_oon_author_counts.remove(&ev.author_did);
+                } else {
+                    *cnt -= 1;
+                }
+            }
+        }
+        match ev.interaction_type {
+            InteractionType::DirectReply | InteractionType::ThreadReply => {
+                self.reply_count_short = self.reply_count_short.saturating_sub(1);
+            }
+            InteractionType::Quote => {
+                self.quote_count_short = self.quote_count_short.saturating_sub(1);
+            }
+            InteractionType::Mention => {
+                self.mention_count_short = self.mention_count_short.saturating_sub(1);
+            }
+        }
+        if ev.is_quote_of_focal && ev.interaction_type != InteractionType::Quote {
+            self.quote_count_short = self.quote_count_short.saturating_sub(1);
+        }
+    }
+
+    fn evict_front_event(&mut self) {
+        let Some(ev) = self.events.pop_front() else {
+            return;
+        };
+        self.seen_post_uris.remove(&ev.post_uri);
+        if self.short_cursor > 0 {
+            self.short_cursor -= 1;
+        } else {
+            self.decrement_short_metrics(&ev);
+        }
+    }
+
+    fn advance_short_cursor(&mut self, short_cutoff_us: u64) {
+        while self.short_cursor < self.events.len()
+            && self.events[self.short_cursor].timestamp_us < short_cutoff_us
+        {
+            let ev = self.events[self.short_cursor].clone();
+            self.decrement_short_metrics(&ev);
+            self.short_cursor += 1;
+        }
+    }
+
+    fn rebuild_short_metrics(&mut self, short_cutoff_us: u64) {
+        self.short_count = 0;
+        self.short_author_counts.clear();
+        self.short_oon_author_counts.clear();
+        self.reply_count_short = 0;
+        self.quote_count_short = 0;
+        self.mention_count_short = 0;
+        let idx = self
+            .events
+            .iter()
+            .position(|ev| ev.timestamp_us >= short_cutoff_us)
+            .unwrap_or(self.events.len());
+        self.short_cursor = idx;
+        for i in idx..self.events.len() {
+            let ev = self.events[i].clone();
+            self.increment_short_metrics(&ev);
+        }
+    }
+
+    fn push_event(&mut self, ev: TrackedEvent, short_cutoff_us: u64) {
+        while self.events.len() >= MAX_BUCKET_EVENTS {
+            self.evict_front_event();
+        }
+        let is_monotonic = self
+            .events
+            .back()
+            .is_none_or(|back| ev.timestamp_us >= back.timestamp_us);
+        if is_monotonic {
+            self.events.push_back(ev);
+            let idx = self.events.len() - 1;
+            if self.events[idx].timestamp_us >= short_cutoff_us {
+                let inserted = self.events[idx].clone();
+                self.increment_short_metrics(&inserted);
+            } else {
+                self.short_cursor = self.events.len();
+            }
+        } else {
+            let insert_pos = self
+                .events
+                .iter()
+                .position(|existing| existing.timestamp_us > ev.timestamp_us)
+                .unwrap_or(self.events.len());
+            self.events.insert(insert_pos, ev);
+            self.rebuild_short_metrics(short_cutoff_us);
+        }
+    }
+
+    fn prune(&mut self, medium_cutoff_us: u64, short_cutoff_us: Option<u64>) {
         while self
             .events
             .front()
             .is_some_and(|ev| ev.timestamp_us < medium_cutoff_us)
         {
-            self.events.pop_front();
+            self.evict_front_event();
+        }
+        if let Some(sc) = short_cutoff_us {
+            self.advance_short_cursor(sc);
         }
         if self.events.is_empty()
             || self.seen_post_uris.len() > self.events.len().saturating_mul(2).max(64)
         {
             self.seen_post_uris.clear();
+            for ev in &self.events {
+                self.seen_post_uris.insert(ev.post_uri.clone());
+            }
         }
+        let prev_evals = self.eval_outcomes.len();
         self.eval_outcomes.retain(|&(ts, _)| ts >= medium_cutoff_us);
+        if self.eval_outcomes.len() != prev_evals {
+            self.eval_violation_count = self.eval_outcomes.iter().filter(|&&(_, v)| v).count();
+        }
         self.oon_samples.retain(|(ts, _)| *ts >= medium_cutoff_us);
         if self.oon_samples.is_empty() {
             self.oon_sample_seen_count = 0;
@@ -98,6 +273,14 @@ impl FocalPostBucket {
 
     fn has_active_storm(&self, now_us: u64) -> bool {
         self.active_storm_id.is_some() && self.storm_expires_us.is_some_and(|exp| exp > now_us)
+    }
+
+    fn active_storm_expires_us(&self, now_us: u64) -> Option<u64> {
+        if self.active_storm_id.is_some() {
+            self.storm_expires_us.filter(|&exp| exp > now_us)
+        } else {
+            None
+        }
     }
 
     fn is_suppressed(&self, now_us: u64) -> bool {
@@ -109,26 +292,138 @@ impl FocalPostBucket {
         self.active_severity = None;
         self.storm_expires_us = None;
     }
+
+    fn clear_buffers(&mut self) {
+        self.events.clear();
+        self.seen_post_uris.clear();
+        self.short_cursor = 0;
+        self.short_count = 0;
+        self.short_author_counts.clear();
+        self.short_oon_author_counts.clear();
+        self.reply_count_short = 0;
+        self.quote_count_short = 0;
+        self.mention_count_short = 0;
+        self.oon_samples.clear();
+        self.oon_sample_seen_count = 0;
+        self.recent_quote_uris.clear();
+        self.eval_outcomes.clear();
+        self.eval_violation_count = 0;
+        self.last_eval_us = None;
+    }
 }
 
 #[derive(Debug, Default)]
-struct TrackerState {
-    buckets: HashMap<(String, String), FocalPostBucket>,
-    defensive: HashMap<String, DefensiveWindow>,
-    postgate_state: HashMap<(String, String), (usize, bool, u64)>,
-    alert_cooldowns: HashMap<(String, String), u64>,
-    manual_storm_mode_until_us: HashMap<String, u64>,
+struct TargetDogpileState {
+    buckets: HashMap<String, FocalPostBucket>,
+    defensive: DefensiveWindow,
+    postgate_state: HashMap<String, (usize, bool, u64)>,
+    alert_cooldowns: HashMap<String, u64>,
+    manual_storm_mode_until_us: Option<u64>,
 }
 
-/// Thread-safe, sliding-window dogpile detector and Storm Mode coordinator.
+impl TargetDogpileState {
+    fn max_active_until_us(&self, now_us: u64) -> Option<u64> {
+        let mut max_until = self.manual_storm_mode_until_us.filter(|&u| u > now_us);
+        for bucket in self.buckets.values() {
+            if let Some(exp) = bucket.active_storm_expires_us(now_us) {
+                max_until = Some(max_until.map_or(exp, |m| m.max(exp)));
+            }
+        }
+        max_until
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+            && self.defensive.is_empty()
+            && self.postgate_state.is_empty()
+            && self.alert_cooldowns.is_empty()
+            && self.manual_storm_mode_until_us.is_none()
+    }
+
+    fn evict_oldest_bucket(&mut self, medium_cutoff: u64, now_us: u64, max_tracked_posts: usize) {
+        for bucket in self.buckets.values_mut() {
+            bucket.prune(medium_cutoff, None);
+        }
+        self.buckets.retain(|_, b| {
+            !b.events.is_empty()
+                || !b.eval_outcomes.is_empty()
+                || b.active_storm_id.is_some()
+                || b.digest_bounced_count > 0
+                || b.is_suppressed(now_us)
+        });
+        if self.buckets.len() < max_tracked_posts || self.buckets.is_empty() {
+            return;
+        }
+        let victim = self
+            .buckets
+            .iter()
+            .filter(|(_, b)| !b.has_active_storm(now_us) && !b.is_suppressed(now_us))
+            .min_by_key(|(_, b)| b.last_activity_us)
+            .map(|(k, _)| k.clone())
+            .or_else(|| {
+                self.buckets
+                    .iter()
+                    .min_by_key(|(_, b)| b.last_activity_us)
+                    .map(|(k, _)| k.clone())
+            });
+        if let Some(key) = victim {
+            self.buckets.remove(&key);
+        }
+    }
+
+    fn drain_due_digests(
+        &mut self,
+        target_did: &str,
+        now_us: u64,
+        interval_us: u64,
+        force_flush_expired: bool,
+    ) -> Vec<StormDigestNotification> {
+        let manual_active = self
+            .manual_storm_mode_until_us
+            .is_some_and(|until| until > now_us);
+        let mut out = Vec::new();
+        for (focal_uri, bucket) in &mut self.buckets {
+            if bucket.digest_bounced_count == 0 {
+                continue;
+            }
+            let storm_still_active = bucket.has_active_storm(now_us) || manual_active;
+            let start_us = bucket.digest_window_start_us.unwrap_or(now_us);
+            let elapsed_us = now_us.saturating_sub(start_us);
+            let due = elapsed_us >= interval_us || (force_flush_expired && !storm_still_active);
+            if due {
+                let bounced_count = bucket.digest_bounced_count;
+                let sample_violators = std::mem::take(&mut bucket.digest_sample_violators);
+                bucket.digest_bounced_count = 0;
+                bucket.digest_window_start_us = if storm_still_active {
+                    Some(now_us)
+                } else {
+                    None
+                };
+                out.push(StormDigestNotification {
+                    target_did: target_did.to_string(),
+                    focal_post_uri: focal_uri.clone(),
+                    bounced_count,
+                    sample_violators,
+                    window_secs: (elapsed_us / 1_000_000).max(1),
+                    storm_still_active,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Thread-safe, per-target sharded sliding-window dogpile detector and Storm Mode coordinator.
 ///
-/// Tracks per-`(target_did, focal_post_uri)` interaction velocity, out-of-network
-/// author ratio, target defensive distress signals (`app.bsky.graph.block` /
-/// `app.bsky.feed.postgate`), alert cooldowns, and Storm Mode bounce digests.
+/// Tracks per-`(target_did, focal_post_uri)` interaction velocity with O(1) incremental
+/// short-window author refcounts, target defensive distress signals (`app.bsky.graph.block` /
+/// `app.bsky.feed.postgate`), alert cooldowns, Storm Mode bounce digests, and an O(1)
+/// lock-ordered `active_storms` lookup index.
 #[derive(Clone, Debug)]
 pub struct DogpileTracker {
     config: DogpileConfig,
-    state: Arc<RwLock<TrackerState>>,
+    targets: Arc<RwLock<HashMap<String, Arc<Mutex<TargetDogpileState>>>>>,
+    active_storms: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 impl DogpileTracker {
@@ -137,7 +432,8 @@ impl DogpileTracker {
     pub fn new(config: DogpileConfig) -> Self {
         Self {
             config,
-            state: Arc::new(RwLock::new(TrackerState::default())),
+            targets: Arc::new(RwLock::new(HashMap::new())),
+            active_storms: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -145,6 +441,32 @@ impl DogpileTracker {
     #[must_use]
     pub fn config(&self) -> &DogpileConfig {
         &self.config
+    }
+
+    fn get_target_shard(&self, target_did: &str) -> Option<Arc<Mutex<TargetDogpileState>>> {
+        self.targets.read().get(target_did).map(Arc::clone)
+    }
+
+    fn get_or_create_target_shard(&self, target_did: &str) -> Arc<Mutex<TargetDogpileState>> {
+        if let Some(existing) = self.get_target_shard(target_did) {
+            return existing;
+        }
+        let mut guard = self.targets.write();
+        Arc::clone(
+            guard
+                .entry(target_did.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(TargetDogpileState::default()))),
+        )
+    }
+
+    fn sync_active_storm(&self, target_did: &str, state: &TargetDogpileState, now_us: u64) {
+        let max_until = state.max_active_until_us(now_us);
+        let mut active = self.active_storms.write();
+        if let Some(until) = max_until {
+            active.insert(target_did.to_string(), until);
+        } else {
+            active.remove(target_did);
+        }
     }
 
     /// Records a matched interaction for Stage 1 streaming velocity tracking.
@@ -171,27 +493,20 @@ impl DogpileTracker {
         let short_cutoff = now_us.saturating_sub(short_us);
         let medium_cutoff = now_us.saturating_sub(medium_us);
 
-        let mut guard = self.state.write();
+        let shard = self.get_or_create_target_shard(&target_did);
+        let mut guard = shard.lock();
 
         // Read target defensive signals (blocks/detaches in short_window) before bucket insertion
-        let (defensive_blocks, defensive_detaches) = guard
-            .defensive
-            .get_mut(&target_did)
-            .map_or((0, 0), |d| d.counts(short_cutoff));
+        let (defensive_blocks, defensive_detaches) = guard.defensive.counts(short_cutoff);
 
-        let key = (target_did.clone(), focal_uri.clone());
-        if !guard.buckets.contains_key(&key) && guard.buckets.len() >= self.config.max_tracked_posts
+        if !guard.buckets.contains_key(&focal_uri)
+            && guard.buckets.len() >= self.config.max_tracked_posts
         {
-            Self::evict_oldest_locked(
-                &mut guard,
-                medium_cutoff,
-                now_us,
-                self.config.max_tracked_posts,
-            );
+            guard.evict_oldest_bucket(medium_cutoff, now_us, self.config.max_tracked_posts);
         }
 
-        let bucket = guard.buckets.entry(key).or_default();
-        bucket.prune(medium_cutoff);
+        let bucket = guard.buckets.entry(focal_uri.clone()).or_default();
+        bucket.prune(medium_cutoff, Some(short_cutoff));
         if bucket.is_suppressed(now_us) {
             return None;
         }
@@ -203,13 +518,17 @@ impl DogpileTracker {
 
         // Deduplicate identical post URIs (e.g., if matched via both reply + mention)
         if bucket.seen_post_uris.insert(interaction.post_uri.clone()) {
-            bucket.events.push_back(TrackedEvent {
-                timestamp_us: now_us,
-                author_did: interaction.author_did.clone(),
-                is_oon: is_out_of_network,
-                interaction_type: interaction.interaction_type,
-                is_quote_of_focal,
-            });
+            bucket.push_event(
+                TrackedEvent {
+                    post_uri: interaction.post_uri.clone(),
+                    timestamp_us: now_us,
+                    author_did: interaction.author_did.clone(),
+                    is_oon: is_out_of_network,
+                    interaction_type: interaction.interaction_type,
+                    is_quote_of_focal,
+                },
+                short_cutoff,
+            );
         }
 
         if is_quote_of_focal
@@ -255,37 +574,13 @@ impl DogpileTracker {
             }
         }
 
-        // Compute short & medium counts and unique author sets
-        let mut unique_short: HashSet<&str> = HashSet::new();
-        let mut unique_oon_short: HashSet<&str> = HashSet::new();
-        let mut short_count = 0usize;
-        let mut reply_count_short = 0usize;
-        let mut quote_count_short = 0usize;
-        let mut mention_count_short = 0usize;
+        let short_count = bucket.short_count;
         let medium_count = bucket.events.len();
-
-        for ev in &bucket.events {
-            if ev.timestamp_us >= short_cutoff {
-                short_count += 1;
-                unique_short.insert(ev.author_did.as_str());
-                if ev.is_oon {
-                    unique_oon_short.insert(ev.author_did.as_str());
-                }
-                match ev.interaction_type {
-                    InteractionType::DirectReply | InteractionType::ThreadReply => {
-                        reply_count_short += 1;
-                    }
-                    InteractionType::Quote => quote_count_short += 1,
-                    InteractionType::Mention => mention_count_short += 1,
-                }
-                if ev.is_quote_of_focal && ev.interaction_type != InteractionType::Quote {
-                    quote_count_short += 1;
-                }
-            }
-        }
-
-        let unique_authors_short = unique_short.len();
-        let unique_oon_authors_short = unique_oon_short.len();
+        let reply_count_short = bucket.reply_count_short;
+        let quote_count_short = bucket.quote_count_short;
+        let mention_count_short = bucket.mention_count_short;
+        let unique_authors_short = bucket.short_author_counts.len();
+        let unique_oon_authors_short = bucket.short_oon_author_counts.len();
         let out_of_network_ratio = if unique_authors_short > 0 {
             unique_oon_authors_short as f64 / unique_authors_short as f64
         } else {
@@ -312,9 +607,8 @@ impl DogpileTracker {
         bucket.last_eval_us = Some(now_us);
 
         let eval_total = bucket.eval_outcomes.len();
-        let eval_violations = bucket.eval_outcomes.iter().filter(|&&(_, v)| v).count();
         let violation_rate = if eval_total > 0 {
-            eval_violations as f64 / eval_total as f64
+            bucket.eval_violation_count as f64 / eval_total as f64
         } else {
             0.0
         };
@@ -359,11 +653,11 @@ impl DogpileTracker {
     /// Rolls back `last_eval_us` if a [`SurgeCandidate`] could not be dispatched onto
     /// `storm_tx` (channel full), ensuring backpressure does not lock out Stage 2 for 60s.
     pub fn rollback_eval_recheck(&self, target_did: &str, focal_uri: &str, observed_at_us: u64) {
-        let mut guard = self.state.write();
-        if let Some(bucket) = guard
-            .buckets
-            .get_mut(&(target_did.to_string(), focal_uri.to_string()))
-        {
+        let Some(shard) = self.get_target_shard(target_did) else {
+            return;
+        };
+        let mut guard = shard.lock();
+        if let Some(bucket) = guard.buckets.get_mut(focal_uri) {
             if bucket.last_eval_us == Some(observed_at_us) {
                 bucket.last_eval_us = None;
             }
@@ -382,16 +676,23 @@ impl DogpileTracker {
         if !self.config.enabled {
             return;
         }
+        let Some(shard) = self.get_target_shard(target_did) else {
+            return;
+        };
         let medium_cutoff = now_us.saturating_sub(dur_to_us(self.config.medium_window));
-        let mut guard = self.state.write();
-        if let Some(bucket) = guard
-            .buckets
-            .get_mut(&(target_did.to_string(), focal_uri.to_string()))
-        {
-            bucket.prune(medium_cutoff);
+        let mut guard = shard.lock();
+        if let Some(bucket) = guard.buckets.get_mut(focal_uri) {
+            bucket.prune(medium_cutoff, None);
             bucket.eval_outcomes.push_back((now_us, violated));
+            if violated {
+                bucket.eval_violation_count = bucket.eval_violation_count.saturating_add(1);
+            }
             while bucket.eval_outcomes.len() > MAX_EVAL_OUTCOMES {
-                bucket.eval_outcomes.pop_front();
+                if let Some((_, was_violation)) = bucket.eval_outcomes.pop_front() {
+                    if was_violation {
+                        bucket.eval_violation_count = bucket.eval_violation_count.saturating_sub(1);
+                    }
+                }
             }
         }
     }
@@ -402,10 +703,9 @@ impl DogpileTracker {
             return;
         }
         let short_cutoff = now_us.saturating_sub(dur_to_us(self.config.short_window));
-        let mut guard = self.state.write();
-        let win = guard.defensive.entry(target_did.to_string()).or_default();
-        win.prune(short_cutoff);
-        win.recent_blocks.push_back(now_us);
+        let shard = self.get_or_create_target_shard(target_did);
+        let mut guard = shard.lock();
+        guard.defensive.push_block(now_us, short_cutoff);
     }
 
     /// Records a target user creating or updating an `app.bsky.feed.postgate` record.
@@ -424,20 +724,21 @@ impl DogpileTracker {
             return;
         }
         let short_cutoff = now_us.saturating_sub(dur_to_us(self.config.short_window));
-        let mut guard = self.state.write();
-        let pg_key = (target_did.to_string(), post_uri.to_string());
+        let shard = self.get_or_create_target_shard(target_did);
+        let mut guard = shard.lock();
         let (prev_count, prev_disabled, _) = guard
             .postgate_state
-            .get(&pg_key)
+            .get(post_uri)
             .copied()
             .unwrap_or((0, false, now_us));
         let new_detaches = detached_count.saturating_sub(prev_count);
         let new_disable = usize::from(disabled_quotes && !prev_disabled);
         let delta = new_detaches.saturating_add(new_disable).min(50);
 
-        guard
-            .postgate_state
-            .insert(pg_key, (detached_count, disabled_quotes, now_us));
+        guard.postgate_state.insert(
+            post_uri.to_string(),
+            (detached_count, disabled_quotes, now_us),
+        );
         if guard.postgate_state.len() > MAX_POSTGATE_STATES {
             guard
                 .postgate_state
@@ -454,11 +755,7 @@ impl DogpileTracker {
             }
         }
 
-        let win = guard.defensive.entry(target_did.to_string()).or_default();
-        win.prune(short_cutoff);
-        for _ in 0..delta {
-            win.recent_detaches.push_back(now_us);
-        }
+        guard.defensive.push_detaches(now_us, short_cutoff, delta);
     }
 
     /// Activates or updates an active storm bucket and returns `(should_emit_alert, is_escalation)`.
@@ -477,19 +774,15 @@ impl DogpileTracker {
         let cooldown_us = dur_to_us(self.config.alert_cooldown);
         let medium_cutoff = now_us.saturating_sub(dur_to_us(self.config.medium_window));
 
-        let mut guard = self.state.write();
-        let key = (target_did.to_string(), focal_uri.to_string());
-        if !guard.buckets.contains_key(&key) && guard.buckets.len() >= self.config.max_tracked_posts
+        let shard = self.get_or_create_target_shard(target_did);
+        let mut guard = shard.lock();
+        if !guard.buckets.contains_key(focal_uri)
+            && guard.buckets.len() >= self.config.max_tracked_posts
         {
-            Self::evict_oldest_locked(
-                &mut guard,
-                medium_cutoff,
-                now_us,
-                self.config.max_tracked_posts,
-            );
+            guard.evict_oldest_bucket(medium_cutoff, now_us, self.config.max_tracked_posts);
         }
-        let persisted_last_alert = guard.alert_cooldowns.get(&key).copied();
-        let bucket = guard.buckets.entry(key.clone()).or_default();
+        let persisted_last_alert = guard.alert_cooldowns.get(focal_uri).copied();
+        let bucket = guard.buckets.entry(focal_uri.to_string()).or_default();
         bucket.last_activity_us = bucket.last_activity_us.max(now_us);
 
         let was_active = bucket.has_active_storm(now_us);
@@ -514,9 +807,27 @@ impl DogpileTracker {
         }
         if should_emit {
             bucket.last_alert_us = Some(now_us);
-            guard.alert_cooldowns.insert(key, now_us);
+            if guard.alert_cooldowns.len() >= MAX_ALERT_COOLDOWNS
+                && !guard.alert_cooldowns.contains_key(focal_uri)
+            {
+                guard
+                    .alert_cooldowns
+                    .retain(|_, &mut ts| now_us.saturating_sub(ts) < cooldown_us);
+                if guard.alert_cooldowns.len() >= MAX_ALERT_COOLDOWNS {
+                    if let Some(oldest_key) = guard
+                        .alert_cooldowns
+                        .iter()
+                        .min_by_key(|(_, &ts)| ts)
+                        .map(|(k, _)| k.clone())
+                    {
+                        guard.alert_cooldowns.remove(&oldest_key);
+                    }
+                }
+            }
+            guard.alert_cooldowns.insert(focal_uri.to_string(), now_us);
         }
 
+        self.sync_active_storm(target_did, &guard, now_us);
         (should_emit, escalated)
     }
 
@@ -530,10 +841,12 @@ impl DogpileTracker {
         updated_at_us: u64,
         expires_at_us: u64,
     ) {
-        let mut guard = self.state.write();
-        let key = (target_did.to_string(), focal_uri.to_string());
-        guard.alert_cooldowns.insert(key.clone(), updated_at_us);
-        let bucket = guard.buckets.entry(key).or_default();
+        let shard = self.get_or_create_target_shard(target_did);
+        let mut guard = shard.lock();
+        guard
+            .alert_cooldowns
+            .insert(focal_uri.to_string(), updated_at_us);
+        let bucket = guard.buckets.entry(focal_uri.to_string()).or_default();
         bucket.active_storm_id = Some(storm_id);
         bucket.active_severity = Some(severity);
         bucket.storm_expires_us = Some(expires_at_us);
@@ -542,24 +855,17 @@ impl DogpileTracker {
         if bucket.digest_window_start_us.is_none() {
             bucket.digest_window_start_us = Some(updated_at_us);
         }
+        self.sync_active_storm(target_did, &guard, updated_at_us);
     }
 
     /// Returns `true` if Storm Mode is currently active for `target_did`
-    /// (either via an active confirmed storm or manual Storm Mode toggle).
+    /// (either via an active confirmed storm or manual Storm Mode toggle) in O(1) time.
     #[must_use]
     pub fn is_storm_mode_active(&self, target_did: &str, now_us: u64) -> bool {
-        let guard = self.state.read();
-        if guard
-            .manual_storm_mode_until_us
+        self.active_storms
+            .read()
             .get(target_did)
             .is_some_and(|&until| until > now_us)
-        {
-            return true;
-        }
-        guard
-            .buckets
-            .iter()
-            .any(|((did, _), bucket)| did == target_did && bucket.has_active_storm(now_us))
     }
 
     /// Manually enables or disables Storm Mode for `target_did`.
@@ -572,24 +878,28 @@ impl DogpileTracker {
         enabled: bool,
         now_us: u64,
     ) -> Vec<(String, i64)> {
-        let mut guard = self.state.write();
         if enabled {
+            let shard = self.get_or_create_target_shard(target_did);
+            let mut guard = shard.lock();
             let until = now_us.saturating_add(dur_to_us(self.config.storm_mode_ttl));
-            guard
-                .manual_storm_mode_until_us
-                .insert(target_did.to_string(), until);
+            guard.manual_storm_mode_until_us = Some(until);
+            self.sync_active_storm(target_did, &guard, now_us);
             Vec::new()
         } else {
-            guard.manual_storm_mode_until_us.remove(target_did);
+            let Some(shard) = self.get_target_shard(target_did) else {
+                self.active_storms.write().remove(target_did);
+                return Vec::new();
+            };
+            let mut guard = shard.lock();
+            guard.manual_storm_mode_until_us = None;
             let mut cleared = Vec::new();
-            for ((did, focal_uri), bucket) in &mut guard.buckets {
-                if did == target_did {
-                    if let Some(id) = bucket.active_storm_id {
-                        cleared.push((focal_uri.clone(), id));
-                    }
-                    bucket.clear_storm();
+            for (focal_uri, bucket) in &mut guard.buckets {
+                if let Some(id) = bucket.active_storm_id {
+                    cleared.push((focal_uri.clone(), id));
                 }
+                bucket.clear_storm();
             }
+            self.sync_active_storm(target_did, &guard, now_us);
             cleared
         }
     }
@@ -605,27 +915,24 @@ impl DogpileTracker {
         now_us: u64,
     ) -> Option<StormDigestNotification> {
         let ttl_us = dur_to_us(self.config.storm_mode_ttl);
-        let mut guard = self.state.write();
-        let key = (target_did.to_string(), focal_uri.to_string());
-        if !guard.buckets.contains_key(&key) {
-            if let Some(existing_key) = guard
+        let shard = self.get_or_create_target_shard(target_did);
+        let mut guard = shard.lock();
+        let target_focal = if guard.buckets.contains_key(focal_uri) {
+            focal_uri.to_string()
+        } else {
+            guard
                 .buckets
                 .iter()
-                .find(|((did, _), b)| did == target_did && b.active_storm_id == Some(storm_id))
+                .find(|(_, b)| b.active_storm_id == Some(storm_id))
                 .map(|(k, _)| k.clone())
-            {
-                let bucket = guard.buckets.entry(existing_key.clone()).or_default();
-                return Self::clear_dismissed_bucket(
-                    &existing_key.0,
-                    &existing_key.1,
-                    bucket,
-                    now_us,
-                    ttl_us,
-                );
-            }
-        }
-        let bucket = guard.buckets.entry(key).or_default();
-        Self::clear_dismissed_bucket(target_did, focal_uri, bucket, now_us, ttl_us)
+                .unwrap_or_else(|| focal_uri.to_string())
+        };
+        let digest = {
+            let bucket = guard.buckets.entry(target_focal.clone()).or_default();
+            Self::clear_dismissed_bucket(target_did, &target_focal, bucket, now_us, ttl_us)
+        };
+        self.sync_active_storm(target_did, &guard, now_us);
+        digest
     }
 
     fn clear_dismissed_bucket(
@@ -637,13 +944,7 @@ impl DogpileTracker {
     ) -> Option<StormDigestNotification> {
         bucket.clear_storm();
         bucket.dismissed_until_us = Some(now_us.saturating_add(ttl_us));
-        bucket.events.clear();
-        bucket.seen_post_uris.clear();
-        bucket.oon_samples.clear();
-        bucket.oon_sample_seen_count = 0;
-        bucket.recent_quote_uris.clear();
-        bucket.eval_outcomes.clear();
-        bucket.last_eval_us = None;
+        bucket.clear_buffers();
 
         if bucket.digest_bounced_count > 0 {
             let bounced_count = bucket.digest_bounced_count;
@@ -678,38 +979,37 @@ impl DogpileTracker {
         category: &str,
         now_us: u64,
     ) -> bool {
-        let mut guard = self.state.write();
+        let Some(shard) = self.get_target_shard(target_did) else {
+            return false;
+        };
+        let mut guard = shard.lock();
         let manual_active = guard
             .manual_storm_mode_until_us
-            .get(target_did)
-            .is_some_and(|&until| until > now_us);
+            .is_some_and(|until| until > now_us);
 
         // Prefer exact focal_uri match when that bucket has an active storm.
-        let exact_key = focal_uri.map(|u| (target_did.to_string(), u.to_string()));
-        let exact_active = exact_key
-            .as_ref()
-            .and_then(|k| guard.buckets.get(k))
+        let exact_active = focal_uri
+            .and_then(|u| guard.buckets.get(u))
             .is_some_and(|b| b.has_active_storm(now_us));
 
         let chosen_key = if exact_active {
-            exact_key
+            focal_uri.map(str::to_string)
         } else {
             // Fall back to the most recently updated active storm bucket for target_did, if any.
             let active_fallback = guard
                 .buckets
                 .iter()
-                .filter(|((did, _), b)| did == target_did && b.has_active_storm(now_us))
+                .filter(|(_, b)| b.has_active_storm(now_us))
                 .max_by_key(|(_, b)| b.last_activity_us)
                 .map(|(k, _)| k.clone());
 
             match active_fallback {
                 Some(k) => Some(k),
-                None if manual_active => Some((
-                    target_did.to_string(),
+                None if manual_active => Some(
                     focal_uri
                         .map(str::to_string)
                         .unwrap_or_else(|| format!("at://{target_did}/app.bsky.feed.post/_storm")),
-                )),
+                ),
                 None => None,
             }
         };
@@ -722,12 +1022,7 @@ impl DogpileTracker {
         if !guard.buckets.contains_key(&bucket_key)
             && guard.buckets.len() >= self.config.max_tracked_posts
         {
-            Self::evict_oldest_locked(
-                &mut guard,
-                medium_cutoff,
-                now_us,
-                self.config.max_tracked_posts,
-            );
+            guard.evict_oldest_bucket(medium_cutoff, now_us, self.config.max_tracked_posts);
         }
 
         let bucket = guard.buckets.entry(bucket_key).or_default();
@@ -762,43 +1057,23 @@ impl DogpileTracker {
         force_flush_expired: bool,
     ) -> Vec<StormDigestNotification> {
         let interval_us = dur_to_us(self.config.digest_interval);
-        let mut guard = self.state.write();
-        let manual_map = guard.manual_storm_mode_until_us.clone();
+        let snapshot: Vec<(String, Arc<Mutex<TargetDogpileState>>)> = {
+            let guard = self.targets.read();
+            guard
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
+        };
         let mut out = Vec::new();
-
-        for ((target_did, focal_uri), bucket) in &mut guard.buckets {
-            if bucket.digest_bounced_count == 0 {
-                continue;
-            }
-            let manual_active = manual_map
-                .get(target_did)
-                .is_some_and(|&until| until > now_us);
-            let storm_still_active = bucket.has_active_storm(now_us) || manual_active;
-            let start_us = bucket.digest_window_start_us.unwrap_or(now_us);
-            let elapsed_us = now_us.saturating_sub(start_us);
-
-            let due = elapsed_us >= interval_us || (force_flush_expired && !storm_still_active);
-            if due {
-                let bounced_count = bucket.digest_bounced_count;
-                let sample_violators = std::mem::take(&mut bucket.digest_sample_violators);
-                bucket.digest_bounced_count = 0;
-                bucket.digest_window_start_us = if storm_still_active {
-                    Some(now_us)
-                } else {
-                    None
-                };
-
-                out.push(StormDigestNotification {
-                    target_did: target_did.clone(),
-                    focal_post_uri: focal_uri.clone(),
-                    bounced_count,
-                    sample_violators,
-                    window_secs: (elapsed_us / 1_000_000).max(1),
-                    storm_still_active,
-                });
-            }
+        for (target_did, shard) in snapshot {
+            let mut guard = shard.lock();
+            out.extend(guard.drain_due_digests(
+                &target_did,
+                now_us,
+                interval_us,
+                force_flush_expired,
+            ));
         }
-
         out
     }
 
@@ -814,16 +1089,32 @@ impl DogpileTracker {
     ) -> (Vec<(String, String, i64)>, Vec<StormDigestNotification>) {
         let medium_cutoff = now_us.saturating_sub(dur_to_us(self.config.medium_window));
         let short_cutoff = now_us.saturating_sub(dur_to_us(self.config.short_window));
-        let mut expired = Vec::new();
+        let interval_us = dur_to_us(self.config.digest_interval);
+        let cooldown_us = dur_to_us(self.config.alert_cooldown);
 
-        {
-            let mut guard = self.state.write();
+        let snapshot: Vec<(String, Arc<Mutex<TargetDogpileState>>)> = {
+            let guard = self.targets.read();
             guard
-                .manual_storm_mode_until_us
-                .retain(|_, &mut until| until > now_us);
+                .iter()
+                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                .collect()
+        };
 
-            for ((target_did, focal_uri), bucket) in &mut guard.buckets {
-                bucket.prune(medium_cutoff);
+        let mut expired = Vec::new();
+        let mut digests = Vec::new();
+        let mut empty_candidates = Vec::new();
+
+        for (target_did, shard) in snapshot {
+            let mut guard = shard.lock();
+            if guard
+                .manual_storm_mode_until_us
+                .is_some_and(|until| until <= now_us)
+            {
+                guard.manual_storm_mode_until_us = None;
+            }
+
+            for (focal_uri, bucket) in &mut guard.buckets {
+                bucket.prune(medium_cutoff, Some(short_cutoff));
                 if let Some(exp) = bucket.storm_expires_us {
                     if exp <= now_us {
                         if let Some(id) = bucket.active_storm_id {
@@ -834,19 +1125,9 @@ impl DogpileTracker {
                 }
             }
 
-            for win in guard.defensive.values_mut() {
-                win.prune(short_cutoff);
-            }
-            guard
-                .defensive
-                .retain(|_, win| !win.recent_blocks.is_empty() || !win.recent_detaches.is_empty());
-        }
+            guard.defensive.prune(short_cutoff);
+            digests.extend(guard.drain_due_digests(&target_did, now_us, interval_us, true));
 
-        let digests = self.drain_due_digests(now_us, true);
-
-        let cooldown_us = dur_to_us(self.config.alert_cooldown);
-        {
-            let mut guard = self.state.write();
             guard.buckets.retain(|_, bucket| {
                 !bucket.events.is_empty()
                     || !bucket.eval_outcomes.is_empty()
@@ -860,46 +1141,27 @@ impl DogpileTracker {
             guard
                 .postgate_state
                 .retain(|_, (_, _, ts)| now_us.saturating_sub(*ts) <= POSTGATE_STATE_TTL_US);
+
+            self.sync_active_storm(&target_did, &guard, now_us);
+            if guard.is_empty() {
+                empty_candidates.push(target_did);
+            }
+        }
+
+        if !empty_candidates.is_empty() {
+            let mut targets_guard = self.targets.write();
+            for did in empty_candidates {
+                if let Some(arc) = targets_guard.get(&did) {
+                    let can_remove =
+                        Arc::strong_count(arc) == 1 && arc.try_lock().is_some_and(|g| g.is_empty());
+                    if can_remove {
+                        targets_guard.remove(&did);
+                    }
+                }
+            }
         }
 
         (expired, digests)
-    }
-
-    fn evict_oldest_locked(
-        state: &mut TrackerState,
-        medium_cutoff: u64,
-        now_us: u64,
-        max_tracked_posts: usize,
-    ) {
-        for bucket in state.buckets.values_mut() {
-            bucket.prune(medium_cutoff);
-        }
-        state.buckets.retain(|_, b| {
-            !b.events.is_empty()
-                || !b.eval_outcomes.is_empty()
-                || b.active_storm_id.is_some()
-                || b.digest_bounced_count > 0
-                || b.is_suppressed(now_us)
-        });
-        if state.buckets.len() < max_tracked_posts || state.buckets.is_empty() {
-            return;
-        }
-        let victim = state
-            .buckets
-            .iter()
-            .filter(|(_, b)| !b.has_active_storm(now_us) && !b.is_suppressed(now_us))
-            .min_by_key(|(_, b)| b.last_activity_us)
-            .map(|(k, _)| k.clone())
-            .or_else(|| {
-                state
-                    .buckets
-                    .iter()
-                    .min_by_key(|(_, b)| b.last_activity_us)
-                    .map(|(k, _)| k.clone())
-            });
-        if let Some(key) = victim {
-            state.buckets.remove(&key);
-        }
     }
 }
 
@@ -1206,7 +1468,8 @@ mod tests {
             );
             let _ = tracker.record_interaction(&inter, true, t0 + idx * 1000);
         }
-        assert!(tracker.state.read().buckets.len() <= 2);
+        let alice_shard = tracker.get_target_shard("did:plc:alice").unwrap();
+        assert!(alice_shard.lock().buckets.len() <= 2);
     }
 
     #[test]
@@ -1253,13 +1516,12 @@ mod tests {
             t0 + 2_000_000_000, // advances medium_cutoff past both prior entries
         );
         {
-            let guard = tracker.state.read();
-            let b = guard
-                .buckets
-                .get(&("did:plc:alice".to_string(), focal.to_string()))
-                .unwrap();
+            let shard = tracker.get_target_shard("did:plc:alice").unwrap();
+            let guard = shard.lock();
+            let b = guard.buckets.get(focal).unwrap();
             assert_eq!(b.eval_outcomes.len(), 1);
             assert!(b.eval_outcomes[0].1);
+            assert_eq!(b.eval_violation_count, 1);
         }
 
         // 3. `dismiss_storm` flushes pending digest immediately and suppresses re-triggering for TTL.
@@ -1301,12 +1563,11 @@ mod tests {
             t0 + 401_000_000,
         );
         assert_eq!(
-            tracker
-                .state
-                .read()
+            tracker.get_target_shard("did:plc:carol").map_or(0, |s| s
+                .lock()
                 .defensive
-                .get("did:plc:carol")
-                .map_or(0, |w| w.recent_detaches.len()),
+                .recent_detaches
+                .len()),
             0,
             "unchanged postgate after 5m prune must not double-count prior detaches"
         );
@@ -1375,10 +1636,12 @@ mod tests {
             true,
             t0 + 101_000_000,
         );
-        assert!(evict_tracker.state.read().buckets.contains_key(&(
-            "did:plc:eve".to_string(),
-            "at://did:plc:eve/app.bsky.feed.post/live".to_string()
-        )));
+        assert!(evict_tracker
+            .get_target_shard("did:plc:eve")
+            .unwrap()
+            .lock()
+            .buckets
+            .contains_key("at://did:plc:eve/app.bsky.feed.post/live"));
 
         // 7. rollback_eval_recheck clears last_eval_us; oon_samples reservoir-samples > max_sample_replies;
         //    dismiss_storm drains immediate digest and clears bucket buffers; rehydrate_storm restores active state.
@@ -1454,5 +1717,73 @@ mod tests {
         );
         assert!(digest_on_dismiss.is_some());
         assert!(!r_tracker.is_storm_mode_active("did:plc:faye", surge_ts + 4_000_000));
+    }
+
+    #[test]
+    fn tracker_sharding_bounds_events_defensive_and_short_cursor_incrementally() {
+        let cfg = DogpileConfig::default()
+            .with_short_window(Duration::from_secs(300))
+            .with_medium_window(Duration::from_secs(1800))
+            .with_min_unique_authors(5000);
+        let tracker = DogpileTracker::new(cfg);
+        let t0 = 1_750_000_000_000_000_u64;
+
+        // Exceed MAX_BUCKET_EVENTS on one focal post and verify cap holds.
+        for i in 0..(MAX_BUCKET_EVENTS + 120) {
+            let inter = reply_from(
+                &format!("did:plc:flood_{i}"),
+                "did:plc:alice",
+                "flood_post",
+                &format!("fp_{i}"),
+                "flood",
+            );
+            let _ = tracker.record_interaction(&inter, true, t0 + (i as u64) * 100);
+        }
+        {
+            let shard = tracker.get_target_shard("did:plc:alice").unwrap();
+            let guard = shard.lock();
+            let bucket = guard
+                .buckets
+                .get("at://did:plc:alice/app.bsky.feed.post/flood_post")
+                .unwrap();
+            assert_eq!(bucket.events.len(), MAX_BUCKET_EVENTS);
+            assert_eq!(bucket.seen_post_uris.len(), MAX_BUCKET_EVENTS);
+            assert_eq!(bucket.short_count, MAX_BUCKET_EVENTS);
+        }
+
+        // Advance time past short_window for old events while keeping them inside medium_window,
+        // verifying short_cursor advances and short_author_counts drops to only new events.
+        let t_later = t0 + 400_000_000;
+        let fresh = reply_from(
+            "did:plc:fresh",
+            "did:plc:alice",
+            "flood_post",
+            "fresh_1",
+            "hi",
+        );
+        let _ = tracker.record_interaction(&fresh, true, t_later);
+        {
+            let shard = tracker.get_target_shard("did:plc:alice").unwrap();
+            let guard = shard.lock();
+            let bucket = guard
+                .buckets
+                .get("at://did:plc:alice/app.bsky.feed.post/flood_post")
+                .unwrap();
+            assert_eq!(bucket.short_count, 1);
+            assert_eq!(bucket.short_author_counts.len(), 1);
+            assert_eq!(bucket.short_oon_author_counts.len(), 1);
+        }
+
+        // Exceed MAX_DEFENSIVE_EVENTS on blocks & detaches.
+        for i in 0..(MAX_DEFENSIVE_EVENTS + 50) {
+            tracker.record_defensive_block("did:plc:alice", t_later + i as u64);
+        }
+        {
+            let shard = tracker.get_target_shard("did:plc:alice").unwrap();
+            assert_eq!(
+                shard.lock().defensive.recent_blocks.len(),
+                MAX_DEFENSIVE_EVENTS
+            );
+        }
     }
 }

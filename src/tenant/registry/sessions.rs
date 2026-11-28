@@ -163,6 +163,8 @@ impl TenantRegistry {
         }
 
         tx.commit()?;
+        drop(conn);
+        let _ = self.list_summaries();
         Ok(())
     }
 
@@ -214,7 +216,7 @@ impl TenantRegistry {
             .filter(|h| !h.trim().is_empty())
             .map(|_| updated_at_i64);
 
-        {
+        let committed_meta = {
             let conn = self.conn.lock();
             let mut stmt = conn.prepare_cached(
                 "INSERT INTO tenants (
@@ -248,6 +250,13 @@ impl TenantRegistry {
                 updated_at_i64,
                 handle_updated_at_i64,
             ])?;
+            Self::query_meta_locked(&conn, &tenant.did)?
+        };
+
+        if let Some(meta) = committed_meta {
+            self.meta_cache.write().insert(meta.did.clone(), meta);
+        } else {
+            self.meta_cache.write().remove(&tenant.did);
         }
 
         // Invalidate cached PDS client and advance epoch after commit
@@ -292,19 +301,7 @@ impl TenantRegistry {
         let now_i64 = us_to_i64(current_time_us());
         let handle_updated_at_i64 = clean_handle.as_ref().map(|_| now_i64);
 
-        let (
-            is_active_int,
-            rubric_prompt,
-            sensitivity_str,
-            bounce_duration_str,
-            bypass_followers_int,
-        ): (
-            i64,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-        ) = {
+        let committed_meta: TenantMeta = {
             let mut conn = self.conn.lock();
             let tx = conn.transaction()?;
             if let Some(ref h) = clean_handle {
@@ -329,28 +326,43 @@ impl TenantRegistry {
                      reauth_notify_count = 0;",
                 params![did, clean_handle, encrypted, now_i64, handle_updated_at_i64],
             )?;
-            let row = tx.query_row(
-                "SELECT is_active, rubric_prompt, sensitivity, bounce_duration, bypass_followers
+            let meta = tx.query_row(
+                "SELECT did, handle,
+                        (session_json IS NOT NULL AND TRIM(session_json) != '') AS has_session,
+                        reauth_required, rubric_prompt, sensitivity, bounce_duration,
+                        bypass_followers, is_active, created_at, updated_at
                  FROM tenants WHERE did = ?1;",
                 params![did],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                Self::map_tenant_meta_row,
             )?;
             tx.commit()?;
-            row
+            meta
         };
+
+        {
+            let mut cache = self.meta_cache.write();
+            if let Some(ref h) = clean_handle {
+                let at_h = format!("@{h}");
+                for (entry_did, entry) in cache.iter_mut() {
+                    if entry_did != did
+                        && entry.handle.as_deref().is_some_and(|existing| {
+                            existing.eq_ignore_ascii_case(h) || existing.eq_ignore_ascii_case(&at_h)
+                        })
+                    {
+                        entry.handle = None;
+                        entry.updated_at = i64_to_us(now_i64);
+                    }
+                }
+            }
+            cache.insert(committed_meta.did.clone(), committed_meta.clone());
+        }
 
         self.bump_epoch_and_evict(did);
 
-        let rubric = Self::decode_rubric_fields(
-            rubric_prompt,
-            sensitivity_str,
-            bounce_duration_str,
-            bypass_followers_int,
-        );
-        Ok((is_active_int != 0, rubric))
+        Ok((committed_meta.is_active, committed_meta.rubric))
     }
 
-    fn decode_rubric_fields(
+    pub(super) fn decode_rubric_fields(
         rubric_prompt: Option<String>,
         sensitivity_str: Option<String>,
         bounce_duration_str: Option<String>,
@@ -520,17 +532,25 @@ impl TenantRegistry {
         let encrypted = self
             .cipher
             .encrypt_with_aad(serialized.as_bytes(), did.as_bytes())?;
-        let now_us = us_to_i64(current_time_us());
+        let now_us = current_time_us();
+        let now_i64 = us_to_i64(now_us);
         let rows = {
             let conn = self.conn.lock();
             conn.execute(
                 "UPDATE tenants SET session_json = ?1, updated_at = ?2, reauth_required = 0, reauth_notified_at = NULL, reauth_notify_count = 0 WHERE did = ?3",
-                params![encrypted, now_us, did],
+                params![encrypted, now_i64, did],
             )
             .map_err(|e| {
                 SkybouncerError::Database(format!("Failed to update session for {did}: {e}"))
             })?
         };
+        if rows > 0 {
+            if let Some(entry) = self.meta_cache.write().get_mut(did) {
+                entry.has_session = true;
+                entry.reauth_required = false;
+                entry.updated_at = now_us;
+            }
+        }
         self.bump_epoch_and_evict(did);
         Ok(rows > 0)
     }
@@ -558,7 +578,8 @@ impl TenantRegistry {
         let encrypted = self
             .cipher
             .encrypt_with_aad(serialized.as_bytes(), did.as_bytes())?;
-        let now_us = us_to_i64(current_time_us());
+        let now_us = current_time_us();
+        let now_i64 = us_to_i64(now_us);
 
         let (rows, exists) = {
             let conn = self.conn.lock();
@@ -571,7 +592,7 @@ impl TenantRegistry {
                          reauth_notified_at = NULL,
                          reauth_notify_count = 0
                      WHERE did = ?3 AND session_json = ?4;",
-                    params![encrypted, now_us, did, expected_raw_session_json],
+                    params![encrypted, now_i64, did, expected_raw_session_json],
                 )
                 .map_err(|e| {
                     SkybouncerError::Database(format!(
@@ -594,11 +615,17 @@ impl TenantRegistry {
         };
 
         if rows > 0 {
+            if let Some(entry) = self.meta_cache.write().get_mut(did) {
+                entry.has_session = true;
+                entry.reauth_required = false;
+                entry.updated_at = now_us;
+            }
             self.bump_epoch_and_evict(did);
             Ok(CasUpdateOutcome::Updated)
         } else if exists {
             Ok(CasUpdateOutcome::Conflict)
         } else {
+            self.meta_cache.write().remove(did);
             self.bump_epoch_and_evict(did);
             Ok(CasUpdateOutcome::NotFound)
         }
@@ -707,20 +734,30 @@ impl TenantRegistry {
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if SQLite update fails.
     pub fn mark_reauth_required(&self, did: &str) -> Result<bool, SkybouncerError> {
-        let now_i64 = us_to_i64(current_time_us());
-        let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE tenants SET reauth_required = 1, updated_at = ?1 WHERE did = ?2;",
-            params![now_i64, did],
-        )?;
+        let now_us = current_time_us();
+        let now_i64 = us_to_i64(now_us);
+        let (rows, row) = {
+            let conn = self.conn.lock();
+            let rows = conn.execute(
+                "UPDATE tenants SET reauth_required = 1, updated_at = ?1 WHERE did = ?2;",
+                params![now_i64, did],
+            )?;
 
-        let row: Option<(i64, Option<i64>)> = conn
-            .query_row(
-                "SELECT is_active, reauth_notified_at FROM tenants WHERE did = ?1 LIMIT 1;",
-                params![did],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+            let row: Option<(i64, Option<i64>)> = conn
+                .query_row(
+                    "SELECT is_active, reauth_notified_at FROM tenants WHERE did = ?1 LIMIT 1;",
+                    params![did],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            (rows, row)
+        };
+        if rows > 0 {
+            if let Some(entry) = self.meta_cache.write().get_mut(did) {
+                entry.reauth_required = true;
+                entry.updated_at = now_us;
+            }
+        }
 
         Ok(matches!(row, Some((active, None)) if active != 0))
     }
@@ -738,24 +775,34 @@ impl TenantRegistry {
         did: &str,
         expected_raw_session_json: &str,
     ) -> Result<bool, SkybouncerError> {
-        let now_i64 = us_to_i64(current_time_us());
-        let conn = self.conn.lock();
-        let rows = conn.execute(
-            "UPDATE tenants SET reauth_required = 1, updated_at = ?1
-             WHERE did = ?2 AND session_json = ?3;",
-            params![now_i64, did, expected_raw_session_json],
-        )?;
-        if rows == 0 {
-            return Ok(false);
-        }
+        let now_us = current_time_us();
+        let now_i64 = us_to_i64(now_us);
+        let (rows, row) = {
+            let conn = self.conn.lock();
+            let rows = conn.execute(
+                "UPDATE tenants SET reauth_required = 1, updated_at = ?1
+                 WHERE did = ?2 AND session_json = ?3;",
+                params![now_i64, did, expected_raw_session_json],
+            )?;
+            if rows == 0 {
+                return Ok(false);
+            }
 
-        let row: Option<(i64, Option<i64>)> = conn
-            .query_row(
-                "SELECT is_active, reauth_notified_at FROM tenants WHERE did = ?1 LIMIT 1;",
-                params![did],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+            let row: Option<(i64, Option<i64>)> = conn
+                .query_row(
+                    "SELECT is_active, reauth_notified_at FROM tenants WHERE did = ?1 LIMIT 1;",
+                    params![did],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            (rows, row)
+        };
+        if rows > 0 {
+            if let Some(entry) = self.meta_cache.write().get_mut(did) {
+                entry.reauth_required = true;
+                entry.updated_at = now_us;
+            }
+        }
 
         Ok(matches!(row, Some((active, None)) if active != 0))
     }
@@ -807,18 +854,12 @@ impl TenantRegistry {
 
     /// Checks whether a tenant is currently marked as requiring OAuth re-authentication.
     ///
+    /// Uses `meta_cache` / lightweight SQL projection without decrypting `session_json`.
+    ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if SQLite query fails.
     pub fn is_reauth_required(&self, did: &str) -> Result<bool, SkybouncerError> {
-        let conn = self.conn.lock();
-        let flag: Option<i64> = conn
-            .query_row(
-                "SELECT reauth_required FROM tenants WHERE did = ?1 LIMIT 1;",
-                params![did],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(flag.unwrap_or(0) != 0)
+        Ok(self.get_meta(did)?.is_some_and(|m| m.reauth_required))
     }
 
     /// Checks whether an active tenant requires OAuth re-authentication and is due for either
@@ -1277,6 +1318,14 @@ impl TenantRegistry {
                     return Ok(Some(Arc::clone(client)));
                 }
             }
+        }
+
+        // 3.5. Short-circuit tenants already marked reauth_required without decrypting session_json
+        if self.is_reauth_required(did)? {
+            self.pds_clients.write().remove(did);
+            return Err(SkybouncerError::Auth(format!(
+                "OAuth session for tenant {did} requires re-authentication"
+            )));
         }
 
         let mut expected_epoch = self.client_epochs.read().get(did).copied().unwrap_or(0);

@@ -12,6 +12,20 @@ use crate::matcher::{Interaction, InteractionType};
 use crate::modlist::cache::{EvaluationLogContext, NewEvaluationLog};
 use crate::types::now_iso8601;
 
+/// Maximum size of a URL-fetched simulation image (2 MiB).
+pub const MAX_SIMULATION_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Fetches a simulation image through `skyauth`'s SSRF-hardened HTTP client, enforcing
+/// scheme/host/IP validation, DNS pinning, redirect bounds, and [`MAX_SIMULATION_IMAGE_BYTES`].
+///
+/// # Errors
+/// Returns [`skyauth::SsrfError`] if URL validation, SSRF checks, HTTP fetch, or size limit fail.
+pub async fn fetch_simulation_image_bytes(url_str: &str) -> Result<Vec<u8>, skyauth::SsrfError> {
+    skyauth::ssrf::SsrfFilter::default()
+        .safe_get(url_str, MAX_SIMULATION_IMAGE_BYTES)
+        .await
+}
+
 /// Per-tier evaluation detail for a [`SimulationResult`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimulateTierStage {

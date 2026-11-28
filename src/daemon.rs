@@ -25,9 +25,22 @@ pub async fn hydrate_cold_start(
     enricher: &crate::enricher::AppViewContextEnricher,
     protected_dids: &std::collections::HashSet<String>,
 ) -> usize {
+    let cancel = CancellationToken::new();
+    hydrate_cold_start_with_cancel(engine, enricher, protected_dids, &cancel).await
+}
+
+/// Cancellable, bounded-concurrency cold-start hydration.
+pub async fn hydrate_cold_start_with_cancel(
+    engine: &SkybouncerEngine,
+    enricher: &crate::enricher::AppViewContextEnricher,
+    protected_dids: &std::collections::HashSet<String>,
+    cancel: &CancellationToken,
+) -> usize {
+    use futures_util::stream::{self, StreamExt};
+
     let mut all_dids = protected_dids.clone();
     all_dids.extend(engine.protected_dids());
-    if let Ok(tenants) = engine.tenant_registry().list_all() {
+    if let Ok(tenants) = engine.tenant_registry().list_summaries() {
         for t in tenants {
             if t.is_active {
                 all_dids.insert(t.did);
@@ -35,23 +48,37 @@ pub async fn hydrate_cold_start(
         }
     }
 
-    let mut hydrated: usize = 0;
-    for did in &all_dids {
-        let follow_records = enricher.fetch_follow_records(did, 100).await;
-        if !follow_records.is_empty() {
-            hydrated = hydrated.saturating_add(engine.hydrate_follow_records(did, follow_records));
-        } else {
-            let follows = enricher.fetch_follows(did, 100).await;
-            if !follows.is_empty() {
-                hydrated = hydrated.saturating_add(engine.hydrate_follows(did, follows));
+    let dids: Vec<String> = all_dids.into_iter().collect();
+    let counts: Vec<usize> = stream::iter(dids)
+        .map(|did| async move {
+            if cancel.is_cancelled() {
+                return 0;
             }
-        }
-        let followers = enricher.fetch_followers(did, 100).await;
-        if !followers.is_empty() {
-            hydrated = hydrated.saturating_add(engine.hydrate_followers(did, followers));
-        }
-    }
-    hydrated
+            let mut local = 0usize;
+            let follow_records = enricher.fetch_follow_records(&did, 100).await;
+            if !follow_records.is_empty() {
+                local = local.saturating_add(engine.hydrate_follow_records(&did, follow_records));
+            } else if !cancel.is_cancelled() {
+                let follows = enricher.fetch_follows(&did, 100).await;
+                if !follows.is_empty() {
+                    local = local.saturating_add(engine.hydrate_follows(&did, follows));
+                }
+            }
+            if !cancel.is_cancelled() {
+                let followers = enricher.fetch_followers(&did, 100).await;
+                if !followers.is_empty() {
+                    local = local.saturating_add(engine.hydrate_followers(&did, followers));
+                }
+            }
+            local
+        })
+        .buffer_unordered(4)
+        .collect()
+        .await;
+
+    counts
+        .into_iter()
+        .fold(0usize, |acc, n| acc.saturating_add(n))
 }
 
 /// Provisions (or verifies) the moderation list + listblock on the sovereign PDS for every
@@ -63,9 +90,9 @@ pub async fn provision_pds_resources(
     protected_dids: &std::collections::HashSet<String>,
 ) -> usize {
     let mut all_dids = protected_dids.clone();
-    if let Ok(tenants) = engine.tenant_registry().list_all() {
+    if let Ok(tenants) = engine.tenant_registry().list_summaries() {
         for t in tenants {
-            if t.is_active && t.session.is_some() {
+            if t.is_active && t.has_session {
                 all_dids.insert(t.did);
             }
         }
@@ -287,7 +314,8 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
     }
 
     // Cold-start follow graph hydration via public AppView.
-    let hydrated = hydrate_cold_start(&engine, &enricher, &config.protected_dids).await;
+    let hydrated =
+        hydrate_cold_start_with_cancel(&engine, &enricher, &config.protected_dids, &cancel).await;
     info!(
         count = hydrated,
         "Cold-start follow graph hydration complete"
@@ -490,24 +518,65 @@ pub async fn run(args: &[String], cancel: CancellationToken) -> Result<(), Skybo
 
     info!("🚀 Skybouncer is running! Press Ctrl+C to stop.");
 
-    // Await shutdown signal
+    #[cfg(unix)]
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!(error = %e, "Failed to register SIGTERM signal handler");
+            None
+        }
+    };
+    #[cfg(unix)]
+    let sigterm_fut = async {
+        if let Some(ref mut s) = sigterm {
+            s.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let sigterm_fut = std::future::pending::<()>();
+
+    // Await shutdown signal or unexpected critical task exit
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received shutdown signal (Ctrl+C); initiating graceful shutdown...");
         }
+        _ = sigterm_fut => {
+            info!("Received SIGTERM; initiating graceful shutdown...");
+        }
         _ = cancel.cancelled() => {
             info!("Cancellation token triggered; initiating graceful shutdown...");
+        }
+        Some(task_res) = join_set.join_next() => {
+            match task_res {
+                Ok(Ok(_)) => {
+                    warn!("Background daemon task exited unexpectedly; initiating graceful shutdown...");
+                }
+                Ok(Err(e)) => {
+                    error!(error = %e, "Background daemon task failed; initiating graceful shutdown...");
+                }
+                Err(e) => {
+                    error!(error = %e, "Background daemon task panicked; initiating graceful shutdown...");
+                }
+            }
         }
     }
 
     // Graceful drain and shutdown
     cancel.cancel();
-    let shutdown_timeout = Duration::from_secs(5);
+    let shutdown_timeout = Duration::from_secs(20);
     let _ = SkybouncerEngine::drain_and_shutdown(&mut join_set, &cancel, shutdown_timeout).await;
 
     // Persist cumulative telemetry counters so dashboard KPIs survive restarts
     if let Err(e) = engine.persist_stats() {
         warn!(error = %e, "Failed to persist dashboard telemetry counters during shutdown");
+    }
+
+    // Truncate SQLite WAL cleanly on exit
+    if let Err(e) = engine.cache().checkpoint_wal_truncate() {
+        warn!(error = %e, "Failed to checkpoint SQLite WAL during shutdown");
     }
 
     // Output final operational telemetry

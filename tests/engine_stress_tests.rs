@@ -637,20 +637,53 @@ async fn test_stress_cancellation_drain_buffered_queue() {
             .expect("try_send into pre-buffered channel");
     }
 
-    // Now trigger cancellation BEFORE engine runs!
+    // 1. Trigger cancellation BEFORE engine runs: PR 3 stops dequeuing new commits/candidates
+    // once cancelled so only already-in-flight PDS writes finish without advancing cursor past
+    // aborted work.
     cancel.cancel();
 
-    // Run engine: it must detect cancellation, drain all 1000 prebuffered commits, and return!
     let run_timeout = tokio::time::timeout(Duration::from_secs(5), engine.run(rx, cancel)).await;
     assert!(
         run_timeout.is_ok(),
-        "Engine run must finish draining buffered commits within 5s"
+        "Engine run must exit promptly after cancellation within 5s"
+    );
+    let cancel_stats = run_timeout.unwrap().expect("engine run ok");
+    assert_eq!(cancel_stats.commits_received, 0);
+
+    // 2. When the input channel closes cleanly (drop(tx)) without cancellation, all 1,000
+    // buffered commits drain and evaluate completely.
+    let (tx2, rx2) = tokio::sync::mpsc::channel::<JetstreamCommit>(2500);
+    for i in 0..num_commits {
+        let commit = if i % 2 == 0 {
+            make_reply_commit(
+                &format!("did:plc:user2_{i}"),
+                "did:plc:carol",
+                &format!("rep2_{i}"),
+                "rt_1",
+                "polite prebuffered comment",
+            )
+        } else {
+            make_standalone_post_commit(
+                &format!("did:plc:user2_{i}"),
+                &format!("post2_{i}"),
+                "standalone post",
+            )
+        };
+        tx2.try_send(commit).expect("try_send into tx2");
+    }
+    drop(tx2);
+
+    let cancel2 = CancellationToken::new();
+    let run_timeout2 = tokio::time::timeout(Duration::from_secs(5), engine.run(rx2, cancel2)).await;
+    assert!(
+        run_timeout2.is_ok(),
+        "Engine run must finish draining closed channel within 5s"
     );
 
-    let stats = run_timeout.unwrap().expect("engine run ok");
+    let stats = run_timeout2.unwrap().expect("engine run ok");
     assert_eq!(
         stats.commits_received, num_commits as u64,
-        "Engine must have drained and processed all 1,000 buffered commits"
+        "Engine must drain and process all 1,000 buffered commits on clean channel close"
     );
     assert_eq!(stats.permitted, (num_commits / 2) as u64);
 }
@@ -780,9 +813,16 @@ async fn test_stress_extreme_channel_saturation_and_backpressure() {
         h.await.expect("producer finished");
     }
 
-    // Drain and shutdown
+    // Wait for engine to naturally drain closed `rx` and internal queues before shutdown
+    let natural_drain = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(res) = join_set.join_next().await {
+            res.expect("engine task join").expect("engine run ok");
+        }
+    })
+    .await;
+    assert!(natural_drain.is_ok(), "engine must drain closed channel");
     let shutdown_res =
-        SkybouncerEngine::drain_and_shutdown(&mut join_set, &cancel, Duration::from_secs(4)).await;
+        SkybouncerEngine::drain_and_shutdown(&mut join_set, &cancel, Duration::from_secs(1)).await;
     assert!(shutdown_res.is_ok());
 
     let stats = engine.stats().snapshot();

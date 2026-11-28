@@ -99,15 +99,24 @@ fn remove_index_entry(
         let still_referenced = index
             .get(outer_key)
             .is_some_and(|m| m.values().any(|v| v == &value));
+        if index.get(outer_key).is_some_and(HashMap::is_empty) {
+            index.remove(outer_key);
+        }
         (value, still_referenced)
     };
     if !still_referenced {
         if forward {
             if let Some(set) = guard.follows.get_mut(outer_key) {
                 set.remove(&value);
+                if set.is_empty() {
+                    guard.follows.remove(outer_key);
+                }
             }
         } else if let Some(set) = guard.followers.get_mut(&value) {
             set.remove(outer_key);
+            if set.is_empty() {
+                guard.followers.remove(&value);
+            }
         }
     }
     Some(value)
@@ -137,15 +146,24 @@ fn remove_synthetic_entry(
             .cloned()?;
         let value = map.remove(&synthetic_key)?;
         let still_referenced = map.values().any(|v| v == &value);
+        if map.is_empty() {
+            index.remove(outer_key);
+        }
         (value, still_referenced)
     };
     if !still_referenced {
         if forward {
             if let Some(set) = guard.follows.get_mut(outer_key) {
                 set.remove(&value);
+                if set.is_empty() {
+                    guard.follows.remove(outer_key);
+                }
             }
         } else if let Some(set) = guard.followers.get_mut(&value) {
             set.remove(outer_key);
+            if set.is_empty() {
+                guard.followers.remove(&value);
+            }
         }
     }
     Some(value)
@@ -259,6 +277,9 @@ impl FollowGraph {
                 if !still_referenced {
                     if let Some(set) = guard.followers.get_mut(&prev_p_did) {
                         set.remove(&f_did);
+                        if set.is_empty() {
+                            guard.followers.remove(&prev_p_did);
+                        }
                     }
                 }
             }
@@ -287,31 +308,14 @@ impl FollowGraph {
     /// Returns `Some(protected_did)` if the incoming follow existed and was removed, or `None`.
     pub fn remove_follower_by_rkey(&self, follower_did: &str, rkey: &str) -> Option<String> {
         let mut guard = self.inner.write();
-
-        let protected_did = guard
-            .incoming_rkey_index
-            .get_mut(follower_did)?
-            .remove(rkey)?;
-
-        let still_referenced = guard
-            .incoming_rkey_index
-            .get(follower_did)
-            .is_some_and(|m| m.values().any(|v| v == &protected_did));
-
-        if !still_referenced {
-            if let Some(set) = guard.followers.get_mut(&protected_did) {
-                set.remove(follower_did);
-            }
-        }
-
-        Some(protected_did)
+        remove_index_entry(&mut guard, false, rkey, follower_did)
     }
 
     /// Hydrates a batch of known incoming followers on cold start.
     ///
-    /// The public AppView `getFollowers` endpoint does not expose repository rkeys, so
-    /// synthetic `hydrate_in_{n}` keys are generated and passed through [`FollowGraph::add_follower`].
-    /// Acquires the write lock once per relationship (via `add_follower`).
+    /// Acquires the write lock **once** for the entire batch and populates only `followers`
+    /// (without inserting synthetic entries into `incoming_rkey_index`), preventing unrelated
+    /// Bluesky unfollows from hydrated followers from acquiring write locks on the firehose.
     ///
     /// Returns the number of hydrated incoming followers.
     pub fn hydrate_followers<I, S>(&self, protected_did: impl Into<String>, followers: I) -> usize
@@ -320,14 +324,23 @@ impl FollowGraph {
         S: Into<String>,
     {
         let p_did = protected_did.into();
+        let mut iter = followers.into_iter().peekable();
+        if iter.peek().is_none() {
+            return 0;
+        }
+        let mut guard = self.inner.write();
         let mut count = 0;
-        for (idx, follower_did) in followers.into_iter().enumerate() {
-            self.add_follower(
-                &p_did,
-                follower_did.into(),
-                format!("hydrate_in_{p_did}_{idx}"),
-            );
+        let set = guard.followers.entry(p_did.clone()).or_default();
+        for follower_did in iter {
+            let f_did = follower_did.into();
+            if f_did.is_empty() {
+                continue;
+            }
+            set.insert(f_did);
             count += 1;
+        }
+        if set.is_empty() {
+            guard.followers.remove(&p_did);
         }
         count
     }
@@ -368,6 +381,9 @@ impl FollowGraph {
                     if !still_referenced {
                         if let Some(set) = guard.follows.get_mut(&p_did) {
                             set.remove(&old_followed);
+                            if set.is_empty() {
+                                guard.follows.remove(&p_did);
+                            }
                         }
                     }
                 }
@@ -398,14 +414,22 @@ impl FollowGraph {
     pub fn remove_follow_by_did(&self, protected_did: &str, followed_did: &str) -> bool {
         let mut guard = self.inner.write();
 
-        let removed = guard
-            .follows
-            .get_mut(protected_did)
-            .is_some_and(|set| set.remove(followed_did));
+        let removed = if let Some(set) = guard.follows.get_mut(protected_did) {
+            let hit = set.remove(followed_did);
+            if set.is_empty() {
+                guard.follows.remove(protected_did);
+            }
+            hit
+        } else {
+            false
+        };
 
         if removed {
             if let Some(user_rkeys) = guard.rkey_to_followed.get_mut(protected_did) {
                 user_rkeys.retain(|_, v| v != followed_did);
+                if user_rkeys.is_empty() {
+                    guard.rkey_to_followed.remove(protected_did);
+                }
             }
         }
 
@@ -479,11 +503,15 @@ impl FollowGraph {
             .and_then(|s| s.as_str());
 
         // Outgoing direction: a protected user follows someone.
+        // If `subject` is also a protected user, keep both `follows` and `followers` synchronized.
         if author_is_protected {
             return match commit.operation {
                 CommitOperation::Create | CommitOperation::Update => match subject_did {
                     Some(subject) => {
                         self.add_follow(&commit.did, &commit.rkey, subject);
+                        if protected_dids.contains(subject) {
+                            self.add_follower(subject, &commit.did, &commit.rkey);
+                        }
                         FollowSyncEvent::FollowAdded {
                             protected_did: commit.did.clone(),
                             rkey: commit.rkey.clone(),
@@ -527,6 +555,22 @@ impl FollowGraph {
                     // Fallback: Reconcile synthetic rkey if present
                     let removed =
                         removed.or_else(|| self.remove_synthetic_follow_fallback(&commit.did));
+
+                    // Synchronize incoming follower edge when unfollowing another protected user.
+                    let removed_incoming = self.remove_follower_by_rkey(&commit.did, &commit.rkey);
+                    if removed_incoming.is_none() {
+                        if let Some(ref target_did) = removed {
+                            if protected_dids.contains(target_did) {
+                                let mut guard = self.inner.write();
+                                if let Some(set) = guard.followers.get_mut(target_did) {
+                                    set.remove(&commit.did);
+                                    if set.is_empty() {
+                                        guard.followers.remove(target_did);
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     match removed {
                         Some(followed_did) => FollowSyncEvent::FollowRemoved {
@@ -609,6 +653,10 @@ impl FollowGraph {
         I: IntoIterator<Item = (String, String)>,
     {
         let p_did = protected_did.into();
+        let mut iter = records.into_iter().peekable();
+        if iter.peek().is_none() {
+            return 0;
+        }
         let mut count = 0;
         let mut guard = self.inner.write();
 
@@ -621,7 +669,7 @@ impl FollowGraph {
         let follows_set = follows.entry(p_did.clone()).or_default();
         let rkeys_map = rkey_to_followed.entry(p_did).or_default();
 
-        for (rkey, followed_did) in records {
+        for (rkey, followed_did) in iter {
             follows_set.insert(followed_did.clone());
             rkeys_map.insert(rkey, followed_did);
             count += 1;

@@ -1,6 +1,27 @@
 use super::*;
 
+/// Maximum number of entries retained in the in-memory `handle_cache`.
+pub const MAX_HANDLE_CACHE_ENTRIES: usize = 10_000;
+
 impl SkybouncerEngine {
+    fn insert_handle_cache_bounded(&self, key: String, did: String, now: std::time::Instant) {
+        let ttl = self.config.handle_cache_ttl;
+        let mut guard = self.handle_cache.write();
+        if guard.len() >= MAX_HANDLE_CACHE_ENTRIES && !guard.contains_key(&key) {
+            guard.retain(|_, (_, cached_at)| now.saturating_duration_since(*cached_at) < ttl);
+            if guard.len() >= MAX_HANDLE_CACHE_ENTRIES {
+                if let Some(oldest_key) = guard
+                    .iter()
+                    .min_by_key(|(_, (_, ts))| *ts)
+                    .map(|(k, _)| k.clone())
+                {
+                    guard.remove(&oldest_key);
+                }
+            }
+        }
+        guard.insert(key, (did, now));
+    }
+
     /// Resolves an ATProto handle to a DID using in-memory monotonic caching,
     /// tenant registry handle-mapping TTL caching, the persisted SQLite handle
     /// cache, and the configured context enricher.
@@ -47,27 +68,21 @@ impl SkybouncerEngine {
             .get_by_handle_with_ttl(clean, self.config.handle_cache_ttl)
         {
             let _ = self.cache.set_handle_for_did(&tenant.did, clean);
-            self.handle_cache
-                .write()
-                .insert(clean.to_string(), (tenant.did.clone(), now));
+            self.insert_handle_cache_bounded(clean.to_string(), tenant.did.clone(), now);
             return Some(tenant.did);
         }
 
         // 3. Persisted SQLite did_handles cache (TTL-bounded to avoid identity shadowing)
         let ttl_us = u64::try_from(self.config.handle_cache_ttl.as_micros()).unwrap_or(u64::MAX);
         if let Ok(Some(cached_did)) = self.cache.get_did_for_handle_with_ttl(clean, ttl_us) {
-            self.handle_cache
-                .write()
-                .insert(clean.to_string(), (cached_did.clone(), now));
+            self.insert_handle_cache_bounded(clean.to_string(), cached_did.clone(), now);
             return Some(cached_did);
         }
 
         // 4. Remote AppView resolution via enricher
         if let Some(live_did) = self.enricher.resolve_handle(clean).await {
             let _ = self.cache.set_handle_for_did(&live_did, clean);
-            self.handle_cache
-                .write()
-                .insert(clean.to_string(), (live_did.clone(), now));
+            self.insert_handle_cache_bounded(clean.to_string(), live_did.clone(), now);
             return Some(live_did);
         }
 
@@ -77,10 +92,20 @@ impl SkybouncerEngine {
     /// Invalidates a handle across the in-memory cache, the tenant registry, and
     /// the persisted SQLite handle cache.
     pub fn invalidate_handle(&self, handle: &str) {
-        let clean = crate::util::normalize_handle(handle);
-        self.handle_cache.write().remove(clean);
-        let _ = self.tenant_registry.invalidate_handle(clean);
-        let _ = self.cache.remove_handle_for_handle(clean);
+        let clean = crate::util::normalize_handle(handle).to_ascii_lowercase();
+        self.handle_cache.write().remove(&clean);
+        let _ = self.tenant_registry.invalidate_handle(&clean);
+        let _ = self.cache.remove_handle_for_handle(&clean);
+    }
+
+    /// Removes expired entries from the in-memory handle cache, returning how many were evicted.
+    pub fn prune_handle_cache(&self) -> usize {
+        let now = std::time::Instant::now();
+        let ttl = self.config.handle_cache_ttl;
+        let mut guard = self.handle_cache.write();
+        let before = guard.len();
+        guard.retain(|_, (_, cached_at)| now.saturating_duration_since(*cached_at) < ttl);
+        before.saturating_sub(guard.len())
     }
 
     /// Clears all entries from the in-memory handle cache.
@@ -99,13 +124,11 @@ impl SkybouncerEngine {
             return None;
         }
 
-        // 1. Check local tenant cache
-        if let Ok(Some(tenant)) = self.tenant_registry.get(clean) {
-            if let Some(handle) = tenant.handle {
-                let trimmed = crate::util::normalize_handle(&handle).to_string();
-                if !trimmed.is_empty() {
-                    return Some(trimmed);
-                }
+        // 1. Check local tenant metadata cache
+        if let Ok(Some(handle)) = self.tenant_registry.get_handle(clean) {
+            let trimmed = crate::util::normalize_handle(&handle).to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
             }
         }
 
@@ -151,10 +174,58 @@ impl SkybouncerEngine {
     #[must_use]
     pub fn target_handle(&self, did: &str) -> String {
         self.tenant_registry
-            .get(did)
+            .get_handle(did)
             .ok()
             .flatten()
-            .and_then(|t| t.handle)
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_handle_cache_lowercase_invalidation_cap_and_prune() {
+        let config =
+            SkybouncerConfig::new(["did:plc:alice"], RuleRubric::default()).with_dry_run(true);
+        let engine = SkybouncerEngine::builder(config)
+            .with_classifier(Arc::new(crate::classifier::MockClassifier::permitted()))
+            .build()
+            .unwrap();
+
+        let now = std::time::Instant::now();
+        for i in 0..(MAX_HANDLE_CACHE_ENTRIES + 25) {
+            engine.insert_handle_cache_bounded(
+                format!("user{i}.bsky.social"),
+                format!("did:plc:u{i}"),
+                now,
+            );
+        }
+        assert!(engine.handle_cache.read().len() <= MAX_HANDLE_CACHE_ENTRIES);
+
+        engine.insert_handle_cache_bounded(
+            "mixedcase.bsky.social".to_string(),
+            "did:plc:mixed".to_string(),
+            now,
+        );
+        engine.invalidate_handle("MixedCase.Bsky.Social");
+        assert!(
+            !engine
+                .handle_cache
+                .read()
+                .contains_key("mixedcase.bsky.social"),
+            "lowercase normalization on invalidate_handle must evict cache entry"
+        );
+
+        let expired_ts = now - engine.config.handle_cache_ttl - std::time::Duration::from_secs(5);
+        engine.handle_cache.write().insert(
+            "stale.bsky.social".to_string(),
+            ("did:plc:stale".to_string(), expired_ts),
+        );
+        let pruned = engine.prune_handle_cache();
+        assert!(pruned >= 1);
+        assert!(!engine.handle_cache.read().contains_key("stale.bsky.social"));
     }
 }

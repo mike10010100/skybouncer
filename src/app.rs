@@ -251,8 +251,13 @@ pub async fn run_cli_pardon(args: &[String]) -> Result<(), SkybouncerError> {
             &["SKYBOUNCER_RESOLVE_HANDLE_URL"],
             "https://bsky.social/xrpc/com.atproto.identity.resolveHandle",
         );
-        let resolve_url = format!("{resolve_base}?handle={clean_handle}");
-        match client.get(&resolve_url).send().await {
+        let mut resolve_url = url::Url::parse(&resolve_base).map_err(|e| {
+            SkybouncerError::Config(format!("Invalid resolveHandle URL '{resolve_base}': {e}"))
+        })?;
+        resolve_url
+            .query_pairs_mut()
+            .append_pair("handle", clean_handle);
+        match client.get(resolve_url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 let json: serde_json::Value = resp.json().await.map_err(|e| {
                     SkybouncerError::Config(format!("Failed to parse resolveHandle JSON: {e}"))
@@ -379,18 +384,59 @@ pub async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
             req = req.bearer_auth(bearer);
         }
 
-        if let Ok(resp) = req.send().await {
-            if resp.status().is_success() {
-                if let Ok(data) = resp.json::<crate::web::api::SimulateResponse>().await {
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    let data = resp
+                        .json::<crate::web::api::SimulateResponse>()
+                        .await
+                        .map_err(|e| {
+                            SkybouncerError::Config(format!(
+                                "Failed to parse daemon /api/simulate response: {e}"
+                            ))
+                        })?;
                     print_simulation_result(&text, &data, &image_arg);
                     return Ok(());
                 }
+                let body = resp.text().await.unwrap_or_default();
+                let detail = body.trim();
+                let msg = if detail.is_empty() {
+                    format!("Daemon /api/simulate returned HTTP {status}")
+                } else {
+                    format!("Daemon /api/simulate returned HTTP {status}: {detail}")
+                };
+                return Err(SkybouncerError::Config(msg));
+            }
+            Err(e) => {
+                println!(
+                    "ℹ️ Daemon unreachable at {sim_endpoint} ({e}); falling back to offline simulation."
+                );
             }
         }
     }
 
     // 2. Fallback: Local offline simulation via a dry-run engine.
     println!("ℹ️ Running local offline simulation...");
+    let (resolved_b64, resolved_from_url) = if image_base64.is_some() {
+        (image_base64, false)
+    } else if let Some(ref img_url) = image_url {
+        use base64::Engine as _;
+        let bytes = crate::engine::simulate::fetch_simulation_image_bytes(img_url)
+            .await
+            .map_err(|e| {
+                SkybouncerError::Config(format!(
+                    "Failed to fetch offline simulation image '{img_url}': {e}"
+                ))
+            })?;
+        (
+            Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+            true,
+        )
+    } else {
+        (None, false)
+    };
+
     let config = SkybouncerConfig::from_env()?.with_dry_run(true);
     let engine = match SkybouncerEngine::builder(config).build() {
         Ok(e) => e,
@@ -405,7 +451,7 @@ pub async fn run_cli_simulate(args: &[String]) -> Result<(), SkybouncerError> {
         "did:plc:candidate-author",
         "did:plc:protected-user",
     )
-    .with_image(image_base64, false);
+    .with_image(resolved_b64, resolved_from_url);
 
     let sim_result = engine.run_simulation(inputs).await?;
     let sim_response = crate::web::api::SimulateResponse {
