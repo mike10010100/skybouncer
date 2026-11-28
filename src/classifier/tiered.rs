@@ -149,10 +149,20 @@ impl CertaintyConfig {
             return true;
         }
 
-        // Uncertainty band escalation:
-        match primary_verdict.confidence() {
-            Some(conf) => self.is_uncertain(conf),
-            None => false,
+        // Uncertainty / low-confidence escalation: escalate whenever confidence falls
+        // below `max_confidence` (including fragmented softmax splits < min_confidence or NaN)
+        // rather than treating low-confidence outputs as decisively permitted.
+        match primary_verdict {
+            Verdict::Violation { confidence, .. } => {
+                confidence.is_nan() || *confidence < self.max_confidence
+            }
+            Verdict::Permitted {
+                confidence: Some(conf),
+                ..
+            } => conf.is_nan() || *conf < self.max_confidence,
+            Verdict::Permitted {
+                confidence: None, ..
+            } => false,
         }
     }
 
@@ -206,6 +216,21 @@ impl TieredClassifierStats {
     }
 }
 
+/// Typed rationale indicating why a primary Tier-1 evaluation escalated to Tier-2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EscalationReason {
+    /// Nuanced interpersonal violation (`harassment`, `sea_lioning`, `hate_speech`, `custom`)
+    /// requiring System-2 contextual disambiguation.
+    NuancedViolation,
+    /// Interaction carries attached visual media requiring multimodal inspection.
+    VisualMedia,
+    /// Author exhibited suspicious automated reply-bait behavioral signals.
+    SuspiciousBotSignals,
+    /// Primary confidence score fell below `max_confidence` (or was `NaN`).
+    UncertaintyBand,
+}
+
 /// Comprehensive multi-tier inspection result breakdown.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TieredEvaluationResult {
@@ -215,6 +240,9 @@ pub struct TieredEvaluationResult {
     pub primary_model: String,
     /// Whether evaluation escalated to the secondary Tier-2 fallback classifier.
     pub escalated: bool,
+    /// Typed reason explaining why escalation occurred, if escalated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_kind: Option<EscalationReason>,
     /// Detailed rationale explaining why escalation was triggered or bypassed.
     pub escalation_reason: Option<String>,
     /// Secondary verdict emitted by the fallback Tier-2 classifier, if escalated.
@@ -341,12 +369,13 @@ impl TieredClassifier {
 
         let effective_rubric = rubric.or(interaction.rubric.as_ref());
 
-        // 1. Evaluate candidate using the fast primary System-1 classifier
-        let primary_verdict = self
+        // 1. Evaluate candidate using the fast primary System-1 classifier (preserving routed model name)
+        let primary_detailed = self
             .primary
-            .classify_with_rubric(interaction, effective_rubric)
+            .classify_detailed_with_stats_and_rubric(interaction, effective_rubric, false)
             .await?;
-        let primary_model = self.primary.model_name().to_string();
+        let primary_verdict = primary_detailed.primary_verdict;
+        let primary_model = primary_detailed.primary_model;
         let fallback_model = Some(self.fallback.model_name().to_string());
         let has_images = interaction.has_images();
 
@@ -361,6 +390,12 @@ impl TieredClassifier {
                     .fetch_add(1, Ordering::Relaxed);
             }
 
+            let is_nuanced_violation = self.certainty.escalate_nuanced_violations
+                && matches!(
+                    &primary_verdict,
+                    Verdict::Violation { category, .. } if category.is_nuanced_interpersonal()
+                );
+
             let suspicious_bot_signal = self.certainty.escalate_suspicious_bot_signals
                 && !self.certainty.should_escalate(&primary_verdict, has_images)
                 && primary_verdict.is_permitted()
@@ -372,9 +407,31 @@ impl TieredClassifier {
                         crate::enricher::AuthorActivitySignals::has_suspicious_bot_signals,
                     );
 
-            let (escalation_prefix, escalation_reason) = if has_images
-                && self.certainty.escalate_on_images
-            {
+            let (escalation_kind, escalation_prefix, escalation_reason) = if is_nuanced_violation {
+                if record_stats {
+                    self.stats
+                        .uncertainty_escalations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let conf = primary_verdict.confidence().unwrap_or(0.0);
+                let cat_str = primary_verdict
+                    .category()
+                    .map_or("nuanced", crate::classifier::ViolationCategory::as_str);
+                debug!(
+                    post_uri = %interaction.post_uri,
+                    category = %cat_str,
+                    confidence = conf,
+                    "Escalating nuanced interpersonal Tier-1 violation to System-2 for verification"
+                );
+                (
+                    EscalationReason::NuancedViolation,
+                    "[Tiered Fallback: uncertainty escalation]",
+                    format!(
+                        "Nuanced interpersonal category '{}' ({:.2}) escalated for System-2 verification",
+                        cat_str, conf
+                    ),
+                )
+            } else if has_images && self.certainty.escalate_on_images {
                 if record_stats {
                     self.stats.image_escalations.fetch_add(1, Ordering::Relaxed);
                 }
@@ -384,6 +441,7 @@ impl TieredClassifier {
                     "Escalating candidate to secondary multimodal classifier due to attached images"
                 );
                 (
+                    EscalationReason::VisualMedia,
                     "[Tiered Fallback: visual image]",
                     "Attached visual media requires multimodal inspection".to_string(),
                 )
@@ -398,6 +456,7 @@ impl TieredClassifier {
                     "Escalating candidate to System-2 due to suspicious automated reply-bait signals"
                 );
                 (
+                    EscalationReason::SuspiciousBotSignals,
                     "[Tiered Fallback: behavioral signals]",
                     "Suspicious automated reply-bait signals escalated for System-2 verification"
                         .to_string(),
@@ -409,37 +468,19 @@ impl TieredClassifier {
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 let conf = primary_verdict.confidence().unwrap_or(0.0);
-                let reason = match &primary_verdict {
-                    Verdict::Violation { category, .. }
-                        if self.certainty.escalate_nuanced_violations
-                            && category.is_nuanced_interpersonal()
-                            && !self.certainty.is_uncertain(conf) =>
-                    {
-                        debug!(
-                            post_uri = %interaction.post_uri,
-                            category = %category,
-                            confidence = conf,
-                            "Escalating nuanced interpersonal Tier-1 violation to System-2 for verification"
-                        );
-                        format!(
-                            "Nuanced interpersonal category '{}' ({:.2}) escalated for System-2 verification",
-                            category.as_str(),
-                            conf
-                        )
-                    }
-                    _ => {
-                        debug!(
-                            post_uri = %interaction.post_uri,
-                            confidence = ?primary_verdict.confidence(),
-                            "Escalating candidate to secondary classifier due to uncertainty band"
-                        );
-                        format!(
-                            "Confidence {:.2} in uncertainty band [{:.2}..{:.2})",
-                            conf, self.certainty.min_confidence, self.certainty.max_confidence
-                        )
-                    }
-                };
-                ("[Tiered Fallback: uncertainty escalation]", reason)
+                debug!(
+                    post_uri = %interaction.post_uri,
+                    confidence = ?primary_verdict.confidence(),
+                    "Escalating candidate to secondary classifier due to uncertainty band"
+                );
+                (
+                    EscalationReason::UncertaintyBand,
+                    "[Tiered Fallback: uncertainty escalation]",
+                    format!(
+                        "Confidence {:.2} below decisive threshold {:.2}",
+                        conf, self.certainty.max_confidence
+                    ),
+                )
             };
 
             // Lazily hydrate parent/quoted context thumbnails only after Tier-1 has already
@@ -500,6 +541,7 @@ impl TieredClassifier {
                 primary_verdict,
                 primary_model,
                 escalated: true,
+                escalation_kind: Some(escalation_kind),
                 escalation_reason: Some(escalation_reason),
                 fallback_verdict: Some(fallback_raw),
                 fallback_model,
@@ -519,6 +561,7 @@ impl TieredClassifier {
                 primary_verdict: primary_verdict.clone(),
                 primary_model,
                 escalated: false,
+                escalation_kind: None,
                 escalation_reason: Some(reason.to_string()),
                 fallback_verdict: None,
                 fallback_model,
@@ -766,6 +809,12 @@ mod tests {
         // Uncertainty-band confidence without images escalates.
         let uncertain = Verdict::permitted_with_confidence("hmm", 0.6);
         assert!(c.should_escalate(&uncertain, false));
+        // Fragmented softmax Permitted confidence below min_confidence also escalates.
+        let fragmented_permitted = Verdict::permitted_with_confidence("split", 0.35);
+        assert!(c.should_escalate(&fragmented_permitted, false));
+        // Decisive Permitted confidence >= max_confidence without images does not escalate.
+        let decisive_permitted = Verdict::permitted_with_confidence("clean", 0.92);
+        assert!(!c.should_escalate(&decisive_permitted, false));
     }
 
     #[tokio::test]
@@ -793,5 +842,23 @@ mod tests {
             .is_ok());
         let _ = tiered.evaluate_tiered(&i, false).await;
         tiered.set_rubric(RuleRubric::default());
+
+        // SuspiciousBotSignals escalation + NaN confidence check
+        let c_nan = CertaintyConfig::default();
+        assert!(c_nan.should_escalate(&Verdict::permitted_with_confidence("nan", f64::NAN), false));
+        let mut bot_i = Interaction::mock_test_candidate("did:plc:bot", "did:plc:t", "hi");
+        bot_i.enriched_context = Some(crate::enricher::EnrichedContext {
+            author_signals: Some(crate::enricher::AuthorActivitySignals {
+                reply_latency_ms: Some(500),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let bot_res = tiered.classify_detailed(&bot_i).await.unwrap();
+        assert!(bot_res.escalated);
+        assert_eq!(
+            bot_res.escalation_kind,
+            Some(EscalationReason::SuspiciousBotSignals)
+        );
     }
 }

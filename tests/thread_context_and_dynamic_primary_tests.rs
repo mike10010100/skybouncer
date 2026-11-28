@@ -279,3 +279,172 @@ async fn thread_context_renders_under_char_cap() {
     assert!(rendered.contains("Conversation Thread"));
     let _ = Verdict::permitted("x");
 }
+
+#[tokio::test]
+async fn test_pr2_dynamic_primary_reports_actual_routed_model_and_builder_wiring() {
+    use skybase::repo::PdsRepoClient;
+    use skybouncer::classifier::{
+        CertaintyConfig, JevClassifier, JevConfig, RuleRubric, Sensitivity, TieredClassifier,
+    };
+    use skybouncer::engine::{SkybouncerConfig, SkybouncerEngineBuilder};
+    use skybouncer::modlist::DeduplicationCache;
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    // 1. DynamicPrimaryClassifier + TieredClassifier report actual routed primary model name
+    let text_srv = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "violates": false,
+            "confidence": 0.96,
+            "reason": "clean text"
+        })))
+        .mount(&text_srv)
+        .await;
+
+    let mm_srv = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": {
+                "role": "assistant",
+                "content": "{\"violates\": true, \"category\": \"spam\", \"confidence\": 0.93, \"reason\": \"crypto spam meme\"}"
+            }
+        })))
+        .mount(&mm_srv)
+        .await;
+
+    let fallback_srv = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "message": {
+                "role": "assistant",
+                "content": "{\"violates\": false, \"confidence\": 0.99, \"reason\": \"unused\"}"
+            }
+        })))
+        .mount(&fallback_srv)
+        .await;
+
+    let text_cfg = JevConfig {
+        base_url: text_srv.uri(),
+        api_key: None,
+        model: "text-model-builder".to_string(),
+        timeout: Duration::from_secs(2),
+        max_retries: 0,
+        supports_images: false,
+    };
+    let mm_cfg = JevConfig {
+        base_url: format!("{}/api/chat", mm_srv.uri()),
+        api_key: None,
+        model: "mm-model-builder".to_string(),
+        timeout: Duration::from_secs(2),
+        max_retries: 0,
+        supports_images: true,
+    };
+    let fb_cfg = JevConfig {
+        base_url: format!("{}/api/chat", fallback_srv.uri()),
+        api_key: None,
+        model: "fallback-model-builder".to_string(),
+        timeout: Duration::from_secs(2),
+        max_retries: 0,
+        supports_images: false,
+    };
+
+    let text_primary: Arc<dyn Classifier> =
+        Arc::new(JevClassifier::new(text_cfg.clone(), RuleRubric::default()).unwrap());
+    let mm_primary: Arc<dyn Classifier> =
+        Arc::new(JevClassifier::new(mm_cfg.clone(), RuleRubric::default()).unwrap());
+    let fallback: Arc<dyn Classifier> =
+        Arc::new(JevClassifier::new(fb_cfg.clone(), RuleRubric::default()).unwrap());
+
+    let policy = DynamicModelPolicy::new("text-model-builder", "mm-model-builder", true);
+    let dyn_primary: Arc<dyn Classifier> = Arc::new(DynamicPrimaryClassifier::new(
+        text_primary,
+        mm_primary,
+        policy,
+    ));
+    let tiered = TieredClassifier::new(
+        dyn_primary,
+        fallback,
+        CertaintyConfig::default().with_escalate_on_images(false),
+    );
+
+    let text_inter = Interaction {
+        post_uri: "at://did:plc:auth/app.bsky.feed.post/1".to_string(),
+        post_cid: None,
+        author_did: "did:plc:auth".to_string(),
+        target_did: "did:plc:target".to_string(),
+        text: "hello".to_string(),
+        interaction_type: InteractionType::DirectReply,
+        parent_uri: None,
+        root_uri: None,
+        quote_uri: None,
+        created_at_us: 1_700_000_000_000_000,
+        image_cids: Vec::new(),
+        image_alts: Vec::new(),
+        enriched_context: None,
+        rubric: None,
+    };
+    let mut img_inter = text_inter.clone();
+    img_inter.post_uri = "at://did:plc:auth2/app.bsky.feed.post/2".to_string();
+    img_inter.author_did = "did:plc:auth2".to_string();
+    img_inter.image_cids = vec!["bafyrei_img".to_string()];
+
+    let text_res = tiered.classify_detailed(&text_inter).await.unwrap();
+    assert_eq!(text_res.primary_model, "text-model-builder");
+    assert!(!text_res.escalated);
+
+    let img_res = tiered.classify_detailed(&img_inter).await.unwrap();
+    assert_eq!(img_res.primary_model, "mm-model-builder");
+    assert!(!img_res.escalated);
+
+    // 2. SkybouncerEngineBuilder wires jev_config, multimodal_jev_config, fallback_jev_config, certainty_config
+    let mut protected = HashSet::new();
+    protected.insert("did:plc:target".to_string());
+    let mut cfg =
+        SkybouncerConfig::new(protected, RuleRubric::new("Be polite", Sensitivity::Medium))
+            .with_dry_run(true);
+    cfg.jev_config = Some(text_cfg);
+    cfg.multimodal_jev_config = Some(mm_cfg);
+    cfg.fallback_jev_config = Some(fb_cfg);
+    cfg.certainty_config = CertaintyConfig::new(0.45, 0.85, true);
+
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let pds_client = Arc::new(
+        PdsRepoClient::from_credentials("https://bsky.social", "did:plc:target", "mock_token")
+            .unwrap(),
+    );
+
+    let engine = SkybouncerEngineBuilder::new(cfg)
+        .with_cache(Arc::clone(&cache))
+        .with_pds_client(pds_client)
+        .build()
+        .expect("builder should wire DynamicModelPolicy and TieredClassifier");
+
+    let text_reqs_before = text_srv.received_requests().await.unwrap().len();
+    let mm_reqs_before = mm_srv.received_requests().await.unwrap().len();
+    let fb_reqs_before = fallback_srv.received_requests().await.unwrap().len();
+
+    // Image candidate routes to mm_srv (and does NOT redundantly escalate to fallback_srv because mm handles images)
+    let outcome = engine.evaluate_candidate(img_inter).await.unwrap();
+    assert!(outcome.is_bounced());
+    assert_eq!(
+        mm_srv.received_requests().await.unwrap().len(),
+        mm_reqs_before + 1
+    );
+    assert_eq!(
+        text_srv.received_requests().await.unwrap().len(),
+        text_reqs_before
+    );
+    assert_eq!(
+        fallback_srv.received_requests().await.unwrap().len(),
+        fb_reqs_before
+    );
+
+    // Check evaluation log recorded the actual routed multimodal model name, not static text model
+    let logs = cache.list_evaluation_logs(None, None, 10, 0).unwrap();
+    assert!(!logs.is_empty());
+    assert_eq!(logs[0].primary_model, "mm-model-builder");
+}

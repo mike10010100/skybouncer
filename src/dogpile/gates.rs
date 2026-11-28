@@ -92,9 +92,12 @@ impl FromStr for ThreadgatePolicy {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "following" | "following_only" | "followed" | "friends" => Ok(Self::FollowingOnly),
-            "followers" | "following_and_followers" | "following+followers" | "mutuals" => {
+            "followers" | "following_and_followers" | "following+followers" => {
                 Ok(Self::FollowingAndFollowers)
             }
+            "mutuals" | "mutual" => Err(SkybouncerError::Config(
+                "Threadgate policy 'mutuals' is not supported because ATProto threadgate allow rules are OR-ed (union, not intersection); use 'following' to restrict replies to accounts you follow".to_string(),
+            )),
             "mentions" | "mentions_only" | "mention" => Ok(Self::MentionsOnly),
             "nobody" | "none" | "off" | "closed" | "all" => Ok(Self::Nobody),
             other => Err(SkybouncerError::Config(format!(
@@ -116,6 +119,9 @@ pub struct ThreadgateRecord {
     /// List of allow-rules (`#followingRule`, `#followerRule`, `#mentionRule`). Empty = nobody.
     #[serde(default)]
     pub allow: Vec<serde_json::Value>,
+    /// Optional hidden reply AT-URIs preserved across threadgate updates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_replies: Vec<String>,
     /// ISO 8601 timestamp when the gate was created.
     pub created_at: String,
 }
@@ -128,6 +134,7 @@ impl ThreadgateRecord {
             record_type: THREADGATE_COLLECTION.to_string(),
             post: post_uri.into(),
             allow: policy.to_allow_rules(),
+            hidden_replies: Vec::new(),
             created_at: now_iso8601(),
         }
     }
@@ -165,16 +172,23 @@ impl PostgateRecord {
         }
     }
 
-    /// Appends quote-post URIs to `detached_embedding_uris` without duplicates, capped at
-    /// [`MAX_DETACHED_EMBEDDING_URIS`], and optionally adds `#disableRule`.
-    pub fn merge_detaches<I, S>(&mut self, qt_uris: I, disable_all_quotes: bool)
+    /// Appends valid `app.bsky.feed.post` quote-post URIs to `detached_embedding_uris`
+    /// without duplicates, capped at [`MAX_DETACHED_EMBEDDING_URIS`], and optionally adds `#disableRule`.
+    ///
+    /// Returns the number of newly added detached quote-post URIs (not counting duplicates or
+    /// previously detached entries).
+    pub fn merge_detaches<I, S>(&mut self, qt_uris: I, disable_all_quotes: bool) -> usize
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        let mut added = 0usize;
         for raw in qt_uris {
             let trimmed = raw.as_ref().trim();
-            if !trimmed.starts_with("at://") {
+            let valid_post =
+                crate::matcher::extract_did_for_collection(trimmed, "app.bsky.feed.post").is_some()
+                    && trimmed.rsplit('/').next().is_some_and(is_valid_rkey);
+            if !valid_post {
                 continue;
             }
             if !self.detached_embedding_uris.iter().any(|u| u == trimmed) {
@@ -182,6 +196,7 @@ impl PostgateRecord {
                     break;
                 }
                 self.detached_embedding_uris.push(trimmed.to_string());
+                added = added.saturating_add(1);
             }
         }
         if disable_all_quotes {
@@ -195,11 +210,16 @@ impl PostgateRecord {
                 }));
             }
         }
+        added
     }
 }
 
-fn is_valid_rkey(rkey: &str) -> bool {
+pub(crate) fn is_valid_rkey(rkey: &str) -> bool {
     !rkey.is_empty()
+        && rkey != "."
+        && rkey != ".."
+        && rkey != "_mentions"
+        && rkey != "_storm"
         && rkey.len() <= 512
         && rkey
             .chars()
@@ -297,11 +317,14 @@ pub fn parse_owned_post_uri(
     ))
 }
 
-/// Applies or updates an `app.bsky.feed.threadgate` record on the protected user's PDS.
+const MAX_GATE_CAS_ATTEMPTS: usize = 3;
+
+/// Applies or updates an `app.bsky.feed.threadgate` record on the protected user's PDS,
+/// preserving existing `createdAt` and `hiddenReplies` via `put_record_with_swap` CAS retry.
 ///
 /// # Errors
 /// Returns [`SkybouncerError::Config`] if ownership validation fails or [`SkybouncerError::Repo`]
-/// if PDS `putRecord` fails.
+/// if PDS reads/writes fail.
 pub async fn apply_threadgate(
     pds_client: &PdsRepoClient,
     protected_did: &str,
@@ -322,20 +345,77 @@ pub async fn apply_threadgate(
         return Ok(simulated_uri);
     }
 
-    let record = ThreadgateRecord::new(&canonical_post_uri, policy);
-    let res = pds_client
-        .put_record(THREADGATE_COLLECTION, &rkey, &record, true)
-        .await
-        .map_err(|e| SkybouncerError::Repo(format!("Failed to write threadgate on PDS: {e}")))?;
+    for attempt in 0..MAX_GATE_CAS_ATTEMPTS {
+        let (mut record, swap_cid) = match pds_client
+            .get_record(protected_did, THREADGATE_COLLECTION, &rkey)
+            .await
+        {
+            Ok(view) => {
+                let parsed =
+                    serde_json::from_value::<ThreadgateRecord>(view.value).map_err(|e| {
+                        SkybouncerError::Repo(format!(
+                            "Failed to deserialize existing threadgate on PDS: {e}"
+                        ))
+                    })?;
+                let cid = (!view.cid.trim().is_empty()).then_some(view.cid);
+                (parsed, cid)
+            }
+            Err(e) => {
+                if crate::util::is_pds_record_not_found(&e.to_string()) {
+                    (ThreadgateRecord::new(&canonical_post_uri, policy), None)
+                } else {
+                    return Err(SkybouncerError::Repo(format!(
+                        "Failed to inspect existing threadgate on PDS: {e}"
+                    )));
+                }
+            }
+        };
 
-    info!(
-        protected_did = %protected_did,
-        post_uri = %canonical_post_uri,
-        policy = %policy,
-        threadgate_uri = %res.uri,
-        "Applied threadgate on sovereign PDS"
-    );
-    Ok(res.uri)
+        record.record_type = THREADGATE_COLLECTION.to_string();
+        record.post = canonical_post_uri.clone();
+        record.allow = policy.to_allow_rules();
+
+        match pds_client
+            .put_record_with_swap(
+                THREADGATE_COLLECTION,
+                &rkey,
+                &record,
+                true,
+                swap_cid.as_deref(),
+            )
+            .await
+        {
+            Ok(res) => {
+                info!(
+                    protected_did = %protected_did,
+                    post_uri = %canonical_post_uri,
+                    policy = %policy,
+                    threadgate_uri = %res.uri,
+                    "Applied threadgate on sovereign PDS"
+                );
+                return Ok(res.uri);
+            }
+            Err(e)
+                if e.to_string().contains("InvalidSwap") && attempt + 1 < MAX_GATE_CAS_ATTEMPTS =>
+            {
+                tracing::debug!(
+                    attempt,
+                    post_uri = %canonical_post_uri,
+                    "Threadgate CAS swap conflict; retrying with fresh record"
+                );
+                continue;
+            }
+            Err(e) => {
+                return Err(SkybouncerError::Repo(format!(
+                    "Failed to write threadgate on PDS: {e}"
+                )));
+            }
+        }
+    }
+
+    Err(SkybouncerError::Repo(
+        "Failed to write threadgate on PDS after CAS retries".to_string(),
+    ))
 }
 
 /// Removes an `app.bsky.feed.threadgate` record from the protected user's PDS, reopening replies.
@@ -374,7 +454,7 @@ pub async fn remove_threadgate(
 
 /// Fetches any existing `app.bsky.feed.postgate` on the PDS, merges newly detached
 /// quote-post URIs (up to [`MAX_DETACHED_EMBEDDING_URIS`]) and optional `#disableRule`,
-/// and writes the updated record via `putRecord`.
+/// and writes the updated record via `put_record_with_swap` CAS retry.
 ///
 /// Returns `(postgate_uri, total_detached_count)`.
 ///
@@ -389,63 +469,126 @@ pub async fn apply_postgate_detach(
     disable_all_quotes: bool,
     dry_run: bool,
 ) -> Result<(String, usize), SkybouncerError> {
+    let (uri, total_detached, _newly_added) = apply_postgate_detach_detailed(
+        pds_client,
+        protected_did,
+        post_uri_or_rkey,
+        qt_uris,
+        disable_all_quotes,
+        dry_run,
+    )
+    .await?;
+    Ok((uri, total_detached))
+}
+
+/// Internal variant of [`apply_postgate_detach`] returning `(postgate_uri, total_detached_count, newly_added_count)`.
+pub(crate) async fn apply_postgate_detach_detailed(
+    pds_client: &PdsRepoClient,
+    protected_did: &str,
+    post_uri_or_rkey: &str,
+    qt_uris: &[String],
+    disable_all_quotes: bool,
+    dry_run: bool,
+) -> Result<(String, usize, usize), SkybouncerError> {
     let (canonical_post_uri, rkey) = parse_owned_post_uri(protected_did, post_uri_or_rkey)?;
     if dry_run {
         let mut sim = PostgateRecord::new(&canonical_post_uri);
-        sim.merge_detaches(qt_uris, disable_all_quotes);
+        let newly_added = sim.merge_detaches(qt_uris, disable_all_quotes);
+        let applied_delta = newly_added.max(usize::from(disable_all_quotes));
         let simulated_uri = format!("at://{protected_did}/{POSTGATE_COLLECTION}/{rkey}");
         info!(
             protected_did = %protected_did,
             post_uri = %canonical_post_uri,
             detached = sim.detached_embedding_uris.len(),
+            newly_added,
             disable_all_quotes,
             postgate_uri = %simulated_uri,
             "🛡️ [SHADOW MODE] Simulated postgate detach on sovereign PDS"
         );
-        return Ok((simulated_uri, sim.detached_embedding_uris.len()));
+        return Ok((
+            simulated_uri,
+            sim.detached_embedding_uris.len(),
+            applied_delta,
+        ));
     }
 
-    let mut record = match pds_client
-        .get_record(protected_did, POSTGATE_COLLECTION, &rkey)
-        .await
-    {
-        Ok(view) => serde_json::from_value::<PostgateRecord>(view.value)
-            .unwrap_or_else(|_| PostgateRecord::new(&canonical_post_uri)),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("CouldNotFindRecord")
-                || msg.contains("RecordNotFound")
-                || msg.contains("Could not locate record")
-                || msg.contains("404")
-                || msg.contains("HTTP 400")
+    for attempt in 0..MAX_GATE_CAS_ATTEMPTS {
+        let (mut record, swap_cid) = match pds_client
+            .get_record(protected_did, POSTGATE_COLLECTION, &rkey)
+            .await
+        {
+            Ok(view) => {
+                let parsed = serde_json::from_value::<PostgateRecord>(view.value).map_err(|e| {
+                    SkybouncerError::Repo(format!(
+                        "Failed to deserialize existing postgate on PDS: {e}"
+                    ))
+                })?;
+                let cid = (!view.cid.trim().is_empty()).then_some(view.cid);
+                (parsed, cid)
+            }
+            Err(e) => {
+                if crate::util::is_pds_record_not_found(&e.to_string()) {
+                    (PostgateRecord::new(&canonical_post_uri), None)
+                } else {
+                    return Err(SkybouncerError::Repo(format!(
+                        "Failed to inspect existing postgate on PDS: {e}"
+                    )));
+                }
+            }
+        };
+
+        let had_disable_rule = record.embedding_rules.iter().any(|r| {
+            r.get("$type").and_then(|v| v.as_str()) == Some("app.bsky.feed.postgate#disableRule")
+        });
+        record.post = canonical_post_uri.clone();
+        let newly_added = record.merge_detaches(qt_uris, disable_all_quotes);
+        let newly_disabled = usize::from(disable_all_quotes && !had_disable_rule);
+        let applied_delta = newly_added.saturating_add(newly_disabled);
+        let total_detached = record.detached_embedding_uris.len();
+
+        match pds_client
+            .put_record_with_swap(
+                POSTGATE_COLLECTION,
+                &rkey,
+                &record,
+                true,
+                swap_cid.as_deref(),
+            )
+            .await
+        {
+            Ok(res) => {
+                info!(
+                    protected_did = %protected_did,
+                    post_uri = %canonical_post_uri,
+                    detached = total_detached,
+                    newly_added,
+                    disable_all_quotes,
+                    postgate_uri = %res.uri,
+                    "Updated postgate on sovereign PDS"
+                );
+                return Ok((res.uri, total_detached, applied_delta));
+            }
+            Err(e)
+                if e.to_string().contains("InvalidSwap") && attempt + 1 < MAX_GATE_CAS_ATTEMPTS =>
             {
-                PostgateRecord::new(&canonical_post_uri)
-            } else {
+                tracing::debug!(
+                    attempt,
+                    post_uri = %canonical_post_uri,
+                    "Postgate CAS swap conflict; retrying with fresh record"
+                );
+                continue;
+            }
+            Err(e) => {
                 return Err(SkybouncerError::Repo(format!(
-                    "Failed to inspect existing postgate on PDS: {e}"
+                    "Failed to write postgate on PDS: {e}"
                 )));
             }
         }
-    };
+    }
 
-    record.post = canonical_post_uri.clone();
-    record.merge_detaches(qt_uris, disable_all_quotes);
-    let total_detached = record.detached_embedding_uris.len();
-
-    let res = pds_client
-        .put_record(POSTGATE_COLLECTION, &rkey, &record, true)
-        .await
-        .map_err(|e| SkybouncerError::Repo(format!("Failed to write postgate on PDS: {e}")))?;
-
-    info!(
-        protected_did = %protected_did,
-        post_uri = %canonical_post_uri,
-        detached = total_detached,
-        disable_all_quotes,
-        postgate_uri = %res.uri,
-        "Updated postgate on sovereign PDS"
-    );
-    Ok((res.uri, total_detached))
+    Err(SkybouncerError::Repo(
+        "Failed to write postgate on PDS after CAS retries".to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -498,6 +641,14 @@ mod tests {
         assert!(parse_owned_post_uri(did, "at://did:plc:alice/app.bsky.graph.list/3abc").is_err());
         assert!(parse_owned_post_uri(did, "bad/rkey").is_err());
         assert!(parse_owned_post_uri(did, "   ").is_err());
+        assert!(parse_owned_post_uri(did, ".").is_err());
+        assert!(parse_owned_post_uri(did, "..").is_err());
+        assert!(parse_owned_post_uri(did, "_mentions").is_err());
+        assert!(parse_owned_post_uri(did, "_storm").is_err());
+        assert!(
+            parse_owned_post_uri(did, "at://did:plc:alice/app.bsky.feed.post/_mentions").is_err()
+        );
+        assert!(parse_owned_post_uri(did, "at://did:plc:alice/app.bsky.feed.post/..").is_err());
     }
 
     #[test]
@@ -519,6 +670,9 @@ mod tests {
             ThreadgatePolicy::Nobody
         );
         assert!("bogus".parse::<ThreadgatePolicy>().is_err());
+        let mutuals_err = "mutuals".parse::<ThreadgatePolicy>().unwrap_err();
+        assert!(mutuals_err.to_string().contains("following"));
+        assert!("mutual".parse::<ThreadgatePolicy>().is_err());
 
         for pol in [
             ThreadgatePolicy::FollowingOnly,
@@ -622,6 +776,23 @@ mod tests {
             .mount(&pds)
             .await;
 
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.getRecord"))
+            .and(query_param("collection", "app.bsky.feed.threadgate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uri": "at://did:plc:alice/app.bsky.feed.threadgate/3post1",
+                "cid": "bafytgold",
+                "value": {
+                    "$type": "app.bsky.feed.threadgate",
+                    "post": "at://did:plc:alice/app.bsky.feed.post/3post1",
+                    "createdAt": "2026-10-01T00:00:00Z",
+                    "allow": [{"$type": "app.bsky.feed.threadgate#followingRule"}],
+                    "hiddenReplies": ["at://did:plc:troll/app.bsky.feed.post/bad1"]
+                }
+            })))
+            .mount(&pds)
+            .await;
+
         let mut many_qts = Vec::new();
         for i in 1..=60 {
             many_qts.push(format!("at://did:plc:q{i}/app.bsky.feed.post/qt{i}"));
@@ -664,18 +835,41 @@ mod tests {
             .expect("putRecord for postgate");
         let body: serde_json::Value = serde_json::from_slice(&put_pg.body).unwrap();
         assert_eq!(body["record"]["createdAt"], "2026-10-01T00:00:00Z");
+        assert_eq!(body["swapRecord"], "bafyold");
         let detached = body["record"]["detachedEmbeddingUris"].as_array().unwrap();
         assert_eq!(detached.len(), MAX_DETACHED_EMBEDDING_URIS);
         assert_eq!(detached[0], "at://did:plc:old/app.bsky.feed.post/qt0");
-        let mut pg_dup = PostgateRecord::new("at://did:plc:alice/app.bsky.feed.post/3x");
-        pg_dup.merge_detaches(
-            &[
-                "https://not-at-uri".to_string(),
-                "at://did:plc:q1/app.bsky.feed.post/1".to_string(),
-            ],
-            true,
+
+        let put_tg = requests
+            .iter()
+            .find(|r| {
+                r.url.path().ends_with("putRecord")
+                    && String::from_utf8_lossy(&r.body).contains("app.bsky.feed.threadgate")
+            })
+            .expect("putRecord for threadgate");
+        let tg_body: serde_json::Value = serde_json::from_slice(&put_tg.body).unwrap();
+        assert_eq!(tg_body["record"]["createdAt"], "2026-10-01T00:00:00Z");
+        assert_eq!(tg_body["swapRecord"], "bafytgold");
+        assert_eq!(
+            tg_body["record"]["hiddenReplies"],
+            serde_json::json!(["at://did:plc:troll/app.bsky.feed.post/bad1"])
         );
-        pg_dup.merge_detaches(&["at://did:plc:q1/app.bsky.feed.post/1".to_string()], true);
+
+        let mut pg_dup = PostgateRecord::new("at://did:plc:alice/app.bsky.feed.post/3x");
+        assert_eq!(
+            pg_dup.merge_detaches(
+                &[
+                    "https://not-at-uri".to_string(),
+                    "at://did:plc:q1/app.bsky.feed.post/1".to_string(),
+                ],
+                true,
+            ),
+            1
+        );
+        assert_eq!(
+            pg_dup.merge_detaches(&["at://did:plc:q1/app.bsky.feed.post/1".to_string()], true),
+            0
+        );
         assert_eq!(pg_dup.detached_embedding_uris.len(), 1);
         assert_eq!(pg_dup.embedding_rules.len(), 1);
 
@@ -768,5 +962,187 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn gates_reject_expired_token_overwrite_propagate_bad_json_and_retry_invalid_swap() {
+        // 1. HTTP 400 ExpiredToken must NOT be treated as RecordNotFound (must fail without overwriting).
+        let expired_pds = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.getRecord"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "ExpiredToken",
+                "message": "Token has expired"
+            })))
+            .mount(&expired_pds)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.repo.putRecord"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uri": "at://did:plc:alice/app.bsky.feed.postgate/3x",
+                "cid": "bafyput"
+            })))
+            .expect(0)
+            .mount(&expired_pds)
+            .await;
+
+        let expired_client =
+            PdsRepoClient::from_credentials(expired_pds.uri(), "did:plc:alice", "tok")
+                .unwrap()
+                .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
+        let err = apply_postgate_detach(
+            &expired_client,
+            "did:plc:alice",
+            "3x",
+            &["at://did:plc:q1/app.bsky.feed.post/1".to_string()],
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("ExpiredToken"));
+
+        // 2. Malformed existing postgate JSON propagates as Repo error (never silently wiped).
+        let bad_json_pds = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.getRecord"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uri": "at://did:plc:alice/app.bsky.feed.postgate/3x",
+                "cid": "bafybad",
+                "value": { "unexpected": true }
+            })))
+            .mount(&bad_json_pds)
+            .await;
+        let bad_json_client =
+            PdsRepoClient::from_credentials(bad_json_pds.uri(), "did:plc:alice", "tok")
+                .unwrap()
+                .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
+        assert!(apply_postgate_detach(
+            &bad_json_client,
+            "did:plc:alice",
+            "3x",
+            &["at://did:plc:q1/app.bsky.feed.post/1".to_string()],
+            false,
+            false,
+        )
+        .await
+        .is_err());
+
+        // 3. InvalidSwap triggers CAS retry on both apply_postgate_detach and apply_threadgate.
+        let cas_pds = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.getRecord"))
+            .and(query_param("collection", "app.bsky.feed.postgate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uri": "at://did:plc:alice/app.bsky.feed.postgate/3cas",
+                "cid": "bafy_v1",
+                "value": {
+                    "$type": "app.bsky.feed.postgate",
+                    "post": "at://did:plc:alice/app.bsky.feed.post/3cas",
+                    "createdAt": "2026-10-01T00:00:00Z",
+                    "detachedEmbeddingUris": []
+                }
+            })))
+            .mount(&cas_pds)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.repo.putRecord"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "InvalidSwap",
+                "message": "Record was at bafy_v2"
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&cas_pds)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.repo.putRecord"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uri": "at://did:plc:alice/app.bsky.feed.postgate/3cas",
+                "cid": "bafy_v3"
+            })))
+            .expect(1)
+            .mount(&cas_pds)
+            .await;
+
+        let cas_client = PdsRepoClient::from_credentials(cas_pds.uri(), "did:plc:alice", "tok")
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
+        let (_uri, total, newly_added) = apply_postgate_detach_detailed(
+            &cas_client,
+            "did:plc:alice",
+            "3cas",
+            &[
+                "at://did:plc:q1/app.bsky.feed.post/1".to_string(),
+                "at://did:plc:q2/app.bsky.feed.list/1".to_string(), // non-post collection rejected!
+            ],
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(newly_added, 1);
+
+        // 4. apply_threadgate propagates corrupt JSON & exhausts CAS retries cleanly
+        let bad_tg_pds = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.getRecord"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{not-json"))
+            .mount(&bad_tg_pds)
+            .await;
+        let bad_client = PdsRepoClient::from_credentials(bad_tg_pds.uri(), "did:plc:alice", "tok")
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
+        assert!(apply_threadgate(
+            &bad_client,
+            "did:plc:alice",
+            "3bad",
+            ThreadgatePolicy::FollowingOnly,
+            false
+        )
+        .await
+        .is_err());
+
+        let cas_tg_pds = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.getRecord"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "RecordNotFound",
+                "message": "Record does not exist"
+            })))
+            .mount(&cas_tg_pds)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.repo.putRecord"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "InvalidSwap",
+                "message": "swap mismatch"
+            })))
+            .mount(&cas_tg_pds)
+            .await;
+        let cas_tg_client =
+            PdsRepoClient::from_credentials(cas_tg_pds.uri(), "did:plc:alice", "tok")
+                .unwrap()
+                .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
+        assert!(apply_threadgate(
+            &cas_tg_client,
+            "did:plc:alice",
+            "3failcas",
+            ThreadgatePolicy::Nobody,
+            false
+        )
+        .await
+        .is_err());
+        assert!(apply_postgate_detach(
+            &cas_tg_client,
+            "did:plc:alice",
+            "3failcas",
+            &["at://did:plc:q1/app.bsky.feed.post/1".to_string()],
+            true,
+            false
+        )
+        .await
+        .is_err());
     }
 }

@@ -981,6 +981,22 @@ async fn test_command_handler_rules_and_set_rules() {
         .await
         .expect("handle");
     assert!(reply_empty_set.contains("Please provide a moderation prompt"));
+
+    // Set rules exceeding MAX_RUBRIC_PROMPT_CHARS is rejected cleanly
+    let oversized_cmd = format!(
+        "set rules {}",
+        "a".repeat(skybouncer::classifier::MAX_RUBRIC_PROMPT_CHARS + 1)
+    );
+    let reply_err = handler
+        .handle_command("did:plc:protected1", &oversized_cmd)
+        .await
+        .unwrap_err();
+    assert!(
+        reply_err
+            .to_string()
+            .contains(&skybouncer::classifier::MAX_RUBRIC_PROMPT_CHARS.to_string()),
+        "expected max char limit error, got: {reply_err}"
+    );
 }
 
 #[tokio::test]

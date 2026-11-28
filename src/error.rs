@@ -63,6 +63,13 @@ impl SkybouncerError {
         }
     }
 
+    /// Returns `true` if this error represents an HTTP 500 server error from the
+    /// classifier backend (as distinct from 502/503/504 gateway outages or transport drops).
+    #[must_use]
+    pub fn is_classifier_http_500(&self) -> bool {
+        matches!(self, Self::Classifier(msg) if msg.contains("server error (HTTP 500)"))
+    }
+
     /// Returns `true` if this error represents a transient classifier unavailability
     /// (such as a network connection drop, timeout, or upstream 5xx server error)
     /// where a queued candidate should be held and retried once the classifier recovers.

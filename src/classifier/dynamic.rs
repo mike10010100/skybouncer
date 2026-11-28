@@ -18,7 +18,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::classifier::{Classifier, RuleRubric, Verdict};
+use crate::classifier::{Classifier, RuleRubric, TieredEvaluationResult, Verdict};
 use crate::error::SkybouncerError;
 use crate::matcher::Interaction;
 
@@ -222,6 +222,20 @@ impl Classifier for DynamicPrimaryClassifier {
     ) -> Result<Verdict, SkybouncerError> {
         let (classifier, _model) = self.route(interaction);
         classifier.classify_with_rubric(interaction, rubric).await
+    }
+
+    async fn classify_detailed_with_stats_and_rubric(
+        &self,
+        interaction: &Interaction,
+        rubric: Option<&RuleRubric>,
+        record_stats: bool,
+    ) -> Result<TieredEvaluationResult, SkybouncerError> {
+        let (classifier, selected_model) = self.route(interaction);
+        let mut detailed = classifier
+            .classify_detailed_with_stats_and_rubric(interaction, rubric, record_stats)
+            .await?;
+        detailed.primary_model = selected_model.to_string();
+        Ok(detailed)
     }
 
     fn model_name(&self) -> &str {

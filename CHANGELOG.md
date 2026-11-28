@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-11-28
+
+### Security
+
+- **Classifier & Stage 3 Prompt-Injection Boundary Hardening (`src/classifier/`, `src/enricher.rs`, `src/dogpile/stance.rs`, `src/modlist/sovereign_config.rs`, `src/web/api/auth.rs`, `src/bot/handler.rs`)**:
+  - Wrapped all untrusted candidate post text and enriched metadata (`author_profile`, `target_profile`, `image_alts`, `thread`, `quoted_post`, `link_card`, `author_signals`) inside a single per-request 64-bit hex nonce `<untrusted_input id="...">...</untrusted_input>` block with case-insensitive tag neutralization, control-character/newline normalization, quote escaping, JSON-encoded post text, and 80-character `display_name` caps (`MAX_DISPLAY_NAME_CHARS = 80`).
+  - Moved anti-injection instructions into the Ollama `system` prompt and SystemOne `state` preamble, and enforced `MAX_RUBRIC_PROMPT_CHARS = 2000` across `RuleRubric::parse_updating`, `SovereignConfigRecord::to_rubric`, `extract_rubric_from_list_description`, `POST /api/rules`, DM `set rules`, and `JevClassifier`.
+  - Isolated `LlmStormStanceClassifier` Stage 3 prompts (`focal_post`, `top_quotes`, `sample_replies`) with per-request nonce delimiters, JSON string escaping, and explicit anti-injection instructions across Ollama, StandardJev, and SystemOne dialects, and added a benign-stance veto floor in `compute_composite_score_with_metrics` when defensive distress or `violation_rate` is high.
+- **PDS Gate & Threadgate Hardening (`src/dogpile/gates.rs`, `src/engine/storm_ops.rs`)**:
+  - Removed the `"mutuals"` alias from `ThreadgatePolicy::from_str` with an explicit explanation recommending `following`.
+  - Hardened `is_valid_rkey` / `parse_owned_post_uri` to reject `.`, `..`, `_mentions`, and `_storm`, and validated `app.bsky.feed.post` collection URIs in `PostgateRecord::merge_detaches`.
+  - Restricted `apply_postgate_detach` missing-record detection to `is_pds_record_not_found`, propagated JSON deserialize errors, preserved existing `hiddenReplies` and `createdAt` in `apply_threadgate`, and switched both `apply_postgate_detach` and `apply_threadgate` to `put_record_with_swap` with CAS retry on `InvalidSwap`.
+
+### Fixed
+
+- **Tiered Confidence Arbitration, Routing, Endpoint Parsing & Retry Bounds (`src/classifier/`, `src/engine/`, `src/limiter.rs`, `src/error.rs`)**:
+  - Removed eager `rubric.is_actionable()` downgrades from `JevClassifier::build_verdict` so nuanced `0.85..0.90` violations reach `TieredClassifier` and `act_on_verdict` enforces `rubric.meets_threshold` post-Tier-2.
+  - Updated `CertaintyConfig::should_escalate` to escalate any `Permitted` confidence `< max_confidence` (or `NaN`) so fragmented softmax outputs escalate rather than bypassing Tier-2.
+  - Replaced string-matched escalation counters with typed `EscalationReason` (`NuancedViolation` > `VisualMedia` > `SuspiciousBotSignals` > `UncertaintyBand`), fixing `tier2_image_escalations`.
+  - Wired `DynamicModelPolicy` in `SkybouncerEngineBuilder::build` with configured model names and certainty flags, and reported dynamically routed model names in `DynamicPrimaryClassifier` detailed evaluations.
+  - Fixed `reply_recipient_line` for quote+reply hybrids, added `"custom_rule"` and `"hate_speech"` to SystemOne criteria, fixed `/api/generate` -> `/api/chat` URL rewriting via shared `url::Url` resolution, added resilient `<think>`/fence/balanced-JSON Ollama extraction with `#[serde(default)]` `reason`, and hoisted prompt/JSON serialization outside retry loops.
+  - Removed inner 100ms timeout retries in `JevClassifier`, bounded per-candidate HTTP 500 retries with a `ClassifierCircuitBreaker` distinguishing poison-pill 500s from 502/503/504 outages, added non-consuming `EvaluationRateLimiter::is_exhausted` before `enricher.check_relationship()`, shared an inference semaphore between `eval_worker` and `storm_worker` for matching Ollama endpoints, recorded heuristic violations in `DogpileTracker`, and fixed multi-directive `[...]` loops in `RuleRubric::parse_updating`.
+- **Dogpile Radar Lifecycle, Clock, Catalyst & Math Fixes (`src/dogpile/`, `src/engine/`, `src/modlist/cache/storms.rs`, `src/time.rs`)**:
+  - Resolved active SQLite storms on `set_storm_mode(..., false)`, added startup storm reconciliation/rehydration in both `SkybouncerEngineBuilder::build` and `SkybouncerEngine::new`, added `dismissed_until_us` suppression + immediate digest flush in `dismiss_storm`, deduplicated concurrent Stage 2/3 evaluations via an RAII in-flight set, rolled back `last_eval_us` on `storm_tx.try_send` drop, and enforced atomic high-water-mark severity in `upsert_active_storm`.
+  - Unified storm/tracker timing on `monotonic_time_us()`, switched `eval_outcomes` pruning to `retain` + cap, counted quote+mention/quote+reply catalysts, left `dunk_ratio = 0.0` when `focal_post` is `None` while taking true max `dunk_ratio` across `quote_snaps`, guarded `DogpileConfig::from_env()` and `compute_burst_acceleration` against non-finite/degenerate floats, decoupled `postgate_state` and `alert_cooldowns` from 5m window pruning, stopped `evict_oldest_locked` below capacity, timestamped + reservoir-sampled `oon_samples`, and tracked actual newly-added detaches in `postgate_detaches_applied`.
+
 ## [0.3.4] - 2026-11-28
 
 ### Security

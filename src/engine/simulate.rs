@@ -313,15 +313,23 @@ impl crate::engine::SkybouncerEngine {
             }
         };
 
-        let evaluator = |reason: &str| -> String {
-            if reason.contains("uncertainty escalation") {
-                "fallback_uncertainty_classifier".to_string()
-            } else if reason.contains("Fallback") || reason.contains("Tiered") {
-                "fallback_vision_classifier".to_string()
-            } else if images_evaluated > 0 {
-                "primary_classifier (multimodal)".to_string()
-            } else {
-                "primary_classifier".to_string()
+        let evaluator = || -> String {
+            match detailed.escalation_kind {
+                Some(crate::classifier::EscalationReason::VisualMedia) => {
+                    "fallback_vision_classifier".to_string()
+                }
+                Some(
+                    crate::classifier::EscalationReason::NuancedViolation
+                    | crate::classifier::EscalationReason::SuspiciousBotSignals
+                    | crate::classifier::EscalationReason::UncertaintyBand,
+                ) => "fallback_uncertainty_classifier".to_string(),
+                None => {
+                    if images_evaluated > 0 {
+                        "primary_classifier (multimodal)".to_string()
+                    } else {
+                        "primary_classifier".to_string()
+                    }
+                }
             }
         };
 
@@ -367,7 +375,7 @@ impl crate::engine::SkybouncerEngine {
                 category: Some(category.to_string()),
                 confidence,
                 meets_threshold: rubric.meets_threshold(&category, confidence),
-                evaluator: evaluator(&reason),
+                evaluator: evaluator(),
                 reason,
                 threshold,
                 images_evaluated,
@@ -381,7 +389,7 @@ impl crate::engine::SkybouncerEngine {
                 category: None,
                 confidence: confidence.unwrap_or(0.05),
                 reason: reason.clone(),
-                evaluator: evaluator(&reason),
+                evaluator: evaluator(),
                 meets_threshold: false,
                 threshold,
                 images_evaluated,

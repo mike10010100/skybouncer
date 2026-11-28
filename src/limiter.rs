@@ -92,6 +92,39 @@ impl EvaluationRateLimiter {
         crate::util::shard_index(target_did, NUM_SHARDS)
     }
 
+    /// Returns `true` if `target_did` has reached or exceeded
+    /// `config.max_evaluations * multiplier` within the current sliding window,
+    /// without consuming an evaluation slot.
+    #[must_use]
+    pub fn is_exhausted(&self, target_did: &str, multiplier: usize) -> bool {
+        if self.config.max_evaluations == 0 {
+            return true;
+        }
+        if self.config.max_evaluations == usize::MAX {
+            return false;
+        }
+
+        let effective_limit = self
+            .config
+            .max_evaluations
+            .saturating_mul(multiplier.max(1));
+        let now = Instant::now();
+        let idx = self.shard_idx(target_did);
+        let mut shard = self.shards[idx].lock();
+
+        if let Some(timestamps) = shard.get_mut(target_did) {
+            let window = self.config.window_duration;
+            timestamps.retain(|&ts| now.saturating_duration_since(ts) < window);
+            let exhausted = timestamps.len() >= effective_limit;
+            if timestamps.is_empty() {
+                shard.remove(target_did);
+            }
+            exhausted
+        } else {
+            false
+        }
+    }
+
     /// Checks whether an evaluation is permitted for `target_did` and records it if allowed.
     ///
     /// Evaluates timestamps using clock-warp safe `saturating_duration_since`.

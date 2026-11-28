@@ -16,6 +16,9 @@ use crate::matcher::{Interaction, InteractionType};
 
 const MAX_RECENT_QUOTES: usize = 25;
 const MAX_DIGEST_SAMPLES: usize = 5;
+const MAX_EVAL_OUTCOMES: usize = 512;
+const MAX_POSTGATE_STATES: usize = 4096;
+const POSTGATE_STATE_TTL_US: u64 = 24 * 3600 * 1_000_000;
 
 #[derive(Debug, Clone)]
 struct TrackedEvent {
@@ -23,13 +26,13 @@ struct TrackedEvent {
     author_did: String,
     is_oon: bool,
     interaction_type: InteractionType,
+    is_quote_of_focal: bool,
 }
 
 #[derive(Debug, Default)]
 struct DefensiveWindow {
     recent_blocks: VecDeque<u64>,
     recent_detaches: VecDeque<u64>,
-    last_postgate_state: HashMap<String, (usize, bool)>,
 }
 
 impl DefensiveWindow {
@@ -56,7 +59,8 @@ impl DefensiveWindow {
 struct FocalPostBucket {
     events: VecDeque<TrackedEvent>,
     seen_post_uris: HashSet<String>,
-    oon_samples: VecDeque<SampleReply>,
+    oon_samples: VecDeque<(u64, SampleReply)>,
+    oon_sample_seen_count: usize,
     recent_quote_uris: VecDeque<String>,
     eval_outcomes: VecDeque<(u64, bool)>,
     last_eval_us: Option<u64>,
@@ -65,6 +69,7 @@ struct FocalPostBucket {
     active_severity: Option<StormSeverity>,
     last_alert_us: Option<u64>,
     storm_expires_us: Option<u64>,
+    dismissed_until_us: Option<u64>,
     digest_window_start_us: Option<u64>,
     digest_bounced_count: u64,
     digest_sample_violators: Vec<DigestBounceSummary>,
@@ -84,17 +89,19 @@ impl FocalPostBucket {
         {
             self.seen_post_uris.clear();
         }
-        while self
-            .eval_outcomes
-            .front()
-            .is_some_and(|&(ts, _)| ts < medium_cutoff_us)
-        {
-            self.eval_outcomes.pop_front();
+        self.eval_outcomes.retain(|&(ts, _)| ts >= medium_cutoff_us);
+        self.oon_samples.retain(|(ts, _)| *ts >= medium_cutoff_us);
+        if self.oon_samples.is_empty() {
+            self.oon_sample_seen_count = 0;
         }
     }
 
     fn has_active_storm(&self, now_us: u64) -> bool {
         self.active_storm_id.is_some() && self.storm_expires_us.is_some_and(|exp| exp > now_us)
+    }
+
+    fn is_suppressed(&self, now_us: u64) -> bool {
+        self.dismissed_until_us.is_some_and(|until| until > now_us)
     }
 
     fn clear_storm(&mut self) {
@@ -108,6 +115,8 @@ impl FocalPostBucket {
 struct TrackerState {
     buckets: HashMap<(String, String), FocalPostBucket>,
     defensive: HashMap<String, DefensiveWindow>,
+    postgate_state: HashMap<(String, String), (usize, bool, u64)>,
+    alert_cooldowns: HashMap<(String, String), u64>,
     manual_storm_mode_until_us: HashMap<String, u64>,
 }
 
@@ -173,12 +182,24 @@ impl DogpileTracker {
         let key = (target_did.clone(), focal_uri.clone());
         if !guard.buckets.contains_key(&key) && guard.buckets.len() >= self.config.max_tracked_posts
         {
-            Self::evict_oldest_locked(&mut guard, medium_cutoff, now_us);
+            Self::evict_oldest_locked(
+                &mut guard,
+                medium_cutoff,
+                now_us,
+                self.config.max_tracked_posts,
+            );
         }
 
         let bucket = guard.buckets.entry(key).or_default();
         bucket.prune(medium_cutoff);
+        if bucket.is_suppressed(now_us) {
+            return None;
+        }
+        bucket.dismissed_until_us = None;
         bucket.last_activity_us = bucket.last_activity_us.max(now_us);
+
+        let is_quote_of_focal = interaction.interaction_type == InteractionType::Quote
+            || interaction.quote_uri.as_deref() == Some(focal_uri.as_str());
 
         // Deduplicate identical post URIs (e.g., if matched via both reply + mention)
         if bucket.seen_post_uris.insert(interaction.post_uri.clone()) {
@@ -187,10 +208,11 @@ impl DogpileTracker {
                 author_did: interaction.author_did.clone(),
                 is_oon: is_out_of_network,
                 interaction_type: interaction.interaction_type,
+                is_quote_of_focal,
             });
         }
 
-        if interaction.interaction_type == InteractionType::Quote
+        if is_quote_of_focal
             && !bucket
                 .recent_quote_uris
                 .iter()
@@ -208,17 +230,28 @@ impl DogpileTracker {
             let already_sampled = bucket
                 .oon_samples
                 .iter()
-                .any(|s| s.author_did == interaction.author_did);
+                .any(|(_, s)| s.author_did == interaction.author_did);
             if !already_sampled {
-                if bucket.oon_samples.len() >= self.config.max_sample_replies {
-                    bucket.oon_samples.pop_front();
-                }
-                bucket.oon_samples.push_back(SampleReply {
+                let sample = SampleReply {
                     author_did: interaction.author_did.clone(),
                     interaction_type: interaction.interaction_type,
                     post_uri: interaction.post_uri.clone(),
                     text_snippet: interaction.text.chars().take(280).collect(),
-                });
+                };
+                bucket.oon_sample_seen_count = bucket.oon_sample_seen_count.saturating_add(1);
+                if bucket.oon_samples.len() < self.config.max_sample_replies {
+                    bucket.oon_samples.push_back((now_us, sample));
+                } else if bucket.oon_sample_seen_count > 0 {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    now_us.hash(&mut hasher);
+                    bucket.oon_sample_seen_count.hash(&mut hasher);
+                    interaction.post_uri.hash(&mut hasher);
+                    let slot = (hasher.finish() as usize) % bucket.oon_sample_seen_count;
+                    if slot < self.config.max_sample_replies {
+                        bucket.oon_samples[slot] = (now_us, sample);
+                    }
+                }
             }
         }
 
@@ -244,6 +277,9 @@ impl DogpileTracker {
                     }
                     InteractionType::Quote => quote_count_short += 1,
                     InteractionType::Mention => mention_count_short += 1,
+                }
+                if ev.is_quote_of_focal && ev.interaction_type != InteractionType::Quote {
+                    quote_count_short += 1;
                 }
             }
         }
@@ -315,9 +351,23 @@ impl DogpileTracker {
             focal_post_uri: focal_uri,
             observed_at_us: now_us,
             initial_metrics,
-            sample_replies: bucket.oon_samples.iter().cloned().collect(),
+            sample_replies: bucket.oon_samples.iter().map(|(_, s)| s.clone()).collect(),
             recent_quote_uris: bucket.recent_quote_uris.iter().cloned().collect(),
         })
+    }
+
+    /// Rolls back `last_eval_us` if a [`SurgeCandidate`] could not be dispatched onto
+    /// `storm_tx` (channel full), ensuring backpressure does not lock out Stage 2 for 60s.
+    pub fn rollback_eval_recheck(&self, target_did: &str, focal_uri: &str, observed_at_us: u64) {
+        let mut guard = self.state.write();
+        if let Some(bucket) = guard
+            .buckets
+            .get_mut(&(target_did.to_string(), focal_uri.to_string()))
+        {
+            if bucket.last_eval_us == Some(observed_at_us) {
+                bucket.last_eval_us = None;
+            }
+        }
     }
 
     /// Records the classifier evaluation outcome (`violated`) for a focal post so
@@ -340,6 +390,9 @@ impl DogpileTracker {
         {
             bucket.prune(medium_cutoff);
             bucket.eval_outcomes.push_back((now_us, violated));
+            while bucket.eval_outcomes.len() > MAX_EVAL_OUTCOMES {
+                bucket.eval_outcomes.pop_front();
+            }
         }
     }
 
@@ -372,25 +425,39 @@ impl DogpileTracker {
         }
         let short_cutoff = now_us.saturating_sub(dur_to_us(self.config.short_window));
         let mut guard = self.state.write();
-        let win = guard.defensive.entry(target_did.to_string()).or_default();
-        win.prune(short_cutoff);
-
-        let (prev_count, prev_disabled) = win
-            .last_postgate_state
-            .get(post_uri)
+        let pg_key = (target_did.to_string(), post_uri.to_string());
+        let (prev_count, prev_disabled, _) = guard
+            .postgate_state
+            .get(&pg_key)
             .copied()
-            .unwrap_or((0, false));
+            .unwrap_or((0, false, now_us));
         let new_detaches = detached_count.saturating_sub(prev_count);
         let new_disable = usize::from(disabled_quotes && !prev_disabled);
         let delta = new_detaches.saturating_add(new_disable).min(50);
 
+        guard
+            .postgate_state
+            .insert(pg_key, (detached_count, disabled_quotes, now_us));
+        if guard.postgate_state.len() > MAX_POSTGATE_STATES {
+            guard
+                .postgate_state
+                .retain(|_, (_, _, ts)| now_us.saturating_sub(*ts) <= POSTGATE_STATE_TTL_US);
+            if guard.postgate_state.len() > MAX_POSTGATE_STATES {
+                if let Some(oldest_key) = guard
+                    .postgate_state
+                    .iter()
+                    .min_by_key(|(_, (_, _, ts))| *ts)
+                    .map(|(k, _)| k.clone())
+                {
+                    guard.postgate_state.remove(&oldest_key);
+                }
+            }
+        }
+
+        let win = guard.defensive.entry(target_did.to_string()).or_default();
+        win.prune(short_cutoff);
         for _ in 0..delta {
             win.recent_detaches.push_back(now_us);
-        }
-        win.last_postgate_state
-            .insert(post_uri.to_string(), (detached_count, disabled_quotes));
-        if win.last_postgate_state.len() > 256 {
-            win.last_postgate_state.clear();
         }
     }
 
@@ -414,15 +481,22 @@ impl DogpileTracker {
         let key = (target_did.to_string(), focal_uri.to_string());
         if !guard.buckets.contains_key(&key) && guard.buckets.len() >= self.config.max_tracked_posts
         {
-            Self::evict_oldest_locked(&mut guard, medium_cutoff, now_us);
+            Self::evict_oldest_locked(
+                &mut guard,
+                medium_cutoff,
+                now_us,
+                self.config.max_tracked_posts,
+            );
         }
-        let bucket = guard.buckets.entry(key).or_default();
+        let persisted_last_alert = guard.alert_cooldowns.get(&key).copied();
+        let bucket = guard.buckets.entry(key.clone()).or_default();
         bucket.last_activity_us = bucket.last_activity_us.max(now_us);
 
         let was_active = bucket.has_active_storm(now_us);
         let escalated = was_active && bucket.active_severity.is_some_and(|prev| severity > prev);
 
-        let should_emit = match bucket.last_alert_us {
+        let effective_last_alert = bucket.last_alert_us.or(persisted_last_alert);
+        let should_emit = match effective_last_alert {
             None => true,
             Some(_) if escalated => true,
             Some(last) => now_us.saturating_sub(last) >= cooldown_us,
@@ -434,14 +508,40 @@ impl DogpileTracker {
             _ => severity,
         });
         bucket.storm_expires_us = Some(now_us.saturating_add(ttl_us));
+        bucket.dismissed_until_us = None;
         if bucket.digest_window_start_us.is_none() {
             bucket.digest_window_start_us = Some(now_us);
         }
         if should_emit {
             bucket.last_alert_us = Some(now_us);
+            guard.alert_cooldowns.insert(key, now_us);
         }
 
         (should_emit, escalated)
+    }
+
+    /// Rehydrates an unexpired active storm loaded from SQLite on engine startup.
+    pub fn rehydrate_storm(
+        &self,
+        target_did: &str,
+        focal_uri: &str,
+        storm_id: i64,
+        severity: StormSeverity,
+        updated_at_us: u64,
+        expires_at_us: u64,
+    ) {
+        let mut guard = self.state.write();
+        let key = (target_did.to_string(), focal_uri.to_string());
+        guard.alert_cooldowns.insert(key.clone(), updated_at_us);
+        let bucket = guard.buckets.entry(key).or_default();
+        bucket.active_storm_id = Some(storm_id);
+        bucket.active_severity = Some(severity);
+        bucket.storm_expires_us = Some(expires_at_us);
+        bucket.last_activity_us = bucket.last_activity_us.max(updated_at_us);
+        bucket.last_alert_us = Some(updated_at_us);
+        if bucket.digest_window_start_us.is_none() {
+            bucket.digest_window_start_us = Some(updated_at_us);
+        }
     }
 
     /// Returns `true` if Storm Mode is currently active for `target_did`
@@ -464,32 +564,104 @@ impl DogpileTracker {
 
     /// Manually enables or disables Storm Mode for `target_did`.
     ///
-    /// When disabled (`enabled == false`), also clears any active storm flags for `target_did`
-    /// so Storm Mode exits immediately.
-    pub fn set_manual_storm_mode(&self, target_did: &str, enabled: bool, now_us: u64) {
+    /// When disabled (`enabled == false`), clears any active storm flags for `target_did`
+    /// and returns the cleared `(focal_post_uri, storm_id)` pairs so SQLite can be resolved.
+    pub fn set_manual_storm_mode(
+        &self,
+        target_did: &str,
+        enabled: bool,
+        now_us: u64,
+    ) -> Vec<(String, i64)> {
         let mut guard = self.state.write();
         if enabled {
             let until = now_us.saturating_add(dur_to_us(self.config.storm_mode_ttl));
             guard
                 .manual_storm_mode_until_us
                 .insert(target_did.to_string(), until);
+            Vec::new()
         } else {
             guard.manual_storm_mode_until_us.remove(target_did);
-            for ((did, _), bucket) in &mut guard.buckets {
+            let mut cleared = Vec::new();
+            for ((did, focal_uri), bucket) in &mut guard.buckets {
                 if did == target_did {
+                    if let Some(id) = bucket.active_storm_id {
+                        cleared.push((focal_uri.clone(), id));
+                    }
                     bucket.clear_storm();
                 }
             }
+            cleared
         }
     }
 
-    /// Clears in-memory active storm state matching `storm_id` for `target_did`.
-    pub fn dismiss_storm(&self, target_did: &str, storm_id: i64) {
+    /// Dismisses active storm state matching `storm_id` for `target_did`, installs a
+    /// `storm_mode_ttl` suppression window so the same focal post does not re-activate 60s
+    /// later, clears sliding-window buffers, and drains any pending bounce digest immediately.
+    pub fn dismiss_storm(
+        &self,
+        target_did: &str,
+        focal_uri: &str,
+        storm_id: i64,
+        now_us: u64,
+    ) -> Option<StormDigestNotification> {
+        let ttl_us = dur_to_us(self.config.storm_mode_ttl);
         let mut guard = self.state.write();
-        for ((did, _), bucket) in &mut guard.buckets {
-            if did == target_did && bucket.active_storm_id == Some(storm_id) {
-                bucket.clear_storm();
+        let key = (target_did.to_string(), focal_uri.to_string());
+        if !guard.buckets.contains_key(&key) {
+            if let Some(existing_key) = guard
+                .buckets
+                .iter()
+                .find(|((did, _), b)| did == target_did && b.active_storm_id == Some(storm_id))
+                .map(|(k, _)| k.clone())
+            {
+                let bucket = guard.buckets.entry(existing_key.clone()).or_default();
+                return Self::clear_dismissed_bucket(
+                    &existing_key.0,
+                    &existing_key.1,
+                    bucket,
+                    now_us,
+                    ttl_us,
+                );
             }
+        }
+        let bucket = guard.buckets.entry(key).or_default();
+        Self::clear_dismissed_bucket(target_did, focal_uri, bucket, now_us, ttl_us)
+    }
+
+    fn clear_dismissed_bucket(
+        target_did: &str,
+        focal_uri: &str,
+        bucket: &mut FocalPostBucket,
+        now_us: u64,
+        ttl_us: u64,
+    ) -> Option<StormDigestNotification> {
+        bucket.clear_storm();
+        bucket.dismissed_until_us = Some(now_us.saturating_add(ttl_us));
+        bucket.events.clear();
+        bucket.seen_post_uris.clear();
+        bucket.oon_samples.clear();
+        bucket.oon_sample_seen_count = 0;
+        bucket.recent_quote_uris.clear();
+        bucket.eval_outcomes.clear();
+        bucket.last_eval_us = None;
+
+        if bucket.digest_bounced_count > 0 {
+            let bounced_count = bucket.digest_bounced_count;
+            let sample_violators = std::mem::take(&mut bucket.digest_sample_violators);
+            let start_us = bucket.digest_window_start_us.unwrap_or(now_us);
+            let elapsed_us = now_us.saturating_sub(start_us);
+            bucket.digest_bounced_count = 0;
+            bucket.digest_window_start_us = None;
+            Some(StormDigestNotification {
+                target_did: target_did.to_string(),
+                focal_post_uri: focal_uri.to_string(),
+                bounced_count,
+                sample_violators,
+                window_secs: (elapsed_us / 1_000_000).max(1),
+                storm_still_active: false,
+            })
+        } else {
+            None
         }
     }
 
@@ -550,7 +722,12 @@ impl DogpileTracker {
         if !guard.buckets.contains_key(&bucket_key)
             && guard.buckets.len() >= self.config.max_tracked_posts
         {
-            Self::evict_oldest_locked(&mut guard, medium_cutoff, now_us);
+            Self::evict_oldest_locked(
+                &mut guard,
+                medium_cutoff,
+                now_us,
+                self.config.max_tracked_posts,
+            );
         }
 
         let bucket = guard.buckets.entry(bucket_key).or_default();
@@ -667,6 +844,7 @@ impl DogpileTracker {
 
         let digests = self.drain_due_digests(now_us, true);
 
+        let cooldown_us = dur_to_us(self.config.alert_cooldown);
         {
             let mut guard = self.state.write();
             guard.buckets.retain(|_, bucket| {
@@ -674,26 +852,42 @@ impl DogpileTracker {
                     || !bucket.eval_outcomes.is_empty()
                     || bucket.active_storm_id.is_some()
                     || bucket.digest_bounced_count > 0
+                    || bucket.is_suppressed(now_us)
             });
+            guard
+                .alert_cooldowns
+                .retain(|_, &mut ts| now_us.saturating_sub(ts) < cooldown_us);
+            guard
+                .postgate_state
+                .retain(|_, (_, _, ts)| now_us.saturating_sub(*ts) <= POSTGATE_STATE_TTL_US);
         }
 
         (expired, digests)
     }
 
-    fn evict_oldest_locked(state: &mut TrackerState, medium_cutoff: u64, now_us: u64) {
+    fn evict_oldest_locked(
+        state: &mut TrackerState,
+        medium_cutoff: u64,
+        now_us: u64,
+        max_tracked_posts: usize,
+    ) {
         for bucket in state.buckets.values_mut() {
             bucket.prune(medium_cutoff);
         }
         state.buckets.retain(|_, b| {
-            !b.events.is_empty() || b.active_storm_id.is_some() || b.digest_bounced_count > 0
+            !b.events.is_empty()
+                || !b.eval_outcomes.is_empty()
+                || b.active_storm_id.is_some()
+                || b.digest_bounced_count > 0
+                || b.is_suppressed(now_us)
         });
-        if state.buckets.is_empty() {
+        if state.buckets.len() < max_tracked_posts || state.buckets.is_empty() {
             return;
         }
         let victim = state
             .buckets
             .iter()
-            .filter(|(_, b)| !b.has_active_storm(now_us))
+            .filter(|(_, b)| !b.has_active_storm(now_us) && !b.is_suppressed(now_us))
             .min_by_key(|(_, b)| b.last_activity_us)
             .map(|(k, _)| k.clone())
             .or_else(|| {
@@ -991,7 +1185,14 @@ mod tests {
             t0,
         );
         assert!(tracker.is_storm_mode_active("did:plc:bob", t0 + 1));
-        tracker.dismiss_storm("did:plc:bob", 7);
+        assert!(tracker
+            .dismiss_storm(
+                "did:plc:bob",
+                "at://did:plc:bob/app.bsky.feed.post/1",
+                7,
+                t0 + 2
+            )
+            .is_none());
         assert!(!tracker.is_storm_mode_active("did:plc:bob", t0 + 2));
 
         // Bounded capacity eviction keeps bucket count <= max_tracked_posts
@@ -1006,5 +1207,252 @@ mod tests {
             let _ = tracker.record_interaction(&inter, true, t0 + idx * 1000);
         }
         assert!(tracker.state.read().buckets.len() <= 2);
+    }
+
+    #[test]
+    fn tracker_dismiss_suppression_out_of_order_outcomes_quote_mention_and_eviction_guards() {
+        let cfg = DogpileConfig::default()
+            .with_min_unique_authors(4)
+            .with_storm_mode_ttl(Duration::from_secs(600))
+            .with_alert_cooldown(Duration::from_secs(300))
+            .with_max_tracked_posts(2)
+            .with_max_sample_replies(3);
+        let tracker = DogpileTracker::new(cfg);
+        let t0 = 1_750_000_000_000_000_u64;
+        let focal = "at://did:plc:alice/app.bsky.feed.post/focal1";
+
+        // 1. Quote+mention hybrid (`InteractionType::Mention` with `quote_uri == focal`) counts as quote catalyst.
+        for i in 0..4 {
+            let mut inter = Interaction::new(
+                format!("did:plc:qtmention{i}"),
+                "did:plc:alice",
+                InteractionType::Mention,
+                format!("at://did:plc:qtmention{i}/app.bsky.feed.post/qm{i}"),
+                format!("cid{i}"),
+                format!("look at @alice {i}"),
+            )
+            .with_quote_uri(focal);
+            if i == 3 {
+                inter.interaction_type = InteractionType::DirectReply;
+            }
+            let cand = tracker.record_interaction(&inter, true, t0 + i * 1_000_000);
+            if i == 3 {
+                let c = cand.expect("4th interaction should trigger");
+                assert_eq!(c.recent_quote_uris.len(), 4);
+                assert_eq!(c.initial_metrics.quote_count_short, 4);
+            }
+        }
+
+        // 2. Out-of-order eval_outcomes prune cleanly via `retain` and respect cap.
+        tracker.record_evaluation_outcome("did:plc:alice", focal, false, t0 + 10_000_000);
+        tracker.record_evaluation_outcome("did:plc:alice", focal, true, t0 + 1_000); // older than later cutoff
+        tracker.record_evaluation_outcome(
+            "did:plc:alice",
+            focal,
+            true,
+            t0 + 2_000_000_000, // advances medium_cutoff past both prior entries
+        );
+        {
+            let guard = tracker.state.read();
+            let b = guard
+                .buckets
+                .get(&("did:plc:alice".to_string(), focal.to_string()))
+                .unwrap();
+            assert_eq!(b.eval_outcomes.len(), 1);
+            assert!(b.eval_outcomes[0].1);
+        }
+
+        // 3. `dismiss_storm` flushes pending digest immediately and suppresses re-triggering for TTL.
+        let _ = tracker.activate_storm("did:plc:alice", focal, 99, StormSeverity::High, t0);
+        assert!(tracker.record_storm_bounce(
+            "did:plc:alice",
+            Some(focal),
+            "did:plc:bad1",
+            None,
+            "harassment",
+            t0 + 10_000_000,
+        ));
+        let flushed = tracker
+            .dismiss_storm("did:plc:alice", focal, 99, t0 + 20_000_000)
+            .expect("pending digest must flush on dismiss");
+        assert_eq!(flushed.bounced_count, 1);
+        assert!(!flushed.storm_still_active);
+
+        // Subsequent surge interaction within TTL is suppressed.
+        let suppressed_inter = reply_from("did:plc:extra", "did:plc:alice", "focal1", "ex1", "hi");
+        assert!(tracker
+            .record_interaction(&suppressed_inter, true, t0 + 30_000_000)
+            .is_none());
+
+        // 4. `postgate_state` survives 5m `DefensiveWindow` prune in `prune_and_expire`.
+        tracker.record_defensive_postgate(
+            "did:plc:carol",
+            "at://did:plc:carol/app.bsky.feed.post/p1",
+            2,
+            false,
+            t0,
+        );
+        let _ = tracker.prune_and_expire(t0 + 400_000_000); // > 5m short window
+        tracker.record_defensive_postgate(
+            "did:plc:carol",
+            "at://did:plc:carol/app.bsky.feed.post/p1",
+            2, // unchanged count!
+            false,
+            t0 + 401_000_000,
+        );
+        assert_eq!(
+            tracker
+                .state
+                .read()
+                .defensive
+                .get("did:plc:carol")
+                .map_or(0, |w| w.recent_detaches.len()),
+            0,
+            "unchanged postgate after 5m prune must not double-count prior detaches"
+        );
+
+        // 5. Alert cooldowns survive bucket event pruning.
+        let cooldown_focal = "at://did:plc:dave/app.bsky.feed.post/cd1";
+        assert_eq!(
+            tracker.activate_storm(
+                "did:plc:dave",
+                cooldown_focal,
+                10,
+                StormSeverity::Elevated,
+                t0
+            ),
+            (true, false)
+        );
+        // Expire storm and prune empty bucket, then re-activate within alert_cooldown (300s).
+        let _ = tracker.prune_and_expire(t0 + 700_000_000);
+        // Use a fresh tracker to test alert_cooldown < storm_mode_ttl directly:
+        let cd_tracker = DogpileTracker::new(
+            DogpileConfig::default()
+                .with_storm_mode_ttl(Duration::from_secs(60))
+                .with_alert_cooldown(Duration::from_secs(300)),
+        );
+        assert_eq!(
+            cd_tracker.activate_storm(
+                "did:plc:dave",
+                cooldown_focal,
+                11,
+                StormSeverity::Elevated,
+                t0
+            ),
+            (true, false)
+        );
+        let _ = cd_tracker.prune_and_expire(t0 + 70_000_000); // storm expired & bucket pruned
+        assert_eq!(
+            cd_tracker.activate_storm(
+                "did:plc:dave",
+                cooldown_focal,
+                12,
+                StormSeverity::Elevated,
+                t0 + 100_000_000
+            ),
+            (false, false),
+            "cooldown must be retained even after bucket was pruned"
+        );
+
+        // 6. `evict_oldest_locked` stops once below `max_tracked_posts` after pruning stale buckets.
+        let evict_tracker = DogpileTracker::new(
+            DogpileConfig::default()
+                .with_max_tracked_posts(2)
+                .with_medium_window(Duration::from_secs(60)),
+        );
+        let _ = evict_tracker.record_interaction(
+            &reply_from("did:plc:a1", "did:plc:eve", "stale", "s1", "old"),
+            true,
+            t0,
+        );
+        let _ = evict_tracker.record_interaction(
+            &reply_from("did:plc:a2", "did:plc:eve", "live", "l1", "recent"),
+            true,
+            t0 + 100_000_000,
+        );
+        let _ = evict_tracker.record_interaction(
+            &reply_from("did:plc:a3", "did:plc:eve", "live2", "l2", "recent2"),
+            true,
+            t0 + 101_000_000,
+        );
+        assert!(evict_tracker.state.read().buckets.contains_key(&(
+            "did:plc:eve".to_string(),
+            "at://did:plc:eve/app.bsky.feed.post/live".to_string()
+        )));
+
+        // 7. rollback_eval_recheck clears last_eval_us; oon_samples reservoir-samples > max_sample_replies;
+        //    dismiss_storm drains immediate digest and clears bucket buffers; rehydrate_storm restores active state.
+        let r_tracker = DogpileTracker::new(
+            DogpileConfig::default()
+                .with_min_unique_authors(6)
+                .with_min_out_of_network_ratio(0.5)
+                .with_max_sample_replies(3)
+                .with_eval_recheck_interval(Duration::from_secs(60))
+                .with_storm_mode_ttl(Duration::from_secs(120)),
+        );
+        let mut surge_ts = t0;
+        let mut last_cand = None;
+        for i in 0..8 {
+            surge_ts += 1_000_000;
+            if let Some(c) = r_tracker.record_interaction(
+                &reply_from(
+                    &format!("did:plc:res_{i}"),
+                    "did:plc:faye",
+                    "p_res",
+                    &format!("r{i}"),
+                    "reply text",
+                ),
+                true,
+                surge_ts,
+            ) {
+                last_cand = Some(c);
+            }
+        }
+        let cand = last_cand.expect("should produce surge candidate");
+        assert_eq!(cand.sample_replies.len(), 3);
+        r_tracker.rollback_eval_recheck(
+            "did:plc:faye",
+            "at://did:plc:faye/app.bsky.feed.post/p_res",
+            cand.observed_at_us,
+        );
+        assert!(r_tracker
+            .record_interaction(
+                &reply_from(
+                    "did:plc:res_extra",
+                    "did:plc:faye",
+                    "p_res",
+                    "re",
+                    "after rollback"
+                ),
+                true,
+                surge_ts + 500_000,
+            )
+            .is_some());
+
+        r_tracker.rehydrate_storm(
+            "did:plc:faye",
+            "at://did:plc:faye/app.bsky.feed.post/p_res",
+            99,
+            StormSeverity::High,
+            surge_ts,
+            surge_ts + 120_000_000,
+        );
+        assert!(r_tracker.is_storm_mode_active("did:plc:faye", surge_ts + 1_000_000));
+        r_tracker.record_storm_bounce(
+            "did:plc:faye",
+            Some("at://did:plc:faye/app.bsky.feed.post/p_res"),
+            "did:plc:bad",
+            Some("bouncer.bsky.social".to_string()),
+            "spam",
+            surge_ts + 2_000_000,
+        );
+        let digest_on_dismiss = r_tracker.dismiss_storm(
+            "did:plc:faye",
+            "at://did:plc:faye/app.bsky.feed.post/p_res",
+            99,
+            surge_ts + 3_000_000,
+        );
+        assert!(digest_on_dismiss.is_some());
+        assert!(!r_tracker.is_storm_mode_active("did:plc:faye", surge_ts + 4_000_000));
     }
 }

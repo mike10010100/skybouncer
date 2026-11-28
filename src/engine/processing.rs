@@ -73,7 +73,7 @@ impl SkybouncerEngine {
             }
         }
 
-        Ok(Self {
+        let engine = Self {
             config,
             protected_dids,
             rubric,
@@ -98,7 +98,13 @@ impl SkybouncerEngine {
             dogpile_tracker,
             storm_stance_classifier,
             sovereign_publish_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
-        })
+            classifier_circuit_breaker: Arc::new(parking_lot::Mutex::new(
+                ClassifierCircuitBreaker::default(),
+            )),
+            in_flight_storm_evals: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+        };
+        engine.reconcile_storms_on_startup();
+        Ok(engine)
     }
 
     /// Configures the active [`AtprotoOAuthClient`] for automatic background session refreshes.
@@ -228,11 +234,7 @@ impl SkybouncerEngine {
             && commit.operation == CommitOperation::Create
         {
             if self.is_protected(&commit.did) && self.config.dogpile_config.enabled {
-                let ts = if commit.time_us > 0 {
-                    commit.time_us
-                } else {
-                    current_time_us()
-                };
+                let ts = monotonic_time_us();
                 self.dogpile_tracker.record_defensive_block(&commit.did, ts);
                 self.stats
                     .defensive_signals_observed
@@ -269,11 +271,7 @@ impl SkybouncerEngine {
                                     == Some("app.bsky.feed.postgate#disableRule")
                             })
                         });
-                    let ts = if commit.time_us > 0 {
-                        commit.time_us
-                    } else {
-                        current_time_us()
-                    };
+                    let ts = monotonic_time_us();
                     self.dogpile_tracker.record_defensive_postgate(
                         &commit.did,
                         &post_uri,
@@ -340,7 +338,13 @@ impl SkybouncerEngine {
 
         if let Some(candidate) = self.observe_interaction_for_dogpile(&interaction) {
             if let Some(tx) = storm_tx {
-                let _ = tx.try_send(candidate);
+                let target = candidate.target_did.clone();
+                let focal = candidate.focal_post_uri.clone();
+                let observed_ts = candidate.observed_at_us;
+                if tx.try_send(candidate).is_err() {
+                    self.dogpile_tracker
+                        .rollback_eval_recheck(&target, &focal, observed_ts);
+                }
             }
         }
 
@@ -486,11 +490,7 @@ impl SkybouncerEngine {
             || self
                 .follow_graph
                 .is_followed_by(&interaction.target_did, &interaction.author_did);
-        let ts = if interaction.created_at_us > 0 {
-            interaction.created_at_us
-        } else {
-            current_time_us()
-        };
+        let ts = monotonic_time_us();
         self.dogpile_tracker
             .record_interaction(interaction, !is_in_network, ts)
     }
@@ -589,6 +589,15 @@ impl SkybouncerEngine {
                 .fetch_add(1, Ordering::Relaxed);
             debug!("Heuristic regex pre-filter detected violation at zero cost");
 
+            if self.config.dogpile_config.enabled {
+                self.dogpile_tracker.record_evaluation_outcome(
+                    &target_did,
+                    &crate::dogpile::canonical_focal_post_uri(interaction),
+                    true,
+                    monotonic_time_us(),
+                );
+            }
+
             let _ = self.cache.set_evaluation(
                 &eval_cache_key,
                 &author_did,
@@ -670,6 +679,29 @@ impl SkybouncerEngine {
             });
         }
 
+        // Pre-enricher non-consuming rate-limit check: when already exhausted, fail closed
+        // before querying AppView `getRelationships` to prevent AppView amplification under flood.
+        let rate_multiplier = if self.is_storm_mode_active(&target_did) {
+            3
+        } else {
+            1
+        };
+        if self.rate_limiter.is_exhausted(&target_did, rate_multiplier) {
+            self.stats
+                .rate_limited_evaluations
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                target = %target_did,
+                author = %author_did,
+                "Evaluation rate limit reached for target user; skipping relationship check and model call"
+            );
+            return Ok(InteractionOutcome::RateLimited {
+                author_did,
+                target_did,
+                reason: "Tier-4 Anti-Denial-of-Wallet rate limit exceeded".to_string(),
+            });
+        }
+
         // Lazy relationship backfill: for large accounts (>7,100 followers) whose oldest
         // followers sit beyond AppView `getFollowers` cursor pagination depth, verify the
         // live `(target_did, author_did)` relationship via `app.bsky.graph.getRelationships`
@@ -719,13 +751,8 @@ impl SkybouncerEngine {
             }
         }
 
-        // Tier 4: Per-User Evaluation Rate Limiter (Anti-Denial-of-Wallet, PRD §5.2) - checked at dequeue
+        // Tier 4: Per-User Evaluation Rate Limiter (Anti-Denial-of-Wallet, PRD §5.2) - consume slot
         // Grants bounded 3x headroom while Storm Mode is active for the target.
-        let rate_multiplier = if self.is_storm_mode_active(&target_did) {
-            3
-        } else {
-            1
-        };
         if !self
             .rate_limiter
             .check_and_record_with_multiplier(&target_did, rate_multiplier)
@@ -770,19 +797,109 @@ impl SkybouncerEngine {
         self.stats.tier1_evaluations.fetch_add(1, Ordering::Relaxed);
         let target_rubric = self.rubric_for(&target_did);
         let interaction = interaction.with_rubric(target_rubric.clone());
+        // Check HTTP 500 circuit breaker before invoking backend
+        {
+            let mut cb = self.classifier_circuit_breaker.lock();
+            if let Some(until) = cb.open_until {
+                if std::time::Instant::now() < until {
+                    return Err(SkybouncerError::Classifier(
+                        "Classifier circuit breaker open after consecutive HTTP 500 errors"
+                            .to_string(),
+                    ));
+                }
+                cb.open_until = None;
+                cb.consecutive_500s = 0;
+            }
+        }
+
         let mut retry_delay = self.config.classifier_retry_backoff;
         let mut timeout_retries: usize = 0;
+        let mut http_500_retries: usize = 0;
         let detailed_eval = loop {
             match self
                 .classifier
                 .classify_detailed_with_stats_and_rubric(&interaction, Some(&target_rubric), true)
                 .await
             {
-                Ok(eval) => break eval,
+                Ok(eval) => {
+                    let mut cb = self.classifier_circuit_breaker.lock();
+                    cb.consecutive_500s = 0;
+                    cb.open_until = None;
+                    break eval;
+                }
                 Err(e) => {
                     self.stats
                         .errors_encountered
                         .fetch_add(1, Ordering::Relaxed);
+
+                    if e.is_classifier_http_500() {
+                        let Some(cancel_token) = cancel.filter(|_| {
+                            self.config.hold_queue_on_classifier_unavailable
+                                && e.is_transient_classifier_error()
+                        }) else {
+                            let mut cb = self.classifier_circuit_breaker.lock();
+                            cb.consecutive_500s = cb.consecutive_500s.saturating_add(1);
+                            if cb.consecutive_500s >= CLASSIFIER_CIRCUIT_BREAKER_500_THRESHOLD {
+                                cb.open_until = Some(
+                                    std::time::Instant::now()
+                                        + self.config.classifier_circuit_breaker_cooldown,
+                                );
+                            }
+                            return Err(e);
+                        };
+                        if cancel_token.is_cancelled() {
+                            return Err(e);
+                        }
+                        if http_500_retries >= self.config.max_classifier_500_retries {
+                            let mut cb = self.classifier_circuit_breaker.lock();
+                            cb.consecutive_500s = cb.consecutive_500s.saturating_add(1);
+                            let opened =
+                                cb.consecutive_500s >= CLASSIFIER_CIRCUIT_BREAKER_500_THRESHOLD;
+                            if opened {
+                                cb.open_until = Some(
+                                    std::time::Instant::now()
+                                        + self.config.classifier_circuit_breaker_cooldown,
+                                );
+                            }
+                            warn!(
+                                error = %e,
+                                post_uri = %post_uri,
+                                http_500_retries,
+                                consecutive_500s = cb.consecutive_500s,
+                                circuit_opened = opened,
+                                "Classifier returned repeated HTTP 500 for candidate; releasing worker permit"
+                            );
+                            return Err(e);
+                        }
+                        http_500_retries += 1;
+                        warn!(
+                            error = %e,
+                            post_uri = %post_uri,
+                            http_500_retry = http_500_retries,
+                            max_http_500_retries = self.config.max_classifier_500_retries,
+                            backoff = ?retry_delay,
+                            "Classifier returned HTTP 500; retrying candidate after bounded backoff"
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = cancel_token.cancelled() => {
+                                return Err(e);
+                            }
+                            _ = tokio::time::sleep(retry_delay) => {}
+                        }
+                        retry_delay = retry_delay
+                            .saturating_mul(2)
+                            .min(MAX_CLASSIFIER_RETRY_BACKOFF);
+                        continue;
+                    }
+
+                    // Non-500 response resets any 500 poison-pill streak
+                    {
+                        let mut cb = self.classifier_circuit_breaker.lock();
+                        cb.consecutive_500s = 0;
+                        cb.open_until = None;
+                    }
+
                     let Some(cancel_token) = cancel.filter(|_| {
                         self.config.hold_queue_on_classifier_unavailable
                             && e.is_transient_classifier_error()
@@ -835,12 +952,10 @@ impl SkybouncerEngine {
 
         if detailed_eval.escalated {
             self.stats.tier2_evaluations.fetch_add(1, Ordering::Relaxed);
-            if detailed_eval
-                .escalation_reason
-                .as_deref()
-                .unwrap_or("")
-                .contains("image")
-            {
+            if matches!(
+                detailed_eval.escalation_kind,
+                Some(crate::classifier::EscalationReason::VisualMedia)
+            ) {
                 self.stats
                     .tier2_image_escalations
                     .fetch_add(1, Ordering::Relaxed);
@@ -858,16 +973,11 @@ impl SkybouncerEngine {
                 .fetch_add(1, Ordering::Relaxed);
         }
         if self.config.dogpile_config.enabled {
-            let outcome_ts = if interaction.created_at_us > 0 {
-                interaction.created_at_us
-            } else {
-                current_time_us()
-            };
             self.dogpile_tracker.record_evaluation_outcome(
                 &target_did,
                 &crate::dogpile::canonical_focal_post_uri(&interaction),
                 model_verdict.is_violation(),
-                outcome_ts,
+                monotonic_time_us(),
             );
         }
 
@@ -1052,11 +1162,7 @@ impl SkybouncerEngine {
                             },
                         };
 
-                        let bounce_ts = if interaction.created_at_us > 0 {
-                            interaction.created_at_us
-                        } else {
-                            current_time_us()
-                        };
+                        let bounce_ts = monotonic_time_us();
                         let focal_uri = crate::dogpile::canonical_focal_post_uri(interaction);
                         let digested = self.dogpile_tracker.record_storm_bounce(
                             &target_did,

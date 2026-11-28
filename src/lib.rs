@@ -75,7 +75,7 @@ pub use enricher::{
     MockContextEnricher, NoopContextEnricher, ParentPostContext, PostEmbedSummary, QuotedAncestor,
     ThreadPost, AUTHOR_FEED_RECENT_LIMIT, AUTHOR_FEED_TOP_LIMIT, DEFAULT_APPVIEW_ENDPOINT,
     DEFAULT_ENRICHER_TIMEOUT_MS, FAST_REPLY_LATENCY_MS, FORGED_TID_DRIFT_SECS, MAX_CONTEXT_IMAGES,
-    MAX_OTHER_REPLY_SNIPPETS, MAX_POST_IMAGES, MAX_PROFILE_FUNDRAISER_URLS,
+    MAX_DISPLAY_NAME_CHARS, MAX_OTHER_REPLY_SNIPPETS, MAX_POST_IMAGES, MAX_PROFILE_FUNDRAISER_URLS,
     MAX_RENDERED_THREAD_ANCESTORS, REPLY_BLAST_MIN_DISTINCT_TARGETS, REPLY_BLAST_WINDOW_SECS,
     THREAD_ANCESTOR_CHAR_CAP,
 };
@@ -101,19 +101,21 @@ pub use web::{
 
 pub use classifier::{
     BounceDuration, Classifier, DynamicModelPolicy, DynamicPrimaryClassifier, DynamicPrimaryStats,
-    DynamicPrimaryStatsSnapshot, HeuristicClassifier, HeuristicRule, JevClassifier, JevConfig,
-    MockClassifier, OllamaChatOptions, RuleRubric, Sensitivity, Verdict, ViolationCategory,
-    DEFAULT_MULTIMODAL_PRIMARY_MODEL, DEFAULT_OLLAMA_NUM_CTX, DEFAULT_TEXT_ONLY_PRIMARY_MODEL,
+    DynamicPrimaryStatsSnapshot, EscalationReason, HeuristicClassifier, HeuristicRule,
+    JevClassifier, JevConfig, MockClassifier, OllamaChatOptions, RuleRubric, Sensitivity, Verdict,
+    ViolationCategory, DEFAULT_MULTIMODAL_PRIMARY_MODEL, DEFAULT_OLLAMA_NUM_CTX,
+    DEFAULT_TEXT_ONLY_PRIMARY_MODEL, MAX_RUBRIC_PROMPT_CHARS,
 };
 pub use dogpile::{
     apply_postgate_detach, apply_threadgate, canonical_focal_post_uri, compute_burst_acceleration,
-    compute_composite_score, compute_direct_ratio, compute_dunk_ratio, compute_power_asymmetry,
-    compute_structural_score, parse_owned_post_uri, remove_threadgate, severity_from_score,
-    CatalystInfo, DigestBounceSummary, DogpileConfig, DogpileTracker, LlmStormStanceClassifier,
-    MockStormStanceClassifier, NoopStormStanceClassifier, PostEngagementSnapshot, PostgateRecord,
-    SampleReply, StormDigestNotification, StormEvent, StormMetrics, StormNotification,
-    StormSeverity, StormStanceClassifier, StormStanceInput, StormStanceVerdict, StormStatus,
-    SurgeCandidate, ThreadgatePolicy, ThreadgateRecord, MAX_DETACHED_EMBEDDING_URIS,
+    compute_composite_score, compute_composite_score_with_metrics, compute_direct_ratio,
+    compute_dunk_ratio, compute_power_asymmetry, compute_structural_score, parse_owned_post_uri,
+    remove_threadgate, severity_from_score, CatalystInfo, DigestBounceSummary, DogpileConfig,
+    DogpileTracker, LlmStormStanceClassifier, MockStormStanceClassifier, NoopStormStanceClassifier,
+    PostEngagementSnapshot, PostgateRecord, SampleReply, StormDigestNotification, StormEvent,
+    StormMetrics, StormNotification, StormSeverity, StormStanceClassifier, StormStanceInput,
+    StormStanceVerdict, StormStatus, SurgeCandidate, ThreadgatePolicy, ThreadgateRecord,
+    MAX_DETACHED_EMBEDDING_URIS,
 };
 pub use engine::{
     simulate::{SimulateTierStage, SimulationInputs, SimulationResult},

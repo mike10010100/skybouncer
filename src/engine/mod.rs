@@ -49,7 +49,7 @@ use crate::modlist::{
     ModListManager, DEFAULT_MOD_LIST_NAME,
 };
 use crate::tenant::{Tenant, TenantRegistry};
-use crate::time::current_time_us;
+use crate::time::{current_time_us, monotonic_time_us};
 
 /// Default capacity for the engine's internal commit event processing channel.
 pub const DEFAULT_ENGINE_CHANNEL_CAPACITY: usize = 1024;
@@ -89,6 +89,24 @@ pub const DEFAULT_FALLBACK_TIMEOUT_MS: u64 = 120_000;
 /// Caps per-post timeout retries so a single slow prompt cannot stall the worker permit forever
 /// while still retrying hard connection/5xx outages indefinitely until recovery.
 pub const DEFAULT_MAX_CLASSIFIER_TIMEOUT_RETRIES: usize = 2;
+
+/// Default maximum per-candidate retries on HTTP 500 Internal Server Error responses before
+/// releasing the worker permit and letting the circuit breaker track systemic 500 failures.
+pub const DEFAULT_MAX_CLASSIFIER_500_RETRIES: usize = 2;
+
+/// Default cooldown window for the HTTP 500 circuit breaker after consecutive candidate failures.
+pub const DEFAULT_CLASSIFIER_CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Consecutive terminal HTTP 500 candidate failures before opening the circuit breaker.
+const CLASSIFIER_CIRCUIT_BREAKER_500_THRESHOLD: usize = 3;
+
+/// Lightweight circuit breaker distinguishing isolated single-payload HTTP 500 poison pills
+/// from systemic backend HTTP 500 outages without deadlocking worker permits.
+#[derive(Debug, Default)]
+pub(super) struct ClassifierCircuitBreaker {
+    consecutive_500s: usize,
+    open_until: Option<std::time::Instant>,
+}
 
 /// Loads persisted cumulative telemetry counters, falling back to a zeroed [`EngineStats`].
 fn load_persisted_stats(cache: &DeduplicationCache) -> EngineStats {
@@ -174,6 +192,10 @@ pub struct SkybouncerConfig {
     pub classifier_retry_backoff: Duration,
     /// Maximum outer queue retries per candidate when a classifier request times out.
     pub max_classifier_timeout_retries: usize,
+    /// Maximum outer queue retries per candidate on HTTP 500 Internal Server Error responses.
+    pub max_classifier_500_retries: usize,
+    /// Cooldown duration when consecutive candidate HTTP 500 failures trip the circuit breaker.
+    pub classifier_circuit_breaker_cooldown: Duration,
     /// Real-time dogpile detection and Storm Mode configuration.
     pub dogpile_config: DogpileConfig,
 }
@@ -204,6 +226,8 @@ impl Default for SkybouncerConfig {
             hold_queue_on_classifier_unavailable: false,
             classifier_retry_backoff: DEFAULT_CLASSIFIER_RETRY_BACKOFF,
             max_classifier_timeout_retries: DEFAULT_MAX_CLASSIFIER_TIMEOUT_RETRIES,
+            max_classifier_500_retries: DEFAULT_MAX_CLASSIFIER_500_RETRIES,
+            classifier_circuit_breaker_cooldown: DEFAULT_CLASSIFIER_CIRCUIT_BREAKER_COOLDOWN,
             dogpile_config: DogpileConfig::default(),
         }
     }
@@ -364,6 +388,20 @@ impl SkybouncerConfig {
     #[must_use]
     pub const fn with_max_classifier_timeout_retries(mut self, max_retries: usize) -> Self {
         self.max_classifier_timeout_retries = max_retries;
+        self
+    }
+
+    /// Sets the maximum outer queue retries per candidate on HTTP 500 Internal Server Errors.
+    #[must_use]
+    pub const fn with_max_classifier_500_retries(mut self, max_retries: usize) -> Self {
+        self.max_classifier_500_retries = max_retries;
+        self
+    }
+
+    /// Sets the cooldown duration for the HTTP 500 classifier circuit breaker.
+    #[must_use]
+    pub fn with_classifier_circuit_breaker_cooldown(mut self, cooldown: Duration) -> Self {
+        self.classifier_circuit_breaker_cooldown = cooldown.max(Duration::from_millis(10));
         self
     }
 
@@ -549,6 +587,14 @@ impl SkybouncerConfig {
             DEFAULT_MAX_CLASSIFIER_TIMEOUT_RETRIES,
         );
 
+        let max_classifier_500_retries = crate::env::parsed_or(
+            &[
+                "MAX_CLASSIFIER_500_RETRIES",
+                "SKYBOUNCER_MAX_CLASSIFIER_500_RETRIES",
+            ],
+            DEFAULT_MAX_CLASSIFIER_500_RETRIES,
+        );
+
         Ok(Self {
             protected_dids,
             rubric,
@@ -573,6 +619,8 @@ impl SkybouncerConfig {
             hold_queue_on_classifier_unavailable,
             classifier_retry_backoff: Duration::from_millis(classifier_retry_backoff_ms.max(10)),
             max_classifier_timeout_retries,
+            max_classifier_500_retries,
+            classifier_circuit_breaker_cooldown: DEFAULT_CLASSIFIER_CIRCUIT_BREAKER_COOLDOWN,
             dogpile_config: DogpileConfig::from_env(),
         })
     }
@@ -1203,6 +1251,8 @@ pub struct SkybouncerEngine {
     dogpile_tracker: Arc<DogpileTracker>,
     storm_stance_classifier: Arc<dyn StormStanceClassifier>,
     sovereign_publish_locks: Arc<crate::modlist::manager::StripedAsyncLocks>,
+    classifier_circuit_breaker: Arc<parking_lot::Mutex<ClassifierCircuitBreaker>>,
+    in_flight_storm_evals: Arc<parking_lot::Mutex<HashSet<(String, String)>>>,
 }
 
 mod accessors;
@@ -1442,15 +1492,41 @@ impl SkybouncerEngineBuilder {
             }
         });
 
+        // Determine if eval_worker and storm_worker share an Ollama inference endpoint so
+        // concurrent Stage 2/3 stance requests and Tier-1/2 evaluations serialize safely on GPU.
+        let stance_cfg_for_sem = if self.storm_stance_classifier.is_none()
+            && self.config.dogpile_config.enable_llm_stance
+        {
+            self.config
+                .fallback_jev_config
+                .as_ref()
+                .or(self.config.jev_config.as_ref())
+        } else {
+            None
+        };
+        let shared_ollama_semaphore: Option<Arc<tokio::sync::Semaphore>> = stance_cfg_for_sem
+            .and_then(|sc| {
+                is_ollama_endpoint(sc).then(|| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        self.config.evaluation_concurrency.max(1),
+                    ))
+                })
+            });
+
         // 4. Initialize Primary Classifier
         let primary_classifier: Arc<dyn Classifier> = match self.classifier {
             Some(c) => c,
             None => {
                 if let Some(ref jev_cfg) = self.config.jev_config {
-                    Arc::new(JevClassifier::new(
-                        jev_cfg.clone(),
-                        self.config.rubric.clone(),
-                    )?)
+                    let mut clf = JevClassifier::new(jev_cfg.clone(), self.config.rubric.clone())?;
+                    if let (Some(ref sem), Some(sc)) =
+                        (&shared_ollama_semaphore, stance_cfg_for_sem)
+                    {
+                        if same_ollama_endpoint(jev_cfg, sc) {
+                            clf = clf.with_inference_semaphore(Arc::clone(sem));
+                        }
+                    }
+                    Arc::new(clf)
                 } else {
                     return Err(SkybouncerError::Config(
                         "No classifier provided and JEV configuration is missing".to_string(),
@@ -1464,10 +1540,15 @@ impl SkybouncerEngineBuilder {
             Some(c) => Some(c),
             None => {
                 if let Some(ref mm_cfg) = self.config.multimodal_jev_config {
-                    Some(Arc::new(JevClassifier::new(
-                        mm_cfg.clone(),
-                        self.config.rubric.clone(),
-                    )?))
+                    let mut clf = JevClassifier::new(mm_cfg.clone(), self.config.rubric.clone())?;
+                    if let (Some(ref sem), Some(sc)) =
+                        (&shared_ollama_semaphore, stance_cfg_for_sem)
+                    {
+                        if same_ollama_endpoint(mm_cfg, sc) {
+                            clf = clf.with_inference_semaphore(Arc::clone(sem));
+                        }
+                    }
+                    Some(Arc::new(clf))
                 } else {
                     None
                 }
@@ -1478,11 +1559,19 @@ impl SkybouncerEngineBuilder {
         // When a multimodal Tier-1 classifier is configured, wrap the primary in a
         // DynamicPrimaryClassifier that routes image-bearing interactions to it.
         let primary_classifier: Arc<dyn Classifier> = match multimodal_classifier {
-            Some(multimodal) => Arc::new(DynamicPrimaryClassifier::new(
-                primary_classifier,
-                multimodal,
-                DynamicModelPolicy::default(),
-            )),
+            Some(multimodal) => {
+                let mut policy = DynamicModelPolicy::new(
+                    primary_classifier.model_name(),
+                    multimodal.model_name(),
+                    self.config.certainty_config.escalate_on_images,
+                );
+                policy.decisive_confidence = self.config.certainty_config.max_confidence;
+                Arc::new(DynamicPrimaryClassifier::new(
+                    primary_classifier,
+                    multimodal,
+                    policy,
+                ))
+            }
             None => primary_classifier,
         };
 
@@ -1491,10 +1580,16 @@ impl SkybouncerEngineBuilder {
             Some(c) => Some(c),
             None => {
                 if let Some(ref fallback_cfg) = self.config.fallback_jev_config {
-                    Some(Arc::new(JevClassifier::new(
-                        fallback_cfg.clone(),
-                        self.config.rubric.clone(),
-                    )?))
+                    let mut clf =
+                        JevClassifier::new(fallback_cfg.clone(), self.config.rubric.clone())?;
+                    if let (Some(ref sem), Some(sc)) =
+                        (&shared_ollama_semaphore, stance_cfg_for_sem)
+                    {
+                        if same_ollama_endpoint(fallback_cfg, sc) {
+                            clf = clf.with_inference_semaphore(Arc::clone(sem));
+                        }
+                    }
+                    Some(Arc::new(clf))
                 } else {
                     None
                 }
@@ -1666,9 +1761,17 @@ impl SkybouncerEngineBuilder {
                 Some(c) => c,
                 None if self.config.dogpile_config.enable_llm_stance => {
                     if let Some(ref fb_cfg) = self.config.fallback_jev_config {
-                        Arc::new(LlmStormStanceClassifier::new(fb_cfg.clone())?)
+                        let mut sc = LlmStormStanceClassifier::new(fb_cfg.clone())?;
+                        if let Some(ref sem) = shared_ollama_semaphore {
+                            sc = sc.with_inference_semaphore(Arc::clone(sem));
+                        }
+                        Arc::new(sc)
                     } else if let Some(ref jev_cfg) = self.config.jev_config {
-                        Arc::new(LlmStormStanceClassifier::new(jev_cfg.clone())?)
+                        let mut sc = LlmStormStanceClassifier::new(jev_cfg.clone())?;
+                        if let Some(ref sem) = shared_ollama_semaphore {
+                            sc = sc.with_inference_semaphore(Arc::clone(sem));
+                        }
+                        Arc::new(sc)
                     } else {
                         Arc::new(NoopStormStanceClassifier)
                     }
@@ -1676,7 +1779,7 @@ impl SkybouncerEngineBuilder {
                 None => Arc::new(NoopStormStanceClassifier),
             };
 
-        Ok(SkybouncerEngine {
+        let engine = SkybouncerEngine {
             config: self.config,
             protected_dids,
             rubric,
@@ -1701,8 +1804,41 @@ impl SkybouncerEngineBuilder {
             dogpile_tracker,
             storm_stance_classifier,
             sovereign_publish_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
-        })
+            classifier_circuit_breaker: Arc::new(parking_lot::Mutex::new(
+                ClassifierCircuitBreaker::default(),
+            )),
+            in_flight_storm_evals: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+        };
+        engine.reconcile_storms_on_startup();
+        Ok(engine)
     }
+}
+
+fn is_ollama_endpoint(cfg: &JevConfig) -> bool {
+    crate::classifier::jev::resolve_classifier_endpoint(&cfg.base_url)
+        .is_ok_and(|(kind, _)| kind == crate::classifier::JevEndpointKind::Ollama)
+}
+
+fn same_ollama_endpoint(a: &JevConfig, b: &JevConfig) -> bool {
+    let Ok((kind_a, url_a)) = crate::classifier::jev::resolve_classifier_endpoint(&a.base_url)
+    else {
+        return false;
+    };
+    let Ok((kind_b, url_b)) = crate::classifier::jev::resolve_classifier_endpoint(&b.base_url)
+    else {
+        return false;
+    };
+    if kind_a != crate::classifier::JevEndpointKind::Ollama
+        || kind_b != crate::classifier::JevEndpointKind::Ollama
+    {
+        return false;
+    }
+    let (Ok(pa), Ok(pb)) = (url::Url::parse(&url_a), url::Url::parse(&url_b)) else {
+        return false;
+    };
+    pa.scheme() == pb.scheme()
+        && pa.host_str() == pb.host_str()
+        && pa.port_or_known_default() == pb.port_or_known_default()
 }
 
 #[cfg(test)]

@@ -54,13 +54,27 @@ fn map_storm_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<StormEvent> {
 }
 
 impl DeduplicationCache {
-    /// Inserts a new active storm or updates the existing active storm for `(target_did, focal_post_uri)`.
+    /// Inserts a new active storm or updates the existing active storm for `(target_did, focal_post_uri)`,
+    /// preserving the high-water-mark severity atomically inside the transaction.
     ///
     /// Returns the persisted row `id`.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if SQLite insertion/update fails.
     pub fn upsert_active_storm(&self, event: &StormEvent) -> Result<i64, SkybouncerError> {
+        self.upsert_active_storm_with_status(event)
+            .map(|(id, _created)| id)
+    }
+
+    /// Inserts a new active storm or updates the existing active storm for `(target_did, focal_post_uri)`,
+    /// returning `(row_id, created)` atomically and preserving high-water-mark severity.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite insertion/update fails.
+    pub fn upsert_active_storm_with_status(
+        &self,
+        event: &StormEvent,
+    ) -> Result<(i64, bool), SkybouncerError> {
         let metrics_json = serde_json::to_string(&event.metrics)?;
         let catalyst_json = event
             .top_catalyst
@@ -79,19 +93,23 @@ impl DeduplicationCache {
             SkybouncerError::Database(format!("Failed to start storm upsert tx: {e}"))
         })?;
 
-        let existing_id: Option<i64> = {
+        let existing: Option<(i64, String)> = {
             let mut stmt = tx.prepare_cached(
-                "SELECT id FROM dogpile_events
+                "SELECT id, severity FROM dogpile_events
                  WHERE target_did = ?1 AND focal_post_uri = ?2 AND status = 'active'
                  ORDER BY updated_at_us DESC LIMIT 1;",
             )?;
             stmt.query_row(params![event.target_did, event.focal_post_uri], |r| {
-                r.get(0)
+                Ok((r.get(0)?, r.get(1)?))
             })
             .optional()?
         };
 
-        let storm_id = if let Some(id) = existing_id {
+        let (storm_id, created) = if let Some((id, existing_sev_str)) = existing {
+            let existing_sev = existing_sev_str
+                .parse::<StormSeverity>()
+                .unwrap_or(event.severity);
+            let merged_severity = existing_sev.max(event.severity);
             let mut upd = tx.prepare_cached(
                 "UPDATE dogpile_events SET
                     target_handle = COALESCE(?2, target_handle),
@@ -108,14 +126,14 @@ impl DeduplicationCache {
                 id,
                 event.target_handle,
                 event.focal_post_snippet,
-                event.severity.as_str(),
+                merged_severity.as_str(),
                 us_to_i64(event.updated_at_us),
                 metrics_json,
                 catalyst_json,
                 qt_uris_json,
                 stance_json,
             ])?;
-            id
+            (id, false)
         } else {
             let mut ins = tx.prepare_cached(
                 "INSERT INTO dogpile_events (
@@ -143,14 +161,14 @@ impl DeduplicationCache {
                 i64::from(event.threadgate_applied),
                 i64::try_from(event.postgate_detaches_applied).unwrap_or(i64::MAX),
             ])?;
-            tx.last_insert_rowid()
+            (tx.last_insert_rowid(), true)
         };
 
         tx.commit().map_err(|e| {
             SkybouncerError::Database(format!("Failed to commit storm upsert tx: {e}"))
         })?;
 
-        Ok(storm_id)
+        Ok((storm_id, created))
     }
 
     /// Retrieves a single [`StormEvent`] by its primary key ID.

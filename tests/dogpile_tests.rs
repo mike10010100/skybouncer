@@ -834,6 +834,10 @@ async fn test_engine_threadgate_and_postgate_live_and_dry_run() {
         like_count: 1500,
         repost_count: 200,
     });
+    let ttl_cfg = DogpileConfig {
+        storm_mode_ttl: Duration::from_millis(1),
+        ..Default::default()
+    };
     let ttl_engine = build_test_engine(
         alice,
         &sort_pds,
@@ -841,7 +845,7 @@ async fn test_engine_threadgate_and_postgate_live_and_dry_run() {
         MockStormStanceClassifier::new(StormStanceVerdict::new(
             true, 0.9, "dogpile", "hostile", "mock",
         )),
-        DogpileConfig::default().with_storm_mode_ttl(Duration::from_millis(1)),
+        ttl_cfg,
         100,
         false,
     );
@@ -871,6 +875,7 @@ async fn test_engine_threadgate_and_postgate_live_and_dry_run() {
         ev.top_catalyst.as_ref().unwrap().post_uri,
         "at://did:plc:cat_big/app.bsky.feed.post/qhigh"
     );
+    tokio::time::sleep(Duration::from_millis(5)).await;
     ttl_engine.flush_storm_maintenance().unwrap();
     let after_flush = ttl_engine.cache().get_storm(ev.id).unwrap().unwrap();
     assert_eq!(after_flush.status, StormStatus::Resolved);
@@ -1630,4 +1635,424 @@ async fn test_web_api_storms_endpoints_auth_prometheus_and_cli() {
     assert!(summary.contains("Dogpiles Detected:            2"));
     assert!(summary.contains("Storm Alerts Emitted:         3"));
     assert!(summary.contains("Storm Bounces Digested:       14"));
+}
+
+#[tokio::test]
+async fn test_pr2_dogpile_lifecycle_rehydration_high_water_and_dedup() {
+    use skybouncer::time::monotonic_time_us;
+
+    let alice = "did:plc:alice";
+    let focal_active = "at://did:plc:alice/app.bsky.feed.post/3kactive";
+    let focal_expired = "at://did:plc:alice/app.bsky.feed.post/3kexpired";
+    let pds = GateMockPds::start().await;
+
+    // 1. Seed shared cache with one expired 'active' storm row and one fresh 'active' storm row
+    let shared_cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let now_mono = monotonic_time_us();
+
+    let expired_ev = StormEvent {
+        id: 0,
+        target_did: alice.to_string(),
+        target_handle: None,
+        focal_post_uri: focal_expired.to_string(),
+        focal_post_snippet: "old post".to_string(),
+        status: StormStatus::Active,
+        severity: StormSeverity::High,
+        started_at_us: now_mono.saturating_sub(3_600_000_000),
+        updated_at_us: now_mono.saturating_sub(3_600_000_000),
+        resolved_at_us: None,
+        metrics: StormMetrics::default(),
+        top_catalyst: None,
+        catalyst_qt_uris: vec![],
+        stance: None,
+        bounces_during_storm: 2,
+        threadgate_applied: false,
+        postgate_detaches_applied: 0,
+    };
+    let (exp_id, inserted) = shared_cache
+        .upsert_active_storm_with_status(&expired_ev)
+        .unwrap();
+    assert!(inserted);
+
+    let fresh_ev = StormEvent {
+        id: 0,
+        target_did: alice.to_string(),
+        target_handle: None,
+        focal_post_uri: focal_active.to_string(),
+        focal_post_snippet: "hot post".to_string(),
+        status: StormStatus::Active,
+        severity: StormSeverity::Critical,
+        started_at_us: now_mono.saturating_sub(5_000_000),
+        updated_at_us: now_mono,
+        resolved_at_us: None,
+        metrics: StormMetrics {
+            composite_score: 0.91,
+            ..Default::default()
+        },
+        top_catalyst: None,
+        catalyst_qt_uris: vec![],
+        stance: None,
+        bounces_during_storm: 4,
+        threadgate_applied: false,
+        postgate_detaches_applied: 0,
+    };
+    let (fresh_id, inserted2) = shared_cache
+        .upsert_active_storm_with_status(&fresh_ev)
+        .unwrap();
+    assert!(inserted2);
+
+    // High-water severity check: upserting Elevated over Critical preserves Critical
+    let lower_sev = StormEvent {
+        severity: StormSeverity::Elevated,
+        metrics: StormMetrics {
+            composite_score: 0.40,
+            ..Default::default()
+        },
+        ..fresh_ev.clone()
+    };
+    let (same_id, inserted3) = shared_cache
+        .upsert_active_storm_with_status(&lower_sev)
+        .unwrap();
+    assert!(!inserted3);
+    assert_eq!(same_id, fresh_id);
+    assert_eq!(
+        shared_cache.get_storm(fresh_id).unwrap().unwrap().severity,
+        StormSeverity::Critical
+    );
+
+    // 2. Startup reconciliation via SkybouncerEngineBuilder::build()
+    let mut protected = HashSet::new();
+    protected.insert(alice.to_string());
+    let rubric = RuleRubric::new("rules", Sensitivity::Medium);
+    let mut cfg = SkybouncerConfig::new(protected.clone(), rubric.clone())
+        .with_dry_run(true)
+        .with_dogpile_config(DogpileConfig {
+            storm_mode_ttl: Duration::from_secs(600),
+            ..Default::default()
+        });
+    cfg.pds_endpoint = Some(pds.server.uri());
+
+    let engine_builder = SkybouncerEngineBuilder::new(cfg.clone())
+        .with_cache(Arc::clone(&shared_cache))
+        .with_classifier(Arc::new(MockClassifier::permitted()))
+        .with_modlist_manager(Arc::new(ModListManager::from_shared_cache(Arc::clone(
+            &shared_cache,
+        ))))
+        .with_pds_client(Arc::new(
+            PdsRepoClient::from_credentials(pds.server.uri(), alice, "tok").unwrap(),
+        ))
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        shared_cache.get_storm(exp_id).unwrap().unwrap().status,
+        StormStatus::Resolved,
+        "expired SQLite active storm must be resolved on builder startup"
+    );
+    assert!(
+        engine_builder.is_storm_mode_active(alice),
+        "unexpired SQLite active storm must rehydrate into DogpileTracker on builder startup"
+    );
+
+    // 3. Startup reconciliation ALSO runs in SkybouncerEngine::new()
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let engine_new = skybouncer::SkybouncerEngine::new(
+        cfg,
+        follow_graph,
+        gate,
+        Arc::new(MockClassifier::permitted()),
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&shared_cache))),
+        Arc::new(PdsRepoClient::from_credentials(pds.server.uri(), alice, "tok").unwrap()),
+    )
+    .unwrap();
+    assert!(engine_new.is_storm_mode_active(alice));
+
+    // 4. set_storm_mode(alice, false) resolves active SQLite storm rows immediately
+    engine_builder.set_storm_mode(alice, false);
+    assert!(!engine_builder.is_storm_mode_active(alice));
+    assert_eq!(
+        shared_cache.get_storm(fresh_id).unwrap().unwrap().status,
+        StormStatus::Resolved
+    );
+    assert!(shared_cache
+        .list_storms(Some(alice), true, 10)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn test_pr2_dogpile_concurrent_dedup_missing_focal_dunk_ratio_and_detach_count() {
+    use async_trait::async_trait;
+    use skybouncer::dogpile::{StormStanceClassifier, StormStanceInput};
+    use skybouncer::time::monotonic_time_us;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SlowStance {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl StormStanceClassifier for SlowStance {
+        async fn classify_storm(
+            &self,
+            _input: &StormStanceInput,
+        ) -> Result<StormStanceVerdict, skybouncer::SkybouncerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(StormStanceVerdict::new(
+                true,
+                0.95,
+                "dogpile",
+                "hostile",
+                "coordinated quote cascade",
+            ))
+        }
+    }
+
+    let alice = "did:plc:alice";
+    let focal = "at://did:plc:alice/app.bsky.feed.post/3kmissing_focal";
+    let qt_low = "at://did:plc:q1/app.bsky.feed.post/q1";
+    let qt_high = "at://did:plc:q2/app.bsky.feed.post/q2";
+    let pds = GateMockPds::start().await;
+
+    // Deliberately omit focal post snapshot (focal_post == None) and provide 2 quote snaps
+    let enricher = Arc::new(MockContextEnricher::new());
+    enricher.set_post_engagement(PostEngagementSnapshot {
+        uri: qt_low.to_string(),
+        author_did: "did:plc:q1".to_string(),
+        author_handle: None,
+        author_followers: Some(200),
+        text: "low dunk".to_string(),
+        like_count: 50,
+        repost_count: 10,
+        reply_count: 0,
+        quote_count: 0,
+    });
+    enricher.set_post_engagement(PostEngagementSnapshot {
+        uri: qt_high.to_string(),
+        author_did: "did:plc:q2".to_string(),
+        author_handle: None,
+        author_followers: Some(500),
+        text: "huge dunk".to_string(),
+        like_count: 400,
+        repost_count: 50,
+        reply_count: 0,
+        quote_count: 0,
+    });
+
+    let stance_calls = Arc::new(AtomicUsize::new(0));
+    let dogpile_cfg = DogpileConfig {
+        storm_mode_ttl: Duration::from_secs(120),
+        structural_trigger_score: 0.25,
+        confirmed_score_threshold: 0.35,
+        ..Default::default()
+    };
+
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block harassment and spam", Sensitivity::Medium);
+    let modlist_manager =
+        Arc::new(ModListManager::from_shared_cache(Arc::clone(&cache)).with_rubric(rubric.clone()));
+    let mut protected = HashSet::new();
+    protected.insert(alice.to_string());
+    let mut cfg = SkybouncerConfig::new(protected, rubric)
+        .with_dry_run(false)
+        .with_enable_heuristic_prefilter(false)
+        .with_dogpile_config(dogpile_cfg)
+        .with_admin_did(alice);
+    cfg.pds_endpoint = Some(pds.server.uri());
+
+    let engine = SkybouncerEngineBuilder::new(cfg)
+        .with_cache(cache)
+        .with_follow_graph(follow_graph)
+        .with_gate(gate)
+        .with_classifier(Arc::new(MockClassifier::permitted()))
+        .with_modlist_manager(modlist_manager)
+        .with_pds_client(Arc::new(pds.client(alice)))
+        .with_enricher(enricher)
+        .with_storm_stance_classifier(Arc::new(SlowStance {
+            calls: Arc::clone(&stance_calls),
+        }))
+        .build()
+        .unwrap();
+
+    let candidate = SurgeCandidate {
+        target_did: alice.to_string(),
+        focal_post_uri: focal.to_string(),
+        observed_at_us: monotonic_time_us(),
+        initial_metrics: StormMetrics {
+            burst_z_score: 6.0,
+            direct_ratio: 2.0,
+            unique_authors_short: 40,
+            unique_oon_authors_short: 38,
+            out_of_network_ratio: 0.95,
+            structural_score: 0.90,
+            ..Default::default()
+        },
+        sample_replies: vec![],
+        recent_quote_uris: vec![qt_low.to_string(), qt_high.to_string()],
+    };
+
+    // Concurrent Stage 2/3 evaluation dedup: second caller gets Ok(None) while first runs
+    let (r1, r2) = tokio::join!(
+        engine.evaluate_storm_candidate(candidate.clone()),
+        engine.evaluate_storm_candidate(candidate)
+    );
+    let ev1 = r1.unwrap();
+    let ev2 = r2.unwrap();
+    let winners: Vec<StormEvent> = [ev1, ev2].into_iter().flatten().collect();
+    assert_eq!(winners.len(), 1, "concurrent evaluations must deduplicate");
+    assert_eq!(stance_calls.load(Ordering::SeqCst), 1);
+    // Missing focal_post must NOT synthesize dunk_ratio (must remain 0.0)
+    assert!(winners[0].metrics.dunk_ratio.abs() < f64::EPSILON);
+
+    // detach_quotes returns total detached count (2), while stats & SQLite postgate_detaches_applied
+    // increment ONLY by newly added detaches (2 first time, +0 on duplicate)!
+    let (_, _, total_1) = engine
+        .detach_quotes(
+            alice,
+            focal,
+            Some(&[qt_low.to_string(), qt_high.to_string()]),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total_1, 2);
+    assert_eq!(engine.stats().snapshot().postgate_detaches_applied, 2);
+    assert_eq!(
+        engine
+            .cache()
+            .get_storm(winners[0].id)
+            .unwrap()
+            .unwrap()
+            .postgate_detaches_applied,
+        2
+    );
+    let (_, _, total_2) = engine
+        .detach_quotes(
+            alice,
+            focal,
+            Some(&[qt_low.to_string(), qt_high.to_string()]),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total_2, 2);
+    assert_eq!(engine.stats().snapshot().postgate_detaches_applied, 2);
+    assert_eq!(
+        engine
+            .cache()
+            .get_storm(winners[0].id)
+            .unwrap()
+            .unwrap()
+            .postgate_detaches_applied,
+        2
+    );
+}
+
+#[tokio::test]
+async fn test_pr2_dogpile_stale_commit_clock_and_heuristic_prefilter_recording() {
+    use skybouncer::dogpile::MockStormStanceClassifier;
+    use tokio_util::sync::CancellationToken;
+
+    let alice = "did:plc:alice";
+    let focal = "at://did:plc:alice/app.bsky.feed.post/3kstale";
+    let pds = GateMockPds::start().await;
+
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist_manager = Arc::new(
+        ModListManager::from_shared_cache(Arc::clone(&cache))
+            .with_rubric(rubric.clone())
+            .with_dry_run(true),
+    );
+    let mut protected = HashSet::new();
+    protected.insert(alice.to_string());
+
+    let dogpile_cfg = DogpileConfig::default()
+        .with_min_unique_authors(3)
+        .with_min_out_of_network_ratio(0.5)
+        .with_structural_trigger_score(0.25)
+        .with_confirmed_score_threshold(0.55);
+    let mut cfg = SkybouncerConfig::new(protected, rubric)
+        .with_dry_run(true)
+        .with_enable_heuristic_prefilter(true)
+        .with_dogpile_config(dogpile_cfg);
+    cfg.pds_endpoint = Some(pds.server.uri());
+
+    let engine = SkybouncerEngineBuilder::new(cfg)
+        .with_cache(cache)
+        .with_follow_graph(follow_graph)
+        .with_gate(gate)
+        .with_classifier(Arc::new(MockClassifier::permitted()))
+        .with_modlist_manager(modlist_manager)
+        .with_pds_client(Arc::new(pds.client(alice)))
+        .with_storm_stance_classifier(Arc::new(MockStormStanceClassifier::new(
+            StormStanceVerdict::new(true, 0.9, "dogpile", "hostile", "mock"),
+        )))
+        .build()
+        .unwrap();
+
+    // Pre-seed heuristic pre-filter bounce on `focal` BEFORE the surge commits run so
+    // `dogpile_tracker.eval_outcomes` holds the recorded heuristic violation when surge triggers!
+    let (ev_tx, _ev_rx) = tokio::sync::mpsc::channel(16);
+    let heur_inter = skybouncer::matcher::Interaction {
+        post_uri: "at://did:plc:heur/app.bsky.feed.post/h1".to_string(),
+        post_cid: Some("cidh1".to_string()),
+        author_did: "did:plc:heur".to_string(),
+        target_did: alice.to_string(),
+        text: "CLAIM FREE AIRDROP CONNECT WALLET NOW http://scam.example".to_string(),
+        interaction_type: skybouncer::matcher::InteractionType::DirectReply,
+        parent_uri: Some(focal.to_string()),
+        root_uri: Some(focal.to_string()),
+        quote_uri: None,
+        created_at_us: 1_650_000_000_000_000,
+        image_cids: Vec::new(),
+        image_alts: Vec::new(),
+        enriched_context: None,
+        rubric: None,
+    };
+    let fast_out = engine
+        .process_interaction_queued(heur_inter, &ev_tx)
+        .await
+        .unwrap();
+    assert!(fast_out.is_bounced());
+
+    // Now feed additional replies with stale 2022 timestamps (time_us = 1_650_000_000_000_000):
+    // local monotonic clock activates Storm Mode AND the storm event carries violation_rate > 0!
+    let mut storm_rx = engine.subscribe_storm_alerts();
+    let (commit_tx, commit_rx) = tokio::sync::mpsc::channel(32);
+    let cancel = CancellationToken::new();
+    let eng_clone = engine.clone();
+    let cancel_clone = cancel.clone();
+    let runner = tokio::spawn(async move { eng_clone.run(commit_rx, cancel_clone).await });
+
+    for i in 0..4 {
+        let mut c = make_reply_commit(
+            &format!("did:plc:stale_{i}"),
+            alice,
+            &format!("r{i}"),
+            "3kstale",
+            "hostile reply",
+        );
+        c.time_us = 1_650_000_000_000_000;
+        commit_tx.send(c).await.unwrap();
+    }
+    drop(commit_tx);
+    runner.await.unwrap().unwrap();
+
+    let storm_notif = tokio::time::timeout(Duration::from_secs(2), storm_rx.recv())
+        .await
+        .expect("storm notification timeout")
+        .expect("storm notification present");
+    assert_eq!(storm_notif.storm.focal_post_uri, focal);
+    assert!(engine.is_storm_mode_active(alice));
+    assert!(
+        storm_notif.storm.metrics.violation_rate > 0.0,
+        "heuristic pre-filter violation must be recorded into dogpile_tracker eval_outcomes"
+    );
 }

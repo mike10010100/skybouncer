@@ -618,7 +618,7 @@ async fn test_appview_enricher_hops_across_blocked_post_boundary() {
         ctx.format_for_interaction(&interaction.author_did, &interaction.target_did);
     assert!(role_formatted.contains("[1] OtherUser (did:plc:troll): \"Bad faith strawman claim\""));
     assert!(role_formatted.contains("[2] Author (did:plc:other): \"No.\""));
-    assert!(role_formatted.contains("[3] Target (did:plc:target): \"\"nuh uh\"\""));
+    assert!(role_formatted.contains("[3] Target (did:plc:target): \"'nuh uh'\""));
     assert!(role_formatted.contains("[IMMEDIATE PARENT — Author is replying to this post]"));
 }
 
