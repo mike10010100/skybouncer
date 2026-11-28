@@ -167,4 +167,62 @@ mod tests {
             .expect("synchronous");
         assert_eq!(sync_mode, 1);
     }
+
+    #[test]
+    fn require_non_empty_did_trims_valid_and_rejects_blank() {
+        assert_eq!(
+            require_non_empty_did("did:plc:alice", "tenant_did").unwrap(),
+            "did:plc:alice"
+        );
+        assert_eq!(
+            require_non_empty_did("  did:plc:alice\t\n ", "tenant_did").unwrap(),
+            "did:plc:alice"
+        );
+
+        let err_empty = require_non_empty_did("", "tenant_did").unwrap_err();
+        assert!(
+            matches!(err_empty, crate::error::SkybouncerError::Config(ref msg) if msg == "tenant_did cannot be empty"),
+            "unexpected error for empty DID: {err_empty:?}"
+        );
+
+        let err_ws = require_non_empty_did("   \t\n ", "protected_did").unwrap_err();
+        assert!(
+            matches!(err_ws, crate::error::SkybouncerError::Config(ref msg) if msg == "protected_did cannot be empty"),
+            "unexpected error for whitespace DID: {err_ws:?}"
+        );
+    }
+
+    #[test]
+    fn is_pds_record_not_found_matches_each_known_pds_error_independently() {
+        assert!(is_pds_record_not_found("CouldNotFindRecord"));
+        assert!(is_pds_record_not_found(
+            r#"XRPC error 400: {"error":"CouldNotFindRecord","message":"missing"}"#
+        ));
+
+        assert!(is_pds_record_not_found("RecordNotFound"));
+        assert!(is_pds_record_not_found(
+            r#"XRPC error 400: {"error":"RecordNotFound","message":"missing"}"#
+        ));
+
+        assert!(is_pds_record_not_found("Could not locate record"));
+        assert!(is_pds_record_not_found(
+            "PDS error: Could not locate record at://did:plc:alice/app.bsky.graph.list/3k"
+        ));
+
+        assert!(is_pds_record_not_found("Could not find record"));
+        assert!(is_pds_record_not_found(
+            "PDS error: Could not find record for rkey 3k"
+        ));
+    }
+
+    #[test]
+    fn is_pds_record_not_found_rejects_unrelated_and_raw_404_errors() {
+        assert!(!is_pds_record_not_found(""));
+        assert!(!is_pds_record_not_found("HTTP 404 Not Found"));
+        assert!(!is_pds_record_not_found(
+            "<html><body>404 Not Found</body></html>"
+        ));
+        assert!(!is_pds_record_not_found("InternalServerError"));
+        assert!(!is_pds_record_not_found("InvalidSwap"));
+    }
 }
