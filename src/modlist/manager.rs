@@ -6,16 +6,15 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::Deserialize;
-use skybase::repo::PdsRepoClient;
+use skybase::repo::{ListRecordEntry, PdsRepoClient};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::classifier::{RuleRubric, ViolationCategory};
 use crate::error::SkybouncerError;
 use crate::modlist::cache::{BouncedUser, DeduplicationCache, ModListConfig};
+use crate::modlist::sovereign_config::fetch_sovereign_config_record;
 use crate::time::current_time_us;
-use crate::types::{
-    now_iso8601, ListBlockRecord, ListItemRecord, ListRecordsResponse, ModListRecord,
-};
+use crate::types::{now_iso8601, ListBlockRecord, ListItemRecord, ModListRecord};
 
 /// Default name assigned to newly provisioned moderation lists.
 pub const DEFAULT_MOD_LIST_NAME: &str = "Skybouncer Moderation List";
@@ -94,6 +93,10 @@ pub struct BounceRequest<'a> {
     /// Explicit expiry (microseconds since Unix epoch); falls back to the rubric duration unless
     /// explicitly set via [`Self::with_expires_at`].
     pub expires_at: Option<u64>,
+    /// Optional per-tenant moderation rubric overriding the manager's default rubric.
+    pub rubric: Option<&'a RuleRubric>,
+    /// When `true`, skips the rubric threshold check inside [`ModListManager::bounce`].
+    pub skip_threshold_check: bool,
     explicit_expiry: bool,
 }
 
@@ -118,6 +121,8 @@ impl<'a> BounceRequest<'a> {
             post_text: "",
             reply_to_uri: None,
             expires_at: None,
+            rubric: None,
+            skip_threshold_check: false,
             explicit_expiry: false,
         }
     }
@@ -143,6 +148,48 @@ impl<'a> BounceRequest<'a> {
         self.expires_at = expires_at;
         self.explicit_expiry = true;
         self
+    }
+
+    /// Attaches a per-tenant [`RuleRubric`] governing sensitivity thresholds and duration.
+    #[must_use]
+    pub fn with_rubric(mut self, rubric: &'a RuleRubric) -> Self {
+        self.rubric = Some(rubric);
+        self
+    }
+
+    /// Controls whether [`ModListManager::bounce`] skips the rubric threshold check.
+    #[must_use]
+    pub fn with_skip_threshold_check(mut self, skip: bool) -> Self {
+        self.skip_threshold_check = skip;
+        self
+    }
+}
+
+/// Outcome of an automated [`ModListManager::bounce`] invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BounceOutcome {
+    /// A new `app.bsky.graph.listitem` record was written on the PDS and persisted to SQLite.
+    Bounced(String),
+    /// The subject was already recorded as bounced for `protected_did` in SQLite.
+    AlreadyBounced,
+    /// The classification confidence was below the governing rubric's sensitivity threshold.
+    BelowThreshold,
+}
+
+impl BounceOutcome {
+    /// Returns `true` if a new bounce was executed and recorded.
+    #[must_use]
+    pub const fn is_bounced(&self) -> bool {
+        matches!(self, Self::Bounced(_))
+    }
+
+    /// Returns the created `app.bsky.graph.listitem` AT-URI if a bounce was executed.
+    #[must_use]
+    pub fn listitem_uri(&self) -> Option<&str> {
+        match self {
+            Self::Bounced(uri) => Some(uri.as_str()),
+            Self::AlreadyBounced | Self::BelowThreshold => None,
+        }
     }
 }
 
@@ -289,6 +336,46 @@ impl ModListManager {
         self.rubric.read().clone()
     }
 
+    fn assert_client_matches_protected_did(
+        &self,
+        pds_client: &PdsRepoClient,
+        protected_did: &str,
+    ) -> Result<(), SkybouncerError> {
+        if !self.dry_run && pds_client.did() != protected_did {
+            return Err(SkybouncerError::Repo(format!(
+                "PDS client DID '{}' does not match protected DID '{protected_did}'",
+                pds_client.did()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_modlist_uri(uri: &str, protected_did: &str) -> Result<(), SkybouncerError> {
+        let Some((did, collection, rkey)) = skybase::repo::split_at_uri(uri) else {
+            return Err(SkybouncerError::Repo(format!(
+                "Invalid moderation list AT-URI: '{uri}'"
+            )));
+        };
+        if did != protected_did || collection != "app.bsky.graph.list" {
+            return Err(SkybouncerError::Repo(format!(
+                "Moderation list AT-URI '{uri}' does not belong to {protected_did}/app.bsky.graph.list"
+            )));
+        }
+        skybase::repo::validate_rkey(rkey).map_err(|e| {
+            SkybouncerError::Repo(format!("Invalid moderation list rkey in '{uri}': {e}"))
+        })?;
+        Ok(())
+    }
+
+    fn is_skybouncer_owned_list(&self, record: &ModListRecord) -> bool {
+        if record.name == self.list_name || record.name == DEFAULT_MOD_LIST_NAME {
+            return true;
+        }
+        record.description.as_deref().is_some_and(|desc| {
+            desc.contains("[skybouncer:") || desc.contains("maintained by Skybouncer")
+        })
+    }
+
     /// Ensures that an ATProto moderation list (`app.bsky.graph.list` with
     /// `purpose: "app.bsky.graph.defs#modlist"`) exists for the given protected user.
     ///
@@ -299,14 +386,15 @@ impl ModListManager {
     ///    concurrent provisioning and prevent duplicate list creations on the PDS.
     /// 3. **Double-check cache (under lock)**: If a concurrent task finished provisioning while
     ///    waiting for the lock, returns the newly cached URI.
-    /// 4. **Remote PDS discovery**: Queries remote PDS via `com.atproto.repo.listRecords`. If an
-    ///    existing list with purpose `app.bsky.graph.defs#modlist` is discovered, caches it and
-    ///    returns its URI.
+    /// 4. **Remote PDS discovery**: Queries remote PDS via `com.atproto.repo.listRecords` with
+    ///    cursor pagination, adopting only lists owned by Skybouncer (matching name/metadata or
+    ///    persisted `mod_list_uri` in `social.skybouncer.config/self`).
     /// 5. **Provisioning**: Creates a new moderation list on the sovereign PDS via
-    ///    `pds_client.create_record`, caches the resulting URI and CID, and returns the URI.
+    ///    `pds_client.create_record`, validates the resulting AT-URI, caches it, and returns it.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Repo`] if PDS record creation fails,
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// [`SkybouncerError::Repo`] if PDS record creation or DID ownership check fails,
     /// or [`SkybouncerError::Database`] if cache access fails.
     #[instrument(skip(self, pds_client), fields(protected_did = %protected_did))]
     pub async fn ensure_mod_list(
@@ -314,8 +402,12 @@ impl ModListManager {
         pds_client: &PdsRepoClient,
         protected_did: &str,
     ) -> Result<String, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
+        self.assert_client_matches_protected_did(pds_client, protected_did)?;
+
         // 1. Fast cache-first lookup (lock-free path)
         if let Some(config) = self.cache.get_mod_list(protected_did)? {
+            Self::validate_modlist_uri(&config.list_uri, protected_did)?;
             debug!(
                 list_uri = %config.list_uri,
                 "Found existing moderation list in SQLite cache"
@@ -332,6 +424,7 @@ impl ModListManager {
 
         // 3. Double-check cache under the lock: another task may have provisioned while we waited
         if let Some(config) = self.cache.get_mod_list(protected_did)? {
+            Self::validate_modlist_uri(&config.list_uri, protected_did)?;
             debug!(
                 list_uri = %config.list_uri,
                 "Found moderation list provisioned by concurrent task in SQLite cache"
@@ -363,32 +456,56 @@ impl ModListManager {
             return Ok(simulated_uri);
         }
 
-        let resp = self
-            .list_pds_records::<ModListRecord>(pds_client, "app.bsky.graph.list", 50)
+        let records = self
+            .list_pds_records::<ModListRecord>(pds_client, protected_did, "app.bsky.graph.list")
             .await?;
 
-        for item in resp.records {
-            if item.value.is_modlist() {
-                info!(
-                    list_uri = %item.uri,
-                    "Discovered existing remote moderation list on PDS; caching locally"
-                );
-                let now_us = current_time_us();
-                let config = ModListConfig {
-                    user_did: protected_did.to_string(),
-                    list_uri: item.uri.clone(),
-                    list_cid: item.cid,
-                    created_at: now_us,
-                };
-                self.cache.set_mod_list(&config)?;
-                if let Err(e) = self
-                    .ensure_list_blocked(pds_client, protected_did, &item.uri)
-                    .await
-                {
-                    warn!(error = %e, protected_did = %protected_did, "Failed to ensure list blocked");
-                }
-                return Ok(item.uri);
+        let valid_modlists: Vec<ListRecordEntry<ModListRecord>> = records
+            .into_iter()
+            .filter(|item| {
+                item.value.is_modlist()
+                    && Self::validate_modlist_uri(&item.uri, protected_did).is_ok()
+            })
+            .collect();
+
+        let matched_by_metadata = valid_modlists
+            .iter()
+            .find(|item| self.is_skybouncer_owned_list(&item.value))
+            .cloned();
+
+        let discovered = if matched_by_metadata.is_some() {
+            matched_by_metadata
+        } else if !valid_modlists.is_empty() {
+            let persisted_uri = fetch_sovereign_config_record(pds_client, protected_did)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|(cfg, _)| cfg.mod_list_uri);
+            persisted_uri.and_then(|uri| valid_modlists.into_iter().find(|item| item.uri == uri))
+        } else {
+            None
+        };
+
+        if let Some(item) = discovered {
+            info!(
+                list_uri = %item.uri,
+                "Discovered existing Skybouncer moderation list on PDS; caching locally"
+            );
+            let now_us = current_time_us();
+            let config = ModListConfig {
+                user_did: protected_did.to_string(),
+                list_uri: item.uri.clone(),
+                list_cid: item.cid,
+                created_at: now_us,
+            };
+            self.cache.set_mod_list(&config)?;
+            if let Err(e) = self
+                .ensure_list_blocked(pds_client, protected_did, &item.uri)
+                .await
+            {
+                warn!(error = %e, protected_did = %protected_did, "Failed to ensure list blocked");
             }
+            return Ok(item.uri);
         }
 
         info!(
@@ -410,6 +527,7 @@ impl ModListManager {
             .map_err(|e| {
                 SkybouncerError::Repo(format!("Failed to create moderation list on PDS: {e}"))
             })?;
+        Self::validate_modlist_uri(&result.uri, protected_did)?;
 
         info!(
             list_uri = %result.uri,
@@ -447,6 +565,9 @@ impl ModListManager {
         protected_did: &str,
         list_uri: &str,
     ) -> Result<(), SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
+        self.assert_client_matches_protected_did(pds_client, protected_did)?;
+
         // Fast path: already confirmed and cached locally
         if self.cache.is_list_blocked(protected_did)? {
             debug!(
@@ -476,11 +597,15 @@ impl ModListManager {
         }
 
         // Check if remote PDS already has a listblock targeting this list_uri
-        let resp = self
-            .list_pds_records::<ListBlockRecord>(pds_client, "app.bsky.graph.listblock", 50)
+        let records = self
+            .list_pds_records::<ListBlockRecord>(
+                pds_client,
+                protected_did,
+                "app.bsky.graph.listblock",
+            )
             .await?;
 
-        for item in resp.records {
+        for item in records {
             if item.value.subject == list_uri {
                 info!(
                     protected_did = %protected_did,
@@ -524,23 +649,22 @@ impl ModListManager {
     /// text in the deduplication cache.
     ///
     /// # Pipeline & Concurrency Architecture
-    /// 1. **Rubric Threshold Check**: If a rubric is configured and the confidence score falls
-    ///    below the required sensitivity threshold, drops the candidate and returns `Ok(None)`.
+    /// 1. **Rubric Threshold Check**: Unless `skip_threshold_check` is `true`, evaluates the
+    ///    per-request rubric (falling back to `self.rubric`). If below threshold, returns
+    ///    `Ok(BounceOutcome::BelowThreshold)`.
     /// 2. **Fast Deduplication Check (unlocked)**: Checks the SQLite cache to see if the user is
-    ///    already bounced. If so, returns `Ok(None)` immediately ($0 cost, 0 network mutations).
-    /// 3. **Striped Async Lock**: Synchronizes on the shard for the composite
-    ///    `(protected_did, candidate_did)` key to serialize in-flight mutations.
-    /// 4. **Double-Check Deduplication (under lock)**: Re-checks if the candidate was bounced by
-    ///    a concurrent task while waiting for the lock. If so, short-circuits to `Ok(None)` with
-    ///    zero additional PDS writes.
-    /// 5. **ModList Provisioning**: Calls [`Self::ensure_mod_list`] to ensure the parent list exists.
-    /// 6. **PDS Mutation**: Issues a DPoP-signed `com.atproto.repo.createRecord` for
-    ///    `app.bsky.graph.listitem` on the PDS.
-    /// 7. **Cache Persistence**: Records the bounce in the local SQLite `bounced_users` table.
+    ///    already bounced. If so, returns `Ok(BounceOutcome::AlreadyBounced)`.
+    /// 3. **Striped Async Lock**: Synchronizes on the shard for `(protected_did, candidate_did)`.
+    /// 4. **Double-Check Deduplication (under lock)**: If concurrently bounced, returns
+    ///    `Ok(BounceOutcome::AlreadyBounced)`.
+    /// 5. **ModList Provisioning & PDS Mutation**: Provisions the list if needed, writes the
+    ///    `app.bsky.graph.listitem` record (verifying `pds_client.did() == protected_did` in live
+    ///    mode), persists in SQLite, and returns `Ok(BounceOutcome::Bounced(uri))`.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Repo`] if PDS mutation fails, or [`SkybouncerError::Database`]
-    /// if cache access fails.
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// [`SkybouncerError::Repo`] if PDS mutation or DID ownership check fails, or
+    /// [`SkybouncerError::Database`] if cache access fails.
     #[instrument(
         skip(self, pds_client, request),
         fields(
@@ -554,7 +678,7 @@ impl ModListManager {
         &self,
         pds_client: &PdsRepoClient,
         request: BounceRequest<'_>,
-    ) -> Result<Option<String>, SkybouncerError> {
+    ) -> Result<BounceOutcome, SkybouncerError> {
         let BounceRequest {
             protected_did,
             candidate_did,
@@ -565,18 +689,28 @@ impl ModListManager {
             post_text,
             reply_to_uri,
             expires_at,
+            rubric: req_rubric,
+            skip_threshold_check,
             explicit_expiry,
         } = request;
 
-        // 1. Check rubric threshold if rubric is configured
-        if let Some(ref rubric) = *self.rubric.read() {
-            if !rubric.meets_threshold(category, confidence) {
-                debug!(
-                    confidence = %confidence,
-                    threshold = %rubric.sensitivity.threshold(),
-                    "Confidence score below sensitivity threshold; skipping bounce"
-                );
-                return Ok(None);
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
+        self.assert_client_matches_protected_did(pds_client, protected_did)?;
+
+        let governing_rubric: Option<RuleRubric> =
+            req_rubric.cloned().or_else(|| self.rubric.read().clone());
+
+        // 1. Check governing rubric threshold unless explicitly bypassed
+        if !skip_threshold_check {
+            if let Some(ref rubric) = governing_rubric {
+                if !rubric.meets_threshold(category, confidence) {
+                    debug!(
+                        confidence = %confidence,
+                        threshold = %rubric.sensitivity.threshold(),
+                        "Confidence score below sensitivity threshold; skipping bounce"
+                    );
+                    return Ok(BounceOutcome::BelowThreshold);
+                }
             }
         }
 
@@ -587,7 +721,7 @@ impl ModListManager {
                 protected_did = %protected_did,
                 "Candidate is already recorded as bounced for this user in cache; skipping duplicate mutation"
             );
-            return Ok(None);
+            return Ok(BounceOutcome::AlreadyBounced);
         }
 
         // 3. Acquire shard async lock for composite key to serialize concurrent bounces
@@ -603,7 +737,7 @@ impl ModListManager {
                 protected_did = %protected_did,
                 "Candidate was bounced by a concurrent task for this user; short-circuiting duplicate mutation"
             );
-            return Ok(None);
+            return Ok(BounceOutcome::AlreadyBounced);
         }
 
         let now_us = current_time_us();
@@ -611,8 +745,7 @@ impl ModListManager {
             expires_at
         } else {
             expires_at.or_else(|| {
-                self.rubric
-                    .read()
+                governing_rubric
                     .as_ref()
                     .and_then(|r| r.bounce_duration.expires_at_us(now_us))
             })
@@ -634,7 +767,7 @@ impl ModListManager {
             )
             .await?;
 
-        Ok(Some(result_uri))
+        Ok(BounceOutcome::Bounced(result_uri))
     }
 
     /// Manually bounces (or permanently blocks) an account on the sovereign PDS, restoring any
@@ -671,6 +804,8 @@ impl ModListManager {
         duration: crate::classifier::BounceDuration,
         upgrade_if_temp: bool,
     ) -> Result<ManualBounceOutcome, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
+        self.assert_client_matches_protected_did(pds_client, protected_did)?;
         let lock_key = format!("{protected_did}:{subject_did}");
         let shard = self.bounce_locks.shard_for(&lock_key);
         let _guard = shard.lock().await;
@@ -766,6 +901,8 @@ impl ModListManager {
         now_us: u64,
         effective_expires_at: Option<u64>,
     ) -> Result<String, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
+        self.assert_client_matches_protected_did(pds_client, protected_did)?;
         let list_uri = self.ensure_mod_list(pds_client, protected_did).await?;
 
         let rkey = if self.dry_run {
@@ -877,6 +1014,8 @@ impl ModListManager {
         protected_did: &str,
         subject_did: &str,
     ) -> Result<bool, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
+        self.assert_client_matches_protected_did(pds_client, protected_did)?;
         let lock_key = format!("{protected_did}:{subject_did}");
         let shard = self.bounce_locks.shard_for(&lock_key);
         let _guard = shard.lock().await;
@@ -901,7 +1040,8 @@ impl ModListManager {
             "Pardoning user: deleting all associated listitems from sovereign PDS"
         );
 
-        // 2. Delete all associated listitem records from PDS (bypassed in dry-run)
+        // 2. Delete all associated listitem records from PDS (bypassed in dry-run),
+        //    pruning each SQLite rkey incrementally as its PDS deletion succeeds or is already gone.
         if self.dry_run {
             info!(
                 subject_did = %subject_did,
@@ -911,14 +1051,32 @@ impl ModListManager {
             );
         } else {
             for rkey in &rkeys {
-                pds_client
+                match pds_client
                     .delete_record("app.bsky.graph.listitem", rkey)
                     .await
-                    .map_err(|e| {
-                        SkybouncerError::Repo(format!(
+                {
+                    Ok(()) => {
+                        let _ =
+                            self.cache
+                                .remove_bounced_rkey_for(protected_did, subject_did, rkey)?;
+                    }
+                    Err(e) if crate::util::is_pds_record_not_found(&e.to_string()) => {
+                        warn!(
+                            rkey = %rkey,
+                            subject_did = %subject_did,
+                            protected_did = %protected_did,
+                            "Listitem record already absent on PDS during pardon; pruning SQLite rkey idempotently"
+                        );
+                        let _ =
+                            self.cache
+                                .remove_bounced_rkey_for(protected_did, subject_did, rkey)?;
+                    }
+                    Err(e) => {
+                        return Err(SkybouncerError::Repo(format!(
                             "Failed to delete listitem {rkey} for {subject_did} on PDS: {e}"
-                        ))
-                    })?;
+                        )));
+                    }
+                }
             }
         }
 
@@ -947,13 +1105,15 @@ impl ModListManager {
     /// - `Ok(None)` if the subject is not recorded as bounced for `protected_did`.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if cache access fails.
+    /// Returns [`SkybouncerError::Config`] if `protected_did` is empty/whitespace,
+    /// or [`SkybouncerError::Database`] if cache access fails.
     #[instrument(skip(self), fields(protected_did = %protected_did, subject_did = %subject_did))]
     pub async fn upgrade_bounce_to_permanent(
         &self,
         protected_did: &str,
         subject_did: &str,
     ) -> Result<Option<bool>, SkybouncerError> {
+        let protected_did = crate::util::require_non_empty_did(protected_did, "protected_did")?;
         let lock_key = format!("{protected_did}:{subject_did}");
         let shard = self.bounce_locks.shard_for(&lock_key);
         let _guard = shard.lock().await;
@@ -1026,37 +1186,36 @@ impl ModListManager {
         self.cache.get_mod_list(user_did)
     }
 
-    /// Queries the PDS via `com.atproto.repo.listRecords`.
+    /// Queries the PDS via `com.atproto.repo.listRecords` with cursor pagination (bounded at 20 pages).
     async fn list_pds_records<T: for<'de> Deserialize<'de>>(
         &self,
         pds_client: &PdsRepoClient,
+        protected_did: &str,
         collection: &str,
-        limit: u32,
-    ) -> Result<ListRecordsResponse<T>, SkybouncerError> {
-        let endpoint = pds_client
-            .pds_endpoint()
-            .map_err(|e| SkybouncerError::Repo(format!("Failed to resolve PDS endpoint: {e}")))?
-            .trim_end_matches('/');
+    ) -> Result<Vec<ListRecordEntry<T>>, SkybouncerError> {
+        const MAX_PAGES: usize = 20;
+        const PAGE_LIMIT: u32 = 100;
 
-        let mut url = url::Url::parse(&format!("{endpoint}/xrpc/com.atproto.repo.listRecords"))
-            .map_err(|e| SkybouncerError::Repo(format!("Invalid PDS endpoint URL: {e}")))?;
+        let mut all_records = Vec::new();
+        let mut cursor: Option<String> = None;
 
-        url.query_pairs_mut()
-            .append_pair("repo", pds_client.did())
-            .append_pair("collection", collection)
-            .append_pair("limit", &limit.to_string());
+        for _ in 0..MAX_PAGES {
+            let page = pds_client
+                .list_records::<T>(protected_did, collection, PAGE_LIMIT, cursor.as_deref())
+                .await
+                .map_err(|e| {
+                    SkybouncerError::Repo(format!("listRecords failed for {collection}: {e}"))
+                })?;
 
-        let resp = pds_client.http_client().get(url).send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err_text = resp.text().await.unwrap_or_default();
-            return Err(SkybouncerError::Repo(format!(
-                "listRecords failed with status {status}: {err_text}"
-            )));
+            all_records.extend(page.records);
+            match page.cursor.filter(|c| !c.trim().is_empty()) {
+                Some(next) if cursor.as_deref() != Some(next.as_str()) => {
+                    cursor = Some(next);
+                }
+                _ => break,
+            }
         }
 
-        let parsed: ListRecordsResponse<T> = resp.json().await?;
-        Ok(parsed)
+        Ok(all_records)
     }
 }

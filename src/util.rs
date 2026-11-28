@@ -59,6 +59,33 @@ pub fn apply_common_pragmas(
     Ok(())
 }
 
+/// Validates that a tenant/protected DID argument is non-empty after trimming whitespace,
+/// failing closed with [`crate::error::SkybouncerError::Config`] otherwise.
+pub(crate) fn require_non_empty_did<'a>(
+    did: &'a str,
+    label: &str,
+) -> Result<&'a str, crate::error::SkybouncerError> {
+    let clean = did.trim();
+    if clean.is_empty() {
+        return Err(crate::error::SkybouncerError::Config(format!(
+            "{label} cannot be empty"
+        )));
+    }
+    Ok(clean)
+}
+
+/// Returns `true` if a PDS error string indicates a missing record (`RecordNotFound` /
+/// `CouldNotFindRecord` / `"Could not locate record"` / `"Could not find record"`).
+///
+/// Intentionally does NOT match raw `"404"` substrings, avoiding misclassifying proxy/gateway
+/// 404 HTML responses as missing records.
+pub(crate) fn is_pds_record_not_found(msg: &str) -> bool {
+    msg.contains("CouldNotFindRecord")
+        || msg.contains("RecordNotFound")
+        || msg.contains("Could not locate record")
+        || msg.contains("Could not find record")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 mod tests {

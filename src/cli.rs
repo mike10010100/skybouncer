@@ -62,7 +62,7 @@ pub fn resolve_daemon_url(args: &[String]) -> String {
 /// Resolves an optional authentication bearer token for CLI requests (`status`, `pardon`, `simulate`).
 ///
 /// Precedence: `--token <TOKEN>` CLI flag, then `SKYBOUNCER_TOKEN` / `SKYBOUNCER_API_TOKEN` /
-/// `SKYBOUNCER_SESSION_TOKEN` / `PDS_ACCESS_TOKEN` environment variables (ignoring placeholder values).
+/// `SKYBOUNCER_SESSION_TOKEN` environment variables (ignoring placeholder values).
 #[must_use]
 pub fn resolve_cli_token(args: &[String]) -> Option<String> {
     if let Some(token) = arg_value(args, "--token") {
@@ -75,7 +75,6 @@ pub fn resolve_cli_token(args: &[String]) -> Option<String> {
         "SKYBOUNCER_TOKEN",
         "SKYBOUNCER_API_TOKEN",
         "SKYBOUNCER_SESSION_TOKEN",
-        "PDS_ACCESS_TOKEN",
     ])
     .filter(|val| {
         !matches!(
@@ -350,7 +349,7 @@ pub fn help_text() -> String {
     );
     out.push_str("PARDON OPTIONS:\n");
     out.push_str("  --url <URL>               Daemon base URL (default: http://127.0.0.1:3000)\n");
-    out.push_str("  --token <TOKEN>           Bearer token (or set SKYBOUNCER_API_TOKEN / PDS_ACCESS_TOKEN)\n");
+    out.push_str("  --token <TOKEN>           Bearer token (or set SKYBOUNCER_API_TOKEN)\n");
     out.push_str("  --target <DID>            Protected user DID whose modlist to pardon from\n");
     out.push_str("  --allowlist               Also add the account to your permanent allowlist\n");
     out

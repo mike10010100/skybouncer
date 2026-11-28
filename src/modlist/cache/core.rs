@@ -24,6 +24,7 @@ impl DeduplicationCache {
 
         Self::apply_pragmas(&conn, 5000)?;
         Self::init_schema(&conn)?;
+        crate::crypto::set_sqlite_file_permissions(path);
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -174,7 +175,8 @@ impl DeduplicationCache {
             CREATE TABLE IF NOT EXISTS did_handles (
                 did TEXT PRIMARY KEY,
                 handle TEXT NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                handle_verified INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS dashboard_stats (
@@ -231,6 +233,10 @@ impl DeduplicationCache {
         );
         let _ = conn.execute(
             "ALTER TABLE bounced_users ADD COLUMN reply_to_uri TEXT;",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE did_handles ADD COLUMN handle_verified INTEGER NOT NULL DEFAULT 0;",
             [],
         );
 

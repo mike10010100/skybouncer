@@ -79,6 +79,9 @@ pub fn load_dotenv_file(path: &std::path::Path) {
             if let Some((k, v)) = line.split_once('=') {
                 let key = k.trim();
                 let val = v.trim().trim_matches('"').trim_matches('\'');
+                if key.is_empty() || key.contains('=') || key.contains('\0') || val.contains('\0') {
+                    continue;
+                }
                 if std::env::var_os(key).is_none() {
                     std::env::set_var(key, val);
                 }
@@ -265,5 +268,31 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         // Must not panic.
         load_dotenv_file(&path);
+    }
+
+    #[test]
+    fn load_dotenv_file_skips_empty_equals_and_nul_keys_or_values() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "skyb_env_invalid_{}.env",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let (valid_key, nul_val_key) = unique("dotenv_guard");
+        unset(&valid_key);
+        unset(&nul_val_key);
+
+        let contents = format!(
+            "=empty_key\n   =whitespace_key\nBAD\0KEY=value\n{nul_val_key}=val\0ue\n{valid_key}=safe_val\n"
+        );
+        std::fs::write(&path, contents).expect("write invalid .env");
+
+        // Must not panic on empty/NUL keys or values, and still loads valid keys.
+        load_dotenv_file(&path);
+        assert_eq!(var(&[&valid_key]).as_deref(), Some("safe_val"));
+        assert_eq!(var(&[&nul_val_key]), None);
+
+        let _ = std::fs::remove_file(&path);
+        unset(&valid_key);
+        unset(&nul_val_key);
     }
 }

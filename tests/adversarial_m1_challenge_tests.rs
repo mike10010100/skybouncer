@@ -687,15 +687,11 @@ async fn test_adversarial_rubric_precedence() {
 /// When the engine default rubric is Medium sensitivity (threshold 0.75), but a tenant
 /// configures a custom rubric with High sensitivity (threshold 0.50):
 /// 1. `SkybouncerEngine` Tier 8 checks `tenant_rubric.meets_threshold()` -> passes for confidence 0.70.
-/// 2. `ModListManager::bounce` re-checks its internal global rubric (`meets_threshold()`).
-/// 3. Because `0.70 < 0.75`, `ModListManager` drops the bounce and returns `Ok(None)`.
-/// 4. `SkybouncerEngine` assumes `None` means `AlreadyBounced` ("double-checked lock hit").
-///
-/// This test empirically confirms and documents this cross-layer interaction.
+/// Regression test: per-tenant High rubric honors 0.70 confidence even when fleet default is Medium (0.75).
 #[tokio::test]
-async fn test_adversarial_multitenant_modlist_manager_rubric_collision() {
+async fn test_adversarial_multitenant_modlist_manager_honors_tenant_rubric() {
     let tenant_did = "did:plc:high_sens_tenant";
-    let tenant_rubric = RuleRubric::new("Custom high sensitivity", Sensitivity::High); // 0.50
+    let tenant_rubric = RuleRubric::new("Custom high sensitivity", Sensitivity::High); // 0.60
     let fleet_default_rubric = RuleRubric::new("Fleet medium default", Sensitivity::Medium); // 0.75
 
     let mut protected = HashSet::new();
@@ -704,7 +700,7 @@ async fn test_adversarial_multitenant_modlist_manager_rubric_collision() {
     let config = SkybouncerConfig::new(protected, fleet_default_rubric).with_dry_run(true);
     let classifier = Arc::new(MockClassifier::new(Verdict::violation(
         ViolationCategory::Spam,
-        0.70, // 0.70 is >= 0.50 (tenant High) but < 0.75 (fleet Medium)
+        0.70, // 0.70 is >= 0.60 (tenant High) but < 0.75 (fleet Medium)
         "Spam detected",
     )));
 
@@ -733,19 +729,15 @@ async fn test_adversarial_multitenant_modlist_manager_rubric_collision() {
 
     let outcome = engine.process_interaction(interaction).await.unwrap();
 
-    // EMPIRICAL VERIFICATION OF MODLIST_MANAGER DRIFT:
-    // Instead of Bounced, outcome is AlreadyBounced because ModListManager dropped it
-    // against the fleet default rubric threshold (0.75)!
     match outcome {
-        InteractionOutcome::AlreadyBounced {
+        InteractionOutcome::Bounced {
             author_did,
             target_did,
+            ..
         } => {
             assert_eq!(author_did, "did:plc:violator");
             assert_eq!(target_did, tenant_did);
         }
-        other => panic!(
-            "Expected AlreadyBounced due to ModListManager global rubric collision, got {other:?}"
-        ),
+        other => panic!("Expected Bounced under tenant High sensitivity rubric, got {other:?}"),
     }
 }

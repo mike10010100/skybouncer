@@ -28,6 +28,8 @@ pub struct ApiState {
     pub engine: Arc<SkybouncerEngine>,
     /// Bounded sliding-window rate limiter for the anonymous live sandbox (`POST /api/simulate/guest`).
     pub guest_limiter: Arc<GuestSandboxLimiter>,
+    /// Publicly configured base URL for origin/CSRF validation and HTTPS cookie flags.
+    pub public_url: String,
 }
 
 impl ApiState {
@@ -37,8 +39,40 @@ impl ApiState {
         Self {
             engine,
             guest_limiter: Arc::new(GuestSandboxLimiter::default()),
+            public_url: format!(
+                "http://{}:{}",
+                crate::web::DEFAULT_WEB_HOST,
+                crate::web::DEFAULT_WEB_PORT
+            ),
         }
     }
+
+    /// Configures the public base URL used for HTTPS cookie flags and CSRF origin matching.
+    #[must_use]
+    pub fn with_public_url(mut self, public_url: impl Into<String>) -> Self {
+        self.public_url = public_url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Returns `true` if `public_url` uses HTTPS.
+    #[must_use]
+    pub fn is_https(&self) -> bool {
+        self.public_url.starts_with("https://")
+    }
+
+    /// Extracts `(scheme, lowercase_host, effective_port)` for `public_url`.
+    #[must_use]
+    pub fn public_origin(&self) -> Option<(String, String, u16)> {
+        parse_url_origin(&self.public_url)
+    }
+}
+
+pub(crate) fn parse_url_origin(raw: &str) -> Option<(String, String, u16)> {
+    let parsed = url::Url::parse(raw.trim()).ok()?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed.port_or_known_default()?;
+    Some((scheme, host, port))
 }
 
 /// Response payload for service health check endpoints.

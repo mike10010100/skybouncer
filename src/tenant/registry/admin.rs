@@ -103,18 +103,22 @@ impl TenantRegistry {
         Ok(count > 0)
     }
 
-    /// Deletes a tenant from the registry.
+    /// Deletes a tenant and all of their web sessions atomically from the registry.
     ///
     /// Returns `true` if the tenant was found and deleted.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if deletion fails.
     pub fn remove(&self, did: &str) -> Result<bool, SkybouncerError> {
-        self.pds_clients.write().remove(did);
-
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare_cached("DELETE FROM tenants WHERE did = ?1;")?;
-        let count = stmt.execute(params![did])?;
+        let count = {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM web_sessions WHERE did = ?1;", params![did])?;
+            let count = tx.execute("DELETE FROM tenants WHERE did = ?1;", params![did])?;
+            tx.commit()?;
+            count
+        };
+        self.bump_epoch_and_evict(did);
         Ok(count > 0)
     }
 }

@@ -71,8 +71,59 @@ pub async fn health_check() -> (StatusCode, Json<HealthResponse>) {
     )
 }
 
+fn is_metrics_authorized(
+    headers: &HeaderMap,
+    engine: &SkybouncerEngine,
+) -> Result<(), (StatusCode, &'static str)> {
+    if crate::env::bool_or(&["SKYBOUNCER_METRICS_PUBLIC"], false) {
+        return Ok(());
+    }
+
+    if let Some(bearer) = extract_bearer_token(headers) {
+        if let Some(metrics_tok) = crate::env::var(&["SKYBOUNCER_METRICS_TOKEN"]) {
+            if metrics_tok.len() >= 8 && constant_time_token_eq(&metrics_tok, bearer) {
+                return Ok(());
+            }
+        }
+        if let Some(api_tok) = crate::env::var(&["SKYBOUNCER_API_TOKEN", "SKYBOUNCER_TOKEN"])
+            .filter(|val| {
+                !matches!(
+                    val.as_str(),
+                    "your_access_jwt_here" | "placeholder" | "changeme" | "test_token"
+                )
+            })
+        {
+            if api_tok.len() >= 8 && constant_time_token_eq(&api_tok, bearer) {
+                return Ok(());
+            }
+        }
+    }
+
+    if let Some(caller_did) = extract_authenticated_caller(headers, engine) {
+        if engine.is_admin(&caller_did) {
+            return Ok(());
+        }
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Administrator privileges required to access metrics",
+        ));
+    }
+
+    Err((
+        StatusCode::UNAUTHORIZED,
+        "Authentication required to access metrics",
+    ))
+}
+
 /// Handler for `GET /metrics` and `GET /api/metrics`: exports telemetry counters and gauges in Prometheus text exposition format.
-pub async fn get_prometheus_metrics(State(state): State<ApiState>) -> Response {
+///
+/// Requires Fleet Admin session or `Authorization: Bearer <SKYBOUNCER_API_TOKEN | SKYBOUNCER_METRICS_TOKEN>`
+/// unless `SKYBOUNCER_METRICS_PUBLIC=true` is explicitly configured.
+pub async fn get_prometheus_metrics(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Err((status, msg)) = is_metrics_authorized(&headers, &state.engine) {
+        return (status, msg).into_response();
+    }
+
     let stats = state.engine.stats().snapshot();
     let protected_count = state.engine.protected_dids().len();
     let tenant_count = state.engine.tenant_registry().count().unwrap_or(0);

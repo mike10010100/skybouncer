@@ -8,23 +8,28 @@ impl DeduplicationCache {
     pub fn get_handle_for_did(&self, did: &str) -> Result<Option<String>, SkybouncerError> {
         let conn = self.conn.lock();
         let clean = did.trim();
-        let mut stmt =
-            conn.prepare_cached("SELECT handle FROM did_handles WHERE did = ?1 LIMIT 1;")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT handle FROM did_handles WHERE did = ?1 ORDER BY updated_at DESC LIMIT 1;",
+        )?;
         let handle = stmt
             .query_row(params![clean], |row| row.get(0))
             .optional()?;
         Ok(handle)
     }
 
-    /// Looks up the cached DID for a given handle from SQLite.
+    /// Looks up the cached DID for a given verified handle from SQLite.
+    ///
+    /// Only rows with `handle_verified = 1` are eligible for reverse handle-to-DID resolution.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if SQLite query fails.
     pub fn get_did_for_handle(&self, handle: &str) -> Result<Option<String>, SkybouncerError> {
-        let clean = crate::util::normalize_handle(handle);
+        let clean = crate::util::normalize_handle(handle).to_ascii_lowercase();
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
-            "SELECT did FROM did_handles WHERE handle = ?1 COLLATE NOCASE LIMIT 1;",
+            "SELECT did FROM did_handles
+             WHERE handle = ?1 COLLATE NOCASE AND handle_verified = 1
+             ORDER BY updated_at DESC LIMIT 1;",
         )?;
         let did = stmt
             .query_row(params![clean], |row| row.get(0))
@@ -32,7 +37,7 @@ impl DeduplicationCache {
         Ok(did)
     }
 
-    /// Looks up the cached DID for a handle, ignoring mappings older than `max_age_us`
+    /// Looks up the cached DID for a verified handle, ignoring mappings older than `max_age_us`
     /// microseconds.
     ///
     /// This prevents a stale persisted mapping from shadowing a handle that has since
@@ -45,11 +50,13 @@ impl DeduplicationCache {
         handle: &str,
         max_age_us: u64,
     ) -> Result<Option<String>, SkybouncerError> {
-        let clean = crate::util::normalize_handle(handle);
+        let clean = crate::util::normalize_handle(handle).to_ascii_lowercase();
         let cutoff_i64 = us_to_i64(current_time_us().saturating_sub(max_age_us));
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
-            "SELECT did FROM did_handles WHERE handle = ?1 COLLATE NOCASE AND updated_at >= ?2 LIMIT 1;",
+            "SELECT did FROM did_handles
+             WHERE handle = ?1 COLLATE NOCASE AND handle_verified = 1 AND updated_at >= ?2
+             ORDER BY updated_at DESC LIMIT 1;",
         )?;
         let did = stmt
             .query_row(params![clean, cutoff_i64], |row| row.get(0))
@@ -57,24 +64,62 @@ impl DeduplicationCache {
         Ok(did)
     }
 
-    /// Caches a DID to handle mapping in SQLite.
+    /// Caches a verified DID-to-handle mapping in SQLite, normalizing the handle to lowercase
+    /// and removing any stale rows that previously held the same handle for another DID.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if SQLite execution fails.
     pub fn set_handle_for_did(&self, did: &str, handle: &str) -> Result<(), SkybouncerError> {
         let clean_did = did.trim();
-        let clean_handle = crate::util::normalize_handle(handle);
-        if clean_did.is_empty() || clean_handle.is_empty() {
+        let clean_handle = crate::util::normalize_handle(handle).to_ascii_lowercase();
+        if clean_did.is_empty() || clean_handle.is_empty() || clean_handle == "handle.invalid" {
             return Ok(());
         }
-        let conn = self.conn.lock();
         let now_us = current_time_us();
         let now_i64 = us_to_i64(now_us);
-        let mut stmt = conn.prepare_cached(
-            "INSERT INTO did_handles (did, handle, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(did) DO UPDATE SET handle = excluded.handle, updated_at = excluded.updated_at;",
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM did_handles WHERE LOWER(handle) = LOWER(?1) AND did != ?2;",
+            params![clean_handle, clean_did],
         )?;
-        stmt.execute(params![clean_did, clean_handle, now_i64])?;
+        tx.execute(
+            "INSERT INTO did_handles (did, handle, updated_at, handle_verified) VALUES (?1, ?2, ?3, 1)
+             ON CONFLICT(did) DO UPDATE SET handle = excluded.handle, updated_at = excluded.updated_at, handle_verified = 1;",
+            params![clean_did, clean_handle, now_i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Caches an unverified display handle (`handle_verified = 0`) for a DID without allowing
+    /// reverse handle-to-DID lookup until bidirectional verification succeeds.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError::Database`] if SQLite execution fails.
+    pub fn set_unverified_handle_for_did(
+        &self,
+        did: &str,
+        handle: &str,
+    ) -> Result<(), SkybouncerError> {
+        let clean_did = did.trim();
+        let clean_handle = crate::util::normalize_handle(handle).to_ascii_lowercase();
+        if clean_did.is_empty() || clean_handle.is_empty() || clean_handle == "handle.invalid" {
+            return Ok(());
+        }
+        let now_i64 = us_to_i64(current_time_us());
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO did_handles (did, handle, updated_at, handle_verified) VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(did) DO UPDATE SET
+                 handle = excluded.handle,
+                 updated_at = excluded.updated_at,
+                 handle_verified = CASE
+                     WHEN LOWER(did_handles.handle) = LOWER(excluded.handle) THEN did_handles.handle_verified
+                     ELSE 0
+                 END;",
+            params![clean_did, clean_handle, now_i64],
+        )?;
         Ok(())
     }
 

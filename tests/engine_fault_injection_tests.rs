@@ -144,14 +144,17 @@ impl EngineTestRig {
 
         let config = SkybouncerConfig::new(protected_dids, rubric).with_channel_capacity(100);
 
-        let engine = Arc::new(SkybouncerEngine::new(
-            config,
-            Arc::clone(&follow_graph),
-            Arc::clone(&gate),
-            classifier,
-            Arc::clone(&modlist_manager),
-            pds_client,
-        ));
+        let engine = Arc::new(
+            SkybouncerEngine::new(
+                config,
+                Arc::clone(&follow_graph),
+                Arc::clone(&gate),
+                classifier,
+                Arc::clone(&modlist_manager),
+                pds_client,
+            )
+            .expect("fault injection test engine"),
+        );
 
         Self {
             pds,
@@ -329,14 +332,17 @@ async fn test_jev_socket_drop_exhaustion_counted_in_engine_stats_and_loop_surviv
     protected_dids.insert("did:plc:alice".to_string());
     let config = SkybouncerConfig::new(protected_dids, rubric);
 
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        Arc::clone(&follow_graph),
-        Arc::clone(&gate),
-        classifier,
-        Arc::clone(&modlist_manager),
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(
+            config,
+            Arc::clone(&follow_graph),
+            Arc::clone(&gate),
+            classifier,
+            Arc::clone(&modlist_manager),
+            pds_client,
+        )
+        .expect("fault injection test engine"),
+    );
 
     let mut join_set = JoinSet::new();
     let cancel = CancellationToken::new();
@@ -646,7 +652,8 @@ async fn test_pds_socket_drop_during_bounce_pipeline_survives() {
             "did:plc:alice",
             "mock_token",
         )
-        .unwrap(),
+        .unwrap()
+        .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true)),
     );
 
     let classifier = jev.classifier(rubric.clone(), 0);
@@ -655,14 +662,17 @@ async fn test_pds_socket_drop_during_bounce_pipeline_survives() {
     protected_dids.insert("did:plc:alice".to_string());
     let config = SkybouncerConfig::new(protected_dids, rubric);
 
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        Arc::clone(&follow_graph),
-        Arc::clone(&gate),
-        classifier,
-        Arc::clone(&modlist_manager),
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(
+            config,
+            Arc::clone(&follow_graph),
+            Arc::clone(&gate),
+            classifier,
+            Arc::clone(&modlist_manager),
+            pds_client,
+        )
+        .expect("fault injection test engine"),
+    );
 
     let mut join_set = JoinSet::new();
     let cancel = CancellationToken::new();
@@ -1227,7 +1237,10 @@ async fn test_adversarial_pds_connection_reset_during_pardon() {
         .await
         .unwrap();
 
-    assert!(bounce_res.is_some());
+    assert!(matches!(
+        bounce_res,
+        skybouncer::modlist::BounceOutcome::Bounced(_)
+    ));
     assert!(rig.cache.is_bounced("did:plc:pardon_violator").unwrap());
 
     // Inject 500 / 503 error on deleteRecord

@@ -155,10 +155,6 @@ pub async fn auth_preview(
     let canonical_handle = resolved_handle
         .or_else(|| profile.as_ref().and_then(|p| p.handle.clone()))
         .unwrap_or(normalized);
-    let _ = state
-        .engine
-        .cache()
-        .set_handle_for_did(&did, &canonical_handle);
 
     Ok(Json(AuthPreviewResponse {
         did,

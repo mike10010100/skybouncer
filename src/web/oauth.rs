@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::Deserialize;
 use tracing::{error, info, warn};
@@ -19,7 +19,33 @@ use skyauth::integrations::axum::{client_metadata_response, redirect_to_authoriz
 use skyauth::integrations::OAuthCallbackQuery;
 
 use crate::engine::SkybouncerEngine;
-use crate::tenant::Tenant;
+
+const OAUTH_STATE_COOKIE: &str = "skybouncer_oauth_state";
+
+fn sha256_hex(raw: &str) -> String {
+    let digest = skyauth::crypto::sha256_digest(raw.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    hex
+}
+
+fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    for part in cookie_header.split(';') {
+        let trimmed = part.trim();
+        if let Some(val) = trimmed.strip_prefix(&prefix) {
+            let val = val.trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
 
 /// Shared state for OAuth route handlers.
 #[derive(Clone)]
@@ -30,6 +56,15 @@ pub struct OAuthState {
     pub metadata: OAuthClientMetadata,
     /// Reference to moderation engine for multi-tenant enrollment.
     pub engine: Option<Arc<SkybouncerEngine>>,
+    /// Publicly configured base URL for HTTPS cookie flags.
+    pub public_url: String,
+}
+
+impl OAuthState {
+    fn is_https(&self) -> bool {
+        self.public_url.starts_with("https://")
+            || self.metadata.redirect_uri.starts_with("https://")
+    }
 }
 
 /// Query parameters for initiating OAuth login.
@@ -46,16 +81,19 @@ pub async fn get_client_metadata(
     State(state): State<OAuthState>,
 ) -> Result<Response, (StatusCode, String)> {
     client_metadata_response(&state.metadata).map_err(|e| {
+        error!(error = %e, "Failed to generate OAuth client metadata response");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to generate client metadata response: {e}"),
+            "Failed to generate client metadata response".to_string(),
         )
     })
 }
 
 /// Handler for `GET /oauth/login`.
 ///
-/// Initiates the PAR and PKCE authorization flow for the provided Bluesky handle.
+/// Initiates the PAR and PKCE authorization flow for the provided Bluesky handle,
+/// binding the browser session to the issued OAuth `state` parameter via an `HttpOnly`
+/// SHA-256 state cookie to defeat OAuth Login CSRF attacks.
 pub async fn oauth_login(
     State(state): State<OAuthState>,
     Query(query): Query<LoginQuery>,
@@ -84,27 +122,52 @@ pub async fn oauth_login(
     info!(handle = %handle, "Initiating ATProto OAuth login flow");
 
     match client.authorize(&handle).await {
-        Ok(auth_req) => redirect_to_authorization(&auth_req).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to construct authorization redirect: {e}"),
-            )
-        }),
+        Ok(auth_req) => {
+            let mut response = redirect_to_authorization(&auth_req).map_err(|e| {
+                error!(error = %e, "Failed to construct OAuth authorization redirect");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to construct authorization redirect".to_string(),
+                )
+            })?;
+            let state_hash = sha256_hex(&auth_req.state);
+            let secure_attr = if state.is_https() { "; Secure" } else { "" };
+            let cookie = format!(
+                "{OAUTH_STATE_COOKIE}={state_hash}; Path=/oauth/callback; Max-Age=300; HttpOnly; SameSite=Lax{secure_attr}"
+            );
+            if let Ok(cookie_val) = HeaderValue::from_str(&cookie) {
+                response
+                    .headers_mut()
+                    .append(header::SET_COOKIE, cookie_val);
+            }
+            Ok(response)
+        }
         Err(e) => {
             error!(error = %e, handle = %handle, "OAuth authorization request failed");
             Err((
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to initiate authorization with user's PDS: {e}"),
+                "Failed to initiate authorization with user's PDS".to_string(),
             ))
         }
     }
 }
 
+fn redirect_with_clear_cookie(target: &str, clear_state_cookie: &str) -> Response {
+    let mut resp = Redirect::to(target).into_response();
+    if let Ok(val) = HeaderValue::from_str(clear_state_cookie) {
+        resp.headers_mut().append(header::SET_COOKIE, val);
+    }
+    resp
+}
+
 /// Handler for `GET /oauth/callback`.
 ///
-/// Processes the OAuth code exchange and redirects back to the dashboard with auth status.
+/// Verifies the browser-bound OAuth state cookie, processes the OAuth code exchange,
+/// atomically enrolls the tenant session, revokes any prior web session, and redirects
+/// back to the dashboard.
 pub async fn oauth_callback(
     State(state): State<OAuthState>,
+    headers: HeaderMap,
     query: OAuthCallbackQuery,
 ) -> Result<Response, (StatusCode, String)> {
     if query.code.is_none() && query.error.is_none() {
@@ -121,15 +184,41 @@ pub async fn oauth_callback(
         )
     })?;
 
+    let secure_attr = if state.is_https() { "; Secure" } else { "" };
+    let clear_state_cookie = format!(
+        "{OAUTH_STATE_COOKIE}=; Path=/oauth/callback; Max-Age=0; HttpOnly; SameSite=Lax{secure_attr}"
+    );
+
+    if query.error.is_none() {
+        let state_cookie = extract_cookie_value(&headers, OAUTH_STATE_COOKIE);
+        let valid_state = match (state_cookie, query.state.as_deref()) {
+            (Some(cookie_hash), Some(query_state)) => {
+                let expected = sha256_hex(query_state);
+                cookie_hash.len() == expected.len()
+                    && skyauth::crypto::constant_time_eq(
+                        cookie_hash.as_bytes(),
+                        expected.as_bytes(),
+                    )
+            }
+            _ => false,
+        };
+        if !valid_state {
+            warn!("Rejected OAuth callback due to missing or mismatched state cookie (Login CSRF protection)");
+            return Ok(redirect_with_clear_cookie(
+                "/?auth=error&reason=invalid_state",
+                &clear_state_cookie,
+            ));
+        }
+    }
+
     let params = match query.to_callback_params() {
         Ok(p) => p,
         Err(e) => {
             warn!(error = %e, "Invalid or error OAuth callback query");
-            return Ok(Redirect::to(&format!(
-                "/?auth=error&error={}",
-                urlencoding_simple(&e.to_string())
-            ))
-            .into_response());
+            return Ok(redirect_with_clear_cookie(
+                "/?auth=error&reason=invalid_callback",
+                &clear_state_cookie,
+            ));
         }
     };
 
@@ -138,74 +227,74 @@ pub async fn oauth_callback(
             let did = session.sub.clone();
             info!(did = %did, "OAuth authorization completed successfully");
 
-            if let Some(ref engine) = state.engine {
-                let existing = engine.tenant_registry().get(&did).ok().flatten();
-                let mut tenant = Tenant::new(did.clone()).with_session(session);
-                if let Some(prev) = existing {
-                    tenant.is_active = prev.is_active;
-                    tenant.rubric = prev.rubric;
-                    tenant.handle = prev.handle;
-                }
-                if let Err(e) = engine.enroll_tenant(tenant) {
-                    error!(error = %e, did = %did, "Failed to enroll tenant into registry");
-                } else {
-                    info!(did = %did, "Enrolled tenant into Skybouncer engine");
-                    let eng = Arc::clone(engine);
-                    let enroll_did = did.clone();
-                    tokio::spawn(async move {
-                        let _ = eng.resolve_did_to_handle(&enroll_did).await;
-                        if let Err(e) = eng.ensure_mod_list(&enroll_did).await {
-                            tracing::warn!(error = %e, did = %enroll_did, "Failed to ensure mod list on enrollment");
-                        }
-                        if let Err(e) = eng.sync_sovereign_config(&enroll_did).await {
-                            tracing::warn!(error = %e, did = %enroll_did, "Failed to sync sovereign config on enrollment");
-                        }
-                    });
-                }
-            }
-
-            let session_token = if let Some(ref engine) = state.engine {
-                match engine
-                    .tenant_registry()
-                    .create_web_session(&did, Duration::from_secs(30 * 86400))
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        error!(error = %e, did = %did, "Failed to create web session in SQLite");
-                        return Ok(
-                            Redirect::to("/?auth=error&reason=session_failed").into_response()
-                        );
-                    }
-                }
-            } else {
-                return Ok(Redirect::to("/?auth=error&reason=no_engine").into_response());
+            let Some(ref engine) = state.engine else {
+                return Ok(redirect_with_clear_cookie(
+                    "/?auth=error&reason=no_engine",
+                    &clear_state_cookie,
+                ));
             };
 
-            let redirect_target = "/?auth=success";
-            let mut response = Redirect::to(redirect_target).into_response();
+            if let Err(e) = engine.enroll_oauth_tenant(&did, None, &session) {
+                error!(error = %e, did = %did, "Failed to enroll tenant into registry; aborting session issuance");
+                return Ok(redirect_with_clear_cookie(
+                    "/?auth=error&reason=enrollment_failed",
+                    &clear_state_cookie,
+                ));
+            }
 
-            // Detect if running on HTTPS
-            let is_https = state.metadata.redirect_uri.starts_with("https://");
-            let secure_attr = if is_https { "; Secure" } else { "" };
+            info!(did = %did, "Enrolled tenant into Skybouncer engine");
+            let eng = Arc::clone(engine);
+            let enroll_did = did.clone();
+            tokio::spawn(async move {
+                let _ = eng.resolve_did_to_handle(&enroll_did).await;
+                if let Err(e) = eng.ensure_mod_list(&enroll_did).await {
+                    tracing::warn!(error = %e, did = %enroll_did, "Failed to ensure mod list on enrollment");
+                }
+                if let Err(e) = eng.sync_sovereign_config(&enroll_did).await {
+                    tracing::warn!(error = %e, did = %enroll_did, "Failed to sync sovereign config on enrollment");
+                }
+            });
+
+            if let Some(old_token) = extract_cookie_value(&headers, "skybouncer_session") {
+                let _ = engine.tenant_registry().delete_web_session(&old_token);
+            }
+
+            let session_token = match engine
+                .tenant_registry()
+                .create_web_session(&did, Duration::from_secs(30 * 86400))
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = %e, did = %did, "Failed to create web session in SQLite");
+                    return Ok(redirect_with_clear_cookie(
+                        "/?auth=error&reason=session_failed",
+                        &clear_state_cookie,
+                    ));
+                }
+            };
+
+            let mut response = Redirect::to("/?auth=success").into_response();
+            if let Ok(clear_val) = HeaderValue::from_str(&clear_state_cookie) {
+                response.headers_mut().append(header::SET_COOKIE, clear_val);
+            }
 
             let cookie_header = format!(
                 "skybouncer_session={session_token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax{secure_attr}"
             );
-            if let Ok(cookie_val) = axum::http::HeaderValue::from_str(&cookie_header) {
+            if let Ok(cookie_val) = HeaderValue::from_str(&cookie_header) {
                 response
                     .headers_mut()
-                    .insert(axum::http::header::SET_COOKIE, cookie_val);
+                    .append(header::SET_COOKIE, cookie_val);
             }
 
             Ok(response)
         }
         Err(e) => {
             error!(error = %e, "Failed to exchange OAuth authorization code for session");
-            Ok(Redirect::to(&format!(
-                "/?auth=error&error={}",
-                urlencoding_simple(&e.to_string())
+            Ok(redirect_with_clear_cookie(
+                "/?auth=error&reason=oauth_failed",
+                &clear_state_cookie,
             ))
-            .into_response())
         }
     }
 }
@@ -254,6 +343,7 @@ mod tests {
                 "http://127.0.0.1:3000/oauth/callback",
             ),
             engine: None,
+            public_url: "http://127.0.0.1:3000".to_string(),
         }
     }
 
@@ -316,7 +406,7 @@ mod tests {
             error: None,
             error_description: None,
         };
-        let err = oauth_callback(State(state), query)
+        let err = oauth_callback(State(state), HeaderMap::new(), query)
             .await
             .expect_err("missing code/error");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -326,7 +416,7 @@ mod tests {
     async fn oauth_callback_without_client_is_unavailable() {
         let state = state_without_client();
         let query = OAuthCallbackQuery::new("code123", "state123");
-        let err = oauth_callback(State(state), query)
+        let err = oauth_callback(State(state), HeaderMap::new(), query)
             .await
             .expect_err("no oauth client");
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
@@ -340,7 +430,7 @@ mod tests {
         let state = state_without_client();
         let query = OAuthCallbackQuery::new_error("access_denied", None);
         // With a client absent, returns SERVICE_UNAVAILABLE.
-        let err = oauth_callback(State(state), query)
+        let err = oauth_callback(State(state), HeaderMap::new(), query)
             .await
             .expect_err("no client");
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);

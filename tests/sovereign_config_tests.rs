@@ -112,11 +112,22 @@ async fn test_sovereign_config_pds_publish_and_fetch() {
 
     let pds_client =
         PdsRepoClient::from_credentials(mock_server.uri(), repo_did, "dummy_token_for_mock_tests")
-            .unwrap();
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
 
     let rubric = RuleRubric::new("Block harassment and scams immediately.", Sensitivity::High);
 
-    // 1. Mock putRecord
+    // 1. Mock getRecord (not found before first put) & putRecord
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "RecordNotFound",
+            "message": "Could not locate record"
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
     Mock::given(method("POST"))
         .and(path("/xrpc/com.atproto.repo.putRecord"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -160,7 +171,8 @@ async fn test_sovereign_config_pds_not_found_returns_none() {
 
     let pds_client =
         PdsRepoClient::from_credentials(mock_server.uri(), repo_did, "dummy_token_for_mock_tests")
-            .unwrap();
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
 
     // Mock 404 RecordNotFound
     Mock::given(method("GET"))
@@ -195,7 +207,9 @@ use std::sync::Arc;
 async fn setup_sovereign_test_engine(protected_did: &str) -> (Arc<SkybouncerEngine>, MockServer) {
     let mock_server = MockServer::start().await;
     let pds_client = Arc::new(
-        PdsRepoClient::from_credentials(mock_server.uri(), protected_did, "mock_token").unwrap(),
+        PdsRepoClient::from_credentials(mock_server.uri(), protected_did, "mock_token")
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true)),
     );
     let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
     let follow_graph = Arc::new(FollowGraph::new());
@@ -210,14 +224,17 @@ async fn setup_sovereign_test_engine(protected_did: &str) -> (Arc<SkybouncerEngi
     protected_dids.insert(protected_did.to_string());
     let config = SkybouncerConfig::new(protected_dids, initial_rubric);
 
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        follow_graph,
-        gate,
-        classifier,
-        modlist_manager,
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(
+            config,
+            follow_graph,
+            gate,
+            classifier,
+            modlist_manager,
+            pds_client,
+        )
+        .expect("sovereign test engine should initialize"),
+    );
 
     (engine, mock_server)
 }
@@ -536,6 +553,15 @@ async fn test_engine_publish_sovereign_config_roundtrips_active_rubric() {
     let protected_did = "did:plc:protected_publish";
     let (engine, server) = setup_sovereign_test_engine(protected_did).await;
 
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "RecordNotFound",
+            "message": "Could not locate record"
+        })))
+        .mount(&server)
+        .await;
+
     Mock::given(method("POST"))
         .and(path("/xrpc/com.atproto.repo.putRecord"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -666,4 +692,121 @@ async fn test_engine_sync_sovereign_config_legacy_upgrade_survives_put_record_fa
         engine.rubric().prompt,
         skybouncer::classifier::DEFAULT_RUBRIC_PROMPT
     );
+}
+
+#[test]
+fn test_extract_rubric_from_list_description_handles_closing_braces_in_rules() {
+    let tricky = RuleRubric::new(
+        "Block payloads with }] or {nested} braces inside prompt text!",
+        Sensitivity::High,
+    );
+    let desc = format_list_description_with_rubric("Managed list header", &tricky);
+    let extracted = extract_rubric_from_list_description(&desc)
+        .expect("balanced JSON scanner must extract rubric with }] in prompt");
+    assert_eq!(extracted.prompt, tricky.prompt);
+    assert_eq!(extracted.sensitivity, Sensitivity::High);
+}
+
+#[tokio::test]
+async fn test_fetch_sovereign_config_could_not_locate_record_vs_500_and_repo_owner_check() {
+    let server = MockServer::start().await;
+    let alice = "did:plc:alice_sov_fetch";
+    let wrong_client = PdsRepoClient::from_credentials(server.uri(), "did:plc:someone_else", "tok")
+        .unwrap()
+        .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
+
+    // Ownership verification fails before any network call when client.did() != repo_did.
+    assert!(
+        publish_sovereign_config(&wrong_client, alice, &RuleRubric::default())
+            .await
+            .is_err()
+    );
+
+    let client = PdsRepoClient::from_credentials(server.uri(), alice, "tok")
+        .unwrap()
+        .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
+
+    // "Could not locate record" returns Ok(None).
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "InvalidRequest",
+            "message": "Could not locate record: at://..."
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    assert!(fetch_sovereign_config(&client, alice)
+        .await
+        .unwrap()
+        .is_none());
+
+    // HTTP 500 does NOT silently degrade to Ok(None).
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream error"))
+        .mount(&server)
+        .await;
+    assert!(fetch_sovereign_config(&client, alice).await.is_err());
+}
+
+#[tokio::test]
+async fn test_publish_sovereign_config_cas_invalid_swap_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let server = MockServer::start().await;
+    let alice = "did:plc:alice_cas_swap";
+    let client = PdsRepoClient::from_credentials(server.uri(), alice, "tok")
+        .unwrap()
+        .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
+
+    let get_calls = Arc::new(AtomicUsize::new(0));
+    let get_calls_ref = Arc::clone(&get_calls);
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .respond_with(move |_: &wiremock::Request| {
+            let n = get_calls_ref.fetch_add(1, Ordering::SeqCst);
+            let cid = if n == 0 { "bafyoldcid" } else { "bafyfreshcid" };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "uri": format!("at://{alice}/{SOVEREIGN_CONFIG_COLLECTION}/{SOVEREIGN_CONFIG_RKEY}"),
+                "cid": cid,
+                "value": SovereignConfigRecord::from_rubric(&RuleRubric::default())
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let put_calls = Arc::new(AtomicUsize::new(0));
+    let put_calls_ref = Arc::clone(&put_calls);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.repo.putRecord"))
+        .respond_with(move |req: &wiremock::Request| {
+            let n = put_calls_ref.fetch_add(1, Ordering::SeqCst);
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            if n == 0 {
+                assert_eq!(body["swapRecord"], "bafyoldcid");
+                ResponseTemplate::new(400).set_body_json(json!({
+                    "error": "InvalidSwap",
+                    "message": "Record was at bafyfreshcid"
+                }))
+            } else {
+                assert_eq!(body["swapRecord"], "bafyfreshcid");
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "uri": format!("at://{alice}/{SOVEREIGN_CONFIG_COLLECTION}/{SOVEREIGN_CONFIG_RKEY}"),
+                    "cid": "bafynewcid"
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let uri = publish_sovereign_config(
+        &client,
+        alice,
+        &RuleRubric::new("Updated prompt", Sensitivity::High),
+    )
+    .await
+    .expect("CAS retry must succeed");
+    assert!(uri.contains(SOVEREIGN_CONFIG_COLLECTION));
+    assert_eq!(put_calls.load(Ordering::SeqCst), 2);
 }

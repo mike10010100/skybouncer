@@ -45,8 +45,8 @@ use crate::matcher::{
     TargetMatcher,
 };
 use crate::modlist::{
-    BounceRequest, BouncedUser, DeduplicationCache, ManualBounceOutcome, ModListManager,
-    DEFAULT_MOD_LIST_NAME,
+    BounceOutcome, BounceRequest, BouncedUser, DeduplicationCache, ManualBounceOutcome,
+    ModListManager, DEFAULT_MOD_LIST_NAME,
 };
 use crate::tenant::{Tenant, TenantRegistry};
 use crate::time::current_time_us;
@@ -1202,6 +1202,7 @@ pub struct SkybouncerEngine {
     handle_cache: Arc<RwLock<HashMap<String, (String, std::time::Instant)>>>,
     dogpile_tracker: Arc<DogpileTracker>,
     storm_stance_classifier: Arc<dyn StormStanceClassifier>,
+    sovereign_publish_locks: Arc<crate::modlist::manager::StripedAsyncLocks>,
 }
 
 mod accessors;
@@ -1609,18 +1610,10 @@ impl SkybouncerEngineBuilder {
             }
         };
 
-        // 7. Initialize TenantRegistry
+        // 7. Initialize TenantRegistry (fail closed: never silently fall back to in-memory)
         let tenant_registry = match self.tenant_registry {
             Some(tr) => tr,
-            None => Arc::new(
-                TenantRegistry::from_connection(cache.connection())
-                    .or_else(|_| TenantRegistry::open_in_memory())
-                    .map_err(|e| {
-                        SkybouncerError::Database(format!(
-                            "Failed to initialize TenantRegistry: {e}"
-                        ))
-                    })?,
-            ),
+            None => Arc::new(TenantRegistry::from_connection(cache.connection())?),
         };
 
         // 7.5. Seed per-user incoming-follower bypass flags into the in-memory gate.
@@ -1707,6 +1700,7 @@ impl SkybouncerEngineBuilder {
             handle_cache,
             dogpile_tracker,
             storm_stance_classifier,
+            sovereign_publish_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
         })
     }
 }

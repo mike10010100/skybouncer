@@ -4,7 +4,8 @@ impl TenantRegistry {
     /// Opens or creates a persistent SQLite tenant registry at the given filesystem path.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if directory creation or SQLite initialization fails.
+    /// Returns [`SkybouncerError::Database`] or [`SkybouncerError::Config`] if directory creation,
+    /// `.skybouncer.key` resolution, SQLite initialization, or startup secret migration fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SkybouncerError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -17,20 +18,26 @@ impl TenantRegistry {
             }
         }
 
+        let (cipher, legacy_cipher) = SessionCipher::resolve_for_db_path(Some(path))?;
+
         let conn = Connection::open(path).map_err(|e| {
             SkybouncerError::Database(format!("Failed to open SQLite database: {e}"))
         })?;
 
         Self::apply_pragmas(&conn)?;
         Self::init_schema(&conn)?;
+        crate::crypto::set_sqlite_file_permissions(path);
 
-        Ok(Self {
+        let registry = Self {
             conn: Arc::new(Mutex::new(conn)),
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
+            client_epochs: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
-            cipher: SessionCipher::from_env(),
+            cipher,
             refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
-        })
+        };
+        registry.migrate_encrypted_secrets(legacy_cipher.as_ref())?;
+        Ok(registry)
     }
 
     /// Opens an isolated in-memory tenant registry (ideal for testing).
@@ -38,6 +45,7 @@ impl TenantRegistry {
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if in-memory SQLite initialization fails.
     pub fn open_in_memory() -> Result<Self, SkybouncerError> {
+        let (cipher, legacy_cipher) = SessionCipher::resolve_for_db_path(None)?;
         let conn = Connection::open_in_memory().map_err(|e| {
             SkybouncerError::Database(format!("Failed to open in-memory SQLite: {e}"))
         })?;
@@ -45,47 +53,59 @@ impl TenantRegistry {
         Self::apply_pragmas(&conn)?;
         Self::init_schema(&conn)?;
 
-        Ok(Self {
+        let registry = Self {
             conn: Arc::new(Mutex::new(conn)),
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
+            client_epochs: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
-            cipher: SessionCipher::from_env(),
+            cipher,
             refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
-        })
+        };
+        registry.migrate_encrypted_secrets(legacy_cipher.as_ref())?;
+        Ok(registry)
     }
 
-    /// Creates a fallback in-memory tenant registry with zero panics.
-    #[must_use]
-    pub fn fallback() -> Self {
-        Self::open_in_memory().unwrap_or_else(|_| {
-            let conn = Connection::open_in_memory().unwrap_or_else(|_| std::process::exit(1));
-            Self {
-                conn: Arc::new(Mutex::new(conn)),
-                pds_clients: Arc::new(RwLock::new(HashMap::new())),
-                oauth_client: Arc::new(RwLock::new(None)),
-                cipher: SessionCipher::from_env(),
-                refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
-            }
-        })
+    /// Creates a fallback in-memory tenant registry without aborting the process.
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if in-memory SQLite initialization fails.
+    pub fn fallback() -> Result<Self, SkybouncerError> {
+        Self::open_in_memory()
     }
 
     /// Initializes a `TenantRegistry` reusing an existing shared SQLite connection.
     ///
     /// # Errors
-    /// Returns [`SkybouncerError::Database`] if schema migration fails.
+    /// Returns [`SkybouncerError::Database`] or [`SkybouncerError::Config`] if schema migration,
+    /// key resolution, or startup secret migration fails.
     pub fn from_connection(conn: Arc<Mutex<Connection>>) -> Result<Self, SkybouncerError> {
+        let db_path: Option<PathBuf> = {
+            let guard = conn.lock();
+            guard
+                .path()
+                .filter(|p| !p.is_empty() && *p != ":memory:")
+                .map(PathBuf::from)
+        };
+        let (cipher, legacy_cipher) = SessionCipher::resolve_for_db_path(db_path.as_deref())?;
+
         {
             let guard = conn.lock();
             Self::init_schema(&guard)?;
         }
+        if let Some(ref p) = db_path {
+            crate::crypto::set_sqlite_file_permissions(p);
+        }
 
-        Ok(Self {
+        let registry = Self {
             conn,
             pds_clients: Arc::new(RwLock::new(HashMap::new())),
+            client_epochs: Arc::new(RwLock::new(HashMap::new())),
             oauth_client: Arc::new(RwLock::new(None)),
-            cipher: SessionCipher::from_env(),
+            cipher,
             refresh_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
-        })
+        };
+        registry.migrate_encrypted_secrets(legacy_cipher.as_ref())?;
+        Ok(registry)
     }
 
     /// Configures a custom [`SessionCipher`] for encrypting and decrypting OAuth session tokens at rest.
@@ -202,6 +222,45 @@ impl TenantRegistry {
                 params![upgraded, legacy],
             );
         }
+
+        // Zero-logout web_sessions migration:
+        // 1. Prefix existing 64-char lowercase hex SHA-256 digests with `sha256:`.
+        // 2. Purge expired unprefixed rows, then hash any remaining legacy plaintext tokens in place.
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE web_sessions
+             SET token = 'sha256:' || token
+             WHERE token NOT LIKE 'sha256:%'
+               AND length(token) = 64
+               AND token NOT GLOB '*[^0-9a-f]*';",
+            [],
+        )?;
+        let now_i64 = us_to_i64(current_time_us());
+        tx.execute(
+            "DELETE FROM web_sessions WHERE token NOT LIKE 'sha256:%' AND expires_at < ?1;",
+            params![now_i64],
+        )?;
+        let legacy_tokens: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT token FROM web_sessions WHERE token NOT LIKE 'sha256:%';")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut tokens = Vec::new();
+            for row in rows {
+                tokens.push(row?);
+            }
+            tokens
+        };
+        for raw_token in legacy_tokens {
+            let prefixed = format!(
+                "{WEB_SESSION_HASH_PREFIX}{}",
+                hash_session_token(&raw_token)
+            );
+            tx.execute(
+                "UPDATE web_sessions SET token = ?1 WHERE token = ?2;",
+                params![prefixed, raw_token],
+            )?;
+        }
+        tx.commit()?;
 
         Ok(())
     }

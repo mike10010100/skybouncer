@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-11-28
+
+### Security
+
+- **Zero-Logout `web_sessions` Migration & Pass-the-Hash Elimination (`src/tenant/registry/core.rs`, `src/tenant/registry/sessions.rs`)**:
+  - Added atomic startup migration in `init_schema` prefixing existing 64-character lowercase hex `web_sessions` rows with `sha256:` and hashing any legacy unprefixed tokens in place.
+  - Updated `create_web_session`, `validate_web_session`, and `delete_web_session` to query strictly `WHERE token = ?1` using `sha256:{hash}`, eliminating the raw pass-the-hash `OR token = ?2` clause.
+- **Auto-Generated `0600` `.skybouncer.key`, Zero-Logout Secret Re-Encryption & Strict AAD (`src/crypto.rs`, `src/tenant/registry/sessions.rs`, `src/modlist/cache/core.rs`)**:
+  - Added `SessionCipher::resolve_for_db_path`, loading/atomically creating `<db_dir>/.skybouncer.key` (`0600` on Unix) when `SKYBOUNCER_SESSION_ENCRYPTION_KEY` is unset and failing closed on malformed keys or unwritable directories.
+  - Added `SessionCipher::decrypt_strict_with_aad` returning `zeroize::Zeroizing<String>`, enforced `session.sub == did` on reads and writes, set `0600` permissions on SQLite `.db`/`-wal`/`-shm` files, and added `TenantRegistry::migrate_encrypted_secrets` to transparently re-seal legacy plaintext, empty-AAD, and host-keyed secrets at startup.
+  - Propagated `TenantRegistry::from_connection` errors in `SkybouncerEngineBuilder::build` and `SkybouncerEngine::new` instead of falling back to an in-memory database, and removed `std::process::exit(1)` from `TenantRegistry::fallback`.
+- **Handle Cache Integrity (`src/web/api/resolve.rs`, `src/modlist/cache/handles.rs`, `src/tenant/registry/handles.rs`, `src/enricher.rs`)**:
+  - Removed unauthenticated `did_handles` writes from `GET /api/auth/preview`, added `handle_verified` column gating reverse handle-to-DID lookups, normalized handles to ASCII lowercase, cleared stale cross-DID handle rows transactionally, enforced `ORDER BY` on lookups, and verified PLC fallback handles bidirectionally while ignoring `"handle.invalid"`.
+- **OAuth Login CSRF, Same-Site CSRF, API Token, `/metrics` Auth & Error Sanitization (`src/web/`)**:
+  - Bound `/oauth/login` to `/oauth/callback` via an `HttpOnly; SameSite=Lax` `skybouncer_oauth_state` SHA-256 state cookie verified with constant-time equality, revoked prior `skybouncer_session` cookies on re-login, and aborted session issuance if tenant enrollment fails.
+  - Added same-site CSRF middleware (`Sec-Fetch-Site: same-origin` or `Origin` matching `public_url`) for cookie-authenticated non-`GET`/non-`HEAD` `/api/*` requests.
+  - Replaced `validate_configured_api_token` comparison with constant-time SHA-256 matching, removed the `PDS_ACCESS_TOKEN` fallback, failed closed when `admin_did` is unset in multi-tenant mode, gated `/metrics` and `/api/metrics` behind Admin / `SKYBOUNCER_API_TOKEN` / `SKYBOUNCER_METRICS_TOKEN` (with `SKYBOUNCER_METRICS_PUBLIC=true` opt-in), fixed `logout` `Secure` cookie detection and Bearer session revocation, added `Cache-Control: no-store` and HSTS headers, and sanitized internal error messages in HTTP 500/502 responses and OAuth redirects.
+- **Synchronous Startup `.env` Loading (`src/main.rs`, `src/env.rs`)**:
+  - Replaced `#[tokio::main]` with a synchronous `fn main()` that runs `load_dotenv_file` (with empty/`=`/NUL key and NUL value guards) before building the Tokio runtime.
+
+### Fixed
+
+- **OAuth Refresh Concurrency, CAS & Single-Retry 401 Recovery (`src/tenant/registry/`, `src/engine/`)**:
+  - Added epoch-guarded `pds_clients` eviction, SQL CAS (`WHERE did = ?1 AND session_json = ?2`) for `update_session_cas` (with transient DB retries and error propagation) and `mark_reauth_required_cas`, single-flight PDS HTTP 401 `ExpiredToken`/`InvalidToken` refresh+retry across all 11 PDS call sites, transactional `web_sessions` cleanup in `TenantRegistry::remove`, `BEGIN IMMEDIATE` / re-select race fix in `load_or_create_oauth_client_key`, and atomic `upsert_oauth_session` for `/oauth/callback`.
+- **Multi-Tenant Isolation, Modlist Discovery & Sovereign Config (`src/modlist/`, `src/engine/`, `src/web/api/`)**:
+  - Introduced `BounceOutcome::{Bounced, AlreadyBounced, BelowThreshold}`, per-tenant rubric/threshold enforcement in `ModListManager::bounce`, `pds_client.did() == protected_did` checks on PDS mutations, strict `is_single_tenant()` checks, `POST /api/tenant/toggle` `404` & `protected_dids` sync, non-admin `update_rules` protection, and fail-closed validation on blank `protected_did` values.
+  - Switched `ModListManager::list_pds_records` to cursor-paginated `pds_client.list_records`, restricted `ensure_mod_list` to Skybouncer-owned lists (or persisted `mod_list_uri`) with AT-URI validation, made `pardon_user` delete SQLite `rkey`s incrementally with idempotent not-found handling, serialized `publish_sovereign_config` via `StripedAsyncLocks` + `put_record_with_swap`, fixed `"Could not locate record"` matching, and replaced `extract_rubric_from_list_description` delimiter heuristics with balanced JSON scanning.
+- **Dependency Upgrades (`Cargo.toml`, `Cargo.lock`)**:
+  - Updated `skyauth` to `0.3.14`, `skybase` to `0.1.13`, `tokio` to `1.53.3`, and added `zeroize` `1.8`.
+
 ## [0.3.3] - 2026-11-23
 
 ### Fixed

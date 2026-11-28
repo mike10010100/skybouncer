@@ -128,7 +128,8 @@ async fn test_queue_enqueued_and_processed_successfully() {
         classifier,
         modlist_manager,
         pds_client,
-    );
+    )
+    .expect("evaluation queue test engine");
 
     let (commit_tx, commit_rx) = tokio::sync::mpsc::channel(100);
     let cancel = CancellationToken::new();
@@ -201,7 +202,8 @@ async fn test_queue_overflow_shedding_under_saturation() {
         classifier,
         modlist_manager,
         pds_client,
-    );
+    )
+    .expect("evaluation queue test engine");
 
     // Directly test process_interaction_queued with an artificial bounded queue channel
     let (eval_tx, _eval_rx) = tokio::sync::mpsc::channel(2);
@@ -288,7 +290,8 @@ async fn test_queue_strictly_enforces_concurrency_1() {
         classifier,
         modlist_manager,
         pds_client,
-    );
+    )
+    .expect("evaluation queue test engine");
 
     let (commit_tx, commit_rx) = tokio::sync::mpsc::channel(100);
     let cancel = CancellationToken::new();
@@ -365,7 +368,8 @@ async fn test_in_worker_dedup_double_check_skips_redundant_model_calls() {
         classifier,
         modlist_manager,
         pds_client,
-    );
+    )
+    .expect("evaluation queue test engine");
 
     let (commit_tx, commit_rx) = tokio::sync::mpsc::channel(100);
     let cancel = CancellationToken::new();
@@ -476,7 +480,8 @@ async fn test_queue_holds_and_retries_candidates_while_classifier_offline_then_d
         classifier,
         modlist_manager,
         pds_client,
-    );
+    )
+    .expect("evaluation queue test engine");
 
     let (commit_tx, commit_rx) = tokio::sync::mpsc::channel(100);
     let cancel = CancellationToken::new();
@@ -616,7 +621,8 @@ async fn test_queue_caps_per_candidate_timeout_retries_without_head_of_line_bloc
         classifier,
         modlist_manager,
         pds_client,
-    );
+    )
+    .expect("evaluation queue test engine");
 
     let (commit_tx, commit_rx) = tokio::sync::mpsc::channel(100);
     let cancel = CancellationToken::new();

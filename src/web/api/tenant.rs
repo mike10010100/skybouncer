@@ -104,11 +104,13 @@ pub async fn get_admin_tenants(
         ));
     }
 
-    let all_tenants = state
-        .engine
-        .tenant_registry()
-        .list_all()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let all_tenants = state.engine.tenant_registry().list_all().map_err(|e| {
+        tracing::error!(error = %e, "Failed to list tenants");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load tenant fleet".to_string(),
+        )
+    })?;
 
     let mut active_count = 0;
     let mut paused_count = 0;
@@ -171,10 +173,15 @@ pub async fn get_evaluations(
     })?;
 
     let is_admin = state.engine.is_admin(&caller_did);
+    let requested_target = query
+        .target_did
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let target_filter = if is_admin {
-        query.target_did.as_deref().filter(|s| !s.trim().is_empty())
+        requested_target
     } else {
-        if let Some(requested_did) = query.target_did.as_deref().filter(|s| !s.trim().is_empty()) {
+        if let Some(requested_did) = requested_target {
             if requested_did != caller_did {
                 return Err((
                     StatusCode::FORBIDDEN,
@@ -194,13 +201,25 @@ pub async fn get_evaluations(
         .engine
         .cache()
         .count_evaluation_logs(target_filter, source_filter)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to count evaluation logs");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load evaluation logs".to_string(),
+            )
+        })?;
 
     let evaluations = state
         .engine
         .cache()
         .list_evaluation_logs(target_filter, source_filter, limit, offset)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to list evaluation logs");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load evaluation logs".to_string(),
+            )
+        })?;
 
     Ok(Json(EvaluationsResponse { total, evaluations }))
 }
@@ -228,20 +247,36 @@ pub async fn get_admin_evaluations(
 
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let offset = query.offset.unwrap_or(0);
-    let target_filter = query.target_did.as_deref();
+    let target_filter = query
+        .target_did
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let source_filter = query.source.as_deref();
 
     let total = state
         .engine
         .cache()
         .count_evaluation_logs(target_filter, source_filter)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to count admin evaluation logs");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load evaluation logs".to_string(),
+            )
+        })?;
 
     let evaluations = state
         .engine
         .cache()
         .list_evaluation_logs(target_filter, source_filter, limit, offset)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to list admin evaluation logs");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to load evaluation logs".to_string(),
+            )
+        })?;
 
     Ok(Json(AdminEvaluationsResponse { total, evaluations }))
 }
@@ -261,7 +296,13 @@ pub async fn toggle_tenant(
     })?;
     let is_admin = state.engine.is_admin(&caller_did);
 
-    let target_did = payload.did.unwrap_or_else(|| caller_did.clone());
+    let target_did = payload
+        .did
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| caller_did.clone());
 
     if !is_admin && caller_did != target_did {
         return Err((
@@ -274,7 +315,24 @@ pub async fn toggle_tenant(
         .engine
         .tenant_registry()
         .get(&target_did)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(did = %target_did, error = %e, "Failed to read tenant state");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to read tenant status".to_string(),
+            )
+        })?;
+
+    let is_configured_or_protected = state.engine.is_admin(&target_did)
+        || state.engine.is_protected(&target_did)
+        || state.engine.config().protected_dids.contains(&target_did);
+
+    if current_tenant.is_none() && !is_configured_or_protected {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Tenant {target_did} not found"),
+        ));
+    }
 
     let new_active = match payload.is_active {
         Some(explicit) => explicit,
@@ -284,20 +342,29 @@ pub async fn toggle_tenant(
         },
     };
 
-    state
-        .engine
-        .tenant_registry()
-        .set_active(&target_did, new_active)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to update tenant status: {e}"),
-            )
-        })?;
+    if current_tenant.is_some() {
+        state
+            .engine
+            .tenant_registry()
+            .set_active(&target_did, new_active)
+            .map_err(|e| {
+                tracing::error!(did = %target_did, error = %e, "Failed to update tenant status");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to update tenant status".to_string(),
+                )
+            })?;
+
+        if new_active {
+            state.engine.add_protected_did(&target_did);
+        } else if !state.engine.config().protected_dids.contains(&target_did) {
+            state.engine.remove_protected_did(&target_did);
+        }
+    }
 
     if current_tenant.is_none()
         && (state.engine.is_admin(&target_did) || state.engine.is_single_tenant())
-        && state.engine.is_protected(&target_did)
+        && is_configured_or_protected
     {
         if new_active {
             state.engine.resume();
@@ -315,8 +382,12 @@ pub async fn toggle_tenant(
     }))
 }
 
-/// Handler for `POST /api/auth/logout`: clears session cookie and returns unauthenticated state.
+/// Handler for `POST /api/auth/logout`: revokes session tokens (cookie or bearer), clears session cookie,
+/// and returns unauthenticated state.
 pub async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Some(bearer) = extract_bearer_token(&headers) {
+        let _ = state.engine.tenant_registry().delete_web_session(bearer);
+    }
     if let Some(cookie_header) = headers.get(header::COOKIE) {
         if let Ok(s) = cookie_header.to_str() {
             for part in s.split(';') {
@@ -331,13 +402,7 @@ pub async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Respon
         }
     }
 
-    let is_local_http = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|h| {
-            h.starts_with("localhost") || h.starts_with("127.0.0.1") || h.starts_with("[::1]")
-        });
-    let secure_attr = if is_local_http { "" } else { "; Secure" };
+    let secure_attr = if state.is_https() { "; Secure" } else { "" };
     let clear_cookie =
         format!("skybouncer_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{secure_attr}");
 

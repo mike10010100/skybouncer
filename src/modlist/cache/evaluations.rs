@@ -189,7 +189,10 @@ impl DeduplicationCache {
     ) -> Result<Vec<EvaluationLogEntry>, SkybouncerError> {
         let limit_i64 = i64::try_from(limit.clamp(1, 200)).unwrap_or(50);
         let offset_i64 = i64::try_from(offset).unwrap_or(0);
-        let clean_target = target_did.filter(|s| !s.trim().is_empty());
+        let clean_target = match target_did {
+            Some(raw) => Some(crate::util::require_non_empty_did(raw, "target_did")?),
+            None => None,
+        };
         let clean_source = source.filter(|s| !s.trim().is_empty() && *s != "all");
         let conn = self.conn.lock();
 
@@ -292,7 +295,10 @@ impl DeduplicationCache {
         target_did: Option<&str>,
         source: Option<&str>,
     ) -> Result<usize, SkybouncerError> {
-        let clean_target = target_did.filter(|s| !s.trim().is_empty());
+        let clean_target = match target_did {
+            Some(raw) => Some(crate::util::require_non_empty_did(raw, "target_did")?),
+            None => None,
+        };
         let clean_source = source.filter(|s| !s.trim().is_empty() && *s != "all");
         let conn = self.conn.lock();
 

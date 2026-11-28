@@ -204,7 +204,7 @@ async fn test_ensure_mod_list_discovers_existing_remote_list() {
     pds.mount_existing_list(
         "did:plc:alice",
         "existing_modlist_rkey",
-        "Pre-existing Mod List",
+        "Skybouncer Moderation List",
     )
     .await;
 
@@ -257,8 +257,9 @@ async fn test_bounce_user_success_and_cache_population() {
         .await
         .unwrap();
 
-    assert!(res.is_some());
-    let listitem_uri = res.unwrap();
+    let skybouncer::modlist::BounceOutcome::Bounced(listitem_uri) = res else {
+        panic!("expected BounceOutcome::Bounced, got {res:?}");
+    };
     assert!(listitem_uri.starts_with("at://did:plc:alice/app.bsky.graph.listitem/"));
 
     // Verify 3 PDS creations: list + listblock + listitem
@@ -302,7 +303,10 @@ async fn test_bounce_user_deduplication_drops_redundant_writes() {
         )
         .await
         .unwrap();
-    assert!(res1.is_some());
+    assert!(matches!(
+        res1,
+        skybouncer::modlist::BounceOutcome::Bounced(_)
+    ));
     assert_eq!(pds.created_records.lock().len(), 3); // 1 list + 1 listblock + 1 listitem
 
     // Second bounce: same candidate DID drops immediately at zero cost
@@ -320,7 +324,10 @@ async fn test_bounce_user_deduplication_drops_redundant_writes() {
         )
         .await
         .unwrap();
-    assert!(res2.is_none());
+    assert!(matches!(
+        res2,
+        skybouncer::modlist::BounceOutcome::AlreadyBounced
+    ));
     assert_eq!(pds.created_records.lock().len(), 3); // No new PDS requests
 }
 
@@ -349,7 +356,10 @@ async fn test_bounce_user_sensitivity_threshold_filter() {
         .await
         .unwrap();
 
-    assert!(res.is_none());
+    assert!(matches!(
+        res,
+        skybouncer::modlist::BounceOutcome::BelowThreshold
+    ));
     assert_eq!(pds.created_records.lock().len(), 0);
     assert!(!manager.is_bounced("did:plc:borderline_user").unwrap());
 }
@@ -440,7 +450,10 @@ async fn test_bounce_user_recovers_from_dpop_nonce_challenge() {
         .await
         .unwrap();
 
-    assert!(res.is_some());
+    assert!(matches!(
+        res,
+        skybouncer::modlist::BounceOutcome::Bounced(_)
+    ));
     assert!(manager
         .is_bounced("did:plc:dpop_challenge_violator")
         .unwrap());
@@ -546,7 +559,10 @@ async fn test_concurrent_distinct_violator_bounces() {
 
     for h in handles {
         let res = h.await.unwrap().unwrap();
-        assert!(res.is_some());
+        assert!(matches!(
+            res,
+            skybouncer::modlist::BounceOutcome::Bounced(_)
+        ));
     }
 
     assert_eq!(manager.cache().count_bounced().unwrap(), 10);
@@ -807,4 +823,253 @@ async fn test_manager_is_bounced_for_delegates_to_cache() {
     assert!(!manager
         .is_bounced_for("did:plc:bob", "did:plc:scoped")
         .unwrap());
+}
+
+#[tokio::test]
+async fn test_ensure_mod_list_ignores_personal_lists_paginates_and_matches_sovereign_uri() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let alice = "did:plc:alice_paginated";
+    let sovereign_rkey = "sovereign_rkey_99";
+    let sovereign_uri = format!("at://{alice}/app.bsky.graph.list/{sovereign_rkey}");
+
+    // Sovereign config points explicitly at a custom-named Skybouncer list on page 2.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.getRecord"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uri": format!("at://{alice}/social.skybouncer.config/self"),
+            "cid": "bafycfg1",
+            "value": {
+                "$type": "social.skybouncer.config",
+                "rules": "Block spam",
+                "sensitivity": "medium",
+                "modListUri": sovereign_uri,
+                "updatedAt": "2026-11-28T00:00:00Z"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    // Page 1: a personal non-Skybouncer curatelist / modlist that MUST be ignored!
+    let alice_owned = alice.to_string();
+    let sovereign_rkey_owned = sovereign_rkey.to_string();
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.listRecords"))
+        .and(query_param("collection", "app.bsky.graph.list"))
+        .respond_with(move |req: &wiremock::Request| {
+            let cursor = req.url.query_pairs().find(|(k, _)| k == "cursor").map(|(_, v)| v.to_string());
+            if cursor.is_none() {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "cursor": "page2",
+                    "records": [{
+                        "uri": format!("at://{alice_owned}/app.bsky.graph.list/personal_list"),
+                        "cid": "bafypersonal",
+                        "value": {
+                            "$type": "app.bsky.graph.list",
+                            "purpose": "app.bsky.graph.defs#modlist",
+                            "name": "My Personal Friends Mute List",
+                            "description": "Not managed by skybouncer",
+                            "createdAt": "2026-11-28T00:00:00Z"
+                        }
+                    }]
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "records": [{
+                        "uri": format!("at://{alice_owned}/app.bsky.graph.list/{sovereign_rkey_owned}"),
+                        "cid": "bafysovereignlist",
+                        "value": {
+                            "$type": "app.bsky.graph.list",
+                            "purpose": "app.bsky.graph.defs#modlist",
+                            "name": "Renamed Custom List",
+                            "description": "Custom description",
+                            "createdAt": "2026-11-28T00:00:00Z"
+                        }
+                    }]
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let client = skybase::repo::PdsRepoClient::from_credentials(server.uri(), alice, "mock_token")
+        .unwrap()
+        .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
+    let manager = ModListManager::open_in_memory().unwrap();
+
+    let resolved = manager.ensure_mod_list(&client, alice).await.unwrap();
+    assert_eq!(resolved, sovereign_uri);
+
+    // Invalid mod_list_uri variants (foreign repo, wrong collection, invalid syntax, bad rkey) must fail closed.
+    for bad_uri in [
+        "https://not-an-at-uri",
+        "at://did:plc:attacker/app.bsky.graph.list/evil",
+        &format!("at://{alice}/app.bsky.feed.post/wrongcoll"),
+        &format!("at://{alice}/app.bsky.graph.list/.."),
+    ] {
+        manager
+            .cache()
+            .set_mod_list(&skybouncer::modlist::ModListConfig {
+                user_did: alice.to_string(),
+                list_uri: bad_uri.to_string(),
+                list_cid: "bafyevil".to_string(),
+                created_at: 1,
+            })
+            .unwrap();
+        assert!(
+            manager.ensure_mod_list(&client, alice).await.is_err(),
+            "bad_uri={bad_uri}"
+        );
+    }
+
+    // Mismatched PDS client DID must fail ownership assertion before touching PDS.
+    let other_client =
+        skybase::repo::PdsRepoClient::from_credentials(server.uri(), "did:plc:other", "mock_token")
+            .unwrap()
+            .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
+    assert!(manager.ensure_mod_list(&other_client, alice).await.is_err());
+}
+
+#[tokio::test]
+async fn test_pardon_user_incremental_rkey_cleanup_and_record_not_found_idempotency() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let alice = "did:plc:alice_pardon_inc";
+    let violator = "did:plc:multi_rkey_spammer";
+
+    let manager = ModListManager::open_in_memory().unwrap();
+    for (i, rkey) in ["rk1", "rk2", "rk3"].iter().enumerate() {
+        manager
+            .cache()
+            .record_bounce(&skybouncer::modlist::BouncedUser {
+                subject_did: violator.to_string(),
+                protected_did: alice.to_string(),
+                listitem_uri: format!("at://{alice}/app.bsky.graph.listitem/{rkey}"),
+                listitem_rkey: (*rkey).to_string(),
+                listitem_cid: format!("bafy{i}"),
+                category: "spam".to_string(),
+                confidence: 0.95,
+                reason: "spam".to_string(),
+                post_uri: format!("at://{violator}/app.bsky.feed.post/{i}"),
+                post_text: "spam".to_string(),
+                reply_to_uri: None,
+                bounced_at: 1_700_000_000 + i as u64,
+                expires_at: None,
+            })
+            .unwrap();
+    }
+
+    // 1st delete -> 200 OK; 2nd delete -> 400 RecordNotFound (treated idempotently); 3rd -> 500 error.
+    let call_idx = Arc::new(AtomicUsize::new(0));
+    let call_idx_ref = Arc::clone(&call_idx);
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.repo.deleteRecord"))
+        .respond_with(move |_: &wiremock::Request| {
+            match call_idx_ref.fetch_add(1, Ordering::SeqCst) {
+                0 => ResponseTemplate::new(200).set_body_json(serde_json::json!({})),
+                1 => ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": "InvalidRequest",
+                    "message": "Could not locate record"
+                })),
+                _ => ResponseTemplate::new(500).set_body_string("transient PDS error"),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let client = skybase::repo::PdsRepoClient::from_credentials(server.uri(), alice, "mock_token")
+        .unwrap()
+        .with_ssrf_filter(skyauth::ssrf::SsrfFilter::new(true));
+
+    // Fails on the 3rd rkey, AFTER removing the 1st and 2nd rkeys incrementally from SQLite!
+    let err = manager
+        .pardon_user(&client, alice, violator)
+        .await
+        .unwrap_err();
+    let _ = err;
+    let remaining = manager
+        .cache()
+        .get_all_bounced_rkeys_for(alice, violator)
+        .unwrap();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "already-deleted rkeys must stay deleted"
+    );
+}
+
+#[tokio::test]
+async fn test_bounce_per_tenant_rubric_outcome_distinction() {
+    let pds = MockPdsServer::start().await;
+    let client = pds.pds_client("did:plc:alice");
+    let global_low = RuleRubric::new("Low global", Sensitivity::Low); // 0.90
+    let tenant_high = RuleRubric::new("High tenant", Sensitivity::High); // 0.60
+    let manager = ModListManager::open_in_memory()
+        .unwrap()
+        .with_rubric(global_low);
+
+    // 1. Confidence 0.70 < global Low (0.90) -> BelowThreshold.
+    let below = manager
+        .bounce(
+            &client,
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:target_below",
+                &ViolationCategory::Spam,
+                0.70,
+                "mild",
+                "at://did:plc:target_below/app.bsky.feed.post/1",
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(below, skybouncer::modlist::BounceOutcome::BelowThreshold);
+    assert!(!below.is_bounced());
+    assert_eq!(below.listitem_uri(), None);
+
+    // 2. Same 0.70 with tenant High rubric -> Bounced!
+    let bounced = manager
+        .bounce(
+            &client,
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:target_tenant_high",
+                &ViolationCategory::Spam,
+                0.70,
+                "tenant high",
+                "at://did:plc:target_tenant_high/app.bsky.feed.post/1",
+            )
+            .with_rubric(&tenant_high),
+        )
+        .await
+        .unwrap();
+    assert!(bounced.is_bounced());
+    assert!(bounced
+        .listitem_uri()
+        .is_some_and(|u| u.contains("app.bsky.graph.listitem")));
+
+    // 3. Repeat on same target -> AlreadyBounced.
+    let already = manager
+        .bounce(
+            &client,
+            BounceRequest::new(
+                "did:plc:alice",
+                "did:plc:target_tenant_high",
+                &ViolationCategory::Spam,
+                0.95,
+                "repeat",
+                "at://did:plc:target_tenant_high/app.bsky.feed.post/2",
+            )
+            .with_rubric(&tenant_high),
+        )
+        .await
+        .unwrap();
+    assert_eq!(already, skybouncer::modlist::BounceOutcome::AlreadyBounced);
+    assert!(!already.is_bounced());
+    assert_eq!(already.listitem_uri(), None);
 }

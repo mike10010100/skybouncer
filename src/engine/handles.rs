@@ -27,6 +27,8 @@ impl SkybouncerEngine {
     }
 
     async fn resolve_handle_exact(&self, clean: &str) -> Option<String> {
+        let clean_lower = clean.to_ascii_lowercase();
+        let clean = clean_lower.as_str();
         let now = std::time::Instant::now();
 
         // 1. In-memory monotonic check
@@ -134,8 +136,8 @@ impl SkybouncerEngine {
 
         // Resolve via enricher
         if let Some(resolved) = self.enricher.resolve_did(clean).await {
-            let trimmed = crate::util::normalize_handle(&resolved).to_string();
-            if !trimmed.is_empty() {
+            let trimmed = crate::util::normalize_handle(&resolved).to_ascii_lowercase();
+            if !trimmed.is_empty() && trimmed != "handle.invalid" {
                 let _ = self.cache.set_handle_for_did(clean, &trimmed);
                 let _ = self.tenant_registry.update_handle(clean, &trimmed);
                 return Some(trimmed);

@@ -455,7 +455,8 @@ async fn engine_new_direct_constructor_branches() {
     dids.insert("did:plc:alice".to_string());
     let config = SkybouncerConfig::new(dids, rubric).with_dry_run(true);
 
-    let engine = SkybouncerEngine::new(config, follow_graph, gate, classifier, modlist, pds_client);
+    let engine = SkybouncerEngine::new(config, follow_graph, gate, classifier, modlist, pds_client)
+        .expect("simulate test engine");
     assert!(engine.is_dry_run());
     assert!(engine.is_allowlisted("did:plc:alice", "did:plc:trusted"));
 }

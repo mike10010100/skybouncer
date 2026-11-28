@@ -157,14 +157,17 @@ impl TestEngineFixture {
 
         let config = SkybouncerConfig::new(protected_dids, rubric).with_channel_capacity(100);
 
-        let engine = Arc::new(SkybouncerEngine::new(
-            config,
-            Arc::clone(&follow_graph),
-            Arc::clone(&gate),
-            classifier,
-            Arc::clone(&modlist_manager),
-            pds_client,
-        ));
+        let engine = Arc::new(
+            SkybouncerEngine::new(
+                config,
+                Arc::clone(&follow_graph),
+                Arc::clone(&gate),
+                classifier,
+                Arc::clone(&modlist_manager),
+                pds_client,
+            )
+            .expect("e2e test engine"),
+        );
 
         Self {
             pds,
@@ -689,7 +692,38 @@ async fn test_scenario_7_multi_target_discrimination_friend_vs_stranger() {
         classifier,
         modlist_manager,
         pds_client,
+    )
+    .expect("e2e test engine");
+    let oauth_metadata = skyauth::client::OAuthClientMetadata::new(
+        "http://127.0.0.1:3000/oauth/client-metadata.json",
+        "http://127.0.0.1:3000/oauth/callback",
     );
+    let oauth_client = Arc::new(
+        skyauth::client::AtprotoOAuthClient::builder()
+            .client_metadata(oauth_metadata)
+            .allow_insecure_localhost(true)
+            .build()
+            .expect("oauth client"),
+    );
+    engine.set_oauth_client(oauth_client);
+    for did in ["did:plc:alice", "did:plc:bob"] {
+        let session = skyauth::session::OAuthSession::new(
+            did,
+            "mock_token",
+            Some("rt-mock".to_string()),
+            "DPoP",
+            Some("atproto".to_string()),
+            Some(3600),
+            skyauth::dpop::DPoPKey::generate(),
+            Some(pds.uri()),
+            Some(pds.uri()),
+            Some(format!("{}/oauth/token", pds.uri())),
+        )
+        .expect("session");
+        engine
+            .enroll_tenant(skybouncer::tenant::Tenant::new(did).with_session(session))
+            .expect("enroll tenant");
+    }
 
     // Commit mentions both Alice and Bob with toxic text
     let commit = make_thread_reply_commit(
@@ -885,14 +919,17 @@ async fn test_scenario_11_shadow_mode_simulates_bounces_with_zero_pds_writes() {
         .with_channel_capacity(100)
         .with_dry_run(true);
 
-    let engine = Arc::new(SkybouncerEngine::new(
-        config,
-        Arc::clone(&follow_graph),
-        Arc::clone(&gate),
-        classifier,
-        Arc::clone(&modlist_manager),
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(
+            config,
+            Arc::clone(&follow_graph),
+            Arc::clone(&gate),
+            classifier,
+            Arc::clone(&modlist_manager),
+            pds_client,
+        )
+        .expect("e2e test engine"),
+    );
 
     assert!(engine.is_dry_run());
 
@@ -989,14 +1026,17 @@ async fn test_allowlist_bypass_latency_and_pardon_immunization_pipeline() {
     protected_dids.insert("did:plc:alice".to_string());
     let config = SkybouncerConfig::new(protected_dids, rubric);
 
-    let engine = Arc::new(SkybouncerEngine::new(
-        config.clone(),
-        Arc::clone(&follow_graph),
-        Arc::clone(&gate),
-        Arc::clone(&classifier) as Arc<dyn skybouncer::classifier::Classifier>,
-        Arc::clone(&modlist_manager),
-        pds_client,
-    ));
+    let engine = Arc::new(
+        SkybouncerEngine::new(
+            config.clone(),
+            Arc::clone(&follow_graph),
+            Arc::clone(&gate),
+            Arc::clone(&classifier) as Arc<dyn skybouncer::classifier::Classifier>,
+            Arc::clone(&modlist_manager),
+            pds_client,
+        )
+        .expect("e2e test engine"),
+    );
 
     // 1. Pre-allowlist a trusted friend
     engine
@@ -1161,7 +1201,8 @@ async fn test_allowlist_bypass_latency_and_pardon_immunization_pipeline() {
         Arc::clone(&classifier) as Arc<dyn skybouncer::classifier::Classifier>,
         modlist_manager2,
         pds_client2,
-    );
+    )
+    .expect("e2e test engine");
 
     // Verify all allowlisted users were automatically hydrated into memory on startup
     assert!(engine2.is_allowlisted("did:plc:alice", "did:plc:friend_bob"));

@@ -8,7 +8,9 @@ impl SkybouncerEngine {
     }
 
     /// Creates a new [`SkybouncerEngine`] with direct component references.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns [`SkybouncerError`] if [`TenantRegistry`] initialization or secret migration fails.
     pub fn new(
         config: SkybouncerConfig,
         follow_graph: Arc<FollowGraph>,
@@ -16,18 +18,9 @@ impl SkybouncerEngine {
         classifier: Arc<dyn Classifier>,
         modlist_manager: Arc<ModListManager>,
         pds_client: Arc<PdsRepoClient>,
-    ) -> Self {
+    ) -> Result<Self, SkybouncerError> {
         let cache = Arc::clone(modlist_manager.cache());
-        let tenant_registry = Arc::new(
-            TenantRegistry::from_connection(cache.connection())
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to initialize TenantRegistry from cache connection; falling back to in-memory registry");
-                    TenantRegistry::open_in_memory().unwrap_or_else(|e2| {
-                        tracing::error!(error = %e2, "Failed to initialize in-memory TenantRegistry; using emergency fallback");
-                        TenantRegistry::fallback()
-                    })
-                }),
-        );
+        let tenant_registry = Arc::new(TenantRegistry::from_connection(cache.connection())?);
         let heuristic_classifier = if config.enable_heuristic_prefilter {
             HeuristicClassifier::default()
         } else {
@@ -80,7 +73,7 @@ impl SkybouncerEngine {
             }
         }
 
-        Self {
+        Ok(Self {
             config,
             protected_dids,
             rubric,
@@ -104,7 +97,8 @@ impl SkybouncerEngine {
             handle_cache,
             dogpile_tracker,
             storm_stance_classifier,
-        }
+            sovereign_publish_locks: Arc::new(crate::modlist::manager::StripedAsyncLocks::new()),
+        })
     }
 
     /// Configures the active [`AtprotoOAuthClient`] for automatic background session refreshes.
@@ -758,7 +752,7 @@ impl SkybouncerEngine {
             .as_ref()
             .and_then(|a| a.handle.as_deref())
             .map(str::trim)
-            .filter(|h| !h.is_empty())
+            .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("handle.invalid"))
         {
             let _ = self.cache.set_handle_for_did(&author_did, handle);
         }
@@ -980,23 +974,37 @@ impl SkybouncerEngine {
 
                 // Actionable violation: bounce on sovereign PDS
                 let expires_at = rubric.bounce_duration.expires_at_us(current_time_us());
-                let pds_client = self.resolve_pds_client_for(&target_did).await?;
                 let bounce_result = self
-                    .modlist_manager
-                    .bounce(
-                        &pds_client,
-                        BounceRequest::new(
-                            &target_did,
-                            &author_did,
-                            &category,
-                            confidence,
-                            &reason,
-                            &post_uri,
-                        )
-                        .with_post_text(&post_text)
-                        .with_reply_to_uri(interaction.parent_uri.as_deref())
-                        .with_expires_at(expires_at),
-                    )
+                    .with_pds_client_401_retry(&target_did, |pds_client| {
+                        let req_rubric = rubric.clone();
+                        let target_did_ref = target_did.as_str();
+                        let author_did_ref = author_did.as_str();
+                        let category_ref = &category;
+                        let reason_ref = reason.as_str();
+                        let post_uri_ref = post_uri.as_str();
+                        let post_text_ref = post_text.as_str();
+                        let reply_to_ref = interaction.parent_uri.as_deref();
+                        async move {
+                            self.modlist_manager
+                                .bounce(
+                                    &pds_client,
+                                    BounceRequest::new(
+                                        target_did_ref,
+                                        author_did_ref,
+                                        category_ref,
+                                        confidence,
+                                        reason_ref,
+                                        post_uri_ref,
+                                    )
+                                    .with_post_text(post_text_ref)
+                                    .with_reply_to_uri(reply_to_ref)
+                                    .with_expires_at(expires_at)
+                                    .with_rubric(&req_rubric)
+                                    .with_skip_threshold_check(true),
+                                )
+                                .await
+                        }
+                    })
                     .await
                     .inspect_err(|_e| {
                         self.stats
@@ -1005,7 +1013,7 @@ impl SkybouncerEngine {
                     })?;
 
                 match bounce_result {
-                    Some(listitem_uri) => {
+                    BounceOutcome::Bounced(listitem_uri) => {
                         self.stats.bounces_executed.fetch_add(1, Ordering::Relaxed);
                         self.stats.bounced.fetch_add(1, Ordering::Relaxed);
                         info!(
@@ -1024,8 +1032,10 @@ impl SkybouncerEngine {
                             .as_ref()
                             .and_then(|c| c.author.as_ref())
                             .and_then(|a| a.handle.clone())
-                            .filter(|h| !h.trim().is_empty())
-                        {
+                            .filter(|h| {
+                                let t = h.trim();
+                                !t.is_empty() && !t.eq_ignore_ascii_case("handle.invalid")
+                            }) {
                             Some(h) => {
                                 let _ = self.cache.set_handle_for_did(&author_did, &h);
                                 Some(h)
@@ -1090,12 +1100,25 @@ impl SkybouncerEngine {
                             reason,
                         })
                     }
-                    None => {
+                    BounceOutcome::AlreadyBounced => {
                         // Double-checked locking detected concurrent task already bounced author
                         self.stats.dedup_cache_hits.fetch_add(1, Ordering::Relaxed);
                         Ok(InteractionOutcome::AlreadyBounced {
                             author_did,
                             target_did,
+                        })
+                    }
+                    BounceOutcome::BelowThreshold => {
+                        self.stats
+                            .bounces_skipped_rubric
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.stats.permitted.fetch_add(1, Ordering::Relaxed);
+                        Ok(InteractionOutcome::BelowThreshold {
+                            author_did,
+                            target_did,
+                            category,
+                            confidence,
+                            threshold,
                         })
                     }
                 }
