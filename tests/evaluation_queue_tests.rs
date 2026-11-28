@@ -679,3 +679,485 @@ async fn test_queue_caps_per_candidate_timeout_retries_without_head_of_line_bloc
     assert_eq!(final_stats.bounces_executed, 1);
     assert!(final_stats.errors_encountered >= 2);
 }
+
+#[tokio::test]
+async fn test_pr2_http_500_bounded_retries_and_recovers() {
+    let pds = MockPdsServer::start().await;
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                ResponseTemplate::new(500).set_body_string("malformed prompt context")
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "violates": true,
+                    "category": "spam",
+                    "confidence": 0.96,
+                    "reason": "spam"
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist_manager = Arc::new(
+        ModListManager::from_shared_cache(Arc::clone(&cache))
+            .with_rubric(rubric.clone())
+            .with_dry_run(true),
+    );
+    let pds_client = Arc::new(pds.pds_client("did:plc:alice"));
+    let jev_config = JevConfig {
+        base_url: server.uri(),
+        api_key: None,
+        model: "jev-test".to_string(),
+        timeout: Duration::from_secs(2),
+        max_retries: 0,
+        supports_images: false,
+    };
+    let classifier = Arc::new(JevClassifier::new(jev_config, rubric.clone()).unwrap());
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+
+    let config = SkybouncerConfig::new(protected_dids, rubric)
+        .with_evaluation_queue_capacity(16)
+        .with_evaluation_concurrency(1)
+        .with_hold_queue_on_classifier_unavailable(true)
+        .with_classifier_retry_backoff(Duration::from_millis(5))
+        .with_max_classifier_500_retries(2)
+        .with_classifier_circuit_breaker_cooldown(Duration::from_secs(30))
+        .with_dry_run(true);
+
+    let engine = SkybouncerEngine::new(
+        config,
+        follow_graph,
+        gate,
+        classifier,
+        modlist_manager,
+        pds_client,
+    )
+    .unwrap();
+
+    let (commit_tx, commit_rx) = tokio::sync::mpsc::channel(16);
+    let cancel = CancellationToken::new();
+    let mut join_set = JoinSet::new();
+    let eng_clone = engine.clone();
+    let cancel_clone = cancel.clone();
+    join_set.spawn(async move { eng_clone.run(commit_rx, cancel_clone).await });
+
+    commit_tx
+        .send(make_reply_commit(
+            "did:plc:spam_500",
+            "did:plc:alice",
+            "p1",
+            "root_1",
+            "buy scam",
+        ))
+        .await
+        .unwrap();
+
+    for _ in 0..80 {
+        if engine.stats().snapshot().eval_queue_processed >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    cancel.cancel();
+    SkybouncerEngine::drain_and_shutdown(&mut join_set, &cancel, Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "1 initial + 2 bounded HTTP 500 retries inside eval worker"
+    );
+    let stats = engine.stats().snapshot();
+    assert_eq!(stats.bounces_executed, 1);
+    assert_eq!(stats.errors_encountered, 2);
+}
+
+#[tokio::test]
+async fn test_pr2_circuit_breaker_trips_on_consecutive_500s_and_503_does_not_trip() {
+    let pds = MockPdsServer::start().await;
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_clone = Arc::clone(&calls);
+
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = calls_clone.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // First call returns 503: transient infrastructure error must NOT trip 500 breaker
+                ResponseTemplate::new(503).set_body_string("upstream restarting")
+            } else if n <= 3 {
+                // Next 3 calls return HTTP 500: reach threshold (3) and trip breaker
+                ResponseTemplate::new(500).set_body_string("poison payload")
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "violates": false,
+                    "confidence": 0.95,
+                    "reason": "ok"
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist_manager = Arc::new(
+        ModListManager::from_shared_cache(Arc::clone(&cache))
+            .with_rubric(rubric.clone())
+            .with_dry_run(true),
+    );
+    let pds_client = Arc::new(pds.pds_client("did:plc:alice"));
+    let jev_config = JevConfig {
+        base_url: server.uri(),
+        api_key: None,
+        model: "jev-test".to_string(),
+        timeout: Duration::from_secs(2),
+        max_retries: 0,
+        supports_images: false,
+    };
+    let classifier = Arc::new(JevClassifier::new(jev_config, rubric.clone()).unwrap());
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+
+    let config = SkybouncerConfig::new(protected_dids, rubric)
+        .with_hold_queue_on_classifier_unavailable(false)
+        .with_classifier_circuit_breaker_cooldown(Duration::from_millis(80))
+        .with_dry_run(true);
+
+    let engine = SkybouncerEngine::new(
+        config,
+        follow_graph,
+        gate,
+        classifier,
+        modlist_manager,
+        pds_client,
+    )
+    .unwrap();
+
+    let mk = |idx: usize| Interaction {
+        post_uri: format!("at://did:plc:a{idx}/app.bsky.feed.post/p{idx}"),
+        post_cid: Some(format!("c{idx}")),
+        author_did: format!("did:plc:a{idx}"),
+        target_did: "did:plc:alice".to_string(),
+        text: "hello".to_string(),
+        interaction_type: InteractionType::DirectReply,
+        parent_uri: Some("at://did:plc:alice/app.bsky.feed.post/root".to_string()),
+        root_uri: Some("at://did:plc:alice/app.bsky.feed.post/root".to_string()),
+        quote_uri: None,
+        created_at_us: 1_720_000_000_000_000,
+        image_cids: Vec::new(),
+        image_alts: Vec::new(),
+        enriched_context: None,
+        rubric: None,
+    };
+
+    // Call 1: 503 does NOT trip breaker (and if we had only 2 500s afterward, breaker stays closed)
+    assert!(engine.evaluate_candidate(mk(0)).await.is_err());
+    // Calls 2..=4: 3 consecutive HTTP 500s open the circuit breaker
+    for idx in 1..=3 {
+        assert!(engine.evaluate_candidate(mk(idx)).await.is_err());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+    // Call 5 during cooldown short-circuits BEFORE HTTP (0 extra calls)
+    let cb_err = engine.evaluate_candidate(mk(4)).await.unwrap_err();
+    assert!(
+        cb_err.to_string().contains("circuit breaker open"),
+        "expected circuit breaker error, got: {cb_err}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+    // Wait past 80ms cooldown -> half-open/closed recovery succeeds
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let ok = engine.evaluate_candidate(mk(5)).await.unwrap();
+    assert!(ok.is_permitted());
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test]
+async fn test_pr2_rate_limiter_is_exhausted_skips_enricher_check_relationship() {
+    use async_trait::async_trait;
+    use skybouncer::engine::SkybouncerEngineBuilder;
+    use skybouncer::enricher::{ContextEnricher, EnrichedContext};
+    use skybouncer::limiter::{EvaluationRateLimiter, RateLimiterConfig};
+
+    struct SpyEnricher {
+        rel_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ContextEnricher for SpyEnricher {
+        async fn enrich(&self, _interaction: &Interaction) -> EnrichedContext {
+            EnrichedContext::empty()
+        }
+
+        async fn check_relationship(
+            &self,
+            _target_did: &str,
+            _candidate_did: &str,
+        ) -> (bool, bool) {
+            self.rel_calls.fetch_add(1, Ordering::SeqCst);
+            (false, false)
+        }
+    }
+
+    let pds = MockPdsServer::start().await;
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let rubric = RuleRubric::new("Block spam", Sensitivity::Medium);
+    let modlist_manager = Arc::new(
+        ModListManager::from_shared_cache(Arc::clone(&cache))
+            .with_rubric(rubric.clone())
+            .with_dry_run(true),
+    );
+    let pds_client = Arc::new(pds.pds_client("did:plc:alice"));
+    let classifier = Arc::new(skybouncer::classifier::MockClassifier::permitted());
+
+    let rel_calls = Arc::new(AtomicUsize::new(0));
+    let spy = Arc::new(SpyEnricher {
+        rel_calls: Arc::clone(&rel_calls),
+    });
+
+    // Limit to 1 evaluation per target window
+    let limiter = Arc::new(EvaluationRateLimiter::new(RateLimiterConfig {
+        max_evaluations: 1,
+        window_duration: Duration::from_secs(60),
+    }));
+    assert!(!limiter.is_exhausted("did:plc:alice", 1));
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+    let config = SkybouncerConfig::new(protected_dids, rubric).with_dry_run(true);
+
+    let engine = SkybouncerEngineBuilder::new(config)
+        .with_cache(cache)
+        .with_follow_graph(follow_graph)
+        .with_gate(gate)
+        .with_classifier(classifier)
+        .with_modlist_manager(modlist_manager)
+        .with_pds_client(pds_client)
+        .with_enricher(spy)
+        .with_rate_limiter(Arc::clone(&limiter))
+        .build()
+        .unwrap();
+
+    let mk = |idx: usize| Interaction {
+        post_uri: format!("at://did:plc:rl_{idx}/app.bsky.feed.post/p{idx}"),
+        post_cid: Some(format!("c{idx}")),
+        author_did: format!("did:plc:rl_{idx}"),
+        target_did: "did:plc:alice".to_string(),
+        text: "hello".to_string(),
+        interaction_type: InteractionType::DirectReply,
+        parent_uri: Some("at://did:plc:alice/app.bsky.feed.post/root".to_string()),
+        root_uri: Some("at://did:plc:alice/app.bsky.feed.post/root".to_string()),
+        quote_uri: None,
+        created_at_us: 1_720_000_000_000_000,
+        image_cids: Vec::new(),
+        image_alts: Vec::new(),
+        enriched_context: None,
+        rubric: None,
+    };
+
+    let out1 = engine.evaluate_candidate(mk(1)).await.unwrap();
+    assert!(out1.is_permitted());
+    assert_eq!(rel_calls.load(Ordering::SeqCst), 1);
+    assert!(limiter.is_exhausted("did:plc:alice", 1));
+
+    // Second evaluation hits rate limiter BEFORE check_relationship() -> zero extra relationship calls!
+    let out2 = engine.evaluate_candidate(mk(2)).await.unwrap();
+    assert!(matches!(
+        out2,
+        skybouncer::engine::ProcessOutcome::RateLimited { .. }
+    ));
+    assert_eq!(rel_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_pr2_shared_ollama_semaphore_serializes_eval_and_stance_workers() {
+    use skybouncer::classifier::Classifier;
+    use skybouncer::dogpile::{
+        LlmStormStanceClassifier, StormMetrics, StormStanceClassifier, StormStanceInput,
+    };
+
+    let server = MockServer::start().await;
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let active_clone = Arc::clone(&active);
+    let max_clone = Arc::clone(&max_active);
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let cur = active_clone.fetch_add(1, Ordering::SeqCst) + 1;
+            max_clone.fetch_max(cur, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(60));
+            active_clone.fetch_sub(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "message": {
+                    "role": "assistant",
+                    "content": "{\"violates\": false, \"collective_hostility\": false, \"classification\": \"benign_viral\", \"confidence\": 0.92, \"reason\": \"ok\"}"
+                }
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let sem = Arc::new(tokio::sync::Semaphore::new(1));
+    let ollama = JevClassifier::new(
+        JevConfig {
+            base_url: format!("{}/api/chat", server.uri()),
+            api_key: None,
+            model: "qwen3.5:9b".to_string(),
+            timeout: Duration::from_secs(2),
+            max_retries: 0,
+            supports_images: false,
+        },
+        RuleRubric::default(),
+    )
+    .unwrap()
+    .with_inference_semaphore(Arc::clone(&sem));
+
+    let stance = LlmStormStanceClassifier::new(JevConfig {
+        base_url: format!("{}/api/chat", server.uri()),
+        api_key: None,
+        model: "qwen3.5:9b".to_string(),
+        timeout: Duration::from_secs(2),
+        max_retries: 0,
+        supports_images: false,
+    })
+    .unwrap()
+    .with_inference_semaphore(sem);
+
+    let inter = Interaction {
+        post_uri: "at://did:plc:auth/app.bsky.feed.post/1".to_string(),
+        post_cid: None,
+        author_did: "did:plc:auth".to_string(),
+        target_did: "did:plc:alice".to_string(),
+        text: "test".to_string(),
+        interaction_type: InteractionType::DirectReply,
+        parent_uri: None,
+        root_uri: None,
+        quote_uri: None,
+        created_at_us: 1_720_000_000_000_000,
+        image_cids: Vec::new(),
+        image_alts: Vec::new(),
+        enriched_context: None,
+        rubric: None,
+    };
+    let bundle = StormStanceInput {
+        target_did: "did:plc:alice".to_string(),
+        target_handle: None,
+        focal_post_uri: "at://did:plc:alice/app.bsky.feed.post/root".to_string(),
+        focal_post: None,
+        top_quotes: vec![],
+        sample_replies: vec![],
+        metrics: StormMetrics::default(),
+    };
+
+    let (r1, r2) = tokio::join!(ollama.classify(&inter), stance.classify_storm(&bundle));
+    assert!(r1.is_ok());
+    assert!(r2.is_ok());
+    assert_eq!(
+        max_active.load(Ordering::SeqCst),
+        1,
+        "shared Ollama semaphore must serialize eval and stance workers to max 1 in-flight call"
+    );
+}
+
+#[tokio::test]
+async fn test_pr2_engine_tier2_image_escalation_and_rubric_below_threshold_stats() {
+    use skybouncer::classifier::{
+        CertaintyConfig, MockClassifier, TieredClassifier, Verdict, ViolationCategory,
+    };
+
+    let pds = MockPdsServer::start().await;
+    let cache = Arc::new(DeduplicationCache::open_in_memory().unwrap());
+    let follow_graph = Arc::new(FollowGraph::new());
+    let gate = Arc::new(NonFollowedGate::new(Arc::clone(&follow_graph)));
+    let low_rubric = RuleRubric::new("Strict bar", Sensitivity::Low); // threshold 0.90
+    let modlist_manager = Arc::new(
+        ModListManager::from_shared_cache(Arc::clone(&cache))
+            .with_rubric(low_rubric.clone())
+            .with_dry_run(true),
+    );
+    let pds_client = Arc::new(pds.pds_client("did:plc:alice"));
+
+    // Primary permits (0.95) on an image post -> escalates strictly via VisualMedia to Tier 2,
+    // which returns Harassment at 0.88 -> below Low sensitivity (0.90) -> BelowThreshold!
+    let primary = Arc::new(MockClassifier::new(Verdict::Permitted {
+        confidence: Some(0.95),
+        reason: "text ok".to_string(),
+    }));
+    let fallback = Arc::new(MockClassifier::new(Verdict::Violation {
+        category: ViolationCategory::Harassment,
+        confidence: 0.88,
+        reason: "marginal image attack".to_string(),
+    }));
+    let tiered: Arc<dyn skybouncer::classifier::Classifier> = Arc::new(TieredClassifier::new(
+        primary,
+        fallback,
+        CertaintyConfig::default().with_escalate_on_images(true),
+    ));
+
+    let mut protected_dids = HashSet::new();
+    protected_dids.insert("did:plc:alice".to_string());
+    let config = SkybouncerConfig::new(protected_dids, low_rubric).with_dry_run(true);
+
+    let engine = SkybouncerEngine::new(
+        config,
+        follow_graph,
+        gate,
+        tiered,
+        modlist_manager,
+        pds_client,
+    )
+    .unwrap();
+
+    let inter = Interaction {
+        post_uri: "at://did:plc:img_author/app.bsky.feed.post/p1".to_string(),
+        post_cid: Some("cid_img".to_string()),
+        author_did: "did:plc:img_author".to_string(),
+        target_did: "did:plc:alice".to_string(),
+        text: "look".to_string(),
+        interaction_type: InteractionType::DirectReply,
+        parent_uri: Some("at://did:plc:alice/app.bsky.feed.post/root".to_string()),
+        root_uri: Some("at://did:plc:alice/app.bsky.feed.post/root".to_string()),
+        quote_uri: None,
+        created_at_us: 1_720_000_000_000_000,
+        image_cids: vec!["bafyrei_img".to_string()],
+        image_alts: Vec::new(),
+        enriched_context: None,
+        rubric: None,
+    };
+
+    let outcome = engine.evaluate_candidate(inter).await.unwrap();
+    assert!(matches!(
+        outcome,
+        skybouncer::engine::ProcessOutcome::BelowThreshold { .. }
+    ));
+
+    let stats = engine.stats().snapshot();
+    assert_eq!(stats.tier2_evaluations, 1);
+    assert_eq!(stats.tier2_image_escalations, 1);
+    assert_eq!(stats.bounces_skipped_rubric, 1);
+}

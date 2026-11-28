@@ -73,6 +73,14 @@ impl Default for DogpileConfig {
     }
 }
 
+fn sanitize_finite_unit(val: f64, default: f64) -> f64 {
+    if val.is_finite() {
+        val.clamp(0.0, 1.0)
+    } else {
+        default
+    }
+}
+
 impl DogpileConfig {
     /// Loads dogpile detection parameters from `SKYBOUNCER_DOGPILE_*` / `DOGPILE_*`
     /// environment variables, falling back to [`Self::default`].
@@ -142,15 +150,17 @@ impl DogpileConfig {
                 d.min_unique_authors,
             )
             .max(2),
-            min_out_of_network_ratio: crate::env::parsed_or(
-                &[
-                    "SKYBOUNCER_DOGPILE_MIN_OON_RATIO",
-                    "SKYBOUNCER_DOGPILE_MIN_OUT_OF_NETWORK_RATIO",
-                    "DOGPILE_MIN_OON_RATIO",
-                ],
+            min_out_of_network_ratio: sanitize_finite_unit(
+                crate::env::parsed_or(
+                    &[
+                        "SKYBOUNCER_DOGPILE_MIN_OON_RATIO",
+                        "SKYBOUNCER_DOGPILE_MIN_OUT_OF_NETWORK_RATIO",
+                        "DOGPILE_MIN_OON_RATIO",
+                    ],
+                    d.min_out_of_network_ratio,
+                ),
                 d.min_out_of_network_ratio,
-            )
-            .clamp(0.0, 1.0),
+            ),
             alert_cooldown: Duration::from_secs(alert_cooldown_secs),
             storm_mode_ttl: Duration::from_secs(storm_ttl_secs),
             digest_interval: Duration::from_secs(digest_secs),
@@ -193,30 +203,36 @@ impl DogpileConfig {
                 ],
                 d.enable_llm_stance,
             ),
-            structural_trigger_score: crate::env::parsed_or(
-                &[
-                    "SKYBOUNCER_DOGPILE_STRUCTURAL_TRIGGER_SCORE",
-                    "DOGPILE_STRUCTURAL_TRIGGER_SCORE",
-                ],
+            structural_trigger_score: sanitize_finite_unit(
+                crate::env::parsed_or(
+                    &[
+                        "SKYBOUNCER_DOGPILE_STRUCTURAL_TRIGGER_SCORE",
+                        "DOGPILE_STRUCTURAL_TRIGGER_SCORE",
+                    ],
+                    d.structural_trigger_score,
+                ),
                 d.structural_trigger_score,
-            )
-            .clamp(0.0, 1.0),
-            structural_fallback_threshold: crate::env::parsed_or(
-                &[
-                    "SKYBOUNCER_DOGPILE_STRUCTURAL_FALLBACK_THRESHOLD",
-                    "DOGPILE_STRUCTURAL_FALLBACK_THRESHOLD",
-                ],
+            ),
+            structural_fallback_threshold: sanitize_finite_unit(
+                crate::env::parsed_or(
+                    &[
+                        "SKYBOUNCER_DOGPILE_STRUCTURAL_FALLBACK_THRESHOLD",
+                        "DOGPILE_STRUCTURAL_FALLBACK_THRESHOLD",
+                    ],
+                    d.structural_fallback_threshold,
+                ),
                 d.structural_fallback_threshold,
-            )
-            .clamp(0.0, 1.0),
-            confirmed_score_threshold: crate::env::parsed_or(
-                &[
-                    "SKYBOUNCER_DOGPILE_CONFIRMED_SCORE_THRESHOLD",
-                    "DOGPILE_CONFIRMED_SCORE_THRESHOLD",
-                ],
+            ),
+            confirmed_score_threshold: sanitize_finite_unit(
+                crate::env::parsed_or(
+                    &[
+                        "SKYBOUNCER_DOGPILE_CONFIRMED_SCORE_THRESHOLD",
+                        "DOGPILE_CONFIRMED_SCORE_THRESHOLD",
+                    ],
+                    d.confirmed_score_threshold,
+                ),
                 d.confirmed_score_threshold,
-            )
-            .clamp(0.0, 1.0),
+            ),
             eval_recheck_interval: Duration::from_secs(recheck_secs),
         }
     }
@@ -748,6 +764,13 @@ mod tests {
 
         let env_cfg = DogpileConfig::from_env();
         assert!(env_cfg.short_window >= Duration::from_secs(10));
+
+        assert_eq!(sanitize_finite_unit(f64::NAN, 0.72), 0.72);
+        assert_eq!(sanitize_finite_unit(f64::INFINITY, 0.72), 0.72);
+        assert_eq!(sanitize_finite_unit(f64::NEG_INFINITY, 0.72), 0.72);
+        assert_eq!(sanitize_finite_unit(-0.3, 0.72), 0.0);
+        assert_eq!(sanitize_finite_unit(1.8, 0.72), 1.0);
+        assert!((sanitize_finite_unit(0.65, 0.72) - 0.65).abs() < f64::EPSILON);
     }
 
     #[test]

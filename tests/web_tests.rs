@@ -356,8 +356,24 @@ async fn test_api_get_and_update_rules() {
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&invalid_payload).unwrap()))
         .unwrap();
-    let bad_resp = app.oneshot(bad_req).await.unwrap();
+    let bad_resp = app.clone().oneshot(bad_req).await.unwrap();
     assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 5b. Verify bad request on prompt exceeding MAX_RUBRIC_PROMPT_CHARS (2000)
+    let too_long_payload = json!({
+        "prompt": "x".repeat(skybouncer::classifier::MAX_RUBRIC_PROMPT_CHARS + 1),
+        "sensitivity": "Medium"
+    });
+    let too_long_req = Request::builder()
+        .method("POST")
+        .uri("/api/rules")
+        .header("cookie", format!("skybouncer_session={alice_token}"))
+        .header("origin", "http://127.0.0.1:3000")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&too_long_payload).unwrap()))
+        .unwrap();
+    let too_long_resp = app.oneshot(too_long_req).await.unwrap();
+    assert_eq!(too_long_resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

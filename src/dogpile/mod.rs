@@ -17,8 +17,8 @@ pub use gates::{
 };
 pub use math::{
     canonical_focal_post_uri, compute_burst_acceleration, compute_composite_score,
-    compute_direct_ratio, compute_dunk_ratio, compute_power_asymmetry, compute_structural_score,
-    severity_from_score,
+    compute_composite_score_with_metrics, compute_direct_ratio, compute_dunk_ratio,
+    compute_power_asymmetry, compute_structural_score, severity_from_score,
 };
 pub use stance::{
     LlmStormStanceClassifier, MockStormStanceClassifier, NoopStormStanceClassifier,

@@ -707,6 +707,27 @@ fn test_extract_rubric_from_list_description_handles_closing_braces_in_rules() {
     assert_eq!(extracted.sensitivity, Sensitivity::High);
 }
 
+#[test]
+fn test_pr2_sovereign_config_and_list_description_cap_rubric_at_max_chars() {
+    use skybouncer::classifier::MAX_RUBRIC_PROMPT_CHARS;
+
+    let oversized = "R".repeat(MAX_RUBRIC_PROMPT_CHARS + 300);
+    let record = SovereignConfigRecord::from_rubric(&RuleRubric::new(
+        oversized.clone(),
+        Sensitivity::Medium,
+    ));
+    let rubric = record.to_rubric();
+    assert_eq!(rubric.prompt.chars().count(), MAX_RUBRIC_PROMPT_CHARS);
+
+    let fake_desc = format_list_description_with_rubric(
+        "Header",
+        &RuleRubric::new("seed_prompt_placeholder", Sensitivity::Medium),
+    )
+    .replace("seed_prompt_placeholder", &oversized);
+    let extracted = extract_rubric_from_list_description(&fake_desc).unwrap();
+    assert_eq!(extracted.prompt.chars().count(), MAX_RUBRIC_PROMPT_CHARS);
+}
+
 #[tokio::test]
 async fn test_fetch_sovereign_config_could_not_locate_record_vs_500_and_repo_owner_check() {
     let server = MockServer::start().await;

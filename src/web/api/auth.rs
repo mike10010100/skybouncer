@@ -192,6 +192,16 @@ pub async fn update_rules(
         rubric.bypass_incoming_followers = bypass;
     }
 
+    if rubric.prompt.chars().count() > crate::classifier::MAX_RUBRIC_PROMPT_CHARS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Rule rubric prompt exceeds maximum length of {} characters",
+                crate::classifier::MAX_RUBRIC_PROMPT_CHARS
+            ),
+        ));
+    }
+
     // Apply the incoming-follower bypass toggle to the in-memory gate immediately so the
     // change takes effect without a restart (and regardless of enrollment state).
     state

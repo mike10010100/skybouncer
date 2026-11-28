@@ -1,12 +1,24 @@
 use super::*;
 
 use crate::dogpile::{
-    apply_postgate_detach, apply_threadgate, compute_composite_score, compute_direct_ratio,
-    compute_dunk_ratio, compute_power_asymmetry, compute_structural_score, parse_owned_post_uri,
-    remove_threadgate, severity_from_score, CatalystInfo, PostEngagementSnapshot, StormEvent,
-    StormNotification, StormStanceInput, StormStanceVerdict, StormStatus, SurgeCandidate,
-    ThreadgatePolicy,
+    apply_threadgate, compute_composite_score_with_metrics, compute_direct_ratio,
+    compute_dunk_ratio, compute_power_asymmetry, compute_structural_score,
+    gates::{apply_postgate_detach_detailed, is_valid_rkey},
+    parse_owned_post_uri, remove_threadgate, severity_from_score, CatalystInfo,
+    PostEngagementSnapshot, StormEvent, StormNotification, StormStanceInput, StormStanceVerdict,
+    StormStatus, SurgeCandidate, ThreadgatePolicy,
 };
+
+struct InFlightStormGuard {
+    set: Arc<parking_lot::Mutex<HashSet<(String, String)>>>,
+    key: (String, String),
+}
+
+impl Drop for InFlightStormGuard {
+    fn drop(&mut self) {
+        self.set.lock().remove(&self.key);
+    }
+}
 
 impl SkybouncerEngine {
     /// Evaluates a Stage 1 [`SurgeCandidate`] through Stage 2 AppView engagement/catalyst
@@ -25,6 +37,21 @@ impl SkybouncerEngine {
         if !self.config.dogpile_config.enabled || self.is_tenant_paused(&candidate.target_did) {
             return Ok(None);
         }
+
+        let in_flight_key = (
+            candidate.target_did.clone(),
+            candidate.focal_post_uri.clone(),
+        );
+        {
+            let mut set = self.in_flight_storm_evals.lock();
+            if !set.insert(in_flight_key.clone()) {
+                return Ok(None);
+            }
+        }
+        let _in_flight_guard = InFlightStormGuard {
+            set: Arc::clone(&self.in_flight_storm_evals),
+            key: in_flight_key,
+        };
 
         let is_synthetic_mentions = candidate.focal_post_uri.ends_with("/_mentions");
         let mut fetch_uris = Vec::with_capacity(1 + candidate.recent_quote_uris.len());
@@ -78,7 +105,14 @@ impl SkybouncerEngine {
             );
         }
 
-        let root_likes = focal_post.as_ref().map_or(0, |f| f.like_count);
+        let max_dunk = if let Some(ref fp) = focal_post {
+            quote_snaps
+                .iter()
+                .map(|q| compute_dunk_ratio(q.like_count, fp.like_count))
+                .fold(0.0_f64, f64::max)
+        } else {
+            0.0
+        };
         let mut top_catalyst: Option<CatalystInfo> = None;
         if let Some(top) = quote_snaps.first_mut() {
             let cat_followers = if top.author_followers.is_some() {
@@ -91,9 +125,13 @@ impl SkybouncerEngine {
                 top.author_followers = fetched;
                 fetched
             };
-            let dunk = compute_dunk_ratio(top.like_count, root_likes);
+            let dunk = if let Some(ref fp) = focal_post {
+                compute_dunk_ratio(top.like_count, fp.like_count)
+            } else {
+                0.0
+            };
             let asym = compute_power_asymmetry(cat_followers, target_followers);
-            metrics.dunk_ratio = dunk;
+            metrics.dunk_ratio = max_dunk;
             metrics.power_asymmetry = asym;
 
             top_catalyst = Some(CatalystInfo {
@@ -107,6 +145,8 @@ impl SkybouncerEngine {
                 dunk_ratio: dunk,
                 text_snippet: top.text.chars().take(200).collect(),
             });
+        } else {
+            metrics.dunk_ratio = 0.0;
         }
 
         metrics.structural_score = compute_structural_score(&metrics, &self.config.dogpile_config);
@@ -156,8 +196,11 @@ impl SkybouncerEngine {
         let used_llm = stance
             .as_ref()
             .is_some_and(|s| s.evaluator != "structural_fallback");
-        metrics.composite_score =
-            compute_composite_score(metrics.structural_score, stance.as_ref());
+        metrics.composite_score = compute_composite_score_with_metrics(
+            &metrics,
+            &self.config.dogpile_config,
+            stance.as_ref(),
+        );
 
         let confirmed = if used_llm {
             metrics.composite_score >= self.config.dogpile_config.confirmed_score_threshold
@@ -193,11 +236,7 @@ impl SkybouncerEngine {
             }
         }
 
-        let existed = self
-            .cache
-            .get_active_storm_by_focal_uri(&candidate.target_did, &candidate.focal_post_uri)?
-            .is_some();
-
+        let now_us = monotonic_time_us();
         let event = StormEvent {
             id: 0,
             target_did: candidate.target_did.clone(),
@@ -206,8 +245,8 @@ impl SkybouncerEngine {
             focal_post_snippet,
             status: StormStatus::Active,
             severity,
-            started_at_us: candidate.observed_at_us,
-            updated_at_us: candidate.observed_at_us,
+            started_at_us: now_us,
+            updated_at_us: now_us,
             resolved_at_us: None,
             metrics,
             top_catalyst,
@@ -218,13 +257,13 @@ impl SkybouncerEngine {
             postgate_detaches_applied: 0,
         };
 
-        let storm_id = self.cache.upsert_active_storm(&event)?;
+        let (storm_id, created) = self.cache.upsert_active_storm_with_status(&event)?;
         let persisted = self.cache.get_storm(storm_id)?.unwrap_or(StormEvent {
             id: storm_id,
             ..event
         });
 
-        if !existed {
+        if created {
             self.stats.dogpiles_detected.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -233,7 +272,7 @@ impl SkybouncerEngine {
             &candidate.focal_post_uri,
             storm_id,
             severity,
-            candidate.observed_at_us,
+            now_us,
         );
 
         if should_emit {
@@ -258,12 +297,51 @@ impl SkybouncerEngine {
         Ok(Some(persisted))
     }
 
+    /// Reconciles persisted active dogpile storms on engine startup:
+    /// resolves expired `'active'` rows in SQLite and rehydrates unexpired ones
+    /// into [`DogpileTracker`] so Storm Mode, digest suppression, and 3x rate-limit
+    /// headroom survive restarts cleanly.
+    pub(super) fn reconcile_storms_on_startup(&self) {
+        if !self.config.dogpile_config.enabled {
+            return;
+        }
+        let Ok(active_storms) = self.cache.list_storms(None, true, 200) else {
+            return;
+        };
+        if active_storms.is_empty() {
+            return;
+        }
+        let now_us = monotonic_time_us();
+        let ttl_us = u64::try_from(self.config.dogpile_config.storm_mode_ttl.as_micros())
+            .unwrap_or(u64::MAX);
+        for storm in active_storms {
+            let expires_at_us = storm.updated_at_us.saturating_add(ttl_us);
+            if expires_at_us <= now_us {
+                let _ = self.cache.update_storm_status(
+                    Some(&storm.target_did),
+                    storm.id,
+                    StormStatus::Resolved,
+                    Some(now_us),
+                );
+            } else {
+                self.dogpile_tracker.rehydrate_storm(
+                    &storm.target_did,
+                    &storm.focal_post_uri,
+                    storm.id,
+                    storm.severity,
+                    storm.updated_at_us,
+                    expires_at_us,
+                );
+            }
+        }
+    }
+
     /// Expires stale storms/manual toggles and flushes due Storm Mode bounce digests.
     ///
     /// # Errors
     /// Returns [`SkybouncerError::Database`] if resolving expired storms in SQLite fails.
     pub fn flush_storm_maintenance(&self) -> Result<(), SkybouncerError> {
-        let now_us = current_time_us();
+        let now_us = monotonic_time_us();
         let (expired, digests) = self.dogpile_tracker.prune_and_expire(now_us);
         for (target_did, _focal_uri, storm_id) in expired {
             let _ = self.cache.update_storm_status(
@@ -307,15 +385,34 @@ impl SkybouncerEngine {
     #[must_use]
     pub fn is_storm_mode_active(&self, target_did: &str) -> bool {
         self.dogpile_tracker
-            .is_storm_mode_active(target_did, current_time_us())
+            .is_storm_mode_active(target_did, monotonic_time_us())
     }
 
     /// Manually activates or deactivates Storm Mode for `target_did`.
     pub fn set_storm_mode(&self, target_did: &str, enabled: bool) {
-        let now_us = current_time_us();
-        self.dogpile_tracker
+        let now_us = monotonic_time_us();
+        let cleared = self
+            .dogpile_tracker
             .set_manual_storm_mode(target_did, enabled, now_us);
         if !enabled {
+            for (_focal_uri, storm_id) in cleared {
+                let _ = self.cache.update_storm_status(
+                    Some(target_did),
+                    storm_id,
+                    StormStatus::Resolved,
+                    Some(now_us),
+                );
+            }
+            if let Ok(active_rows) = self.cache.list_storms(Some(target_did), true, 200) {
+                for row in active_rows {
+                    let _ = self.cache.update_storm_status(
+                        Some(target_did),
+                        row.id,
+                        StormStatus::Resolved,
+                        Some(now_us),
+                    );
+                }
+            }
             let _ = self.flush_storm_maintenance();
         }
     }
@@ -340,14 +437,21 @@ impl SkybouncerEngine {
                 ));
             }
         }
+        let now_us = monotonic_time_us();
         let updated = self.cache.update_storm_status(
             Some(&storm.target_did),
             storm_id,
             StormStatus::Dismissed,
-            Some(current_time_us()),
+            Some(now_us),
         )?;
-        self.dogpile_tracker
-            .dismiss_storm(&storm.target_did, storm_id);
+        if let Some(digest) = self.dogpile_tracker.dismiss_storm(
+            &storm.target_did,
+            &storm.focal_post_uri,
+            storm_id,
+            now_us,
+        ) {
+            let _ = self.storm_digest_notifier.send(digest);
+        }
         Ok(updated)
     }
 
@@ -494,7 +598,10 @@ impl SkybouncerEngine {
             .unwrap_or(&[])
             .iter()
             .map(|u| u.trim().to_string())
-            .filter(|u| u.starts_with("at://"))
+            .filter(|u| {
+                crate::matcher::extract_did_for_collection(u, "app.bsky.feed.post").is_some()
+                    && u.rsplit('/').next().is_some_and(is_valid_rkey)
+            })
             .collect();
 
         if effective_qts.is_empty() && !disable_all_quotes {
@@ -520,12 +627,12 @@ impl SkybouncerEngine {
             ));
         }
 
-        let (pg_uri, total_detached) = self
+        let (pg_uri, total_detached, newly_added) = self
             .with_pds_client_401_retry(protected_did, |pds_client| {
                 let post_uri_ref = canonical_post_uri.as_str();
                 let qts_ref = &effective_qts;
                 async move {
-                    apply_postgate_detach(
+                    apply_postgate_detach_detailed(
                         &pds_client,
                         protected_did,
                         post_uri_ref,
@@ -543,16 +650,17 @@ impl SkybouncerEngine {
                     .fetch_add(1, Ordering::Relaxed);
             })?;
 
-        let applied_delta =
-            u64::try_from(effective_qts.len().max(usize::from(disable_all_quotes))).unwrap_or(1);
-        self.stats
-            .postgate_detaches_applied
-            .fetch_add(applied_delta, Ordering::Relaxed);
-        let _ = self.cache.increment_storm_postgate_detaches(
-            protected_did,
-            &canonical_post_uri,
-            applied_delta,
-        );
+        let applied_delta = u64::try_from(newly_added).unwrap_or(0);
+        if applied_delta > 0 {
+            self.stats
+                .postgate_detaches_applied
+                .fetch_add(applied_delta, Ordering::Relaxed);
+            let _ = self.cache.increment_storm_postgate_detaches(
+                protected_did,
+                &canonical_post_uri,
+                applied_delta,
+            );
+        }
 
         Ok((pg_uri, canonical_post_uri, total_detached))
     }

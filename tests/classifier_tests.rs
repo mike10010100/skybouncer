@@ -168,14 +168,21 @@ async fn test_jev_classifier_confidence_below_threshold_downgrades_to_permitted(
         supports_images: false,
     };
     let rubric = RuleRubric::new("Block harassment", Sensitivity::Medium);
-    let classifier = JevClassifier::new(config, rubric).unwrap();
+    let classifier = JevClassifier::new(config, rubric.clone()).unwrap();
 
     let interaction = sample_interaction("I disagree with your take.");
     let verdict = classifier.classify(&interaction).await.unwrap();
 
-    // Must downgrade to Permitted because confidence 0.65 < 0.75 threshold!
-    assert!(!verdict.is_violation());
+    // JevClassifier returns raw Violation (0.65) without premature downgrade so
+    // TieredClassifier and post-Tier-2 rubric arbitration observe the true primary result.
+    assert!(verdict.is_violation());
+    assert_eq!(verdict.confidence(), Some(0.65));
     assert_eq!(verdict.reason(), "Borderline negative comment");
+
+    // Applying the rubric's sensitivity threshold (0.75) post-classification downgrades it to Permitted.
+    let evaluated = rubric.evaluate_verdict(verdict);
+    assert!(!evaluated.is_violation());
+    assert!(evaluated.reason().contains("Borderline negative comment"));
 }
 
 #[tokio::test]
@@ -866,7 +873,7 @@ async fn test_jev_classifier_multimodal_images_injected_ollama() {
         supports_images: false,
     };
     let rubric = RuleRubric::new("Block harassment", Sensitivity::Medium);
-    let classifier = JevClassifier::new(config, rubric).unwrap();
+    let classifier = JevClassifier::new(config, rubric.clone()).unwrap();
 
     let mut interaction = sample_interaction("Look at this");
     let mut enriched = EnrichedContext::default();
@@ -1651,4 +1658,151 @@ async fn test_tiered_classifier_suspicious_bot_signals_escalate_without_false_po
     assert!(!no_esc.escalated);
     assert!(no_esc.final_verdict.is_permitted());
     assert_eq!(fallback.call_count(), 1);
+}
+
+#[tokio::test]
+async fn test_pr2_permitted_fragmented_softmax_escalates_uncertainty_band() {
+    use skybouncer::classifier::EscalationReason;
+
+    let primary = Arc::new(MockClassifier::new(Verdict::Permitted {
+        confidence: Some(0.35),
+        reason: "fragmented choice_probs".to_string(),
+    }));
+    let fallback = Arc::new(MockClassifier::new(Verdict::Violation {
+        category: ViolationCategory::Harassment,
+        confidence: 0.91,
+        reason: "Tier 2 caught subtle harassment".to_string(),
+    }));
+
+    let tiered = TieredClassifier::new(primary, fallback.clone(), CertaintyConfig::default());
+    let detailed = tiered
+        .classify_detailed(&sample_interaction("veiled threat"))
+        .await
+        .unwrap();
+    assert!(detailed.escalated);
+    assert_eq!(
+        detailed.escalation_kind,
+        Some(EscalationReason::UncertaintyBand)
+    );
+    assert!(detailed.final_verdict.is_violation());
+    assert_eq!(fallback.call_count(), 1);
+
+    // High-confidence Permitted does NOT escalate.
+    let confident_primary = Arc::new(MockClassifier::new(Verdict::Permitted {
+        confidence: Some(0.95),
+        reason: "clearly benign".to_string(),
+    }));
+    let fallback2 = Arc::new(MockClassifier::new(Verdict::permitted("unused")));
+    let tiered2 = TieredClassifier::new(
+        confident_primary,
+        fallback2.clone(),
+        CertaintyConfig::default(),
+    );
+    let not_esc = tiered2
+        .classify_detailed(&sample_interaction("nice post!"))
+        .await
+        .unwrap();
+    assert!(!not_esc.escalated);
+    assert_eq!(not_esc.escalation_kind, None);
+    assert_eq!(fallback2.call_count(), 0);
+}
+
+#[tokio::test]
+async fn test_pr2_sensitivity_threshold_raw_violation_and_nuanced_priority_over_visual() {
+    use skybouncer::classifier::EscalationReason;
+
+    // 1. NuancedViolation (Custom category below low-sensitivity threshold, WITH images)
+    //    prioritizes NuancedViolation over VisualMedia.
+    let primary_nuanced = Arc::new(MockClassifier::new(Verdict::Violation {
+        category: ViolationCategory::Custom("custom_rule".to_string()),
+        confidence: 0.88,
+        reason: "custom rule triggered".to_string(),
+    }));
+    let fallback_low = Arc::new(MockClassifier::new(Verdict::Violation {
+        category: ViolationCategory::Harassment,
+        confidence: 0.88,
+        reason: "sub-threshold under Low sensitivity".to_string(),
+    }));
+
+    let mut image_interaction = sample_interaction("look at this meme");
+    image_interaction.image_cids = vec!["bafyrei_img1".to_string()];
+    let low_rubric = RuleRubric::new("Strict bar", Sensitivity::Low); // threshold 0.90
+    image_interaction.rubric = Some(low_rubric.clone());
+
+    let tiered = TieredClassifier::new(
+        primary_nuanced,
+        fallback_low,
+        CertaintyConfig::default().with_escalate_on_images(true),
+    );
+    let res = tiered.classify_detailed(&image_interaction).await.unwrap();
+    assert!(res.escalated);
+    assert_eq!(
+        res.escalation_kind,
+        Some(EscalationReason::NuancedViolation)
+    );
+    assert!(low_rubric
+        .evaluate_verdict(res.final_verdict)
+        .is_permitted());
+
+    // 2. When primary permits cleanly on an image post, EscalationReason::VisualMedia fires.
+    let primary_ok = Arc::new(MockClassifier::new(Verdict::Permitted {
+        confidence: Some(0.95),
+        reason: "text ok".to_string(),
+    }));
+    let fallback_ok = Arc::new(MockClassifier::new(Verdict::Permitted {
+        confidence: Some(0.92),
+        reason: "image ok".to_string(),
+    }));
+    let tiered_img = TieredClassifier::new(
+        primary_ok,
+        fallback_ok,
+        CertaintyConfig::default().with_escalate_on_images(true),
+    );
+    let img_res = tiered_img
+        .classify_detailed(&image_interaction)
+        .await
+        .unwrap();
+    assert!(img_res.escalated);
+    assert_eq!(img_res.escalation_kind, Some(EscalationReason::VisualMedia));
+}
+
+#[tokio::test]
+async fn test_pr2_jev_timeout_does_not_retry_100ms_internally() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/classify"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(250))
+                .set_body_json(json!({"violates": false, "confidence": 0.9, "reason": "late"})),
+        )
+        .mount(&server)
+        .await;
+
+    let cfg = JevConfig {
+        base_url: server.uri(),
+        api_key: None,
+        model: "jev-timeout-test".to_string(),
+        timeout: Duration::from_millis(60),
+        max_retries: 2, // Should NOT retry on reqwest timeout inside JevClassifier
+        supports_images: false,
+    };
+    let jev = JevClassifier::new(cfg, RuleRubric::default()).unwrap();
+
+    let err = jev
+        .classify(&sample_interaction("hello"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("timeout")
+            || err.to_string().to_lowercase().contains("timed out")
+            || matches!(err, SkybouncerError::Classifier(_)),
+        "expected timeout error, got: {err}"
+    );
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "JevClassifier must not retry client timeouts after 100ms internally"
+    );
 }

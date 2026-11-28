@@ -8,6 +8,12 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+/// Maximum character length permitted for a moderation rule rubric prompt.
+///
+/// Enforced across API, DM bot, sovereign PDS config, and classifier interpolation boundaries
+/// to prevent context-window exhaustion and prompt-injection flooding.
+pub const MAX_RUBRIC_PROMPT_CHARS: usize = 2000;
+
 /// Sensitivity level determining confidence thresholds for automated list actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Sensitivity {
@@ -452,71 +458,44 @@ impl RuleRubric {
 
         for line in trimmed.lines() {
             let line_trimmed = line.trim();
-            let directive = line_trimmed
-                .strip_prefix('[')
-                .and_then(|s| s.strip_suffix(']'))
-                .unwrap_or(line_trimmed);
+            let mut remaining = line_trimmed;
+            let mut matched_bracketed = false;
 
-            if let Some(rest) = directive.strip_prefix("sensitivity:") {
-                let level_str = rest.trim();
-                sensitivity = level_str.parse::<Sensitivity>()?;
-            } else if let Some(rest) = directive.strip_prefix("sensitivity =") {
-                let level_str = rest.trim().trim_matches('"');
-                sensitivity = level_str.parse::<Sensitivity>()?;
-            } else if let Some(rest) = directive.strip_prefix("duration:") {
-                let dur_str = rest.trim();
-                bounce_duration = dur_str.parse::<BounceDuration>()?;
-            } else if let Some(rest) = directive.strip_prefix("duration =") {
-                let dur_str = rest.trim().trim_matches('"');
-                bounce_duration = dur_str.parse::<BounceDuration>()?;
-            } else if let Some(rest) = directive.strip_prefix("timeout:") {
-                let dur_str = rest.trim();
-                bounce_duration = dur_str.parse::<BounceDuration>()?;
-            } else if let Some(rest) = directive.strip_prefix("timeout =") {
-                let dur_str = rest.trim().trim_matches('"');
-                bounce_duration = dur_str.parse::<BounceDuration>()?;
-            } else if let Some(rest) = directive.strip_prefix("bypass_followers:") {
-                let flag = rest.trim();
-                bypass_incoming_followers = flag.parse::<bool>().map_err(|_| {
-                    SkybouncerError::Config(format!(
-                        "Invalid bypass_followers value '{flag}'; expected true or false"
-                    ))
-                })?;
-            } else if let Some(rest) = directive.strip_prefix("bypass_followers =") {
-                let flag = rest.trim().trim_matches('"');
-                bypass_incoming_followers = flag.parse::<bool>().map_err(|_| {
-                    SkybouncerError::Config(format!(
-                        "Invalid bypass_followers value '{flag}'; expected true or false"
-                    ))
-                })?;
-            } else if let Some(idx) = line_trimmed.rfind('[') {
-                if let Some(rest) = line_trimmed[idx..].strip_suffix(']') {
-                    let inline_dir = &rest[1..];
-                    if let Some(dur_str) = inline_dir.strip_prefix("duration:") {
-                        bounce_duration = dur_str.trim().parse::<BounceDuration>()?;
-                        let rem = line_trimmed[..idx].trim();
-                        if !rem.is_empty() {
-                            prompt_lines.push(rem);
-                        }
-                    } else if let Some(dur_str) = inline_dir.strip_prefix("timeout:") {
-                        bounce_duration = dur_str.trim().parse::<BounceDuration>()?;
-                        let rem = line_trimmed[..idx].trim();
-                        if !rem.is_empty() {
-                            prompt_lines.push(rem);
-                        }
-                    } else if let Some(sens_str) = inline_dir.strip_prefix("sensitivity:") {
-                        sensitivity = sens_str.trim().parse::<Sensitivity>()?;
-                        let rem = line_trimmed[..idx].trim();
-                        if !rem.is_empty() {
-                            prompt_lines.push(rem);
-                        }
-                    } else {
-                        prompt_lines.push(line);
-                    }
+            while let Some(stripped_end) = remaining.strip_suffix(']') {
+                let Some(idx) = stripped_end.rfind('[') else {
+                    break;
+                };
+                let inner = stripped_end[idx + 1..].trim();
+                if parse_directive_token(
+                    inner,
+                    &mut sensitivity,
+                    &mut bounce_duration,
+                    &mut bypass_incoming_followers,
+                )? {
+                    remaining = remaining[..idx].trim();
+                    matched_bracketed = true;
                 } else {
-                    prompt_lines.push(line);
+                    break;
                 }
-            } else {
+            }
+
+            if matched_bracketed {
+                if !remaining.is_empty()
+                    && !parse_directive_token(
+                        remaining,
+                        &mut sensitivity,
+                        &mut bounce_duration,
+                        &mut bypass_incoming_followers,
+                    )?
+                {
+                    prompt_lines.push(remaining);
+                }
+            } else if !parse_directive_token(
+                line_trimmed,
+                &mut sensitivity,
+                &mut bounce_duration,
+                &mut bypass_incoming_followers,
+            )? {
                 prompt_lines.push(line);
             }
         }
@@ -528,6 +507,11 @@ impl RuleRubric {
                     .to_string(),
             ));
         }
+        if prompt.chars().count() > MAX_RUBRIC_PROMPT_CHARS {
+            return Err(SkybouncerError::Config(format!(
+                "Rule rubric prompt exceeds maximum length of {MAX_RUBRIC_PROMPT_CHARS} characters"
+            )));
+        }
 
         Ok(Self {
             prompt,
@@ -535,6 +519,51 @@ impl RuleRubric {
             bounce_duration,
             bypass_incoming_followers,
         })
+    }
+}
+
+fn parse_directive_token(
+    directive: &str,
+    sensitivity: &mut Sensitivity,
+    bounce_duration: &mut BounceDuration,
+    bypass_incoming_followers: &mut bool,
+) -> Result<bool, SkybouncerError> {
+    if let Some(rest) = directive.strip_prefix("sensitivity:") {
+        *sensitivity = rest.trim().parse::<Sensitivity>()?;
+        Ok(true)
+    } else if let Some(rest) = directive.strip_prefix("sensitivity =") {
+        *sensitivity = rest.trim().trim_matches('"').parse::<Sensitivity>()?;
+        Ok(true)
+    } else if let Some(rest) = directive.strip_prefix("duration:") {
+        *bounce_duration = rest.trim().parse::<BounceDuration>()?;
+        Ok(true)
+    } else if let Some(rest) = directive.strip_prefix("duration =") {
+        *bounce_duration = rest.trim().trim_matches('"').parse::<BounceDuration>()?;
+        Ok(true)
+    } else if let Some(rest) = directive.strip_prefix("timeout:") {
+        *bounce_duration = rest.trim().parse::<BounceDuration>()?;
+        Ok(true)
+    } else if let Some(rest) = directive.strip_prefix("timeout =") {
+        *bounce_duration = rest.trim().trim_matches('"').parse::<BounceDuration>()?;
+        Ok(true)
+    } else if let Some(rest) = directive.strip_prefix("bypass_followers:") {
+        let flag = rest.trim();
+        *bypass_incoming_followers = flag.parse::<bool>().map_err(|_| {
+            SkybouncerError::Config(format!(
+                "Invalid bypass_followers value '{flag}'; expected true or false"
+            ))
+        })?;
+        Ok(true)
+    } else if let Some(rest) = directive.strip_prefix("bypass_followers =") {
+        let flag = rest.trim().trim_matches('"');
+        *bypass_incoming_followers = flag.parse::<bool>().map_err(|_| {
+            SkybouncerError::Config(format!(
+                "Invalid bypass_followers value '{flag}'; expected true or false"
+            ))
+        })?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -895,5 +924,36 @@ mod tests {
         let mut custom = RuleRubric::with_default_sensitivity("Block all spoilers.");
         assert!(!custom.upgrade_legacy_prompt());
         assert_eq!(custom.prompt, "Block all spoilers.");
+    }
+
+    #[test]
+    fn test_rubric_parse_multiple_inline_directives_and_max_length_cap() {
+        let r = RuleRubric::parse(
+            "Block spam [sensitivity: high] [duration: 24h] [bypass_followers: false]",
+        )
+        .unwrap();
+        assert_eq!(r.prompt, "Block spam");
+        assert_eq!(r.sensitivity, Sensitivity::High);
+        assert_eq!(r.bounce_duration, BounceDuration::Cooldown24h);
+        assert!(!r.bypass_incoming_followers);
+
+        // Multiple directives on their own line with no prompt text still errors cleanly.
+        assert!(RuleRubric::parse("[sensitivity: high] [duration: 24h]").is_err());
+
+        // Equals-form inline directives also parse cleanly in a loop.
+        let r_eq = RuleRubric::parse(
+            "Block spam [sensitivity = low] [timeout = 7d] [bypass_followers = true]",
+        )
+        .unwrap();
+        assert_eq!(r_eq.prompt, "Block spam");
+        assert_eq!(r_eq.sensitivity, Sensitivity::Low);
+        assert_eq!(r_eq.bounce_duration, BounceDuration::Timeout7d);
+        assert!(r_eq.bypass_incoming_followers);
+
+        // Prompt length cap: exactly MAX_RUBRIC_PROMPT_CHARS succeeds, +1 fails.
+        let at_limit = "a".repeat(MAX_RUBRIC_PROMPT_CHARS);
+        assert!(RuleRubric::parse(&at_limit).is_ok());
+        let over_limit = "a".repeat(MAX_RUBRIC_PROMPT_CHARS + 1);
+        assert!(RuleRubric::parse(&over_limit).is_err());
     }
 }

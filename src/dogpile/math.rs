@@ -48,11 +48,12 @@ pub fn compute_burst_acceleration(
     medium_count: usize,
     medium_secs: f64,
 ) -> f64 {
-    if short_secs <= 0.0 || short_secs.is_nan() || medium_secs.is_nan() {
+    if !short_secs.is_finite()
+        || !medium_secs.is_finite()
+        || short_secs <= 0.0
+        || medium_secs <= short_secs
+    {
         return 0.0;
-    }
-    if medium_secs <= short_secs {
-        return short_count as f64;
     }
 
     let prior_secs = medium_secs - short_secs;
@@ -61,7 +62,7 @@ pub fn compute_burst_acceleration(
     let rate_bg = (prior_count as f64 / prior_secs).max(min_rate);
     let expected_short = rate_bg * short_secs;
     let z = (short_count as f64 - expected_short) / expected_short.max(1.0).sqrt();
-    if z.is_nan() || z < 0.0 {
+    if !z.is_finite() || z < 0.0 {
         0.0
     } else {
         z
@@ -137,23 +138,72 @@ pub fn compute_structural_score(metrics: &StormMetrics, config: &DogpileConfig) 
 /// Fallback verdicts (`evaluator == "structural_fallback"`) leave `structural_score` unchanged.
 #[must_use]
 pub fn compute_composite_score(structural_score: f64, stance: Option<&StormStanceVerdict>) -> f64 {
-    let base = if structural_score.is_nan() {
-        0.0
-    } else {
+    let base = if structural_score.is_finite() {
         structural_score.clamp(0.0, 1.0)
+    } else {
+        0.0
     };
 
     match stance {
         Some(verdict) if verdict.evaluator != "structural_fallback" => {
-            let conf = if verdict.confidence.is_nan() {
-                0.0
-            } else {
+            let conf = if verdict.confidence.is_finite() {
                 verdict.confidence.clamp(0.0, 1.0)
+            } else {
+                0.0
             };
             if verdict.collective_hostility {
                 (0.45 * base + 0.55 * conf).clamp(0.0, 1.0)
             } else {
                 (base * (1.0 - 0.70 * conf)).clamp(0.0, 1.0)
+            }
+        }
+        _ => base,
+    }
+}
+
+/// Combines `metrics.structural_score` with an optional Stage 3 [`StormStanceVerdict`],
+/// flooring benign stance attenuation when objective defensive distress (`defensive_blocks`
+/// or `defensive_detaches`) or evaluated `violation_rate` is high so a crafted quote-post
+/// cannot neutralize Storm Mode via a benign stance veto.
+#[must_use]
+pub fn compute_composite_score_with_metrics(
+    metrics: &StormMetrics,
+    config: &DogpileConfig,
+    stance: Option<&StormStanceVerdict>,
+) -> f64 {
+    let base = if metrics.structural_score.is_finite() {
+        metrics.structural_score.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    match stance {
+        Some(verdict) if verdict.evaluator != "structural_fallback" => {
+            let conf = if verdict.confidence.is_finite() {
+                verdict.confidence.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            if verdict.collective_hostility {
+                (0.45 * base + 0.55 * conf).clamp(0.0, 1.0)
+            } else {
+                let block_ratio =
+                    metrics.defensive_blocks as f64 / config.defensive_block_burst.max(1) as f64;
+                let detach_ratio =
+                    metrics.defensive_detaches as f64 / config.defensive_detach_burst.max(1) as f64;
+                let distress = block_ratio.max(detach_ratio).clamp(0.0, 1.0);
+                let viol_norm = if metrics.violation_rate.is_finite() {
+                    metrics.violation_rate.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let min_multiplier = if distress >= 1.0 || viol_norm >= 0.40 {
+                    0.85
+                } else {
+                    0.0
+                };
+                let multiplier = (1.0 - 0.70 * conf).max(min_multiplier);
+                (base * multiplier).clamp(0.0, 1.0)
             }
         }
         _ => base,
@@ -238,7 +288,8 @@ mod tests {
         // Edge cases
         assert_eq!(compute_burst_acceleration(5, 0.0, 10, 100.0), 0.0);
         assert_eq!(compute_burst_acceleration(5, f64::NAN, 10, 100.0), 0.0);
-        assert_eq!(compute_burst_acceleration(5, 300.0, 10, 300.0), 5.0);
+        assert_eq!(compute_burst_acceleration(5, f64::INFINITY, 10, 100.0), 0.0);
+        assert_eq!(compute_burst_acceleration(5, 300.0, 10, 300.0), 0.0);
     }
 
     #[test]
@@ -352,5 +403,92 @@ mod tests {
             canonical_focal_post_uri(&i),
             "at://did:plc:alice/app.bsky.feed.post/_mentions"
         );
+    }
+
+    #[test]
+    fn benign_stance_veto_is_floored_when_distress_or_violation_rate_is_high() {
+        let cfg = DogpileConfig::default();
+        let benign_veto = StormStanceVerdict::new(
+            false,
+            1.0,
+            "benign_viral",
+            "Injected benign verdict",
+            "gemma4:26b",
+        );
+
+        // High defensive distress + structural score 0.85 must NOT collapse below 0.65.
+        let distressed_metrics = StormMetrics {
+            unique_oon_authors_short: 12,
+            out_of_network_ratio: 0.9,
+            defensive_blocks: cfg.defensive_block_burst,
+            structural_score: 0.85,
+            ..Default::default()
+        };
+        let floored_distress =
+            compute_composite_score_with_metrics(&distressed_metrics, &cfg, Some(&benign_veto));
+        assert!(
+            floored_distress >= cfg.confirmed_score_threshold,
+            "distressed surge should survive benign veto: got {floored_distress}"
+        );
+
+        // High violation_rate (>= 0.40) also floors the benign veto.
+        let high_viol_metrics = StormMetrics {
+            violation_rate: 0.55,
+            structural_score: 0.82,
+            ..Default::default()
+        };
+        let floored_viol =
+            compute_composite_score_with_metrics(&high_viol_metrics, &cfg, Some(&benign_veto));
+        assert!(
+            floored_viol >= cfg.confirmed_score_threshold,
+            "high violation rate surge should survive benign veto: got {floored_viol}"
+        );
+
+        // Genuine benign viral surge (0 distress, 0 violation rate) still attenuates strongly.
+        let clean_viral = StormMetrics {
+            structural_score: 0.60,
+            ..Default::default()
+        };
+        let attenuated =
+            compute_composite_score_with_metrics(&clean_viral, &cfg, Some(&benign_veto));
+        assert!(
+            attenuated < 0.25,
+            "benign viral should attenuate: {attenuated}"
+        );
+
+        // NaN / non-finite and fallback paths sanitize to 0.0 safely
+        let nan_metrics = StormMetrics {
+            out_of_network_ratio: f64::NAN,
+            direct_ratio: f64::NAN,
+            dunk_ratio: f64::NAN,
+            burst_z_score: f64::NAN,
+            violation_rate: f64::NAN,
+            structural_score: f64::NAN,
+            ..Default::default()
+        };
+        assert_eq!(compute_structural_score(&nan_metrics, &cfg), 0.0);
+        assert_eq!(
+            compute_composite_score_with_metrics(&nan_metrics, &cfg, None),
+            0.0
+        );
+        let fallback_stance = StormStanceVerdict {
+            collective_hostility: true,
+            confidence: f64::NAN,
+            classification: "fallback".to_string(),
+            summary: String::new(),
+            evaluator: "structural_fallback".to_string(),
+        };
+        assert_eq!(
+            compute_composite_score_with_metrics(&distressed_metrics, &cfg, Some(&fallback_stance)),
+            0.85
+        );
+        assert_eq!(
+            compute_composite_score(
+                0.5,
+                Some(&StormStanceVerdict::new(true, 0.8, "x", "y", "m"))
+            ),
+            (0.45 * 0.5 + 0.55 * 0.8)
+        );
+        assert_eq!(compute_burst_acceleration(0, 60.0, 100, 300.0), 0.0);
     }
 }

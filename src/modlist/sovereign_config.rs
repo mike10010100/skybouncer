@@ -70,8 +70,13 @@ impl SovereignConfigRecord {
     pub fn to_rubric(&self) -> RuleRubric {
         let sensitivity = sensitivity_from_db(Some(&self.sensitivity));
         let bounce_duration = bounce_duration_from_db(self.bounce_duration.as_deref());
+        let prompt: String = self
+            .rules
+            .chars()
+            .take(crate::classifier::MAX_RUBRIC_PROMPT_CHARS)
+            .collect();
         RuleRubric {
-            prompt: self.rules.clone(),
+            prompt,
             sensitivity,
             bounce_duration,
             bypass_incoming_followers: self.bypass_incoming_followers,
@@ -166,9 +171,14 @@ pub fn extract_rubric_from_list_description(description: &str) -> Option<RuleRub
     let meta: ListMetadata = serde_json::from_str(json_str).ok()?;
     let sensitivity = sensitivity_from_db(Some(&meta.sensitivity));
     let bounce_duration = bounce_duration_from_db(meta.bounce_duration.as_deref());
+    let prompt: String = meta
+        .rules
+        .chars()
+        .take(crate::classifier::MAX_RUBRIC_PROMPT_CHARS)
+        .collect();
 
     Some(RuleRubric {
-        prompt: meta.rules,
+        prompt,
         sensitivity,
         bounce_duration,
         bypass_incoming_followers: meta.bypass_incoming_followers,

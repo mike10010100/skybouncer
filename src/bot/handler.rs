@@ -507,6 +507,12 @@ impl BotCommandHandler {
 
         let current = self.engine.rubric_for(sender_did);
         let parsed = current.parse_updating(prompt)?;
+        if parsed.prompt.chars().count() > crate::classifier::MAX_RUBRIC_PROMPT_CHARS {
+            return Err(SkybouncerError::Config(format!(
+                "Rule rubric prompt exceeds maximum length of {} characters",
+                crate::classifier::MAX_RUBRIC_PROMPT_CHARS
+            )));
+        }
         self.engine
             .set_bypass_incoming_followers(sender_did, parsed.bypass_incoming_followers);
         if self.engine.is_enrolled(sender_did) {

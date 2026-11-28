@@ -37,6 +37,9 @@ pub const MAX_POST_IMAGES: usize = 20;
 /// escalation for visual disambiguation.
 pub const MAX_CONTEXT_IMAGES: usize = 2;
 
+/// Maximum character length enforced on untrusted actor display names in classifier prompts.
+pub const MAX_DISPLAY_NAME_CHARS: usize = 80;
+
 /// Maximum number of protected target profiles cached in memory by [`AppViewContextEnricher`].
 const MAX_TARGET_PROFILE_CACHE_ENTRIES: usize = 1024;
 
@@ -75,6 +78,63 @@ pub const MAX_OTHER_REPLY_SNIPPETS: usize = 3;
 
 const TID_TIMESTAMP_MIN_US: u64 = 1_577_836_800_000_000;
 const TID_TIMESTAMP_MAX_US: u64 = 2_208_988_800_000_000;
+
+/// Neutralizes prompt-injection boundary tags (`<untrusted_input`, `</untrusted_input`,
+/// `<candidate_content`, `</candidate_content`, case-insensitive) by replacing `<` with `[`.
+#[must_use]
+pub(crate) fn strip_boundary_tags(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    let mut out = String::with_capacity(raw.len());
+    let mut last = 0usize;
+    let bytes = lower.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            let mut j = i + 1;
+            if j < bytes.len() && bytes[j] == b'/' {
+                j += 1;
+            }
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let tail = &lower[j..];
+            if tail.starts_with("untrusted_input") || tail.starts_with("candidate_content") {
+                out.push_str(&raw[last..i]);
+                out.push('[');
+                last = i + 1;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&raw[last..]);
+    out
+}
+
+/// Normalizes control characters/newlines, escapes double quotes, neutralizes prompt boundary tags,
+/// and truncates an untrusted metadata field to `max_chars` Unicode scalar values.
+#[must_use]
+pub(crate) fn sanitize_untrusted_field(raw: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let normalized: String = raw
+        .trim()
+        .chars()
+        .take(max_chars.saturating_mul(4).max(1024))
+        .map(|ch| {
+            if ch.is_control() {
+                ' '
+            } else if ch == '"' {
+                '\''
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stripped = strip_boundary_tags(&collapsed);
+    stripped.chars().take(max_chars).collect()
+}
 
 /// Extracts the final record key (`rkey`) segment from a canonical `at://did/.../collection/rkey` URI.
 #[must_use]
@@ -323,10 +383,15 @@ impl AuthorActivitySignals {
             parts.push("forged/backdated post TID rkey".to_string());
         }
         if !self.profile_fundraiser_urls.is_empty() {
+            let urls: Vec<String> = self
+                .profile_fundraiser_urls
+                .iter()
+                .map(|u| sanitize_untrusted_field(u, 200))
+                .collect();
             parts.push(format!(
                 "profile/repost fundraiser funnel ({} item(s)): {}",
                 self.profile_fundraiser_item_count.max(1),
-                self.profile_fundraiser_urls.join(", ")
+                urls.join(", ")
             ));
         }
         if self.is_reply_blast() {
@@ -361,7 +426,7 @@ impl AuthorActivitySignals {
                 .recent_other_reply_snippets
                 .iter()
                 .take(MAX_OTHER_REPLY_SNIPPETS)
-                .map(|s| format!("\"{}\"", s.replace('"', "'")))
+                .map(|s| format!("\"{}\"", sanitize_untrusted_field(s, 200)))
                 .collect();
             parts.push(format!("recent replies to others: {}", quoted.join("; ")));
         }
@@ -446,13 +511,11 @@ impl PostEmbedSummary {
 
     fn format_link_card(label: &str, title: Option<&str>, description: Option<&str>) -> String {
         let t = title
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.chars().take(140).collect::<String>());
+            .map(|s| sanitize_untrusted_field(s, 140))
+            .filter(|s| !s.is_empty());
         let d = description
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.chars().take(160).collect::<String>());
+            .map(|s| sanitize_untrusted_field(s, 160))
+            .filter(|s| !s.is_empty());
         match (t, d) {
             (Some(title), Some(desc)) => format!(" [{label}: \"{title}\" — \"{desc}\"]"),
             (Some(only), None) | (None, Some(only)) => format!(" [{label}: \"{only}\"]"),
@@ -471,9 +534,8 @@ impl PostEmbedSummary {
         }
         let capped_alts: Vec<String> = alts
             .iter()
-            .map(|s| s.trim())
+            .map(|s| sanitize_untrusted_field(s, 160))
             .filter(|s| !s.is_empty())
-            .map(|s| s.chars().take(160).collect())
             .collect();
         if capped_alts.is_empty() {
             format!(" [{empty_tag} (no alt text)]")
@@ -649,14 +711,20 @@ impl EnrichedContext {
         if let Some(ref target) = self.target {
             let mut target_desc = Vec::new();
             if let Some(ref handle) = target.handle {
-                target_desc.push(format!("handle: @{handle}"));
+                let clean_h = sanitize_untrusted_field(crate::util::normalize_handle(handle), 120);
+                if !clean_h.is_empty() {
+                    target_desc.push(format!("handle: @{clean_h}"));
+                }
             }
             if let Some(ref name) = target.display_name {
-                target_desc.push(format!("name: \"{name}\""));
+                let clean_n = sanitize_untrusted_field(name, MAX_DISPLAY_NAME_CHARS);
+                if !clean_n.is_empty() {
+                    target_desc.push(format!("name: \"{clean_n}\""));
+                }
             }
             if let Some(ref bio) = target.description {
-                let bio_snippet: String = bio.chars().take(160).collect();
-                if !bio_snippet.trim().is_empty() {
+                let bio_snippet = sanitize_untrusted_field(bio, 160);
+                if !bio_snippet.is_empty() {
                     target_desc.push(format!("bio: \"{bio_snippet}\""));
                 }
             }
@@ -671,13 +739,19 @@ impl EnrichedContext {
         if let Some(ref author) = self.author {
             let mut author_desc = Vec::new();
             if let Some(ref handle) = author.handle {
-                author_desc.push(format!("handle: @{handle}"));
+                let clean_h = sanitize_untrusted_field(crate::util::normalize_handle(handle), 120);
+                if !clean_h.is_empty() {
+                    author_desc.push(format!("handle: @{clean_h}"));
+                }
             }
             if let Some(ref name) = author.display_name {
-                author_desc.push(format!("name: \"{name}\""));
+                let clean_n = sanitize_untrusted_field(name, MAX_DISPLAY_NAME_CHARS);
+                if !clean_n.is_empty() {
+                    author_desc.push(format!("name: \"{clean_n}\""));
+                }
             }
             if let Some(ref bio) = author.description {
-                let bio_snippet: String = bio.chars().take(250).collect();
+                let bio_snippet = sanitize_untrusted_field(bio, 250);
                 author_desc.push(format!("bio: \"{bio_snippet}\""));
             }
             if let Some(followers) = author.followers_count {
@@ -690,7 +764,7 @@ impl EnrichedContext {
 
         if self.thread_ancestors.is_empty() {
             if let Some(ref parent) = self.parent_post {
-                let text_snippet: String = parent.text.chars().take(200).collect();
+                let text_snippet = sanitize_untrusted_field(&parent.text, 200);
                 sections.push(format!(
                     "In Reply To (by {}): \"{}\"",
                     format_actor(&parent.author_did),
@@ -708,11 +782,7 @@ impl EnrichedContext {
             let mut rendered = Vec::new();
             for (offset, ancestor) in slice.iter().enumerate() {
                 let depth = start + offset + 1;
-                let snippet: String = ancestor
-                    .text
-                    .chars()
-                    .take(THREAD_ANCESTOR_CHAR_CAP)
-                    .collect();
+                let snippet = sanitize_untrusted_field(&ancestor.text, THREAD_ANCESTOR_CHAR_CAP);
                 let is_immediate_parent = roles.is_some()
                     && !is_standalone_quote
                     && offset == last_idx
@@ -733,7 +803,7 @@ impl EnrichedContext {
                         .get(start + offset)
                         .and_then(Option::as_ref)
                         .map(|q| {
-                            let q_snippet: String = q.text.chars().take(160).collect();
+                            let q_snippet = sanitize_untrusted_field(&q.text, 160);
                             let role = if q.author_did == target_did {
                                 "Target"
                             } else if q.author_did == author_did {
@@ -744,7 +814,7 @@ impl EnrichedContext {
                             let actor = match q.author_handle.as_deref() {
                                 Some(h) if !h.trim().is_empty() => format!(
                                     "{role} @{} ({})",
-                                    crate::util::normalize_handle(h),
+                                    sanitize_untrusted_field(crate::util::normalize_handle(h), 120),
                                     q.author_did
                                 ),
                                 _ => format!("{role} ({})", q.author_did),
@@ -793,7 +863,7 @@ impl EnrichedContext {
                         .last()
                         .is_none_or(|last| last.author_did != parent.author_did)
                     {
-                        let text_snippet: String = parent.text.chars().take(200).collect();
+                        let text_snippet = sanitize_untrusted_field(&parent.text, 200);
                         sections.push(format!(
                             "In Reply To (by {}): \"{}\"",
                             format_actor(&parent.author_did),
@@ -805,7 +875,7 @@ impl EnrichedContext {
         }
 
         if let Some(ref quoted) = self.quoted_post {
-            let text_snippet: String = quoted.text.chars().take(300).collect();
+            let text_snippet = sanitize_untrusted_field(&quoted.text, 300);
             sections.push(format!(
                 "Quoted Post (by {}): \"{}\"",
                 format_actor(&quoted.author_did),
@@ -819,11 +889,10 @@ impl EnrichedContext {
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, alt)| {
-                    let trimmed = alt.trim();
-                    if trimmed.is_empty() {
+                    let cap = sanitize_untrusted_field(alt, 200);
+                    if cap.is_empty() {
                         None
                     } else {
-                        let cap: String = trimmed.chars().take(200).collect();
                         Some(format!("[{}] \"{}\"", idx + 1, cap))
                     }
                 })
@@ -1420,7 +1489,9 @@ impl AppViewContextEnricher {
         let profile = self.client.fetch_profile(did).await?;
         Some(AuthorContext {
             handle: profile.handle,
-            display_name: profile.display_name,
+            display_name: profile
+                .display_name
+                .map(|s| s.chars().take(MAX_DISPLAY_NAME_CHARS).collect()),
             description: profile.description,
             followers_count: profile.followers_count,
             follows_count: profile.follows_count,
@@ -1474,7 +1545,9 @@ impl AppViewContextEnricher {
 
         let ctx = AuthorContext {
             handle: resp.handle,
-            display_name: resp.display_name,
+            display_name: resp
+                .display_name
+                .map(|s| s.chars().take(MAX_DISPLAY_NAME_CHARS).collect()),
             description: resp.description,
             followers_count: resp.followers_count,
             follows_count: resp.follows_count,

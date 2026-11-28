@@ -25,12 +25,13 @@ pub use jev::{
 pub use mock::MockClassifier;
 pub use rubric::{
     bounce_duration_from_db, sensitivity_from_db, upgrade_legacy_prompt_str, BounceDuration,
-    RuleRubric, Sensitivity, DEFAULT_RUBRIC_PROMPT, PRESET_ANTI_CRYPTO_PROMPT,
-    PRESET_ANTI_HOSTILITY_PROMPT, PRESET_ANTI_RAGEBAIT_PROMPT, PRESET_BALANCED_PROMPT,
+    RuleRubric, Sensitivity, DEFAULT_RUBRIC_PROMPT, MAX_RUBRIC_PROMPT_CHARS,
+    PRESET_ANTI_CRYPTO_PROMPT, PRESET_ANTI_HOSTILITY_PROMPT, PRESET_ANTI_RAGEBAIT_PROMPT,
+    PRESET_BALANCED_PROMPT,
 };
 pub use tiered::{
-    CertaintyConfig, TieredClassifier, TieredClassifierStats, TieredEvaluationResult,
-    TieredStatsSnapshot, DEFAULT_UNCERTAINTY_MAX_CONFIDENCE,
+    CertaintyConfig, EscalationReason, TieredClassifier, TieredClassifierStats,
+    TieredEvaluationResult, TieredStatsSnapshot, DEFAULT_UNCERTAINTY_MAX_CONFIDENCE,
 };
 
 /// Category classification for house rule violations.
@@ -327,6 +328,7 @@ pub trait Classifier: Send + Sync {
             primary_verdict: verdict.clone(),
             primary_model: self.model_name().to_string(),
             escalated: false,
+            escalation_kind: None,
             escalation_reason: Some("Single-tier standalone classifier configured".to_string()),
             fallback_verdict: None,
             fallback_model: None,
